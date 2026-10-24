@@ -77,6 +77,7 @@ pub mod namespace_probe;
 pub mod net_namespace;
 pub mod pid_namespace;
 pub mod poll;
+pub mod populate;
 pub mod process;
 pub mod rcu;
 pub mod scheduler_hook;

@@ -1456,6 +1456,16 @@ pub struct MmState {
     /// reflected in `mmap_regions`. Non-zero during PT operations.
     pub mprotect_pending_bytes: u64,
 
+    /// LEAD-MREMAP-MIGRATE-1 FIX. Transient: bytes of in-flight `mremap`
+    /// entries in `mmap_regions` that carry no cgroup charge. A relocation
+    /// reserves `new_len` at the destination while the claimed source still
+    /// counts `old_len`, but only the growth was charged; a PROT_NONE
+    /// reservation was never charged. `compute_cgroup_charged_bytes` subtracts
+    /// this, so a migration racing the lock-dropped page-table work moves
+    /// exactly the charged bytes. Set in mremap Phase 1, cleared in the commit
+    /// or rollback section that replaces the reservation.
+    pub mremap_uncharged_reserve_bytes: u64,
+
     /// Transient: bytes charged by sys_exec (ELF loader) not yet reflected
     /// in `elf_charged_bytes`. Non-zero between load_elf() and exec commit.
     pub exec_pending_bytes: u64,
@@ -1549,6 +1559,7 @@ impl MmState {
             pt_ledger_authoritative: true,
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
+            mremap_uncharged_reserve_bytes: 0,
             exec_pending_bytes: 0,
             brk_in_progress: false,
             brk_grow_resv_lo: 0,
@@ -1710,6 +1721,45 @@ impl MmState {
         if self.shared_regions.is_empty() {
             self.shared_fault_pt_frames.reclaim_empty_capacity();
         }
+    }
+
+    /// R192-RES-2 + LEAD-ROLLBACK-PRUNE-LEDGER-1: account the page tables of a
+    /// mapping that failed and was rolled back. Returns `(debit, charge)`: the
+    /// caller uncharges `debit` and force-charges `charge` to the current cgroup
+    /// under the same `Process -> MmState` hold, and frees `pruned` only after it
+    /// (free-after-remove).
+    ///
+    /// `pruned` are the table frames the rollback detached. One of them can be a
+    /// table another operation created and ledgered: mprotect Path B leaves
+    /// empty ledgered tables, and between population chunks a sibling's munmap
+    /// cannot prune a table this mapping still had leaves in. They are removed
+    /// from the ledger here, exactly as munmap does.
+    ///
+    /// `survivors` counts the frames this mapping's `map_page` calls built and
+    /// the rollback did not prune: a sibling mapped next to the range between
+    /// chunks, or a PDPT (never pruned). A survivor no longer holds this
+    /// mapping's leaves, so a sibling may prune and free it before this commit;
+    /// a ledger key could then alias a reused frame. Survivors are charged into
+    /// the untracked basis instead: they release at teardown or exec, an
+    /// over-count bounded by the edge tables of one failed mapping, never an
+    /// under-count. The caller counts them with no lock held
+    /// (`populate::count_unpruned`).
+    pub(crate) fn settle_failed_populate(
+        &mut self,
+        pruned: &[PhysFrame<Size4KiB>],
+        survivors: usize,
+    ) -> (u64, u64) {
+        let debit = if self.pt_ledger_authoritative {
+            let freed = self.reclaim_pt_charges(pruned.iter().map(|f| f.start_address().as_u64()));
+            self.pt_charged_bytes = self.pt_charged_bytes.saturating_sub(freed);
+            freed
+        } else {
+            0
+        };
+        let charge = (survivors as u64).saturating_mul(0x1000);
+        self.pt_charged_bytes = self.pt_charged_bytes.saturating_add(charge);
+        self.pt_inherited_bytes = self.pt_inherited_bytes.saturating_add(charge);
+        (debit, charge)
     }
 
     /// M0-7 item7 SLICE 4: the PURE migration-atomic accounting commit for a
@@ -13425,6 +13475,9 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
             },
         )
         .sum();
+    // LEAD-MREMAP-MIGRATE-1 FIX: an in-flight mremap's reservation and claimed
+    // source overstate what it charged; count only the charged bytes.
+    let mmap_bytes = mmap_bytes.saturating_sub(mm.mremap_uncharged_reserve_bytes);
 
     // Compute brk heap charge (page-aligned).
     const PAGE_SIZE: usize = 0x1000;
@@ -13566,6 +13619,48 @@ pub fn run_shared_fault_pt_ledger_self_test() {
 #[test]
 fn shared_fault_pt_provenance_and_capacity() {
     run_shared_fault_pt_ledger_self_test();
+}
+
+/// R192-RES-2 + LEAD-ROLLBACK-PRUNE-LEDGER-1: a rolled-back mapping debits the
+/// ledgered tables its rollback pruned, charges its unpruned tables to the
+/// untracked basis and never inserts a ledger key.
+#[cfg(test)]
+#[test]
+fn r192_res_2_failed_populate_settles_pruned_and_surviving_tables() {
+    let frame = |addr: u64| PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(addr));
+    let invariant = |state: &MmState| {
+        state.pt_charged_bytes
+            == state.pt_inherited_bytes + state.pt_charged_frames.len() as u64 * 0x1000
+    };
+
+    // A sibling's mapping charged and ledgered table A; this mapping built B,
+    // C and D. Its rollback pruned A (left empty by the sibling), B and C; D
+    // survives because a sibling's leaf now sits in it.
+    let mut state = MmState::new(0);
+    state.record_pt_charge(&[frame(0xA000)]);
+    assert!(invariant(&state));
+    let mut pruned = [frame(0xA000), frame(0xB000), frame(0xC000)];
+    let mut recorded = [frame(0xD000), frame(0xC000), frame(0xB000)];
+    let survivors = crate::populate::count_unpruned(&mut recorded, &mut pruned);
+    assert_eq!(survivors, 1);
+    assert_eq!(
+        state.settle_failed_populate(&pruned, survivors),
+        (0x1000, 0x1000)
+    );
+    assert!(state.pt_charged_frames.is_empty(), "no key for a survivor");
+    assert_eq!(state.pt_charged_bytes, 0x1000);
+    assert_eq!(state.pt_inherited_bytes, 0x1000);
+    assert!(invariant(&state));
+
+    // A forked child's ledger is not authoritative: nothing is debited, the
+    // inherited basis rides to teardown as on munmap.
+    let mut child = MmState::new(0);
+    child.pt_ledger_authoritative = false;
+    child.pt_charged_bytes = 0x3000;
+    child.pt_inherited_bytes = 0x3000;
+    assert_eq!(child.settle_failed_populate(&pruned, 0), (0, 0));
+    assert_eq!(child.pt_charged_bytes, 0x3000);
+    assert!(invariant(&child));
 }
 
 pub fn run_pt_ledger_self_test() {

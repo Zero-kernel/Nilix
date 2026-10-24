@@ -1037,6 +1037,7 @@ fn fork_inner(
             // operations can be inherited across fork.
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
+            mremap_uncharged_reserve_bytes: 0,
             exec_pending_bytes: 0,
             // R165-1 FIX: child starts with no brk reservation (fork is
             // rejected above while a brk is in flight).

@@ -3149,6 +3149,34 @@ fn verify_user_memory(ptr: *const u8, len: usize, require_write: bool) -> Result
     )
 }
 
+/// LEAD-MREMAP-MIGRATE-1: while a growing mremap is in flight, the migration
+/// snapshot (`compute_cgroup_charged_bytes`: every non-PROT_NONE entry minus the
+/// uncharged lane) equals exactly what the call has charged.
+#[cfg(test)]
+mod r192_res_2_mremap_tests {
+    use super::mremap_uncharged_reserve;
+
+    #[test]
+    fn lead_mremap_migrate_1_snapshot_counts_only_charged_bytes() {
+        let (old_len, new_len) = (0x3000usize, 0x8000usize);
+        let tail_len = new_len - old_len;
+        for prot_none in [false, true] {
+            for moved in [false, true] {
+                let reserved_len = if moved { new_len } else { tail_len };
+                // The claimed source counts unless it is a PROT_NONE entry; the
+                // reservation is plain PENDING_MAP and always counts.
+                let counted = if prot_none { 0 } else { old_len } + reserved_len;
+                let charged = if prot_none { 0 } else { old_len + tail_len };
+                assert_eq!(
+                    counted - mremap_uncharged_reserve(reserved_len, tail_len, prot_none),
+                    charged,
+                    "moved={moved} prot_none={prot_none}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod st_k2_p2a_preflight_tests {
     use super::*;
@@ -7766,6 +7794,7 @@ fn exec_from_bytes(
             mm.stack_grow_pending_bytes = 0;
             mm.stack_grow_in_progress = false;
             mm.mprotect_pending_bytes = 0; // R147-1 FIX: Clear pending mprotect charges on exec
+            mm.mremap_uncharged_reserve_bytes = 0; // LEAD-MREMAP-MIGRATE-1: no mremap survives exec
             mm.exec_pending_bytes = 0; // R149-3 FIX: Charge now reflected in elf_charged_bytes
                                        // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
                                        // so that process exit and subsequent exec can uncharge them. The old
@@ -13861,6 +13890,24 @@ pub(crate) fn mremap_tail_len(old_len: usize, new_len: usize) -> Option<usize> {
     new_len.checked_sub(old_len).filter(|len| *len != 0)
 }
 
+/// LEAD-MREMAP-MIGRATE-1: bytes of a growing `mremap`'s in-flight
+/// `mmap_regions` entries that carry no charge.  Phase 1 reserves
+/// `reserved_len` (the tail in place, the whole new length for a move) while
+/// the claimed source keeps counting its length, but charges only the tail,
+/// and nothing for a PROT_NONE mapping (whose source does not count either).
+#[inline]
+pub(crate) fn mremap_uncharged_reserve(
+    reserved_len: usize,
+    tail_len: usize,
+    prot_none: bool,
+) -> usize {
+    if prot_none {
+        reserved_len
+    } else {
+        reserved_len.saturating_sub(tail_len)
+    }
+}
+
 /// ST-K2-MREMAP: pure oracle for the resize decision logic and the page-flag
 /// reconstruction the live path uses.
 ///
@@ -14557,200 +14604,26 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // 释放 Process 锁后进行映射操作
         drop(proc);
 
-        // R37-5 FIX: Track mapped pages for rollback on partial allocation failure.
-        // If allocation fails partway, we must unmap+free pages already mapped in this call.
-        let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
-            use x86_64::structures::paging::PhysFrame;
-            with_current_manager(
-                VirtAddr::new(0),
-                |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-                    // M2-1 SLICE-4b: record the intermediate PT/PD/PDPT frames map_page
-                    // builds for this heap growth so they are charged + ledgered at the
-                    // commit fold (mirrors sys_mmap Phase-2/3). The per-page DATA frame
-                    // below goes through the inherent allocate_data_frame (UNrecorded);
-                    // only map_page's trait allocate_frame records page-table frames.
-                    let mut frame_alloc = RecordingFrameAllocator::new();
-                    let flags = PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::USER_ACCESSIBLE
-                        | PageTableFlags::NO_EXECUTE;
-                    let mut mapped_pages: Vec<Page<x86_64::structures::paging::Size4KiB>> =
-                        Vec::new();
+        // R192-RES-2: populate the grow in bounded holds (frames allocated and
+        // zeroed with no lock held, at most POPULATE_CHUNK_PAGES pages per
+        // PT_LOCK hold, a fatal signal aborts between chunks). R192-3: every heap
+        // page is backed eagerly, so the driver refuses a grow larger than the
+        // free frames before the first allocation instead of draining the
+        // allocator and rolling back. Phase 1 proved the window empty and the
+        // reservation keeps it so: a page `map_page` finds occupied fails the
+        // grow (unchanged break) instead of being adopted into the heap.
+        // M2-1 SLICE-4b: the populator records the intermediate PT/PD/PDPT frames
+        // for the Step-3 charge + ledger fold; DATA frames are not recorded.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        let map_result =
+            EagerPopulator::new("brk", &process, old_top, grow_size / PAGE_SIZE, flags).run();
 
-                    // R192-3 FIX: every heap page is backed eagerly, so a grow
-                    // larger than the free frames cannot succeed. Refuse it
-                    // before the first allocation instead of draining the
-                    // allocator (other tasks' allocations fail meanwhile) and
-                    // rolling back. The span is already bounded to user-owned
-                    // pages above; the remaining loop is bounded by free memory.
-                    // Read here, in the data-frame allocation's own context.
-                    if mm::buddy_allocator::get_allocator_stats()
-                        .is_some_and(|stats| grow_size / PAGE_SIZE > stats.free_pages)
-                    {
-                        return Err(SyscallError::ENOMEM);
-                    }
-
-                    for offset in (0..grow_size).step_by(PAGE_SIZE) {
-                        let vaddr = VirtAddr::new((old_top + offset) as u64);
-                        let page = Page::containing_address(vaddr);
-
-                        // 检查页面是否已映射
-                        if manager.translate_addr(vaddr).is_some() {
-                            continue;
-                        }
-
-                        // 分配物理帧 - with rollback on failure
-                        // M2-1 SLICE-4b: DATA frame via the inherent allocate_data_frame
-                        // (NOT recorded into the PT ledger). LOAD-BEARING split — the
-                        // map_page call below KEEPS `&mut frame_alloc`, so only the
-                        // intermediate tables it pulls are recorded.
-                        let frame = match frame_alloc.allocate_data_frame() {
-                            Some(f) => f,
-                            None => {
-                                // R127-2 FIX: 3-phase rollback pattern —
-                                // 1) unmap pages and collect frames
-                                // 2) cross-CPU TLB shootdown
-                                // 3) deallocate frames after TLB is flushed
-                                // R158-12 + R158-6 FIX: Fallible rollback Vec; immediate free on OOM.
-                                let mut frames_to_free = Vec::new();
-                                let _ = frames_to_free.try_reserve(mapped_pages.len());
-                                for &rollback_page in mapped_pages.iter().rev() {
-                                    if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                        if frames_to_free.try_reserve(1).is_ok() {
-                                            frames_to_free.push(freed_frame);
-                                        } else {
-                                            mm::flush_current_as_page(
-                                                rollback_page.start_address(),
-                                            );
-                                            frame_alloc.deallocate_frame(freed_frame);
-                                        }
-                                    }
-                                }
-                                // M2-1 SLICE-4b: reclaim the now-empty intermediate PT/PD
-                                // tables this rolled-back growth left behind (mirrors
-                                // sys_mmap R169-L2; also fixes the pre-existing brk-grow
-                                // rollback table leak). old_top/grow_size spans the whole
-                                // request — mapped_pages is SPARSE (translate_addr skip at
-                                // the top of the loop), and table_empty() leaves a table
-                                // still pinned by a skipped sibling leaf untouched.
-                                manager.prune_empty_tables_in_range(
-                                    VirtAddr::new(old_top as u64),
-                                    grow_size,
-                                    &mut frames_to_free,
-                                );
-                                if !frames_to_free.is_empty() {
-                                    mm::flush_current_as_range(
-                                        VirtAddr::new(old_top as u64),
-                                        grow_size,
-                                    );
-                                    for frame in frames_to_free {
-                                        frame_alloc.deallocate_frame(frame);
-                                    }
-                                }
-                                return Err(SyscallError::ENOMEM);
-                            }
-                        };
-
-                        // 清零新分配的帧
-                        let virt = mm::phys_to_virt(frame.start_address());
-                        core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
-
-                        // 映射页 - with rollback on failure
-                        if manager
-                            .map_page(page, frame, flags, &mut frame_alloc)
-                            .is_err()
-                        {
-                            // Free the frame we just allocated
-                            frame_alloc.deallocate_frame(frame);
-                            // R127-2 + R158-6 FIX: 3-phase rollback; immediate free on OOM.
-                            let mut frames_to_free = Vec::new();
-                            let _ = frames_to_free.try_reserve(mapped_pages.len());
-                            for &rollback_page in mapped_pages.iter().rev() {
-                                if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                    if frames_to_free.try_reserve(1).is_ok() {
-                                        frames_to_free.push(freed_frame);
-                                    } else {
-                                        mm::flush_current_as_page(rollback_page.start_address());
-                                        frame_alloc.deallocate_frame(freed_frame);
-                                    }
-                                }
-                            }
-                            // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
-                            // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
-                            // rollback table leak). old_top/grow_size spans the sparse
-                            // request; table_empty() guards still-pinned tables.
-                            manager.prune_empty_tables_in_range(
-                                VirtAddr::new(old_top as u64),
-                                grow_size,
-                                &mut frames_to_free,
-                            );
-                            if !frames_to_free.is_empty() {
-                                mm::flush_current_as_range(
-                                    VirtAddr::new(old_top as u64),
-                                    grow_size,
-                                );
-                                for frame in frames_to_free {
-                                    frame_alloc.deallocate_frame(frame);
-                                }
-                            }
-                            return Err(SyscallError::ENOMEM);
-                        }
-
-                        // R158-6 FIX: fallible push — unmap+free on OOM.
-                        if mapped_pages.try_reserve(1).is_err() {
-                            if let Ok(freed) = manager.unmap_page(page) {
-                                mm::flush_current_as_page(page.start_address());
-                                frame_alloc.deallocate_frame(freed);
-                            }
-                            let mut frames_to_free = Vec::new();
-                            let _ = frames_to_free.try_reserve(mapped_pages.len());
-                            for &rollback_page in mapped_pages.iter().rev() {
-                                if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                    if frames_to_free.try_reserve(1).is_ok() {
-                                        frames_to_free.push(freed_frame);
-                                    } else {
-                                        mm::flush_current_as_page(rollback_page.start_address());
-                                        frame_alloc.deallocate_frame(freed_frame);
-                                    }
-                                }
-                            }
-                            // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
-                            // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
-                            // rollback table leak). old_top/grow_size spans the sparse
-                            // request; table_empty() guards still-pinned tables.
-                            manager.prune_empty_tables_in_range(
-                                VirtAddr::new(old_top as u64),
-                                grow_size,
-                                &mut frames_to_free,
-                            );
-                            if !frames_to_free.is_empty() {
-                                mm::flush_current_as_range(
-                                    VirtAddr::new(old_top as u64),
-                                    grow_size,
-                                );
-                                for f in frames_to_free {
-                                    frame_alloc.deallocate_frame(f);
-                                }
-                            }
-                            return Err(SyscallError::ENOMEM);
-                        }
-                        mapped_pages.push(page);
-                    }
-                    // M2-1 SLICE-4b: yield the recorded PT-frame identities (NOT a count)
-                    // for the Step-3 charge + ledger fold. Every Err path above freed its
-                    // own DATA leaves AND pruned+freed its own intermediate tables, so this
-                    // Vec is meaningful only on this Ok path.
-                    Ok(frame_alloc.pt_frames)
-                },
-            )
-        };
-
-        // M2-1 SLICE-4b: bind the recorded PT-frame identities on success. The Err arm
-        // is the pre-existing DATA-charge rollback (the Step-2 closure already freed its
-        // own DATA leaves AND pruned+freed its own intermediate tables on every error
-        // path, so no PT uncharge is owed here).
+        // M2-1 SLICE-4b: bind the recorded PT-frame identities on success.
         let pt_frames = match map_result {
-            Err(_) => {
+            Err(failed) => {
                 // 分配失败，返回旧值并回滚内存计费
                 // R144-1 FIX: Clear brk_pending_growth under lock BEFORE
                 // uncharging, and use the *current* cgroup_id (migration may
@@ -14762,9 +14635,14 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
                     let mut mm = mm_arc.lock();
                     mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
+                    // R192-RES-2: settle the rolled-back grow's tables under this
+                    // same hold (free-after-remove; see FailedPopulate).
+                    failed.settle(&mut mm, proc.cgroup_id);
                     proc.cgroup_id
                 };
                 cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
+                drop(failed);
+                // brk reports failure, a fatal signal included, as the old break.
                 return Ok(old_brk);
             }
             Ok(frames) => frames,
@@ -15014,15 +14892,19 @@ fn sys_brk(addr: usize) -> SyscallResult {
 }
 
 /// M0-7 item7 SLICE 4: 3-phase rollback for a partially-mapped user-stack grow — a
-/// faithful mirror of the `sys_brk` grow rollback. Unmaps the pages mapped so far
-/// (reverse order), reclaims the now-empty intermediate PT/PD tables this grow built,
-/// issues the cross-CPU flush, then frees the frames. `frame_alloc` is the SAME
-/// `RecordingFrameAllocator` the grow used, so `deallocate_frame` returns DATA +
-/// reclaimed-table frames to the buddy WITHOUT perturbing the recorded `pt_frames`
-/// (which are consumed only on the Ok path). `[grow_lo, grow_lo+grow_size)` spans the
-/// whole request; `mapped_pages` is SPARSE (already-mapped pages skipped), and
-/// `prune_empty_tables_in_range`'s `table_empty()` guard leaves a table still pinned by
-/// a skipped sibling leaf untouched.
+/// mirror of the `sys_brk` grow rollback. Unmaps the pages mapped so far (reverse
+/// order), issues the cross-CPU flush, frees the DATA frames, then prunes the
+/// now-empty intermediate PT/PD tables of the whole request. `frame_alloc` is the SAME
+/// `RecordingFrameAllocator` the grow used, so `deallocate_frame` returns DATA frames
+/// to the buddy WITHOUT perturbing the recorded `pt_frames`. `[grow_lo,
+/// grow_lo+grow_size)` spans the whole request; `mapped_pages` is SPARSE (already-mapped
+/// pages skipped), and `prune_empty_tables_in_range`'s `table_empty()` guard leaves a
+/// table still pinned by a skipped sibling leaf untouched.
+///
+/// LEAD-ROLLBACK-PRUNE-LEDGER-1 FIX: the pruned tables are returned, not freed. An empty
+/// table under the stack window's 2 MiB span can be another mapping's ledgered table
+/// (mprotect Path B leaves those), so it reaches the buddy only after the caller's
+/// error arm removed it from the ledger (`FailedPopulate::settle`).
 ///
 /// # Safety
 /// Must run inside `with_current_manager` (PT_LOCK held, interrupts off, current CR3).
@@ -15032,7 +14914,7 @@ unsafe fn rollback_stack_grow_pages(
     mapped_pages: &[x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>],
     grow_lo: usize,
     grow_size: usize,
-) {
+) -> Vec<x86_64::structures::paging::PhysFrame> {
     use x86_64::structures::paging::PhysFrame;
     use x86_64::VirtAddr;
 
@@ -15049,17 +14931,30 @@ unsafe fn rollback_stack_grow_pages(
             }
         }
     }
-    manager.prune_empty_tables_in_range(
-        VirtAddr::new(grow_lo as u64),
-        grow_size,
-        &mut frames_to_free,
-    );
     if !frames_to_free.is_empty() {
         mm::flush_current_as_range(VirtAddr::new(grow_lo as u64), grow_size);
         for frame in frames_to_free {
             frame_alloc.deallocate_frame(frame);
         }
     }
+    let mut tables: Vec<PhysFrame> = Vec::new();
+    let _ = tables.try_reserve(grow_size / 0x20_0000 + 2);
+    manager.prune_empty_tables_in_range(VirtAddr::new(grow_lo as u64), grow_size, &mut tables);
+    tables
+}
+
+/// LEAD-ROLLBACK-PRUNE-LEDGER-1: the failure carrier of a rolled-back stack grow, so
+/// its error arm settles the pruned tables like a failed population.
+fn stack_grow_failure(
+    stage: crate::populate::PopulateStage,
+    pruned: Vec<x86_64::structures::paging::PhysFrame>,
+    frame_alloc: &mut RecordingFrameAllocator,
+) -> FailedPopulate {
+    FailedPopulate::new(
+        crate::populate::PopulateError::NoMemory(stage),
+        pruned,
+        mem::take(&mut frame_alloc.pt_frames),
+    )
 }
 
 /// M0-7 item7 SLICE 4: the charge-correct user main-stack demand-grow PRIMITIVE.
@@ -15499,10 +15394,10 @@ pub fn try_grow_user_stack(
     // RecordingFrameAllocator: DATA frames via allocate_data_frame (UNrecorded — stack
     // data is not page-table kmem); intermediate PT/PD frames via the trait allocate_frame
     // (recorded by identity for record_pt_charge). Single 3-phase rollback on any error.
-    let map_result: Result<Vec<PhysFrame<Size4KiB>>, SyscallError> = unsafe {
+    let map_result: Result<Vec<PhysFrame<Size4KiB>>, FailedPopulate> = unsafe {
         with_current_manager(
             VirtAddr::new(0),
-            |manager| -> Result<Vec<PhysFrame<Size4KiB>>, SyscallError> {
+            |manager| -> Result<Vec<PhysFrame<Size4KiB>>, FailedPopulate> {
                 let mut frame_alloc = RecordingFrameAllocator::new();
                 let flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
@@ -15523,14 +15418,18 @@ pub fn try_grow_user_stack(
                     let frame = match frame_alloc.allocate_data_frame() {
                         Some(f) => f,
                         None => {
-                            rollback_stack_grow_pages(
+                            let pruned = rollback_stack_grow_pages(
                                 manager,
                                 &mut frame_alloc,
                                 &mapped_pages,
                                 new_floor,
                                 grow_size,
                             );
-                            return Err(SyscallError::ENOMEM);
+                            return Err(stack_grow_failure(
+                                crate::populate::PopulateStage::DataFrame,
+                                pruned,
+                                &mut frame_alloc,
+                            ));
                         }
                     };
 
@@ -15543,14 +15442,18 @@ pub fn try_grow_user_stack(
                         .is_err()
                     {
                         frame_alloc.deallocate_frame(frame);
-                        rollback_stack_grow_pages(
+                        let pruned = rollback_stack_grow_pages(
                             manager,
                             &mut frame_alloc,
                             &mapped_pages,
                             new_floor,
                             grow_size,
                         );
-                        return Err(SyscallError::ENOMEM);
+                        return Err(stack_grow_failure(
+                            crate::populate::PopulateStage::MapPage,
+                            pruned,
+                            &mut frame_alloc,
+                        ));
                     }
 
                     // R158-6 FIX pattern: fallible push — unmap+free this page then roll back.
@@ -15559,19 +15462,23 @@ pub fn try_grow_user_stack(
                             mm::flush_current_as_page(page.start_address());
                             frame_alloc.deallocate_frame(freed);
                         }
-                        rollback_stack_grow_pages(
+                        let pruned = rollback_stack_grow_pages(
                             manager,
                             &mut frame_alloc,
                             &mapped_pages,
                             new_floor,
                             grow_size,
                         );
-                        return Err(SyscallError::ENOMEM);
+                        return Err(stack_grow_failure(
+                            crate::populate::PopulateStage::MapPage,
+                            pruned,
+                            &mut frame_alloc,
+                        ));
                     }
                     mapped_pages.push(page);
                 }
                 // Yield the recorded PT-frame identities for the Step-3 charge fold (every
-                // Err arm above freed its own DATA leaves + pruned+freed its own tables).
+                // Err arm above freed its own DATA leaves and carries its pruned tables).
                 Ok(frame_alloc.take_pt_frames())
             },
         )
@@ -15579,21 +15486,24 @@ pub fn try_grow_user_stack(
 
     // ── Phase 3: commit or roll back the cgroup accounting ──
     let pt_frames = match map_result {
-        Err(e) => {
+        Err(failed) => {
             // Roll back the DATA charge + the pending lane. Clear pending FIRST (so a
             // concurrent migration cannot transfer a charge about to be rolled back),
             // then uncharge the CURRENT cgroup_id (migration may have re-homed it during
             // the lock-drop) — mirror brk's rollback. The PT work already freed its own
-            // DATA leaves + pruned+freed its own tables, so no PT uncharge is owed.
+            // DATA leaves; LEAD-ROLLBACK-PRUNE-LEDGER-1: the tables it pruned are settled
+            // here (one may be another mapping's ledgered table) and freed after.
             let rollback_cgroup_id = {
                 let proc = process.lock();
                 let mut mm = mm_arc.lock();
                 mm.stack_grow_pending_bytes =
                     mm.stack_grow_pending_bytes.saturating_sub(grow_size as u64);
+                failed.settle(&mut mm, proc.cgroup_id);
                 proc.cgroup_id
             };
             cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
-            return Err(e); // grow_resv Drop clears stack_grow_in_progress
+            drop(failed);
+            return Err(SyscallError::ENOMEM); // grow_resv Drop clears stack_grow_in_progress
         }
         Ok(frames) => frames,
     };
@@ -15756,6 +15666,575 @@ pub fn run_recording_frame_allocator_split_self_test() {
     // Cleanup: return both frames to the buddy (deallocate_frame never perturbs pt_frames).
     fa.deallocate_frame(d);
     fa.deallocate_frame(p);
+}
+
+/// R192-RES-2: populations of at least this many pages print one summary line
+/// in `syscall_test` builds; the ring3-mm oracle reads it.
+#[cfg(feature = "syscall_test")]
+const POPULATE_REPORT_PAGES: usize = 16384;
+
+/// R192-RES-2 test knob: once armed, the next population of exactly this many
+/// pages fails the data-frame allocation of its last page. That allocation
+/// stages the last, three-page chunk, so the guest drives a rollback of the
+/// 16384 pages mapped by the 256 chunks before it.
+#[cfg(feature = "syscall_test")]
+pub const POPULATE_FAULT_PROBE_PAGES: usize = 16384 + 3;
+
+#[cfg(feature = "syscall_test")]
+static POPULATE_FAULT_PROBE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// R192-RES-2 test knob: once armed, the first population of
+/// [`POPULATE_FAULT_PROBE_PAGES`] pages after the fault probe fired stages no
+/// spare page tables, so every table it needs goes through `map_hold`'s
+/// starvation path.
+#[cfg(feature = "syscall_test")]
+static POPULATE_STARVE_PROBE_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Arm the one-shot population fault and starvation probes (`syscall_test`
+/// builds only).
+#[cfg(feature = "syscall_test")]
+pub fn arm_populate_fault_probe() {
+    POPULATE_FAULT_PROBE_ARMED.store(true, AtomicOrdering::Release);
+    POPULATE_STARVE_PROBE_ARMED.store(true, AtomicOrdering::Release);
+}
+
+/// R192-RES-2: page-table frames staged for one chunk. Its 64 pages cross at
+/// most one 2 MiB, one 1 GiB and one 512 GiB boundary, so `map_page` builds at
+/// most two new PTs, two PDs and two PDPTs for it.
+const POPULATE_TABLE_POOL: usize = 6;
+
+/// R192-RES-2: room for the tables a rollback over `pages` pages can prune: one
+/// PT per 2 MiB and one PD per 1 GiB, plus the edges. A short reserve only
+/// makes `prune_empty_tables_in_range` grow the list under the lock.
+fn populate_prune_reserve(pages: usize) -> usize {
+    pages / 512 + pages / (512 * 512) + 4
+}
+
+/// R192-RES-2: the syscall errno of a failed population.
+fn populate_errno(error: crate::populate::PopulateError) -> SyscallError {
+    match error {
+        crate::populate::PopulateError::NoMemory(_) => SyscallError::ENOMEM,
+        crate::populate::PopulateError::Interrupted => SyscallError::EINTR,
+    }
+}
+
+/// R192-RES-2: the kernel backend of [`crate::populate::populate`] for one
+/// private, eagerly backed user range (`brk` grow, private `mmap`, `mprotect`
+/// Path A, the `mremap` grow tail).
+///
+/// Every frame the population needs comes from the buddy with no lock held:
+/// data frames are allocated and zeroed outside the hold, and the page-table
+/// frames a chunk can need are staged before it (`tables`), so the allocator's
+/// OOM handling never runs under `PT_LOCK`. Spare table frames are staged
+/// without it; only a table a chunk actually needs is allocated with it. Every
+/// hold is one
+/// `with_current_manager` over at most one chunk. The page-table frames
+/// `map_page` takes are recorded by identity for the commit's charge and ledger
+/// fold, as before, and the tables a rollback prunes are carried to the
+/// caller's error arm ([`FailedPopulate`]) instead of being freed under the
+/// lock. The caller's reservation keeps the range exclusive while the lock is
+/// dropped between holds, and fork refuses every such reservation, so the data
+/// frames stay private and are freed without a refcount transition.
+pub(crate) struct EagerPopulator {
+    process: crate::process::ProcessArc,
+    base: usize,
+    pages: usize,
+    flags: PageTableFlags,
+    recorder: RecordingFrameAllocator,
+    tables: [Option<x86_64::structures::paging::PhysFrame>; POPULATE_TABLE_POOL],
+    pruned: Vec<x86_64::structures::paging::PhysFrame>,
+    #[cfg(feature = "syscall_test")]
+    site: &'static str,
+    #[cfg(feature = "syscall_test")]
+    allocated: usize,
+    #[cfg(feature = "syscall_test")]
+    fail_at: Option<usize>,
+    /// The starvation probe: stage no spare page tables.
+    #[cfg(feature = "syscall_test")]
+    starve_probe: bool,
+    /// Holds that ended because a table was needed and none was staged.
+    #[cfg(feature = "syscall_test")]
+    starved: usize,
+    #[cfg(feature = "syscall_test")]
+    holds: usize,
+    #[cfg(feature = "syscall_test")]
+    max_pages_per_hold: usize,
+    /// Data frames allocated and not yet freed: every page on success, zero
+    /// after a rollback.
+    #[cfg(feature = "syscall_test")]
+    live: usize,
+}
+
+impl EagerPopulator {
+    /// A population of `pages` pages at `base` with leaf `flags`, for the
+    /// current task `process`. `site` names the syscall in test reports.
+    pub(crate) fn new(
+        site: &'static str,
+        process: &crate::process::ProcessArc,
+        base: usize,
+        pages: usize,
+        flags: PageTableFlags,
+    ) -> Self {
+        let mut pruned = Vec::new();
+        if pages != 0 {
+            let _ = pruned.try_reserve(populate_prune_reserve(pages));
+        }
+        #[cfg(feature = "syscall_test")]
+        let fail_at = (pages == POPULATE_FAULT_PROBE_PAGES
+            && POPULATE_FAULT_PROBE_ARMED.swap(false, AtomicOrdering::AcqRel))
+        .then(|| pages - 1);
+        Self {
+            process: process.clone(),
+            base,
+            pages,
+            flags,
+            recorder: RecordingFrameAllocator::new(),
+            tables: [None; POPULATE_TABLE_POOL],
+            pruned,
+            #[cfg(feature = "syscall_test")]
+            site,
+            #[cfg(feature = "syscall_test")]
+            allocated: 0,
+            #[cfg(feature = "syscall_test")]
+            fail_at,
+            #[cfg(feature = "syscall_test")]
+            starve_probe: fail_at.is_none()
+                && pages == POPULATE_FAULT_PROBE_PAGES
+                && POPULATE_STARVE_PROBE_ARMED.swap(false, AtomicOrdering::AcqRel),
+            #[cfg(feature = "syscall_test")]
+            starved: 0,
+            #[cfg(feature = "syscall_test")]
+            holds: 0,
+            #[cfg(feature = "syscall_test")]
+            max_pages_per_hold: 0,
+            #[cfg(feature = "syscall_test")]
+            live: 0,
+        }
+    }
+
+    /// Populate the whole range. `Ok` carries the recorded page-table frames
+    /// for the commit; on `Err` nothing of the range is mapped any more.
+    pub(crate) fn run(
+        mut self,
+    ) -> Result<Vec<x86_64::structures::paging::PhysFrame>, FailedPopulate> {
+        match self.populate() {
+            Ok(()) => Ok(self.into_commit()),
+            Err(error) => Err(self.into_failure(error)),
+        }
+    }
+
+    /// Populate the whole range, keeping the populator for a caller that maps
+    /// more of the same operation in its own hold (mremap).
+    pub(crate) fn populate(&mut self) -> Result<(), crate::populate::PopulateError> {
+        let pages = self.pages;
+        crate::populate::populate(self, pages)
+    }
+
+    /// Unmap the whole, fully populated range again in bounded holds.
+    pub(crate) fn rollback_all(&mut self) {
+        let pages = self.pages;
+        crate::populate::rollback(self, pages);
+    }
+
+    /// The recorder and the pruned-table carrier, for a caller's own hold that
+    /// maps or rolls back more of the same operation (mremap relocation).
+    pub(crate) fn parts(
+        &mut self,
+    ) -> (
+        &mut RecordingFrameAllocator,
+        &mut Vec<x86_64::structures::paging::PhysFrame>,
+    ) {
+        (&mut self.recorder, &mut self.pruned)
+    }
+
+    /// The recorded page-table frames of a successful operation.
+    pub(crate) fn into_commit(mut self) -> Vec<x86_64::structures::paging::PhysFrame> {
+        #[cfg(feature = "syscall_test")]
+        self.report("ok", 0, 0, self.live.abs_diff(self.pages));
+        mem::take(&mut self.recorder.pt_frames)
+    }
+
+    /// Hand a rolled-back operation's tables to its caller's error arm.
+    pub(crate) fn into_failure(mut self, error: crate::populate::PopulateError) -> FailedPopulate {
+        let failed = FailedPopulate::new(
+            error,
+            mem::take(&mut self.pruned),
+            mem::take(&mut self.recorder.pt_frames),
+        );
+        #[cfg(feature = "syscall_test")]
+        self.report(
+            match error {
+                crate::populate::PopulateError::Interrupted => "eintr",
+                crate::populate::PopulateError::NoMemory(_) => "enomem",
+            },
+            failed.pruned.len(),
+            failed.survivors,
+            self.live,
+        );
+        failed
+    }
+
+    /// Whether `map_hold` stages spare page tables before a hold.
+    fn stages_spares(&self) -> bool {
+        #[cfg(feature = "syscall_test")]
+        {
+            !self.starve_probe
+        }
+        #[cfg(not(feature = "syscall_test"))]
+        {
+            true
+        }
+    }
+
+    #[cfg(feature = "syscall_test")]
+    fn note_hold(&mut self, pages: usize) {
+        self.holds += 1;
+        self.max_pages_per_hold = self.max_pages_per_hold.max(pages);
+    }
+
+    #[cfg(feature = "syscall_test")]
+    fn report(&self, result: &str, pruned: usize, survivors: usize, leaked: usize) {
+        if self.pages >= POPULATE_REPORT_PAGES {
+            klog_always!(
+                "R192-RES-2 populate site={} pages={} holds={} max_pages_per_hold={} result={} pruned={} survivors={} leaked={} starved={}",
+                self.site,
+                self.pages,
+                self.holds,
+                self.max_pages_per_hold,
+                result,
+                pruned,
+                survivors,
+                leaked,
+                self.starved
+            );
+        }
+    }
+}
+
+impl Drop for EagerPopulator {
+    /// Return the staged page-table frames no chunk used; as a leak guard, also
+    /// tables still carried when the populator is dropped without
+    /// `into_failure`.
+    fn drop(&mut self) {
+        for frame in self.tables.iter_mut().filter_map(Option::take) {
+            self.recorder.deallocate_frame(frame);
+        }
+        for frame in self.pruned.drain(..) {
+            self.recorder.deallocate_frame(frame);
+        }
+    }
+}
+
+impl crate::populate::PopulateBackend for EagerPopulator {
+    type Frame = x86_64::structures::paging::PhysFrame;
+
+    fn free_pages(&mut self) -> Option<usize> {
+        mm::buddy_allocator::get_allocator_stats().map(|stats| stats.free_pages)
+    }
+
+    fn fatal_signal_pending(&mut self) -> bool {
+        // Every fatal source (SIGKILL or a fatal default action, exit_group,
+        // the OOM killer, an exec drain) sets `pending_kill`. A plain load: the
+        // syscall epilogue consumes the flag.
+        self.process
+            .lock()
+            .pending_kill
+            .load(AtomicOrdering::Acquire)
+    }
+
+    fn alloc_zeroed(&mut self) -> Option<Self::Frame> {
+        #[cfg(feature = "syscall_test")]
+        {
+            if self.fail_at == Some(self.allocated) {
+                return None;
+            }
+            self.allocated += 1;
+        }
+        let frame = self.recorder.allocate_data_frame()?;
+        #[cfg(feature = "syscall_test")]
+        {
+            self.live += 1;
+        }
+        // Zero the frame before it becomes reachable, so a page never discloses
+        // another task's data.
+        let virt = mm::phys_to_virt(frame.start_address());
+        // SAFETY: a fresh buddy frame, mapped nowhere yet, reached through the
+        // direct map.
+        unsafe { core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE) };
+        Some(frame)
+    }
+
+    fn free_unmapped(&mut self, frame: Self::Frame) {
+        #[cfg(feature = "syscall_test")]
+        {
+            self.live -= 1;
+        }
+        self.recorder.deallocate_frame(frame);
+    }
+
+    fn map_hold(&mut self, first: usize, frames: &[Self::Frame]) -> Result<(), usize> {
+        use x86_64::structures::paging::Page;
+
+        let start = self.base + first * PAGE_SIZE;
+        let flags = self.flags;
+        let mut done = 0;
+        let failed = loop {
+            // Stage spare page tables, and the record slots for them, before
+            // the hold, so nothing inside it allocates. Spares come without the
+            // buddy's OOM handling: most chunks need none, and reclaim (or a
+            // kill) for a frame nobody uses would be worse than the old path.
+            if self.stages_spares() {
+                for slot in self.tables.iter_mut().filter(|slot| slot.is_none()) {
+                    *slot = mm::buddy_allocator::try_with_allocator(|buddy| buddy.alloc_pages(0))
+                        .flatten();
+                }
+            }
+            let _ = self.recorder.pt_frames.try_reserve(POPULATE_TABLE_POOL);
+
+            #[cfg(feature = "syscall_test")]
+            self.note_hold(frames.len() - done);
+            let mut tables = StagedTables {
+                pool: &mut self.tables,
+                recorded: &mut self.recorder.pt_frames,
+            };
+            let data = &mut self.recorder.inner;
+            let pruned = &mut self.pruned;
+            // SAFETY: the pages are this operation's reservation in the
+            // current address space; the closure runs under PT_LOCK with
+            // interrupts off.
+            let outcome = unsafe {
+                mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+                    for index in done..frames.len() {
+                        let page = Page::containing_address(VirtAddr::new(
+                            (start + index * PAGE_SIZE) as u64,
+                        ));
+                        // Never start a table chain the pool cannot finish:
+                        // an empty table left linked while the lock is
+                        // dropped could be pruned and freed by a sibling and
+                        // then ledgered by our commit.
+                        let staged = tables.pool.iter().flatten().count();
+                        let missing = manager.missing_tables(page);
+                        if missing > staged {
+                            // Pages before `index` stay mapped; the
+                            // reservation keeps them ours until we return.
+                            return MapHold::Starved(index, missing - staged);
+                        }
+                        if manager
+                            .map_page(page, frames[index], flags, &mut tables)
+                            .is_err()
+                        {
+                            // Undo this chunk before the lock is released,
+                            // pruning the failing page too: map_page may have
+                            // built its tables.
+                            let freed = unmap_populated_pages(
+                                manager,
+                                data,
+                                start,
+                                index,
+                                index + 1,
+                                pruned,
+                            );
+                            return MapHold::Failed(index, freed);
+                        }
+                    }
+                    MapHold::Done
+                })
+            };
+            match outcome {
+                MapHold::Done => return Ok(()),
+                MapHold::Failed(index, freed) => break (index, freed),
+                MapHold::Starved(index, shortfall) => {
+                    done = index;
+                    #[cfg(feature = "syscall_test")]
+                    {
+                        self.starved += 1;
+                    }
+                    // The page needs tables that were not staged: take them
+                    // with the buddy's OOM handling, still with no lock held,
+                    // and map the rest of the chunk in another hold. A
+                    // sibling may change the walk meanwhile; the next hold
+                    // counts again, and the pool (6) covers any page (3).
+                    let mut filled = 0;
+                    for slot in self.tables.iter_mut().filter(|slot| slot.is_none()) {
+                        if filled == shortfall {
+                            break;
+                        }
+                        *slot = self.recorder.inner.allocate_frame();
+                        if slot.is_none() {
+                            break;
+                        }
+                        filled += 1;
+                    }
+                    if filled == shortfall {
+                        continue;
+                    }
+                    #[cfg(feature = "syscall_test")]
+                    self.note_hold(index);
+                    let data = &mut self.recorder.inner;
+                    let pruned = &mut self.pruned;
+                    // SAFETY: as above; pages `..index` were mapped by this
+                    // population.
+                    let freed = unsafe {
+                        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+                            unmap_populated_pages(manager, data, start, index, index + 1, pruned)
+                        })
+                    };
+                    break (index, freed);
+                }
+            }
+        };
+        let (index, _freed) = failed;
+        #[cfg(feature = "syscall_test")]
+        {
+            self.live -= _freed;
+        }
+        Err(index)
+    }
+
+    fn unmap_hold(&mut self, first: usize, count: usize) {
+        #[cfg(feature = "syscall_test")]
+        self.note_hold(count);
+        let start = self.base + first * PAGE_SIZE;
+        let data = &mut self.recorder.inner;
+        let pruned = &mut self.pruned;
+        // SAFETY: as in `map_hold`; every page was mapped by this population.
+        let _freed = unsafe {
+            mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+                unmap_populated_pages(manager, data, start, count, count, pruned)
+            })
+        };
+        #[cfg(feature = "syscall_test")]
+        {
+            self.live -= _freed;
+        }
+    }
+}
+
+/// R192-RES-2: how one `map_hold` hold ended.
+enum MapHold {
+    Done,
+    /// `map_page` failed at this index and the chunk was rolled back; the
+    /// number of data frames freed.
+    Failed(usize, usize),
+    /// The page at this index needs this many more tables than were staged;
+    /// nothing was built for it.
+    Starved(usize, usize),
+}
+
+/// R192-RES-2: the page-table frame source of one `map_hold`. It hands out the
+/// frames staged before the hold and records each one it hands out, into
+/// capacity reserved before the hold; it never allocates, so the buddy's OOM
+/// handling cannot run under `PT_LOCK`. `map_page` zeroes each frame before
+/// `map_to` links it (LEAD-PT-ZERO-LINK-1).
+struct StagedTables<'a> {
+    pool: &'a mut [Option<x86_64::structures::paging::PhysFrame>; POPULATE_TABLE_POOL],
+    recorded: &'a mut Vec<x86_64::structures::paging::PhysFrame>,
+}
+
+unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::paging::Size4KiB>
+    for StagedTables<'_>
+{
+    fn allocate_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame> {
+        // Record before the frame can become a live table, like
+        // `RecordingFrameAllocator`: no unrecorded table may exist.
+        if self.recorded.len() == self.recorded.capacity() {
+            return None;
+        }
+        let frame = self.pool.iter_mut().find_map(Option::take)?;
+        self.recorded.push(frame);
+        Some(frame)
+    }
+}
+
+/// R192-RES-2: inside a hold, unmap the first `count` pages at `start`, all
+/// mapped by this population, flush them on every CPU, free their data frames,
+/// then prune the tables of the first `prune` pages into `pruned`. Returns the
+/// number of data frames freed. Pruned tables are carried, not freed: one may
+/// still be in the ledger (LEAD-ROLLBACK-PRUNE-LEDGER-1), so it reaches the
+/// buddy only after the caller's settlement removed it.
+///
+/// # Safety
+/// The caller holds PT_LOCK (inside `with_current_manager`), `count` is at most
+/// one chunk and the pages belong to this population's reservation.
+unsafe fn unmap_populated_pages(
+    manager: &mut mm::page_table::PageTableManager,
+    data: &mut mm::memory::FrameAllocator,
+    start: usize,
+    count: usize,
+    prune: usize,
+    pruned: &mut Vec<x86_64::structures::paging::PhysFrame>,
+) -> usize {
+    use x86_64::structures::paging::Page;
+
+    debug_assert!(count <= crate::populate::POPULATE_CHUNK_PAGES);
+    let mut frames = [None; crate::populate::POPULATE_CHUNK_PAGES];
+    let mut removed = 0;
+    for index in 0..count {
+        let page = Page::containing_address(VirtAddr::new((start + index * PAGE_SIZE) as u64));
+        if let Ok(frame) = manager.unmap_page(page) {
+            frames[removed] = Some(frame);
+            removed += 1;
+        }
+    }
+    if removed != 0 {
+        mm::flush_current_as_range(VirtAddr::new(start as u64), count * PAGE_SIZE);
+        for frame in frames.iter().flatten() {
+            data.deallocate_frame(*frame);
+        }
+    }
+    manager.prune_empty_tables_in_range(VirtAddr::new(start as u64), prune * PAGE_SIZE, pruned);
+    removed
+}
+
+/// R192-RES-2: what a failed population leaves for its caller's error arm:
+/// the error, the table frames its rollback detached (still out of the buddy)
+/// and how many page-table frames it built and did not prune.
+pub(crate) struct FailedPopulate {
+    pub(crate) error: crate::populate::PopulateError,
+    pruned: Vec<x86_64::structures::paging::PhysFrame>,
+    survivors: usize,
+}
+
+impl FailedPopulate {
+    /// Count the survivors here, outside the caller's locks (the stack grow,
+    /// at most 512 pages, calls it inside its hold): sorting keeps it
+    /// `O(n log n)` for a population of any size.
+    fn new(
+        error: crate::populate::PopulateError,
+        mut pruned: Vec<x86_64::structures::paging::PhysFrame>,
+        mut recorded: Vec<x86_64::structures::paging::PhysFrame>,
+    ) -> Self {
+        let survivors = crate::populate::count_unpruned(&mut recorded, &mut pruned);
+        Self {
+            error,
+            pruned,
+            survivors,
+        }
+    }
+
+    /// Account the population's page tables under the caller's
+    /// `Process -> MmState` hold (`MmState::settle_failed_populate`): debit the
+    /// ledgered tables it pruned, force-charge the ones it built and did not
+    /// prune. The pruned frames are freed when `self` drops, which the caller
+    /// does after releasing that hold (free-after-remove, as in munmap).
+    pub(crate) fn settle(&self, mm: &mut crate::process::MmState, cgroup_id: cgroup::CgroupId) {
+        let (debit, charge) = mm.settle_failed_populate(&self.pruned, self.survivors);
+        if debit > 0 {
+            cgroup::uncharge_memory(cgroup_id, debit);
+        }
+        if charge > 0 {
+            cgroup::charge_memory_forced(cgroup_id, charge);
+        }
+    }
+}
+
+impl Drop for FailedPopulate {
+    fn drop(&mut self) {
+        let mut allocator = mm::memory::FrameAllocator::new();
+        for frame in self.pruned.drain(..) {
+            allocator.deallocate_frame(frame);
+        }
+    }
 }
 
 /// M0-7 slice 2 (SLICE 1): resolve an AUTO-selected (`addr==0`) mmap base so it SKIPS the
@@ -15961,10 +16440,7 @@ fn sys_mmap(
         coverage::trace_pc(1050); // sys_mmap entry
     }
 
-    use mm::memory::FrameAllocator;
-    use mm::page_table::with_current_manager;
-    use x86_64::structures::paging::{Page, PageTableFlags};
-    use x86_64::VirtAddr;
+    use x86_64::structures::paging::PageTableFlags;
 
     // 获取当前进程
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -16057,8 +16533,8 @@ fn sys_mmap(
     //
     // Phase 1 (Process lock): select/validate address, reserve in mmap_regions
     //   with a PENDING_MAP flag so concurrent mmap/munmap see it as occupied.
-    // Phase 2 (no Process lock): charge cgroup, then perform PT operations via
-    //   with_current_manager() which acquires PT_LOCK.
+    // Phase 2 (no Process lock): populate through EagerPopulator, whose bounded
+    //   with_current_manager() holds acquire PT_LOCK (R192-RES-2).
     // Phase 3 (Process lock): commit (clear pending flag), or rollback on failure.
     let update_next = addr == 0;
 
@@ -16346,267 +16822,66 @@ fn sys_mmap(
     // snapshot an uncharged PENDING_MAP entry. The old standalone charge call
     // and its rollback are no longer needed.
 
-    // M2-1 SLICE-0 / SLICE-4a: the PT-recording frame allocator is now the
-    // module-level `RecordingFrameAllocator` (hoisted above `fn sys_mmap` so
-    // mprotect Path-A — and later brk/exec — share one audited shim).
-
-    // 使用基于当前 CR3 的页表管理器进行映射
-    // 使用 tracked vector 记录已映射的页，确保失败时完整回滚，避免帧泄漏
-    // J2-9: the closure returns the TOTAL frames allocated (data + page-table) so
-    // Phase 3 can charge the page-table-frame kmem AFTER PT_LOCK is dropped (the
-    // cgroup charge must never run under PT_LOCK — lock_ordering invariant).
-    // ST-K2-P2: shared-anonymous mappings are demand-paged.  The VMA and side
-    // map were committed in Phase 1; leave leaf PTEs absent until a first
+    // R192-RES-2: populate the range in bounded holds. Frames are allocated and
+    // zeroed with no lock held, at most POPULATE_CHUNK_PAGES pages are mapped
+    // per PT_LOCK hold, and a fatal signal between chunks aborts the call. A
+    // failure unmaps the range again and hands its tables to the error arm.
+    // J2-9 / R171-CG1x0: on success the populator yields the IDENTITIES of the
+    // page-table frames it built, charged and ledgered in Phase 3 after PT_LOCK
+    // is dropped (never a cgroup charge under PT_LOCK).
+    // ST-K2-P2: shared-anonymous mappings are demand-paged. The VMA and side
+    // map were committed in Phase 1; leaf PTEs stay absent until a first
     // access invokes `handle_shared_page_fault`.
-    let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> =
-        if is_shared {
-            Ok(vec::Vec::new())
-        } else {
-            unsafe {
-                use x86_64::structures::paging::PhysFrame;
-
-                with_current_manager(
-                    VirtAddr::new(0),
-                    |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-                        let mut frame_alloc = RecordingFrameAllocator {
-                            inner: FrameAllocator::new(),
-                            pt_frames: vec::Vec::new(),
-                        };
-                        // 跟踪已成功映射的 (page, frame) 对，用于失败时回滚
-                        let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
-
-                        for offset in (0..length_aligned).step_by(0x1000) {
-                            let page =
-                                Page::containing_address(VirtAddr::new((base + offset) as u64));
-
-                            // 分配物理帧，失败时回滚所有已映射的页
-                            // R171-CG1x0 FIX (M2-1 SLICE-0): the DATA frame uses the inherent
-                            // `allocate_data_frame` (NOT recorded into the PT ledger); only the
-                            // intermediate tables `map_page`/`map_to` pull below are recorded.
-                            let frame = match frame_alloc.allocate_data_frame() {
-                                Some(f) => f,
-                                None => {
-                                    // R127-2 + R158-12 FIX: 3-phase rollback; immediate free on OOM.
-                                    let flush_len = mapped.len() * 0x1000;
-                                    let mut frames_to_free = vec::Vec::new();
-                                    let _ = frames_to_free.try_reserve(mapped.len());
-                                    for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                                        if manager.unmap_page(cleanup_page).is_ok() {
-                                            let should_free = !is_shared
-                                                || PAGE_REF_COUNT
-                                                    .release(cleanup_frame.start_address().as_u64()
-                                                        as usize)
-                                                    .should_free_unmapped();
-                                            if !should_free {
-                                                continue;
-                                            }
-                                            if frames_to_free.try_reserve(1).is_ok() {
-                                                frames_to_free.push(cleanup_frame);
-                                            } else {
-                                                mm::flush_current_as_page(
-                                                    cleanup_page.start_address(),
-                                                );
-                                                frame_alloc.deallocate_frame(cleanup_frame);
-                                            }
-                                        }
-                                    }
-                                    // R169-L2 FIX: reclaim the intermediate PT/PD tables the
-                                    // rolled-back leaves left empty; the frames ride the same
-                                    // flush+free below (3-phase: clear entry, flush, free).
-                                    manager.prune_empty_tables_in_range(
-                                        VirtAddr::new(base as u64),
-                                        flush_len,
-                                        &mut frames_to_free,
-                                    );
-                                    if !frames_to_free.is_empty() {
-                                        mm::flush_current_as_range(
-                                            VirtAddr::new(base as u64),
-                                            flush_len,
-                                        );
-                                        for frame in frames_to_free {
-                                            frame_alloc.deallocate_frame(frame);
-                                        }
-                                    }
-                                    // ST-K3 Phase D: site tag (E5) — data-frame exhaustion.
-                                    #[cfg(debug_assertions)]
-                                    kprintln!(
-                                        "[ST-K3] mmap ENOMEM site=E5 stage=frame_alloc len={}",
-                                        length_aligned
-                                    );
-                                    return Err(SyscallError::ENOMEM);
-                                }
-                            };
-
-                            // 安全：清零新分配的帧，防止泄漏其他进程的数据
-                            // 使用高半区直映访问物理内存
-                            let virt = mm::phys_to_virt(frame.start_address());
-                            core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
-
-                            // ST-K2-P2: the region owns the first mapping reference
-                            // before the frame becomes reachable through its PTE.
-                            if is_shared
-                                && PAGE_REF_COUNT
-                                    .track_shared_frame(frame.start_address().as_u64() as usize)
-                                    .is_err()
-                            {
-                                frame_alloc.deallocate_frame(frame);
-                                return Err(SyscallError::ENOMEM);
-                            }
-
-                            // 映射页，失败时回滚
-                            // ST-K3 Phase D: bind the MapError variant — it discriminates
-                            // PT-frame exhaustion from mapping-collision defects (E6 payload).
-                            if let Err(_map_err) =
-                                manager.map_page(page, frame, page_flags, &mut frame_alloc)
-                            {
-                                let should_free = !is_shared
-                                    || PAGE_REF_COUNT
-                                        .release(frame.start_address().as_u64() as usize)
-                                        .should_free_unmapped();
-                                if should_free {
-                                    frame_alloc.deallocate_frame(frame);
-                                }
-                                // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
-                                // R169-L2: +1 page so the prune covers the CURRENT page, whose
-                                // intermediate tables map_to may have created before failing.
-                                let flush_len = (mapped.len() + 1) * 0x1000;
-                                let mut frames_to_free = vec::Vec::new();
-                                let _ = frames_to_free.try_reserve(mapped.len());
-                                for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                                    if manager.unmap_page(cleanup_page).is_ok() {
-                                        let should_free = !is_shared
-                                            || PAGE_REF_COUNT
-                                                .release(
-                                                    cleanup_frame.start_address().as_u64() as usize
-                                                )
-                                                .should_free_unmapped();
-                                        if !should_free {
-                                            continue;
-                                        }
-                                        if frames_to_free.try_reserve(1).is_ok() {
-                                            frames_to_free.push(cleanup_frame);
-                                        } else {
-                                            mm::flush_current_as_page(cleanup_page.start_address());
-                                            frame_alloc.deallocate_frame(cleanup_frame);
-                                        }
-                                    }
-                                }
-                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                                manager.prune_empty_tables_in_range(
-                                    VirtAddr::new(base as u64),
-                                    flush_len,
-                                    &mut frames_to_free,
-                                );
-                                if !frames_to_free.is_empty() {
-                                    mm::flush_current_as_range(
-                                        VirtAddr::new(base as u64),
-                                        flush_len,
-                                    );
-                                    for frame in frames_to_free {
-                                        frame_alloc.deallocate_frame(frame);
-                                    }
-                                }
-                                // ST-K3 Phase D: site tag (E6) — page-table material.
-                                #[cfg(debug_assertions)]
-                                kprintln!(
-                                    "[ST-K3] mmap ENOMEM site=E6 stage=map_page len={} err={:?}",
-                                    length_aligned,
-                                    _map_err
-                                );
-                                return Err(SyscallError::ENOMEM);
-                            }
-
-                            // R156-3 + R158-12 FIX: Fallible push for mmap page tracking.
-                            if mapped.try_reserve(1).is_err() {
-                                if manager.unmap_page(page).is_ok() {
-                                    mm::flush_current_as_page(page.start_address());
-                                    let should_free = !is_shared
-                                        || PAGE_REF_COUNT
-                                            .release(frame.start_address().as_u64() as usize)
-                                            .should_free_unmapped();
-                                    if should_free {
-                                        frame_alloc.deallocate_frame(frame);
-                                    }
-                                }
-                                // R169-L2: +1 page — the current page was mapped then locally
-                                // unmapped above, so its intermediate tables may now be prunable.
-                                let flush_len = (mapped.len() + 1) * 0x1000;
-                                let mut frames_to_free = vec::Vec::new();
-                                let _ = frames_to_free.try_reserve(mapped.len());
-                                for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                                    if manager.unmap_page(cleanup_page).is_ok() {
-                                        if frames_to_free.try_reserve(1).is_ok() {
-                                            frames_to_free.push(cleanup_frame);
-                                        } else {
-                                            mm::flush_current_as_page(cleanup_page.start_address());
-                                            frame_alloc.deallocate_frame(cleanup_frame);
-                                        }
-                                    }
-                                }
-                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                                manager.prune_empty_tables_in_range(
-                                    VirtAddr::new(base as u64),
-                                    flush_len,
-                                    &mut frames_to_free,
-                                );
-                                if !frames_to_free.is_empty() {
-                                    mm::flush_current_as_range(
-                                        VirtAddr::new(base as u64),
-                                        flush_len,
-                                    );
-                                    for frame in frames_to_free {
-                                        frame_alloc.deallocate_frame(frame);
-                                    }
-                                }
-                                // ST-K3 Phase D: site tag (E7) — kernel-heap OOM on the
-                                // Phase-2 rollback-tracking vec: HEAP-ADMISSION class,
-                                // not frame exhaustion (lens: do not misattribute to E5).
-                                #[cfg(debug_assertions)]
-                                kprintln!(
-                                    "[ST-K3] mmap ENOMEM site=E7 stage=phase2_track_reserve len={}",
-                                    length_aligned
-                                );
-                                return Err(SyscallError::ENOMEM);
-                            }
-                            mapped.push((page, frame));
-                        }
-
-                        // R171-CG1x0 FIX (M2-1 SLICE-0): yield the recorded PT-frame identities
-                        // (NOT a count). On every Err path above the closure freed its own
-                        // frames, so this Vec is meaningful only on the Ok path.
-                        Ok(frame_alloc.pt_frames)
-                    },
-                )
-            }
-        };
+    let map_result = if is_shared {
+        Ok(vec::Vec::new())
+    } else {
+        EagerPopulator::new("mmap", &process, base, length_aligned / 0x1000, page_flags).run()
+    };
 
     // F.2 Cgroup: If mapping fails, rollback the memory charge and Phase 1
     // reservation to maintain correct accounting.
     // R148-2 FIX: Remove reservation under process lock AND capture current
     // cgroup_id, then uncharge with the fresh id. The cached cgroup_id from
     // Phase 1 may be stale if cgroup migration occurred during PT operations.
-    // R171-CG1x0 FIX (M2-1 SLICE-0): the closure now yields the IDENTITIES of the
-    // page-table frames built on success (the closure freed its own frames on every
-    // Err path, so the Vec is meaningful only on Ok).
     let pt_frames = match map_result {
-        Err(e) => {
+        Err(failed) => {
+            // ST-K3 Phase D: site tags. E5 is data-frame exhaustion (including
+            // the free-frame precheck), E6 page-table material.
+            #[cfg(debug_assertions)]
+            match failed.error {
+                crate::populate::PopulateError::NoMemory(
+                    crate::populate::PopulateStage::MapPage,
+                ) => kprintln!(
+                    "[ST-K3] mmap ENOMEM site=E6 stage=map_page len={}",
+                    length_aligned
+                ),
+                crate::populate::PopulateError::NoMemory(stage) => kprintln!(
+                    "[ST-K3] mmap ENOMEM site=E5 stage=frame_alloc len={} cause={:?}",
+                    length_aligned,
+                    stage
+                ),
+                crate::populate::PopulateError::Interrupted => {}
+            }
+            // Only a private mapping populates, so only it can fail here.
             let rollback_cgroup_id = {
                 let proc = process.lock();
                 let mut mm = mm_arc.lock();
                 mm.mmap_regions.remove(&base);
-                if is_shared {
-                    mm.shared_regions.remove(&base);
-                }
                 if update_next && mm.next_mmap_addr == end {
                     mm.next_mmap_addr = old_next_mmap_addr;
                 }
+                // R192-RES-2: debit the ledgered tables the rollback pruned and
+                // charge the ones it built and could not prune, migration-atomic
+                // under this Process + MmState hold.
+                failed.settle(&mut mm, proc.cgroup_id);
                 proc.cgroup_id
             };
-            if !is_shared {
-                cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
-            }
+            cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
+            let error = populate_errno(failed.error);
+            // Free-after-remove: the pruned tables reach the buddy only now.
+            drop(failed);
             drop(shared_region);
-            return Err(e);
+            return Err(error);
         }
         Ok(frames) => frames,
     };
@@ -17478,160 +17753,24 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             }
 
             // Step 2: Allocate zeroed frames + map pages.
-            // Uses same pattern as sys_mmap with 3-phase rollback on failure.
-            let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
-                use x86_64::structures::paging::PhysFrame;
-
-                // M2-1 SLICE-4a: use the PT-recording allocator (lifted module-level
-                // shim) so the intermediate PT/PD frames map_to builds for this
-                // PROT_NONE -> real materialization are charged + ledgered at the
-                // Step-3 commit, mirroring sys_mmap. The DATA frame uses the inherent
-                // allocate_data_frame (NOT recorded); only map_page's trait
-                // allocate_frame records PT/PD frames.
-                with_current_manager(
-                    VirtAddr::new(0),
-                    |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-                        let mut frame_alloc = RecordingFrameAllocator::new();
-                        let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
-
-                        for offset in (0..region_len).step_by(0x1000) {
-                            let page = Page::containing_address(VirtAddr::new(
-                                (region_base + offset) as u64,
-                            ));
-
-                            let frame = match frame_alloc.allocate_data_frame() {
-                                Some(f) => f,
-                                None => {
-                                    // R159-4 FIX: Fallible rollback (same pattern as R158-7).
-                                    let flush_len = mapped.len() * 0x1000;
-                                    let mut frames_to_free = vec::Vec::new();
-                                    let _ = frames_to_free.try_reserve(mapped.len());
-                                    for (cp, cf) in mapped.drain(..) {
-                                        if manager.unmap_page(cp).is_ok() {
-                                            if frames_to_free.try_reserve(1).is_ok() {
-                                                frames_to_free.push(cf);
-                                            } else {
-                                                mm::flush_current_as_page(cp.start_address());
-                                                frame_alloc.deallocate_frame(cf);
-                                            }
-                                        }
-                                    }
-                                    // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                                    manager.prune_empty_tables_in_range(
-                                        VirtAddr::new(region_base as u64),
-                                        flush_len,
-                                        &mut frames_to_free,
-                                    );
-                                    if !frames_to_free.is_empty() {
-                                        mm::flush_current_as_range(
-                                            VirtAddr::new(region_base as u64),
-                                            flush_len,
-                                        );
-                                        for f in frames_to_free {
-                                            frame_alloc.deallocate_frame(f);
-                                        }
-                                    }
-                                    return Err(SyscallError::ENOMEM);
-                                }
-                            };
-
-                            // Security: zero new frame to prevent data leakage.
-                            let virt = mm::phys_to_virt(frame.start_address());
-                            core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
-
-                            if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
-                                frame_alloc.deallocate_frame(frame);
-                                // R159-4 FIX: Fallible rollback.
-                                // R169-L2: +1 page so the prune covers the CURRENT page,
-                                // whose tables map_to may have created before failing.
-                                let flush_len = (mapped.len() + 1) * 0x1000;
-                                let mut frames_to_free = vec::Vec::new();
-                                let _ = frames_to_free.try_reserve(mapped.len());
-                                for (cp, cf) in mapped.drain(..) {
-                                    if manager.unmap_page(cp).is_ok() {
-                                        if frames_to_free.try_reserve(1).is_ok() {
-                                            frames_to_free.push(cf);
-                                        } else {
-                                            mm::flush_current_as_page(cp.start_address());
-                                            frame_alloc.deallocate_frame(cf);
-                                        }
-                                    }
-                                }
-                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                                manager.prune_empty_tables_in_range(
-                                    VirtAddr::new(region_base as u64),
-                                    flush_len,
-                                    &mut frames_to_free,
-                                );
-                                if !frames_to_free.is_empty() {
-                                    mm::flush_current_as_range(
-                                        VirtAddr::new(region_base as u64),
-                                        flush_len,
-                                    );
-                                    for f in frames_to_free {
-                                        frame_alloc.deallocate_frame(f);
-                                    }
-                                }
-                                return Err(SyscallError::ENOMEM);
-                            }
-
-                            // R157-5 FIX: Fallible push (same pattern as R157-1/R156-3).
-                            if mapped.try_reserve(1).is_err() {
-                                if manager.unmap_page(page).is_ok() {
-                                    mm::flush_current_as_page(page.start_address());
-                                    frame_alloc.deallocate_frame(frame);
-                                }
-                                // R159-4 FIX: Fallible rollback.
-                                // R169-L2: +1 page — the current page was mapped then
-                                // locally unmapped; its tables may now be prunable.
-                                let flush_len = (mapped.len() + 1) * 0x1000;
-                                let mut frames_to_free = vec::Vec::new();
-                                let _ = frames_to_free.try_reserve(mapped.len());
-                                for (cp, cf) in mapped.drain(..) {
-                                    if manager.unmap_page(cp).is_ok() {
-                                        if frames_to_free.try_reserve(1).is_ok() {
-                                            frames_to_free.push(cf);
-                                        } else {
-                                            mm::flush_current_as_page(cp.start_address());
-                                            frame_alloc.deallocate_frame(cf);
-                                        }
-                                    }
-                                }
-                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                                manager.prune_empty_tables_in_range(
-                                    VirtAddr::new(region_base as u64),
-                                    flush_len,
-                                    &mut frames_to_free,
-                                );
-                                if !frames_to_free.is_empty() {
-                                    mm::flush_current_as_range(
-                                        VirtAddr::new(region_base as u64),
-                                        flush_len,
-                                    );
-                                    for f in frames_to_free {
-                                        frame_alloc.deallocate_frame(f);
-                                    }
-                                }
-                                return Err(SyscallError::ENOMEM);
-                            }
-                            mapped.push((page, frame));
-                        }
-
-                        // M2-1 SLICE-4a: yield the recorded PT-frame identities (NOT a
-                        // count) for the Step-3 charge + ledger fold. On every Err path
-                        // above the closure freed its own frames, so this Vec is
-                        // meaningful only on the Ok path.
-                        Ok(frame_alloc.pt_frames)
-                    },
-                )
-            };
+            // R192-RES-2: bounded holds, as sys_mmap; the free-frame precheck
+            // refuses a region larger than the free frames before allocating.
+            // M2-1 SLICE-4a: the populator records the intermediate PT/PD frames
+            // map_to builds for this PROT_NONE -> real materialization; they are
+            // charged + ledgered at the Step-3 commit, mirroring sys_mmap.
+            let map_result = EagerPopulator::new(
+                "mprotect",
+                &process,
+                region_base,
+                region_len / 0x1000,
+                flags,
+            )
+            .run();
 
             // M2-1 SLICE-4a: capture the recorded PT-frame identities on success
-            // (consumed by the Step-3 commit fold). The Err arm is the pre-existing
-            // rollback, unchanged: the Step-2 closure already freed its PT frames on
-            // every error path, so there is nothing to uncharge here.
+            // (consumed by the Step-3 commit fold).
             let pt_frames = match map_result {
-                Err(e) => {
+                Err(failed) => {
                     // R146-2 FIX: Re-read cgroup_id under lock before rollback uncharge.
                     // R147-1 FIX: Clear mprotect_pending_bytes before uncharge.
                     let rollback_cgroup_id = {
@@ -17643,10 +17782,15 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
                             entry.clear_pending_mprotect();
                         }
+                        // R192-RES-2: settle the rolled-back region's tables
+                        // under this same hold (free-after-remove).
+                        failed.settle(&mut mm, proc.cgroup_id);
                         proc.cgroup_id
                     };
                     cgroup::uncharge_memory(rollback_cgroup_id, region_len as u64);
-                    return Err(e);
+                    let error = populate_errno(failed.error);
+                    drop(failed);
+                    return Err(error);
                 }
                 Ok(frames) => frames,
             };
@@ -25014,17 +25158,28 @@ struct MremapTx {
     old_next_mmap_addr: usize,
     /// This call advanced `next_mmap_addr` and must restore it on rollback.
     next_advanced: bool,
+    /// LEAD-MREMAP-MIGRATE-1: what this call added to
+    /// `MmState::mremap_uncharged_reserve_bytes`; removed again by the commit or
+    /// the rollback that replaces the reservation.
+    uncharged_reserve: usize,
 }
 
-/// ST-K2-MREMAP: undo a failed destination install.
+/// ST-K2-MREMAP: undo a failed relocation install.
 ///
-/// `installed` holds `(page, frame, owned)` triples in install order.  The
-/// destination range is always built from scratch by this call, so unmapping
-/// it cannot disturb any pre-existing mapping; that is precisely why the whole
-/// install step runs before the source is touched.  `owned` frames were
-/// allocated by this call and go back to the buddy; a *relocated* frame's
-/// reference travelled with its PTE and is still held by the untouched source
-/// PTE, so it is deliberately NOT released here.
+/// `installed` holds the `(page, frame)` pairs of relocated source frames in
+/// install order.  The destination range is always built from scratch by this
+/// call, so unmapping it cannot disturb any pre-existing mapping; that is
+/// precisely why the whole install step runs before the source is touched.  A
+/// relocated frame's reference travelled with its PTE and is still held by the
+/// untouched source PTE, so it is deliberately NOT released here.  (The fresh
+/// growth tail is populated before this hold and rolled back by its populator.)
+///
+/// LEAD-MREMAP-ROLLBACK-FLUSH-1 FIX: another CPU may cache a destination
+/// translation, so the destination is flushed on every CPU whenever a leaf was
+/// removed; once the source is later unmapped and its frames freed, no stale
+/// destination entry can reach them.  The tables pruned here are carried to
+/// the error arm (LEAD-ROLLBACK-PRUNE-LEDGER-1) instead of being freed under
+/// the lock.
 ///
 /// # Safety
 /// Caller must hold `PT_LOCK` (i.e. be inside `with_current_manager`).
@@ -25035,30 +25190,23 @@ unsafe fn mremap_rollback_install(
     installed: &mut vec::Vec<(
         x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>,
         x86_64::structures::paging::PhysFrame,
-        bool,
     )>,
-    frame_alloc: &mut RecordingFrameAllocator,
+    pruned: &mut vec::Vec<x86_64::structures::paging::PhysFrame>,
 ) {
-    use x86_64::structures::paging::{Page, PhysFrame};
     use x86_64::VirtAddr;
 
-    for (page, frame, owned) in installed.drain(..) {
-        if manager.unmap_page(page).is_ok() && owned {
-            frame_alloc.deallocate_frame(frame);
-        }
+    let mut removed_leaf = false;
+    for (page, _frame) in installed.drain(..) {
+        removed_leaf |= manager.unmap_page(page).is_ok();
+    }
+    if removed_leaf {
+        mm::flush_current_as_range(VirtAddr::new(base as u64), len);
     }
 
     // Reclaim intermediate tables the install pulled and then emptied.  A table
-    // that still backs live leaves is not empty and is correctly left alone.
-    let mut table_frames: vec::Vec<PhysFrame> = vec::Vec::new();
-    let _ = table_frames.try_reserve((len / 0x20_0000) + 2);
-    manager.prune_empty_tables_in_range(VirtAddr::new(base as u64), len, &mut table_frames);
-    if !table_frames.is_empty() {
-        mm::flush_current_as_range(VirtAddr::new(base as u64), len);
-        for frame in table_frames {
-            frame_alloc.deallocate_frame(frame);
-        }
-    }
+    // that still backs live leaves (the populated tail) is not empty and is
+    // correctly left alone.
+    manager.prune_empty_tables_in_range(VirtAddr::new(base as u64), len, pruned);
 }
 
 /// mremap(2) - remap a virtual memory address
@@ -25236,6 +25384,8 @@ fn sys_mremap(
                 reserved_base: 0,
                 old_next_mmap_addr,
                 next_advanced: false,
+                // A shrink reserves nothing; the claimed source stays charged.
+                uncharged_reserve: 0,
             })
         } else {
             // ---- Grow: choose the destination, then reserve it. ----
@@ -25338,6 +25488,14 @@ fn sys_mremap(
                 return Err(SyscallError::ENOMEM);
             }
 
+            // LEAD-MREMAP-MIGRATE-1 FIX: the reservation and the claimed source
+            // overstate what was just charged; compute_cgroup_charged_bytes
+            // subtracts the difference until the commit or rollback.
+            let uncharged_reserve = mremap_uncharged_reserve(reserved_len, tail_len, prot_none);
+            mm.mremap_uncharged_reserve_bytes = mm
+                .mremap_uncharged_reserve_bytes
+                .saturating_add(uncharged_reserve as u64);
+
             let moved = new_base != old_base;
             let mut next_advanced = false;
             // Keep the auto-placement cursor at or past the new end for EVERY
@@ -25360,6 +25518,7 @@ fn sys_mremap(
                 reserved_base,
                 old_next_mmap_addr,
                 next_advanced,
+                uncharged_reserve,
             })
         };
         (result, mm_arc_out)
@@ -25374,255 +25533,268 @@ fn sys_mremap(
 
     // ---- Phase 2: page-table work with both locks dropped. ----
     //
+    // R192-RES-2: the fresh growth tail is populated first, in bounded holds
+    // (allocation and zeroing outside PT_LOCK, at most POPULATE_CHUNK_PAGES
+    // pages per hold, a fatal signal aborts between chunks).  The tail lies
+    // only in the reserved destination, so the source is untouched and a
+    // failure undoes just the tail.  The relocation install and the source
+    // removal then run in ONE hold: between holds a sibling's COW fault on the
+    // still-live source could split it from an already-installed destination
+    // PTE.  That hold maps no fresh frames; it is bounded by `old_len`
+    // (residual R192-RES-2a).
+    //
     // Ordering matters.  A relocation installs every destination PTE BEFORE
     // any source PTE is touched, so a failure here rolls back by undoing only
     // what this call installed and the source mapping is still fully intact.
-    let phase2 = unsafe {
-        with_current_manager(
-            VirtAddr::new(0),
-            |manager| -> Result<MremapPhase2, SyscallError> {
-                let mut frame_alloc = RecordingFrameAllocator::new();
-
-                // Installed destination pages: (page, frame, owned).  `owned`
-                // frames were allocated by this call and are freed on rollback.
-                let mut installed: vec::Vec<(
-                    Page<x86_64::structures::paging::Size4KiB>,
-                    PhysFrame,
-                    bool,
-                )> = vec::Vec::new();
-                let _ = installed.try_reserve(tx.old_len / 0x1000);
-
-                // ---- Step 1: install at the destination. ----
-                //
-                // Skipped entirely for PROT_NONE: a reservation owns no frames,
-                // so growing it extends the VA record only, exactly as
-                // sys_mmap's PROT_NONE arm creates no page tables.
-                if !prot_none {
-                    if tx.moved {
+    //
+    // A PROT_NONE reservation owns no frames, so growing it extends the VA
+    // record only, exactly as sys_mmap's PROT_NONE arm creates no page tables.
+    let tail_pages = if prot_none {
+        0
+    } else {
+        // GUARD: only a grow has a tail.  A shrink would underflow
+        // `new_len - old_len` into a colossal page count.
+        mremap_tail_len(tx.old_len, tx.new_len).map_or(0, |len| len / 0x1000)
+    };
+    let mut populator = EagerPopulator::new(
+        "mremap",
+        &process,
+        tx.new_base + tx.old_len,
+        tail_pages,
+        mremap_page_flags(tx.committed_flags),
+    );
+    let phase2: Result<MremapPhase2, (SyscallError, FailedPopulate)> = match populator.populate() {
+        Err(error) => Err((populate_errno(error), populator.into_failure(error))),
+        Ok(()) => {
+            // The relocation's tables are recorded with the tail's, and any it
+            // prunes are carried with them.
+            let (frame_alloc, carried) = populator.parts();
+            if tx.moved && !prot_none {
+                let _ = carried.try_reserve(populate_prune_reserve(tx.old_len / 0x1000));
+            }
+            let hold = unsafe {
+                with_current_manager(
+                    VirtAddr::new(0),
+                    |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                        // ---- Step 1: install the relocated pages. ----
+                        //
                         // Relocate: reuse each source frame verbatim, flags
-                        // included, so protection and COW state travel with the
-                        // PTE and NO refcount transition occurs.
-                        for offset in (0..tx.old_len).step_by(0x1000) {
-                            let src_page =
-                                Page::<x86_64::structures::paging::Size4KiB>::containing_address(
-                                    VirtAddr::new((tx.old_base + offset) as u64),
-                                );
-                            let dst_page = Page::containing_address(VirtAddr::new(
-                                (tx.new_base + offset) as u64,
-                            ));
+                        // included, so protection and COW state travel with
+                        // the PTE and NO refcount transition occurs.
+                        let mut installed: vec::Vec<(
+                            Page<x86_64::structures::paging::Size4KiB>,
+                            PhysFrame,
+                        )> = vec::Vec::new();
+                        if tx.moved && !prot_none {
+                            let _ = installed.try_reserve(tx.old_len / 0x1000);
+                            for offset in (0..tx.old_len).step_by(0x1000) {
+                                let src_page =
+                                    Page::<x86_64::structures::paging::Size4KiB>::containing_address(
+                                        VirtAddr::new((tx.old_base + offset) as u64),
+                                    );
+                                let dst_page = Page::containing_address(VirtAddr::new(
+                                    (tx.new_base + offset) as u64,
+                                ));
 
-                            let Some((phys, leaf_flags)) =
-                                manager.translate_with_flags(src_page.start_address())
-                            else {
-                                // The VMA and the page table disagree about a
-                                // page inside the mapping.
-                                mremap_rollback_install(
-                                    manager,
-                                    tx.new_base,
-                                    tx.new_len,
-                                    &mut installed,
-                                    &mut frame_alloc,
-                                );
-                                return Err(SyscallError::EFAULT);
-                            };
-                            let frame = PhysFrame::containing_address(phys);
+                                let Some((phys, leaf_flags)) =
+                                    manager.translate_with_flags(src_page.start_address())
+                                else {
+                                    // The VMA and the page table disagree about a
+                                    // page inside the mapping.
+                                    mremap_rollback_install(
+                                        manager,
+                                        tx.new_base,
+                                        tx.old_len,
+                                        &mut installed,
+                                        carried,
+                                    );
+                                    return Err(SyscallError::EFAULT);
+                                };
+                                let frame = PhysFrame::containing_address(phys);
 
-                            if installed.try_reserve(1).is_err()
-                                || manager
-                                    .map_page(dst_page, frame, leaf_flags, &mut frame_alloc)
-                                    .is_err()
-                            {
-                                mremap_rollback_install(
-                                    manager,
-                                    tx.new_base,
-                                    tx.new_len,
-                                    &mut installed,
-                                    &mut frame_alloc,
-                                );
-                                return Err(SyscallError::ENOMEM);
+                                if installed.try_reserve(1).is_err()
+                                    || manager
+                                        .map_page(dst_page, frame, leaf_flags, &mut *frame_alloc)
+                                        .is_err()
+                                {
+                                    mremap_rollback_install(
+                                        manager,
+                                        tx.new_base,
+                                        tx.old_len,
+                                        &mut installed,
+                                        carried,
+                                    );
+                                    return Err(SyscallError::ENOMEM);
+                                }
+                                installed.push((dst_page, frame));
                             }
-                            installed.push((dst_page, frame, false));
                         }
-                    }
 
-                    // Materialize the grown tail at the destination.  These
-                    // frames are BRAND NEW, so this call owns them: they are
-                    // freed on rollback and charged on commit.
-                    //
-                    // GUARD: only a grow has a tail.  A shrink reaches this
-                    // point with `new_len < old_len`, and the subtraction would
-                    // underflow into a colossal page count that the fault
-                    // allocator would chase into an OOM before failing.
-                    if let Some(tail_len) = mremap_tail_len(tx.old_len, tx.new_len) {
-                        let tail_start = tx.new_base + tx.old_len;
-                        let page_flags = mremap_page_flags(tx.committed_flags);
-                        for offset in (0..tail_len).step_by(0x1000) {
-                            let page = Page::containing_address(VirtAddr::new(
-                                (tail_start + offset) as u64,
-                            ));
-
-                            let Some(frame) = frame_alloc.allocate_data_frame() else {
-                                mremap_rollback_install(
-                                    manager,
-                                    tx.new_base,
-                                    tx.new_len,
-                                    &mut installed,
-                                    &mut frame_alloc,
-                                );
-                                return Err(SyscallError::ENOMEM);
-                            };
-                            // Zero the frame before it becomes reachable, so a
-                            // grown page can never disclose another process's data.
-                            let virt = mm::phys_to_virt(frame.start_address());
-                            core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
-
-                            if installed.try_reserve(1).is_err()
-                                || manager
-                                    .map_page(page, frame, page_flags, &mut frame_alloc)
-                                    .is_err()
-                            {
-                                frame_alloc.deallocate_frame(frame);
-                                mremap_rollback_install(
-                                    manager,
-                                    tx.new_base,
-                                    tx.new_len,
-                                    &mut installed,
-                                    &mut frame_alloc,
-                                );
-                                return Err(SyscallError::ENOMEM);
-                            }
-                            installed.push((page, frame, true));
-                        }
-                    }
-                }
-
-                // ---- Step 2: remove the source range. ----
-                //
-                // Runs only after every destination PTE is in place.  Removal
-                // mirrors sys_munmap's sweep: a pending/unmapped leaf yields
-                // its frame, and the reference is released through the one
-                // ownership ledger.  A RELOCATED frame is NOT released here —
-                // its reference moved to the destination PTE in step 1.
-                let (removed_start, removed_len) = if tx.moved {
-                    (tx.old_base, tx.old_len)
-                } else if tx.new_len < tx.old_len {
-                    (tx.old_base + tx.new_len, tx.old_len - tx.new_len)
-                } else {
-                    (0, 0)
-                };
-
-                let mut frames_to_free: vec::Vec<PhysFrame> = vec::Vec::new();
-                let _ = frames_to_free.try_reserve(removed_len / 0x1000);
-                let mut reclaimed: vec::Vec<PhysFrame> = vec::Vec::new();
-                // Counts every leaf the sweep reclaimed, present or not, so the
-                // PROT_NONE premise below is checked against real evidence.
-                #[cfg(debug_assertions)]
-                let mut removed_frames: usize = 0;
-
-                if removed_len != 0 {
-                    for offset in (0..removed_len).step_by(0x1000) {
-                        let page = Page::containing_address(VirtAddr::new(
-                            (removed_start + offset) as u64,
-                        ));
-                        // R141-9 shape: a PROT_NONE leaf keeps its frame in a
-                        // non-present entry, so fall back to the raw PTE.
-                        let frame_opt = match manager.unmap_page(page) {
-                            Ok(frame) => Some(frame),
-                            Err(mm::page_table::UnmapError::PageNotMapped) => {
-                                manager.take_nonpresent_leaf_frame(page)
-                            }
-                            Err(_) => None,
+                        // ---- Step 2: remove the source range. ----
+                        //
+                        // Runs only after every destination PTE is in place.
+                        // Removal mirrors sys_munmap's sweep: a pending/unmapped
+                        // leaf yields its frame, and the reference is released
+                        // through the one ownership ledger.
+                        let (removed_start, removed_len) = if tx.moved {
+                            (tx.old_base, tx.old_len)
+                        } else if tx.new_len < tx.old_len {
+                            (tx.old_base + tx.new_len, tx.old_len - tx.new_len)
+                        } else {
+                            (0, 0)
                         };
 
-                        if let Some(frame) = frame_opt {
-                            #[cfg(debug_assertions)]
-                            {
-                                removed_frames += 1;
-                            }
-                            // A RELOCATED frame's reference moved to the
-                            // destination PTE in step 1, so it must not be
-                            // released here.  A PROT_NONE reservation never
-                            // relocates (its range is rebuilt as a bare
-                            // reservation with no destination PTEs), so any
-                            // stray leaf it owns is always released — that
-                            // keeps the refcount ledger consistent with the
-                            // buddy even for the defensive non-present case.
-                            let relocated = tx.moved && !prot_none;
-                            let should_free = relocated
-                                || PAGE_REF_COUNT
-                                    .release(frame.start_address().as_u64() as usize)
-                                    .should_free_unmapped();
-                            if should_free {
-                                if frames_to_free.try_reserve(1).is_ok() {
-                                    frames_to_free.push(frame);
-                                } else {
-                                    mm::flush_current_as_page(page.start_address());
-                                    frame_alloc.deallocate_frame(frame);
+                        let mut frames_to_free: vec::Vec<PhysFrame> = vec::Vec::new();
+                        let _ = frames_to_free.try_reserve(removed_len / 0x1000);
+                        let mut reclaimed: vec::Vec<PhysFrame> = vec::Vec::new();
+                        let mut removed_leaf = false;
+                        // Counts every leaf the sweep reclaimed, present or not,
+                        // so the PROT_NONE premise below is checked against
+                        // real evidence.
+                        #[cfg(debug_assertions)]
+                        let mut removed_frames: usize = 0;
+
+                        if removed_len != 0 {
+                            for offset in (0..removed_len).step_by(0x1000) {
+                                let page = Page::containing_address(VirtAddr::new(
+                                    (removed_start + offset) as u64,
+                                ));
+                                // R141-9 shape: a PROT_NONE leaf keeps its frame in
+                                // a non-present entry, so fall back to the raw PTE.
+                                let frame_opt = match manager.unmap_page(page) {
+                                    Ok(frame) => Some(frame),
+                                    Err(mm::page_table::UnmapError::PageNotMapped) => {
+                                        manager.take_nonpresent_leaf_frame(page)
+                                    }
+                                    Err(_) => None,
+                                };
+
+                                if let Some(frame) = frame_opt {
+                                    removed_leaf = true;
+                                    #[cfg(debug_assertions)]
+                                    {
+                                        removed_frames += 1;
+                                    }
+                                    // LEAD-MREMAP-RELOC-UAF-1 FIX: a RELOCATED
+                                    // frame's reference moved to the destination
+                                    // PTE in step 1; it is neither released nor
+                                    // freed here (this test used to read
+                                    // `relocated || release`, freeing every moved
+                                    // frame while the destination still mapped
+                                    // it).  A PROT_NONE reservation never
+                                    // relocates (its range is rebuilt as a bare
+                                    // reservation with no destination PTEs), so
+                                    // any stray leaf it owns is released, keeping
+                                    // the refcount ledger consistent with the
+                                    // buddy even for the defensive non-present
+                                    // case.
+                                    let relocated = tx.moved && !prot_none;
+                                    let should_free = !relocated
+                                        && PAGE_REF_COUNT
+                                            .release(frame.start_address().as_u64() as usize)
+                                            .should_free_unmapped();
+                                    if should_free {
+                                        if frames_to_free.try_reserve(1).is_ok() {
+                                            frames_to_free.push(frame);
+                                        } else {
+                                            mm::flush_current_as_page(page.start_address());
+                                            frame_alloc.deallocate_frame(frame);
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
 
-                    if !frames_to_free.is_empty() {
-                        mm::flush_current_as_range(
-                            VirtAddr::new(removed_start as u64),
-                            removed_len,
+                            // A relocated leaf is not freed, but another CPU may
+                            // still cache the source translation of a frame that
+                            // now lives at the destination: flush whenever a leaf
+                            // was removed, as sys_munmap does, before any free.
+                            if removed_leaf {
+                                mm::flush_current_as_range(
+                                    VirtAddr::new(removed_start as u64),
+                                    removed_len,
+                                );
+                            }
+                            for frame in frames_to_free {
+                                frame_alloc.deallocate_frame(frame);
+                            }
+
+                            let _ = reclaimed.try_reserve((removed_len / 0x20_0000) + 2);
+                            manager.prune_empty_tables_in_range(
+                                VirtAddr::new(removed_start as u64),
+                                removed_len,
+                                &mut reclaimed,
+                            );
+                        }
+
+                        // Falsify the "a PROT_NONE reservation owns no frames"
+                        // premise with the REAL sweep above — it sees present and
+                        // non-present leaves alike, so a demoted region that ever
+                        // left a frame behind makes this fire instead of leaking
+                        // silently.
+                        #[cfg(debug_assertions)]
+                        debug_assert!(
+                            !prot_none || removed_frames == 0,
+                            "PROT_NONE reservation owned {removed_frames} leaf frame(s)"
                         );
-                        for frame in frames_to_free {
-                            frame_alloc.deallocate_frame(frame);
-                        }
-                    }
 
-                    let _ = reclaimed.try_reserve((removed_len / 0x20_0000) + 2);
-                    manager.prune_empty_tables_in_range(
-                        VirtAddr::new(removed_start as u64),
-                        removed_len,
-                        &mut reclaimed,
-                    );
+                        Ok(reclaimed)
+                    },
+                )
+            };
+            match hold {
+                Ok(reclaimed_tables) => Ok(MremapPhase2 {
+                    new_pt_frames: populator.into_commit(),
+                    reclaimed_tables,
+                }),
+                Err(error) => {
+                    // The relocation failed after the tail was populated:
+                    // unmap the tail again in bounded holds.
+                    populator.rollback_all();
+                    let failed = populator.into_failure(crate::populate::PopulateError::NoMemory(
+                        crate::populate::PopulateStage::MapPage,
+                    ));
+                    Err((error, failed))
                 }
-
-                // Falsify the "a PROT_NONE reservation owns no frames" premise
-                // with the REAL sweep above — it sees present and non-present
-                // leaves alike, so a demoted region that ever left a frame
-                // behind makes this fire instead of leaking silently.
-                #[cfg(debug_assertions)]
-                debug_assert!(
-                    !prot_none || removed_frames == 0,
-                    "PROT_NONE reservation owned {removed_frames} leaf frame(s)"
-                );
-
-                Ok(MremapPhase2 {
-                    new_pt_frames: frame_alloc.take_pt_frames(),
-                    reclaimed_tables: reclaimed,
-                })
-            },
-        )
+            }
+        }
     };
 
     let phase2 = match phase2 {
         Ok(outcome) => outcome,
-        Err(error) => {
+        Err((error, failed)) => {
             // Roll back the whole transaction.  Phase 2 already undid any
-            // partial destination install and left the source untouched, so
-            // here we only restore the VMA records and the cgroup charge.
-            let proc = process.lock();
-            let mut mm = mm_arc.lock();
+            // partial destination install and the tail and left the source
+            // untouched, so here we restore the VMA records and the cgroup
+            // charge and settle the page tables.
+            {
+                let proc = process.lock();
+                let mut mm = mm_arc.lock();
 
-            if tx.reserved_base != 0 {
-                mm.mmap_regions.remove(&tx.reserved_base);
+                if tx.reserved_base != 0 {
+                    mm.mmap_regions.remove(&tx.reserved_base);
+                }
+                // Clear the source claim, restoring the pre-call entry verbatim.
+                // `old_base` is still present, so this is an in-place replace.
+                let _ = mm.mmap_regions.try_insert(
+                    tx.old_base,
+                    MmapEntry::from_len_flags(tx.old_len, tx.committed_flags),
+                );
+                if tx.next_advanced {
+                    mm.next_mmap_addr = tx.old_next_mmap_addr;
+                }
+                // LEAD-MREMAP-MIGRATE-1: the reservation is gone with its lane.
+                mm.mremap_uncharged_reserve_bytes = mm
+                    .mremap_uncharged_reserve_bytes
+                    .saturating_sub(tx.uncharged_reserve as u64);
+                if !prot_none && tx.new_len > tx.old_len {
+                    cgroup::uncharge_memory(proc.cgroup_id, (tx.new_len - tx.old_len) as u64);
+                }
+                // R192-RES-2: debit the ledgered tables the rollback pruned and
+                // charge the ones it built and could not prune.
+                failed.settle(&mut mm, proc.cgroup_id);
             }
-            // Clear the source claim, restoring the pre-call entry verbatim.
-            // `old_base` is still present, so this is an in-place replace.
-            let _ = mm.mmap_regions.try_insert(
-                tx.old_base,
-                MmapEntry::from_len_flags(tx.old_len, tx.committed_flags),
-            );
-            if tx.next_advanced {
-                mm.next_mmap_addr = tx.old_next_mmap_addr;
-            }
-            if !prot_none && tx.new_len > tx.old_len {
-                cgroup::uncharge_memory(proc.cgroup_id, (tx.new_len - tx.old_len) as u64);
-            }
+            // Free-after-remove: the pruned tables reach the buddy only now.
+            drop(failed);
             return Err(error);
         }
     };
@@ -25663,6 +25835,13 @@ fn sys_mremap(
 
         let committed = MmapEntry::from_len_flags(tx.new_len, tx.committed_flags);
         debug_validate_mmap_entry(committed);
+        // LEAD-MREMAP-MIGRATE-1: the committed entry counts exactly the charged
+        // bytes again, so the lane goes in this section, before the inserts
+        // below: if one ever failed, the stuck entries would over-count, never
+        // under-count.
+        mm.mremap_uncharged_reserve_bytes = mm
+            .mremap_uncharged_reserve_bytes
+            .saturating_sub(tx.uncharged_reserve as u64);
 
         // Both arms below replace a key that Phase 1 already inserted, so they
         // cannot allocate and cannot fail.  ST-K3 Phase D style: the tag exists
@@ -25690,7 +25869,6 @@ fn sys_mremap(
                 mm.mmap_regions.remove(&tx.reserved_base);
             }
         }
-
         // DATA leg: move the delta between the two lengths.  A PROT_NONE
         // reservation carries no byte charge in either direction.
         if !prot_none {

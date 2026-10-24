@@ -98,6 +98,8 @@ futex PI: a handler signal does not end LOCK_PI, which returns 0 owning the lock
 futex PI: a dead non-robust owner hands the lock to its waiter with OWNER_DIED
 futex PI: a word naming a task of another address space is EPERM for LOCK_PI and CMP_REQUEUE_PI; a CLONE_VM owner still attaches
 /proc/schedstat reports per-CPU switches and migrations and the RCU backlog
+R192-RES-2: 64 MiB brk, mmap, mprotect and mremap populate in bounded holds; an injected failure rolls back to the baseline charge
+mremap relocation keeps the moved frames: relocated data survives a 32 MiB allocation
 KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them
 LEGS
 
@@ -135,6 +137,37 @@ if [ "$forced_busy" -ne 1 ]; then
 fi
 if [ "$(grep -cFx 'ST-K2-LAST-REGION-RELEASE PASS: refs=0 frames=1 charge=0' "$serial" || true)" -ne 1 ]; then
     report_fail "missing or duplicate exact last-region-release oracle"
+fi
+
+# 6. R192-RES-2: every eager population site ran in page-table holds of at most
+# 64 pages (each 64 MiB population reports its largest hold), the boot-armed
+# injected failure rolled back with no surviving table, the retry that stages
+# no spare tables took them through the starvation path, and no population
+# leaked a data frame. Markers are matched
+# unanchored: guest output can share their line.
+for site in brk mmap mprotect mremap; do
+    if ! grep -Eq "R192-RES-2 populate site=$site pages=[0-9]+ holds=[0-9]+ max_pages_per_hold=64 result=ok " "$serial"; then
+        report_fail "missing R192-RES-2 bounded-population marker for $site"
+    fi
+done
+injected=$(grep -cE 'R192-RES-2 populate site=mmap pages=16387 holds=[0-9]+ max_pages_per_hold=64 result=enomem pruned=[0-9]+ survivors=0([^0-9]|$)' "$serial" || true)
+if [ "$injected" -ne 1 ]; then
+    report_fail "expected exactly one injected population rollback with survivors=0, saw $injected"
+fi
+starved=$(grep -cE 'R192-RES-2 populate site=mmap pages=16387 holds=[0-9]+ max_pages_per_hold=64 result=ok pruned=0 survivors=0 leaked=0 starved=[1-9][0-9]*([^0-9]|$)' "$serial" || true)
+if [ "$starved" -ne 1 ]; then
+    report_fail "expected exactly one population through the starvation path, saw $starved"
+fi
+largest=$(grep -oE 'R192-RES-2 populate .*max_pages_per_hold=[0-9]+' "$serial" | sed 's/.*max_pages_per_hold=//' | sort -n | tail -1)
+if [ -n "$largest" ] && [ "$largest" -gt 64 ]; then
+    report_fail "a population hold touched $largest pages (bound 64)"
+fi
+# Every data frame a population allocated is mapped on success and freed after
+# a rollback: no marker may report a leaked frame (or lack the count).
+markers=$(grep -cE 'R192-RES-2 populate ' "$serial" || true)
+clean=$(grep -cE 'R192-RES-2 populate .* leaked=0([^0-9]|$)' "$serial" || true)
+if [ "$markers" -ne "$clean" ]; then
+    report_fail "population markers with a leaked data frame or no leak count: $((markers - clean)) of $markers"
 fi
 
 if [ "$fail" -ne 0 ]; then

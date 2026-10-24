@@ -478,6 +478,30 @@ pub struct PageTableManager {
     mapper: OffsetPageTable<'static>,
 }
 
+/// LEAD-PT-ZERO-LINK-1: the page-table frame source `map_page` hands to
+/// `map_to`. x86_64's `create_next_table` links a new table into its parent
+/// entry and only then zeroes it, and buddy frames are not zeroed, so in that
+/// window another CPU walking the same address space could load whatever the
+/// frame last held as live entries and keep them in its TLB. Each frame is
+/// zeroed here, before it can be linked.
+struct ZeroedTableFrames<'a, A>(&'a mut A);
+
+unsafe impl<A: FrameAllocator<Size4KiB>> FrameAllocator<Size4KiB> for ZeroedTableFrames<'_, A> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        let frame = self.0.allocate_frame()?;
+        // SAFETY: the allocator handed out a free frame that no table links
+        // yet; page tables are reached through this same direct map.
+        unsafe {
+            core::ptr::write_bytes(
+                phys_to_virt(frame.start_address()).as_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
+        }
+        Some(frame)
+    }
+}
+
 /// Result of allocation-free rollback accounting for page-table frames that a
 /// failed `map_to` operation allocated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -588,6 +612,32 @@ impl PageTableManager {
             .wrapping_sub(PHYSICAL_MEMORY_OFFSET);
         addr < USER_HALF_END
             && classify_user_page(root, addr, &read_direct_map_entry).0 == UserPageAccess::Kernel
+    }
+
+    /// How many page tables `map_page` would create for `page` (0-3): `map_to`
+    /// allocates one for each empty entry on the walk below the PML4. A huge
+    /// leaf, a non-present but used entry or an unreachable table counts as
+    /// none, since `map_page` then refuses the page without allocating.
+    pub fn missing_tables(&mut self, page: Page) -> usize {
+        const PRESENT: u64 = 1;
+        const HUGE: u64 = 1 << 7;
+        let addr = page.start_address().as_u64();
+        let mut table = (self.mapper.level_4_table_mut() as *mut PageTable as u64)
+            .wrapping_sub(PHYSICAL_MEMORY_OFFSET);
+        for (missing, shift) in [(3usize, 39u32), (2, 30), (1, 21)] {
+            let index = ((addr >> shift) & 0x1ff) as usize;
+            let Some(entry) = read_direct_map_entry(table, index) else {
+                return 0;
+            };
+            if entry == 0 {
+                return missing;
+            }
+            if entry & PRESENT == 0 || (missing < 3 && entry & HUGE != 0) {
+                return 0;
+            }
+            table = entry & PTE_ADDR_MASK;
+        }
+        0
     }
 
     /// Whether a present 1 GiB or 2 MiB leaf maps `page`. A table the direct
@@ -723,9 +773,11 @@ impl PageTableManager {
                 | PageTableFlags::USER_ACCESSIBLE;
         }
 
+        // LEAD-PT-ZERO-LINK-1 FIX: tables are zeroed before `map_to` links them.
+        let mut frame_allocator = ZeroedTableFrames(frame_allocator);
         unsafe {
             self.mapper
-                .map_to_with_table_flags(page, frame, flags, parent_flags, frame_allocator)
+                .map_to_with_table_flags(page, frame, flags, parent_flags, &mut frame_allocator)
                 .map_err(|e| match e {
                     MapToError::FrameAllocationFailed => MapError::FrameAllocationFailed,
                     MapToError::ParentEntryHugePage => MapError::ParentEntryHugePage,

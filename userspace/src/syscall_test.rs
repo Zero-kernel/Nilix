@@ -262,6 +262,13 @@ pub extern "C" fn _start() -> ! {
     // GAP-6: the scheduler/RCU counters pressure runs retain.
     test_proc_schedstat(&mut results);
 
+    // R192-RES-2: every eager population site in bounded holds, and the boot-armed
+    // injected failure's rollback. Auto-placed mappings only, freed before the next.
+    test_bounded_population(&mut results);
+
+    // LEAD-MREMAP-RELOC-UAF-1: a relocation keeps the frames it moved.
+    test_mremap_relocation_keeps_frames(&mut results);
+
     // LEAD-KPTI-PML4-1: last, because its hinted mappings move the automatic
     // mmap base past 1 TiB.
     test_kpti_fresh_pml4_slots(&mut results);
@@ -559,6 +566,199 @@ unsafe fn kpti_kernel_copies() -> Result<(), &'static str> {
     }
     if core::ptr::read_volatile((KPTI_SLOT_SHARED + 8) as *const u64) != KPTI_SHARED_WORD {
         return Err("the kernel's copy into the shared slot is missing");
+    }
+    Ok(())
+}
+
+/// R192-RES-2: each eager population site at 64 MiB (16384 pages), so the
+/// kernel prints its summary marker (holds, largest hold) for every site.
+const R192_RES_2_LEN: usize = 64 << 20;
+/// The page count of the kernel's one-shot injected failure
+/// (`POPULATE_FAULT_PROBE_PAGES`): its last data-frame allocation fails.
+const R192_RES_2_FAULT_PAGES: usize = 16384 + 3;
+
+fn test_bounded_population(results: &mut TestResult) {
+    // A full line: the kernel's population markers must start their own lines.
+    println("Testing bounded eager population...");
+    let name = "R192-RES-2: 64 MiB brk, mmap, mprotect and mremap populate in bounded holds; an injected failure rolls back to the baseline charge";
+    match unsafe { bounded_population() } {
+        Ok(()) => results.pass(name),
+        Err(reason) => {
+            print("  population leg: ");
+            println(reason);
+            results.fail(name);
+        }
+    }
+}
+
+/// Every page of `[base, base + len)` reads zero and keeps a word written to
+/// it. One word per page: a byte loop over 64 MiB is slow under emulation.
+unsafe fn populated_and_writable(base: usize, len: usize) -> Result<(), &'static str> {
+    for page in (base..base + len).step_by(PAGE) {
+        if core::ptr::read_volatile(page as *const u64) != 0 {
+            return Err("a populated page is not zero");
+        }
+        core::ptr::write_volatile(page as *mut u64, page as u64);
+    }
+    for page in (base..base + len).step_by(PAGE) {
+        if core::ptr::read_volatile(page as *const u64) != page as u64 {
+            return Err("a populated page lost its word");
+        }
+    }
+    Ok(())
+}
+
+unsafe fn bounded_population() -> Result<(), &'static str> {
+    let len = R192_RES_2_LEN;
+
+    let base = mmap_anon(len, false);
+    if base < 0 {
+        return Err("64 MiB mmap");
+    }
+    populated_and_writable(base as usize, len)?;
+    if munmap(base as usize, len) != 0 {
+        return Err("munmap of the 64 MiB mapping");
+    }
+
+    // mprotect Path A materializes a PROT_NONE reservation.
+    let base = mmap_anon_prot(len, PROT_NONE, false);
+    if base < 0 {
+        return Err("64 MiB PROT_NONE mmap");
+    }
+    if syscall3(
+        SYS_MPROTECT,
+        base as u64,
+        len as u64,
+        PROT_READ | PROT_WRITE,
+    ) != 0
+    {
+        return Err("mprotect of the 64 MiB reservation");
+    }
+    populated_and_writable(base as usize, len)?;
+    if munmap(base as usize, len) != 0 {
+        return Err("munmap of the materialized reservation");
+    }
+
+    // An mremap grow populates its 64 MiB tail; the first page keeps its data.
+    let base = mmap_anon(PAGE, false);
+    if base < 0 {
+        return Err("one-page mmap for the mremap grow");
+    }
+    fill_pattern(base as usize, PAGE);
+    let grown = mremap(base as usize, PAGE, PAGE + len, MREMAP_MAYMOVE);
+    if grown < 0 {
+        return Err("mremap grow by 64 MiB");
+    }
+    let grown = grown as usize;
+    if !pattern_holds(grown, PAGE) {
+        return Err("the mremap grow lost the first page");
+    }
+    populated_and_writable(grown + PAGE, len)?;
+    if munmap(grown, PAGE + len) != 0 {
+        return Err("munmap of the grown mapping");
+    }
+
+    // brk grows the heap by exactly 64 MiB from its page-aligned top.
+    let start = syscall1(SYS_BRK, 0) as usize;
+    let top = (start + PAGE - 1) & !(PAGE - 1);
+    if syscall1(SYS_BRK, (top + len) as u64) as usize != top + len {
+        return Err("64 MiB brk grow");
+    }
+    populated_and_writable(top, len)?;
+    if syscall1(SYS_BRK, start as u64) as usize != start {
+        return Err("brk shrink back");
+    }
+
+    // The armed kernel knob fails the last page of this exact size: the whole
+    // mapped prefix is rolled back and nothing stays charged.
+    let Some(before) = read_memory_current() else {
+        return Err("memory.current is not readable");
+    };
+    let fault_len = R192_RES_2_FAULT_PAGES * PAGE;
+    if err_of(mmap_anon(fault_len, false)) != ENOMEM {
+        return Err("the injected population failure was not ENOMEM");
+    }
+    if read_memory_current() != Some(before) {
+        return Err("the rolled-back mmap left a charge behind");
+    }
+    // The knob is one-shot: the same request now succeeds and unmaps cleanly.
+    // A second knob makes it stage no spare page tables, so each table it
+    // needs is allocated between holds (the starvation path).
+    let again = mmap_anon(fault_len, false);
+    if again < 0 {
+        return Err("the same mmap after the injected failure");
+    }
+    populated_and_writable(again as usize, fault_len)?;
+    if munmap(again as usize, fault_len) != 0 {
+        return Err("munmap after the injected failure");
+    }
+    if read_memory_current() != Some(before) {
+        return Err("map and unmap after the rollback did not return to the baseline");
+    }
+    Ok(())
+}
+
+/// LEAD-MREMAP-RELOC-UAF-1: a relocation used to free every frame it moved
+/// while the destination still mapped it. Those frames went back to the buddy,
+/// so the next allocation took them, zeroed them and wrote over them.
+const RELOC_UAF_PAGES: usize = 16;
+const RELOC_UAF_CHURN: usize = 32 << 20;
+
+fn test_mremap_relocation_keeps_frames(results: &mut TestResult) {
+    print("Testing that an mremap relocation keeps its frames... ");
+    let name =
+        "mremap relocation keeps the moved frames: relocated data survives a 32 MiB allocation";
+    match unsafe { mremap_relocation_keeps_frames() } {
+        Ok(()) => results.pass(name),
+        Err(reason) => {
+            print("  relocation leg: ");
+            println(reason);
+            results.fail(name);
+        }
+    }
+}
+
+unsafe fn mremap_relocation_keeps_frames() -> Result<(), &'static str> {
+    let len = RELOC_UAF_PAGES * PAGE;
+    let a = mmap_anon(len, false);
+    if a < 0 {
+        return Err("mmap of the mapping to relocate");
+    }
+    let a = a as usize;
+    fill_pattern(a, len);
+    // A neighbour in the growth window forces the grow to relocate.
+    let b = mmap_anon(PAGE, false);
+    if b < 0 || b as usize != a + len {
+        return Err("the blocking neighbour is not adjacent");
+    }
+    let moved = mremap(a, len, 2 * len, MREMAP_MAYMOVE);
+    if moved < 0 || moved as usize == a {
+        return Err("the blocked grow did not relocate");
+    }
+    let moved = moved as usize;
+    if !pattern_holds(moved, len) {
+        return Err("the relocation lost the mapped content");
+    }
+    // Take fresh frames: freed relocated frames would be among them.
+    let churn = mmap_anon(RELOC_UAF_CHURN, false);
+    if churn < 0 {
+        return Err("the 32 MiB allocation");
+    }
+    let churn = churn as usize;
+    for page in (churn..churn + RELOC_UAF_CHURN).step_by(PAGE) {
+        core::ptr::write_volatile(page as *mut u64, 0xA5A5_A5A5_A5A5_A5A5);
+    }
+    let kept = pattern_holds(moved, len);
+    if munmap(churn, RELOC_UAF_CHURN) != 0
+        || munmap(moved, 2 * len) != 0
+        || munmap(b as usize, PAGE) != 0
+    {
+        return Err("cleanup munmap");
+    }
+    if !kept {
+        return Err(
+            "a later allocation overwrote relocated pages: the relocation freed its frames",
+        );
     }
     Ok(())
 }
