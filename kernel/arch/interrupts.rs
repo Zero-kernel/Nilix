@@ -1141,18 +1141,18 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 /// leak a kernel pointer).
 ///
 /// Resolved faults are not traced in release builds. Under a fork-heavy load
-/// copy-on-write faults are routine, and the serial port has no lock, so a
-/// trace from one CPU split console lines that another CPU was writing (the
-/// stress protocol rejected runs on split markers). Debug builds still trace
-/// every fault at entry.
+/// copy-on-write faults are routine, and a trace from one CPU used to split
+/// console lines that another CPU was writing (the stress protocol rejected
+/// runs on split markers). Debug builds still trace every fault at entry.
+/// TD-SERIAL-1: both traces take the serial console lock; they are not fatal
+/// paths (an unresolved user fault ends in a kill).
 #[inline(always)]
 fn trace_unresolved_page_fault(error_code: PageFaultErrorCode) {
     #[cfg(not(debug_assertions))]
-    unsafe {
-        serial_write_str("\n[PF ENTRY] err=");
-        serial_write_hex(error_code.bits());
-        serial_write_str("\n");
-    }
+    drivers::vga_buffer::serial_print(format_args!(
+        "\n[PF ENTRY] err={:#018x}\n",
+        error_code.bits()
+    ));
     #[cfg(debug_assertions)]
     let _ = error_code;
 }
@@ -1194,13 +1194,11 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // X-8 FIX: In release builds, avoid leaking kernel pointers over serial
     #[cfg(debug_assertions)]
-    unsafe {
-        serial_write_str("\n[PF ENTRY] CR2=");
-        serial_write_hex(fault_addr_raw);
-        serial_write_str(" err=");
-        serial_write_hex(error_code.bits());
-        serial_write_str("\n");
-    }
+    drivers::vga_buffer::serial_print(format_args!(
+        "\n[PF ENTRY] CR2={:#018x} err={:#018x}\n",
+        fault_addr_raw,
+        error_code.bits()
+    ));
     // Release builds trace only faults that do not resolve; see
     // `trace_unresolved_page_fault`.
 
@@ -1318,10 +1316,13 @@ extern "x86-interrupt" fn page_fault_handler(
                         assert!(!stack_frame
                             .cpu_flags
                             .contains(x86_64::registers::rflags::RFlags::INTERRUPT_FLAG));
-                        // The test diagnostic must not acquire a console lock
-                        // from #PF. The saved frame, not the handler's IF=0,
-                        // proves IRETQ will retry with interrupts disabled.
-                        unsafe { serial_write_str("ST-K2-FORCED-BUSY-USERCOPY-IF0\n") };
+                        // The saved frame, not the handler's IF=0, proves IRETQ
+                        // will retry with interrupts disabled. TD-SERIAL-1: the
+                        // serial lock is a terminal leaf, safe from #PF, and
+                        // keeps this gate marker whole at 8+ CPUs.
+                        drivers::vga_buffer::serial_print(format_args!(
+                            "ST-K2-FORCED-BUSY-USERCOPY-IF0\n"
+                        ));
                     }
                     mm::tlb_shootdown::handle_shootdown_ipi();
                     return;

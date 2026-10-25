@@ -12887,36 +12887,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         {
             coverage::trace_pc(1011); // sys_write stdout/stderr path
         }
-        // R162-17 FIX: Avoid infallible from_utf8_lossy which can allocate ~3x
-        // input size on all-invalid bytes. Print in chunks using from_utf8
-        // on valid spans and individual replacement chars for invalid bytes.
-        // R190-13: user stdout is TTY data, written byte-exact to the serial
-        // console (kernel diagnostics use the sanitizing `print!`).
-        use drivers::vga_buffer::console_write_str;
-        match core::str::from_utf8(&tmp) {
-            Ok(s) => console_write_str(s),
-            Err(_) => {
-                let mut i = 0;
-                while i < tmp.len() {
-                    match core::str::from_utf8(&tmp[i..]) {
-                        Ok(s) => {
-                            console_write_str(s);
-                            break;
-                        }
-                        Err(e) => {
-                            let valid_end = e.valid_up_to();
-                            if valid_end > 0 {
-                                if let Ok(valid) = core::str::from_utf8(&tmp[i..i + valid_end]) {
-                                    console_write_str(valid);
-                                }
-                            }
-                            console_write_str("\u{FFFD}");
-                            i += valid_end + e.error_len().unwrap_or(1);
-                        }
-                    }
-                }
-            }
-        }
+        // TD-SERIAL-1: one console write session for the whole call.
+        let mut session = console_write_session();
+        write_console_lossy(&mut session, &tmp);
+        drop(session);
         // GAP-6 F11 diagnostic: console output is the stress runner's progress.
         #[cfg(feature = "stall_dump")]
         crate::process::LAST_CONSOLE_WRITE_TICK
@@ -13034,6 +13008,16 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
         return Ok(0);
     }
 
+    // TD-SERIAL-1: musl writes every stdio line as `writev({text}, {"\n"})`.
+    // Through `sys_write` each iovec was its own console write, so another
+    // writer's output could land between a line and its newline; a console
+    // `writev` is one session instead.
+    if iov_array.iter().any(|entry| entry.iov_len != 0) {
+        if let Some(console) = lookup_console_file(fd)? {
+            return sys_writev_console(console, &iov_array);
+        }
+    }
+
     // 逐个写入每个缓冲区
     let mut total_written: usize = 0;
     for entry in iov_array.iter() {
@@ -13071,6 +13055,85 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
         }
     }
 
+    Ok(total_written)
+}
+
+/// TD-SERIAL-1: a console write session for the calling task.
+fn console_write_session() -> drivers::vga_buffer::ConsoleWrite {
+    drivers::vga_buffer::ConsoleWrite::begin(current_pid().unwrap_or(0))
+}
+
+/// Write user console bytes to `session`.
+///
+/// R158-I9 FIX: Accept non-UTF-8 bytes (POSIX write(2) is byte-oriented).
+/// Display valid UTF-8 as text; replace invalid sequences with U+FFFD.
+/// R162-17 FIX: Avoid infallible from_utf8_lossy which can allocate ~3x input
+/// size on all-invalid bytes: write valid spans and one replacement character
+/// per invalid sequence. R190-13: user stdout is TTY data, written byte-exact
+/// to the serial console (kernel diagnostics use the sanitizing `print!`).
+fn write_console_lossy(session: &mut drivers::vga_buffer::ConsoleWrite, bytes: &[u8]) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match core::str::from_utf8(rest) {
+            Ok(valid) => {
+                session.write_str(valid);
+                break;
+            }
+            Err(error) => {
+                let (valid, invalid) = rest.split_at(error.valid_up_to());
+                if let Ok(valid) = core::str::from_utf8(valid) {
+                    session.write_str(valid);
+                }
+                session.write_str("\u{FFFD}");
+                rest = &invalid[error.error_len().unwrap_or(1).min(invalid.len())..];
+            }
+        }
+    }
+}
+
+/// TD-SERIAL-1: `writev` on a console descriptor, as one console write
+/// session. Per iovec this keeps `sys_write`'s console contract (size cap,
+/// pointer validation, admitted copy, then EBADF for a readable console); an
+/// error after some bytes returns the count written so far.
+fn sys_writev_console(console: crate::process::ConsoleFile, iovs: &[Iovec]) -> SyscallResult {
+    let mut session = console_write_session();
+    let mut total_written: usize = 0;
+    for entry in iovs.iter().filter(|entry| entry.iov_len != 0) {
+        #[cfg(feature = "kcov")]
+        {
+            coverage::trace_pc(1010); // sys_write entry
+        }
+        let copied = (|| {
+            if entry.iov_len > MAX_RW_SIZE {
+                return Err(SyscallError::E2BIG);
+            }
+            validate_user_ptr(entry.iov_base, entry.iov_len)?;
+            let mut tmp = try_admitted_zeroed_io_buffer(entry.iov_len)?;
+            copy_from_user(&mut tmp, entry.iov_base)?;
+            if console.readable {
+                return Err(SyscallError::EBADF);
+            }
+            Ok(tmp)
+        })();
+        let tmp = match copied {
+            Ok(tmp) => tmp,
+            Err(_) if total_written > 0 => break,
+            Err(error) => return Err(error),
+        };
+        #[cfg(feature = "kcov")]
+        {
+            coverage::trace_pc(1011); // sys_write stdout/stderr path
+        }
+        write_console_lossy(&mut session, &tmp);
+        total_written = total_written
+            .checked_add(tmp.len())
+            .ok_or(SyscallError::EOVERFLOW)?;
+    }
+    drop(session);
+    // GAP-6 F11 diagnostic: console output is the stress runner's progress.
+    #[cfg(feature = "stall_dump")]
+    crate::process::LAST_CONSOLE_WRITE_TICK
+        .store(crate::get_ticks(), core::sync::atomic::Ordering::Relaxed);
     Ok(total_written)
 }
 

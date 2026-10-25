@@ -423,8 +423,8 @@ impl fmt::Write for FramebufferWriter {
 
 /// Global framebuffer writer.
 ///
-/// R190-7: lock it only inside `vga_buffer::with_display`, which masks IRQs
-/// and detects same-CPU re-entry.
+/// R190-7: lock it only inside `vga_buffer::with_display`, which detects
+/// same-CPU re-entry (it keeps the caller's IRQ state).
 pub static WRITER: Mutex<FramebufferWriter> = Mutex::new(FramebufferWriter::new());
 
 /// R190-7 FIX: lock-free mirror of `WRITER.initialized`, so every print no

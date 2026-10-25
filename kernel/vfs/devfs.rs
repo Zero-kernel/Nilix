@@ -461,15 +461,16 @@ impl Inode for ConsoleDevInode {
     fn write_at(&self, _offset: u64, data: &[u8]) -> Result<usize, FsError> {
         // Write to the console. R190-13: user console data is TTY output and
         // reaches the serial console byte-exact (kernel diagnostics are
-        // sanitized by `print!`).
-        use drivers::vga_buffer::console_write_str;
+        // sanitized by `print!`). TD-SERIAL-1: one console write session.
+        let mut session =
+            drivers::vga_buffer::ConsoleWrite::begin(kernel_core::current_pid().unwrap_or(0));
         if let Ok(s) = core::str::from_utf8(data) {
-            console_write_str(s);
+            session.write_str(s);
         } else {
             // Write raw bytes
             let mut utf8 = [0u8; 4];
             for &b in data {
-                console_write_str((b as char).encode_utf8(&mut utf8));
+                session.write_str((b as char).encode_utf8(&mut utf8));
             }
         }
         Ok(data.len())

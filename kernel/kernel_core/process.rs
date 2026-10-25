@@ -11406,6 +11406,17 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
         klog_always!("Process {} terminated with exit code {}", pid, exit_code);
+        // TD-SERIAL-1: record the longest IRQ-masked serial hold for the gates
+        // (cycles per ms from the TSC over the BSP's serviced ticks).
+        if pid == 1 {
+            let cycles = drivers::vga_buffer::serial_max_hold_tsc();
+            let per_ms = crate::time::tsc_since_boot() / crate::time::get_ticks().max(1);
+            klog_always!(
+                "TD-SERIAL-1: longest serial hold {} TSC cycles (~{} us)",
+                cycles,
+                cycles.saturating_mul(1000) / per_ms.max(1)
+            );
+        }
 
         // GAP-5 G8: the group's last live member takes over a leader identity
         // the leader left behind when it exited first.

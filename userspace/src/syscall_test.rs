@@ -141,21 +141,51 @@ impl TestResult {
     }
 
     fn pass(&mut self, name: &str) {
-        print("[PASS] ");
-        println(name);
+        println_parts(&["[PASS] ", name]);
         self.passed += 1;
     }
 
     fn fail(&mut self, name: &str) {
-        print("[FAIL] ");
-        println(name);
+        println_parts(&["[FAIL] ", name]);
         self.failed += 1;
     }
 
     fn skip(&mut self, name: &str) {
-        print("[SKIP] ");
-        println(name);
+        println_parts(&["[SKIP] ", name]);
     }
+}
+
+const SYS_WRITEV: u64 = 20;
+
+/// TD-SERIAL-1: write `parts` and a newline with one `writev`, so no other
+/// console output can land inside a line the gate matches (the kernel keeps a
+/// console `writev` of up to 256 bytes together). At most seven parts.
+fn println_parts(parts: &[&str]) {
+    let mut iov = [[0u64; 2]; 8];
+    let mut count = 0;
+    for part in parts.iter().take(iov.len() - 1) {
+        iov[count] = [part.as_ptr() as u64, part.len() as u64];
+        count += 1;
+    }
+    iov[count] = [b"\n".as_ptr() as u64, 1];
+    count += 1;
+    unsafe {
+        syscall3(SYS_WRITEV, 1, iov.as_ptr() as u64, count as u64);
+    }
+}
+
+/// `value` in decimal, in `buf`.
+fn decimal(mut value: usize, buf: &mut [u8; 20]) -> &str {
+    let mut start = buf.len();
+    loop {
+        start -= 1;
+        buf[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    core::str::from_utf8(&buf[start..]).unwrap_or("?")
 }
 
 /// Program entry point
@@ -276,11 +306,14 @@ pub extern "C" fn _start() -> ! {
     // Print summary
     println("");
     println("================================");
-    print("  Results: ");
-    print_int(results.passed as i64);
-    print(" passed, ");
-    print_int(results.failed as i64);
-    println(" failed");
+    let (mut passed, mut failed) = ([0u8; 20], [0u8; 20]);
+    println_parts(&[
+        "  Results: ",
+        decimal(results.passed, &mut passed),
+        " passed, ",
+        decimal(results.failed, &mut failed),
+        " failed",
+    ]);
     println("================================");
 
     // Exit with appropriate code

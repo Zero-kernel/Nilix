@@ -1657,6 +1657,13 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
         increment_counter(TraceCounter::AllocFailures, 1);
     }
 
+    // TD-SERIAL-1: keep other CPUs' console chunks out of the failure text.
+    // The claim is never released, so mask IRQs first (this path always
+    // panics): an IRQ handler here spinning on a lock whose owner waits for the
+    // serial port would otherwise never let the panic run.
+    unsafe { core::arch::asm!("cli", options(nostack)) };
+    drivers::vga_buffer::claim_serial_for_panic();
+
     // Print heap statistics before panicking
     unsafe {
         serial_write_str("ALLOC FAILED: size=");
@@ -1691,6 +1698,11 @@ fn panic(info: &PanicInfo) -> ! {
         // This captures CPU registers, stack, and panic info before any
         // further state changes. Safe to call multiple times (atomic guard).
         let crash_dump = trace::kdump::capture_crash_context(info);
+
+        // TD-SERIAL-1: claim the serial console for this CPU for good, so other
+        // CPUs' console chunks cannot land inside the panic text or the kdump
+        // (nothing stops them). Bounded; on failure the raw writes go unlocked.
+        drivers::vga_buffer::claim_serial_for_panic();
 
         // R93-16 FIX / G.fin.1: Check PolicySurface for panic output redaction.
         // In Secure profile, suppress detailed panic output to avoid leaking

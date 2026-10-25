@@ -48,7 +48,7 @@
 //! │
 //! Level 8 (Device/Driver)
 //! ├── VGA_BUFFER / FRAMEBUFFER
-//! ├── SERIAL_PORT
+//! ├── SERIAL_OWNER_CPU (terminal leaf: takes nothing, may be taken under any lock)
 //! ├── Keyboard buffer
 //! │
 //! Level 9 (Audit/Security)
@@ -139,7 +139,7 @@
 //! (process.rs) is unchanged and stricter for that path.
 //! | ENDPOINT_REGISTRY | ipc/ipc.rs | 7 | Mutex<HashMap> | Global |
 //! | VGA_BUFFER | drivers/vga_buffer.rs | 8 | Mutex | Global |
-//! | SERIAL_PORT | drivers/serial.rs | 8 | Mutex | Global |
+//! | SERIAL_OWNER_CPU | drivers/vga_buffer.rs | 8 (terminal leaf) | owner-CPU word, IRQs masked while held (TD-SERIAL-1) | Global |
 //! | AUDIT_RING | audit/lib.rs | 9 | Mutex | Global |
 //! | RNG_STATE | security/rng.rs | 9 | Mutex | Global |
 //!

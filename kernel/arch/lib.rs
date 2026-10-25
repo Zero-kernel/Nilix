@@ -99,21 +99,17 @@ pub fn try_read_serial_char() -> Option<u8> {
 /// Write a single byte to serial output (no newline added)
 ///
 /// This is for interactive I/O where character-by-character output is needed.
+/// TD-SERIAL-1: goes through the serial console lock, as the kernel shell's
+/// stream.
 pub fn serial_write_byte(byte: u8) {
-    unsafe {
-        use x86_64::instructions::port::Port;
-        let mut port = Port::new(0x3F8);
-        port.write(byte);
-    }
+    drivers::vga_buffer::shell_serial_write(&[byte]);
 }
 
 /// Write a string to serial output (no newline added)
 ///
 /// This is for interactive I/O where precise control over output is needed.
 pub fn serial_write_str(s: &str) {
-    for byte in s.bytes() {
-        serial_write_byte(byte);
-    }
+    drivers::vga_buffer::shell_serial_write(s.as_bytes());
 }
 
 /// System reboot via keyboard controller
