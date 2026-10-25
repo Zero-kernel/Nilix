@@ -11406,15 +11406,25 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
         klog_always!("Process {} terminated with exit code {}", pid, exit_code);
-        // TD-SERIAL-1: record the longest IRQ-masked serial hold for the gates
-        // (cycles per ms from the TSC over the BSP's serviced ticks).
+        // TD-SERIAL-1: record the IRQ-masked serial holds for the gates
+        // (cycles per ms from the TSC over the BSP's serviced ticks; masked
+        // intervals that lose ticks make this an upper bound).
         if pid == 1 {
-            let cycles = drivers::vga_buffer::serial_max_hold_tsc();
+            let stats = drivers::vga_buffer::serial_hold_stats();
             let per_ms = crate::time::tsc_since_boot() / crate::time::get_ticks().max(1);
             klog_always!(
-                "TD-SERIAL-1: longest serial hold {} TSC cycles (~{} us)",
-                cycles,
-                cycles.saturating_mul(1000) / per_ms.max(1)
+                "TD-SERIAL-1: longest serial hold {} TSC cycles (~{} us, {} bytes); {} holds, {} bytes, {} cycles/byte; holds >= 2^18/2^20/2^22/2^24 cycles: {}/{}/{}/{}; {} cycles/ms",
+                stats.max_tsc,
+                stats.max_tsc.saturating_mul(1000) / per_ms.max(1),
+                stats.max_bytes,
+                stats.holds,
+                stats.bytes,
+                stats.tsc / stats.bytes.max(1),
+                stats.over[0],
+                stats.over[1],
+                stats.over[2],
+                stats.over[3],
+                per_ms
             );
         }
 

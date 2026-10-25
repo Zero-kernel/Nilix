@@ -262,7 +262,7 @@ fn serial_safe_char(ch: char) -> char {
 /// run that reaches the UART with no other output inside it. The longest
 /// console line in the R192 gate logs is 242 bytes. A hold masks IRQs, so this
 /// also bounds the masked time (reported at PID 1's exit, see
-/// [`serial_max_hold_tsc`]). Polling the THRE inside a hold would break that
+/// [`serial_hold_stats`]). Polling the THRE inside a hold would break that
 /// bound.
 const SERIAL_CHUNK: usize = 256;
 
@@ -285,6 +285,32 @@ const USER_STREAM: usize = 1 << 48;
 
 /// Longest hold so far, in TSC cycles.
 static SERIAL_MAX_HOLD_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes written by the longest hold.
+static SERIAL_MAX_HOLD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Locked holds, the bytes they wrote and their total TSC cycles.
+static SERIAL_HOLDS: AtomicU64 = AtomicU64::new(0);
+static SERIAL_HOLD_BYTES: AtomicU64 = AtomicU64::new(0);
+static SERIAL_HOLD_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// Holds of at least 2^18, 2^20, 2^22 and 2^24 TSC cycles.
+const SERIAL_HOLD_BUCKET_SHIFTS: [u32; 4] = [18, 20, 22, 24];
+static SERIAL_HOLDS_OVER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// TD-SERIAL-1: what the serial holds cost so far, for the gates' report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialHoldStats {
+    /// Longest hold, in TSC cycles, and the bytes it wrote.
+    pub max_tsc: u64,
+    pub max_bytes: u64,
+    /// Locked holds, their bytes and their total TSC cycles.
+    pub holds: u64,
+    pub bytes: u64,
+    pub tsc: u64,
+    /// Holds of at least 2^18, 2^20, 2^22 and 2^24 TSC cycles.
+    pub over: [u64; 4],
+}
 
 /// Who writes a chunk, for the line state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,12 +373,7 @@ fn with_serial(write: impl FnOnce(usize, bool)) -> SerialHold {
         }
         if current == NO_SERIAL_OWNER
             && SERIAL_OWNER_CPU
-                .compare_exchange_weak(
-                    NO_SERIAL_OWNER,
-                    owner,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(NO_SERIAL_OWNER, owner, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
         {
             write(owner, true);
@@ -393,13 +414,34 @@ fn serial_emit(stream: SerialStream, chunk: &[u8]) {
             None => open,
         };
         SERIAL_OPEN_LINE.store(open, Ordering::Relaxed);
-        SERIAL_MAX_HOLD_TSC.fetch_max(read_tsc().wrapping_sub(start), Ordering::Relaxed);
+        let held = read_tsc().wrapping_sub(start);
+        // Holds are serialized by the lock, so the max and its byte count
+        // never race with another hold's update.
+        if held > SERIAL_MAX_HOLD_TSC.load(Ordering::Relaxed) {
+            SERIAL_MAX_HOLD_TSC.store(held, Ordering::Relaxed);
+            SERIAL_MAX_HOLD_BYTES.store(chunk.len() as u64, Ordering::Relaxed);
+        }
+        SERIAL_HOLDS.fetch_add(1, Ordering::Relaxed);
+        SERIAL_HOLD_BYTES.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        SERIAL_HOLD_TSC.fetch_add(held, Ordering::Relaxed);
+        for (shift, count) in SERIAL_HOLD_BUCKET_SHIFTS.iter().zip(&SERIAL_HOLDS_OVER) {
+            if held >> shift != 0 {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     });
 }
 
-/// TD-SERIAL-1: longest IRQ-masked serial hold so far, in TSC cycles.
-pub fn serial_max_hold_tsc() -> u64 {
-    SERIAL_MAX_HOLD_TSC.load(Ordering::Relaxed)
+/// TD-SERIAL-1: the IRQ-masked serial holds so far.
+pub fn serial_hold_stats() -> SerialHoldStats {
+    SerialHoldStats {
+        max_tsc: SERIAL_MAX_HOLD_TSC.load(Ordering::Relaxed),
+        max_bytes: SERIAL_MAX_HOLD_BYTES.load(Ordering::Relaxed),
+        holds: SERIAL_HOLDS.load(Ordering::Relaxed),
+        bytes: SERIAL_HOLD_BYTES.load(Ordering::Relaxed),
+        tsc: SERIAL_HOLD_TSC.load(Ordering::Relaxed),
+        over: core::array::from_fn(|i| SERIAL_HOLDS_OVER[i].load(Ordering::Relaxed)),
+    }
 }
 
 /// Exchange attempts before a panic writes without the serial lock.
