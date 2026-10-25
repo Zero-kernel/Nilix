@@ -491,6 +491,8 @@ fn boot_info_from_ptr(boot_info_ptr: u64) -> Option<&'static BootInfo> {
 /// D0-ISO-1 Approach A: the framebuffer's high-half window, in PDPT[509]
 /// between the VT-d probe window and the BSP stack.
 const FRAMEBUFFER_VIRT_BASE: u64 = 0xFFFF_FFFF_6400_0000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(FRAMEBUFFER_VIRT_BASE >= mm::KSTACK_REGION_END);
 const FRAMEBUFFER_VIRT_SIZE: usize = 0x0A00_0000;
 
 /// D0-ISO-1 Approach A (R192-RES-1): a framebuffer above the 1 GiB direct map

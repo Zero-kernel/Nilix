@@ -7,6 +7,8 @@ use x86_64::instructions::{interrupts, port::Port};
 
 const DEV: PciDeviceId = PciDeviceId::new(0, 0, 5, 0);
 const MMIO: u64 = 0xffff_ffff_6200_0000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(MMIO >= mm::KSTACK_REGION_END);
 const PAGE: usize = 4096;
 const BYTES: usize = 64;
 const EDU_BUFFER: u64 = 0x40000;

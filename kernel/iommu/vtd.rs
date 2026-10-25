@@ -496,6 +496,8 @@ pub enum VtdError {
 }
 
 const VTD_MMIO_VIRT_BASE: u64 = 0xffff_ffff_6000_0000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(VTD_MMIO_VIRT_BASE >= mm::KSTACK_REGION_END);
 const VTD_MMIO_SLOT_BYTES: u64 = 0x1_0000;
 static VTD_MMIO_SLOTS: Mutex<[Option<(u64, usize)>; crate::MAX_IOMMU_UNITS]> =
     Mutex::new([None; crate::MAX_IOMMU_UNITS]);

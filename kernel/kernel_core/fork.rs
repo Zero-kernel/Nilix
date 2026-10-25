@@ -3273,6 +3273,9 @@ pub fn run_cow_failure_cleanup_self_test() {
     let parent_kernel_pdpt = frame_alloc
         .allocate_frame()
         .expect("parent entry-island PDPT frame for COW failure probe");
+    let parent_stack_pd = frame_alloc
+        .allocate_frame()
+        .expect("parent kernel-stack PD frame for COW failure probe");
 
     let branch_flags =
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
@@ -3284,6 +3287,7 @@ pub fn run_cow_failure_cleanup_self_test() {
         zero_table(parent_pd);
         zero_table(parent_pt);
         zero_table(parent_kernel_pdpt);
+        zero_table(parent_stack_pd);
 
         let pml4 = phys_to_virt_table(parent_root.start_address());
         pml4[0].set_addr(parent_pdpt.start_address(), branch_flags);
@@ -3294,6 +3298,16 @@ pub fn run_cow_failure_cleanup_self_test() {
             parent_kernel_pdpt.start_address(),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         );
+        // LEAD-KSTACK-WINDOW-1: with the kernel-stack directories present the
+        // KPTI root builds, so the refcount staging below stays the failure
+        // point (and the KPTI root's rollback stays covered).
+        let island = phys_to_virt_table(parent_kernel_pdpt.start_address());
+        for index in KPTI_ISLAND_FIRST_PDPT..=KSTACK_LAST_PDPT {
+            island[index].set_addr(
+                parent_stack_pd.start_address(),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            );
+        }
         let pdpt = phys_to_virt_table(parent_pdpt.start_address());
         pdpt[0].set_addr(parent_pd.start_address(), branch_flags);
         let pd = phys_to_virt_table(parent_pd.start_address());
@@ -3336,6 +3350,7 @@ pub fn run_cow_failure_cleanup_self_test() {
     frame_alloc.deallocate_frame(parent_pd);
     frame_alloc.deallocate_frame(parent_pdpt);
     frame_alloc.deallocate_frame(parent_kernel_pdpt);
+    frame_alloc.deallocate_frame(parent_stack_pd);
     // Exercise the same teardown entry used by fork error cleanup. The user
     // half was cleared by the COW rollback above, so this must reclaim only
     // the private child root and never follow a dangling child branch.
@@ -3347,6 +3362,56 @@ pub fn run_cow_failure_cleanup_self_test() {
     assert_eq!(
         after_stats.free_pages, baseline_stats.free_pages,
         "COW failure rollback leaked or double-freed physical frames"
+    );
+}
+
+/// LEAD-KSTACK-WINDOW-1: `create_kpti_user_pml4` refuses a kernel root whose
+/// kernel-stack page directories are missing, or that has no PML4[511] at
+/// all, and frees both frames it allocated. Neither case reaches the
+/// mitigation probe, so this runs in every guest.
+pub fn run_kpti_island_fail_closed_self_test() {
+    let baseline_stats = mm::buddy_allocator::get_allocator_stats()
+        .expect("buddy allocator stats for KPTI island probe");
+    let mut frame_alloc = FrameAllocator::new();
+    let root = frame_alloc
+        .allocate_frame()
+        .expect("root frame for KPTI island probe");
+    let island = frame_alloc
+        .allocate_frame()
+        .expect("PML4[511] PDPT frame for KPTI island probe");
+    unsafe {
+        zero_table(root);
+        zero_table(island);
+    }
+    let root_phys = root.start_address().as_u64() as usize;
+
+    // No PML4[511] at all.
+    let result = create_kpti_user_pml4(root_phys);
+    assert!(
+        matches!(result, Err(ForkError::PageTableCopyFailed)),
+        "a root without PML4[511] must not get a KPTI root: {result:?}"
+    );
+
+    // PML4[511] without the kernel-stack directories.
+    unsafe {
+        phys_to_virt_table(root.start_address())[511].set_addr(
+            island.start_address(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+    }
+    let result = create_kpti_user_pml4(root_phys);
+    assert!(
+        matches!(result, Err(ForkError::PageTableCopyFailed)),
+        "a root without kernel-stack directories must not get a KPTI root: {result:?}"
+    );
+
+    frame_alloc.deallocate_frame(island);
+    frame_alloc.deallocate_frame(root);
+    let after_stats = mm::buddy_allocator::get_allocator_stats()
+        .expect("buddy allocator stats after KPTI island probe");
+    assert_eq!(
+        after_stats.free_pages, baseline_stats.free_pages,
+        "a refused KPTI root leaked or double-freed frames"
     );
 }
 
@@ -3554,9 +3619,11 @@ pub fn create_kpti_user_pml4(
     // R118-5 FIX: Allocate a dedicated PDPT for the entry island (PML4[511]).
     //
     // Instead of copying the kernel's full PML4[511] (which maps 512 GiB),
-    // we create a fresh PDPT and copy only the top 4 GiB (PDPT[508..=511]).
-    // This limits speculative Meltdown-style exposure from 512 GiB to 4 GiB,
+    // we create a fresh PDPT and copy only its top 6 GiB
+    // (PDPT[KPTI_ISLAND_FIRST_PDPT..=511], 506..=511).
+    // This limits speculative Meltdown-style exposure from 512 GiB to 6 GiB,
     // covering only the regions actually needed by the trampoline:
+    //   - Per-process kernel stacks (TSS.RSP0)
     //   - Kernel text/data (.text at 0xffffffff80100000)
     //   - Per-CPU syscall metadata (SyscallPerCpu)
     //   - IDT/GDT/TSS and scratch stacks
@@ -3582,6 +3649,7 @@ pub fn create_kpti_user_pml4(
     /// Entry island slot — contains kernel text/entry stubs/IDT/GDT/TSS
     const ENTRY_ISLAND_INDEX: usize = 511;
 
+    let mut stacks_reachable = false;
     unsafe {
         let kernel_pml4 = phys_to_virt_table(kernel_pml4_frame.start_address());
         let user_pml4 = phys_to_virt_table(user_pml4_frame.start_address());
@@ -3602,11 +3670,16 @@ pub fn create_kpti_user_pml4(
         // ── Map entry island (PML4[511]) ──
         //
         // R118-5 FIX: Instead of copying the kernel's PML4[511] verbatim (512 GiB),
-        // point to a dedicated PDPT that only maps the top 4 GiB (PDPT[508..=511]).
+        // point to a dedicated PDPT that only maps the top 6 GiB
+        // (PDPT[KPTI_ISLAND_FIRST_PDPT..=511]).
         //
-        // R121-2 NOTE: All four PDPT entries are currently required:
-        //   - PDPT[508]: Per-process kernel stacks (KSTACK_BASE = 0xffff_ffff_0000_0000)
-        //                TSS.RSP0 points here; must be mapped during Ring 3→0 transitions.
+        // R121-2 NOTE: these PDPT entries are currently required:
+        //   - PDPT[506..=507]: Per-process kernel stacks (LEAD-KSTACK-WINDOW-1:
+        //                KSTACK_BASE = 0xffff_fffe_8000_0000; their page
+        //                directories exist from boot, so later stacks appear in
+        //                every island). TSS.RSP0 points here; must be mapped
+        //                during Ring 3→0 transitions.
+        //   - PDPT[508]: Empty since LEAD-KSTACK-WINDOW-1 (copied with the rest).
         //   - PDPT[509]: stack_guard guarded RSP0/IST stacks mapped during boot.
         //   - PDPT[510]: Kernel .text/.rodata/.data/.bss + statics (GDT, TSS,
         //                SYSCALL_PERCPU, scratch stacks).
@@ -3619,7 +3692,7 @@ pub fn create_kpti_user_pml4(
         //
         // All entries are supervisor-only (USER_ACCESSIBLE removed at both PML4
         // and PDPT levels) to prevent normal Ring 3 access and limit Meltdown-style
-        // speculative exposure to 4 GiB instead of 512 GiB.
+        // speculative exposure to 6 GiB instead of 512 GiB.
         if !kernel_pml4[ENTRY_ISLAND_INDEX].is_unused() {
             let mut island_flags = kernel_pml4[ENTRY_ISLAND_INDEX].flags();
             island_flags.remove(PageTableFlags::USER_ACCESSIBLE);
@@ -3628,9 +3701,9 @@ pub fn create_kpti_user_pml4(
             let kernel_pdpt = phys_to_virt_table(kernel_pml4[ENTRY_ISLAND_INDEX].addr());
             let island_pdpt = phys_to_virt_table(entry_island_pdpt_frame.start_address());
 
-            // Copy only PDPT[508..=511] (top 4 GiB) from kernel's PDPT.
-            // PDPT[0..508] remain absent (not present) in the user PDPT.
-            for i in 508..512 {
+            // Copy only PDPT[KPTI_ISLAND_FIRST_PDPT..=511] (top 6 GiB) from the
+            // kernel's PDPT. The entries below remain absent in the user PDPT.
+            for i in KPTI_ISLAND_FIRST_PDPT..512 {
                 island_pdpt[i] = kernel_pdpt[i].clone();
                 if !island_pdpt[i].is_unused() {
                     let addr = island_pdpt[i].addr();
@@ -3639,7 +3712,19 @@ pub fn create_kpti_user_pml4(
                     island_pdpt[i].set_addr(addr, flags);
                 }
             }
+            stacks_reachable = (KPTI_ISLAND_FIRST_PDPT..=KSTACK_LAST_PDPT)
+                .all(|i| kernel_stack_pdpt_entry_ready(&island_pdpt[i]));
         }
+    }
+    // LEAD-KSTACK-WINDOW-1: every kernel stack must be reachable from this
+    // root (an interrupt from ring 3 pushes its frame on TSS.RSP0 before the
+    // CR3 switch), which holds only while the boot-time page directories are
+    // in the copied entries. Fail closed rather than build a root whose first
+    // interrupt would double-fault.
+    if !stacks_reachable {
+        frame_alloc.deallocate_frame(entry_island_pdpt_frame);
+        frame_alloc.deallocate_frame(user_pml4_frame);
+        return Err(ForkError::PageTableCopyFailed);
     }
 
     let phys_addr = user_pml4_frame.start_address().as_u64() as usize;
@@ -3648,6 +3733,23 @@ pub fn create_kpti_user_pml4(
         crate::mitigation_probe::inspect(kernel_pml4_phys as u64, phys_addr as u64);
     }
     Ok((user_pml4_frame, phys_addr))
+}
+
+/// First PML4[511] PDPT entry a KPTI user root's entry island copies: the
+/// kernel-stack region's (LEAD-KSTACK-WINDOW-1).
+pub(crate) const KPTI_ISLAND_FIRST_PDPT: usize = ((mm::KSTACK_REGION_BASE >> 30) & 0x1ff) as usize;
+const _: () = assert!(KPTI_ISLAND_FIRST_PDPT == 506);
+
+/// Last PML4[511] PDPT entry of the kernel-stack region.
+pub(crate) const KSTACK_LAST_PDPT: usize = (((mm::KSTACK_REGION_END - 1) >> 30) & 0x1ff) as usize;
+const _: () = assert!(KSTACK_LAST_PDPT == 507);
+
+/// A kernel-stack region PDPT entry as `process::init` leaves it: a present,
+/// writable, supervisor page directory.
+pub(crate) fn kernel_stack_pdpt_entry_ready(entry: &PageTableEntry) -> bool {
+    let flags = entry.flags();
+    flags.contains(PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
+        && !flags.intersects(PageTableFlags::HUGE_PAGE | PageTableFlags::USER_ACCESSIBLE)
 }
 
 /// H.3 KPTI: Free a user PML4 root created by `create_kpti_user_pml4()`.

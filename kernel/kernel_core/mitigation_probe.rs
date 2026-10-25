@@ -20,6 +20,7 @@ pub extern "C" fn zero_mitigation_probe_anchor() {
 
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 const PRESENT: u64 = 1;
+const WRITABLE: u64 = 2;
 const USER: u64 = 4;
 const HUGE: u64 = 1 << 7;
 
@@ -79,15 +80,24 @@ pub(crate) unsafe fn inspect(kernel: u64, user: u64) {
     let user_island = word(user, 511);
     assert_ne!(kernel_island & ADDRESS, user_island & ADDRESS);
     assert_eq!(user_island & (PRESENT | USER), PRESENT);
-    for index in 0..508 {
+    let island_first = crate::fork::KPTI_ISLAND_FIRST_PDPT;
+    for index in 0..island_first {
         assert_eq!(word(user_island, index) & PRESENT, 0);
     }
-    for index in 508..512 {
+    for index in island_first..512 {
         assert_eq!(
             word(user_island, index) & !(USER | 0x60),
             word(kernel_island, index) & !(USER | 0x60)
         );
         assert_eq!(word(user_island, index) & USER, 0);
+    }
+    // LEAD-KSTACK-WINDOW-1: the kernel-stack directories exist before any user
+    // root, so a stack mapped after this root was built is still reachable.
+    for index in island_first..=crate::fork::KSTACK_LAST_PDPT {
+        assert_eq!(
+            word(user_island, index) & (PRESENT | WRITABLE | USER | HUGE),
+            PRESENT | WRITABLE
+        );
     }
     let layout = security::get_kernel_layout();
     let stack_sample = 0u8;

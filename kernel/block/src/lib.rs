@@ -980,6 +980,8 @@ pub fn init() {
 /// Base virtual address for mapping MMIO regions above 4GB.
 /// This is in the kernel's higher-half address space, separate from the kernel image.
 const HIGH_MMIO_VIRT_BASE: u64 = 0xffff_ffff_4000_0000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(HIGH_MMIO_VIRT_BASE >= mm::KSTACK_REGION_END);
 
 /// Maximum size of the high MMIO virtual address region (256 MB).
 const HIGH_MMIO_VIRT_SIZE: u64 = 256 * 1024 * 1024;

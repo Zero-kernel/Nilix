@@ -70,7 +70,7 @@ pub use kaslr::{
     is_kaslr_enabled, is_kpti_enabled, is_partial_kaslr_enabled, kernel_stack_slide,
     partial_kaslr_status, randomized_mmap_base, text_kaslr_status, BootKaslrState, KernelLayout,
     KptiContext, PartialKaslrFeature, PartialKaslrStatus, TextKaslrStatus, TrampolineDesc,
-    KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
+    KERNEL_PHYS_BASE, KERNEL_VIRT_BASE, KSTACK_MAX_SLIDE,
 };
 pub use kptr::{kptr_strongly_seeded, KptrGuard};
 pub use memory_hardening::{

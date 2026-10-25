@@ -441,6 +441,8 @@ pub fn list_devices() -> Vec<String> {
 /// Base virtual address for network MMIO regions.
 /// Uses a separate range from block driver to avoid conflicts.
 const NET_MMIO_VIRT_BASE: u64 = 0xffff_ffff_5000_0000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(NET_MMIO_VIRT_BASE >= mm::KSTACK_REGION_END);
 
 /// Maximum size of the network MMIO virtual address region (64 MB).
 const NET_MMIO_VIRT_SIZE: u64 = 64 * 1024 * 1024;

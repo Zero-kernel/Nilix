@@ -238,13 +238,14 @@ pub struct BootKaslrState {
 
 /// Maximum slide applied to the kernel stack region base: 256 MiB.
 ///
-/// The kernel stack region starts at KSTACK_BASE (0xFFFF_FFFF_0000_0000).
-/// Bounded to avoid overlapping the kernel heap or other reserved high-half regions.
-/// ST-K3 FIX (doc-truth): each process slot is now 0x9000 (32 KiB stack +
-/// 4 KiB guard — grown from 0x5000 after the Ring-3 fork double fault), so
-/// with PID_MAX=32,768 slots the region spans ~1.2 GiB; with the 256 MiB
-/// slide it stays within the 2 GiB PDPT[508] window below the kernel image.
-const KSTACK_MAX_SLIDE: u64 = 256 * 1024 * 1024;
+/// LEAD-KSTACK-WINDOW-1: the kernel stack region is PML4[511] PDPT[506..=507]
+/// (`mm::KSTACK_REGION_BASE`..`mm::KSTACK_REGION_END`, 2 GiB). Each process slot
+/// is 0x9000 (32 KiB stack + 4 KiB guard), so the 32,769 slots of PIDs
+/// 0..=PID_MAX span ~1.13 GiB and, with this slide, end by
+/// `0xFFFF_FFFE_D800_9000`, below every fixed high-half window
+/// (`kernel_core::process` asserts it). The old base, PDPT[508], let the slid
+/// region run into the block and net MMIO windows in PDPT[509].
+pub const KSTACK_MAX_SLIDE: u64 = 256 * 1024 * 1024;
 
 /// Kernel stack base slide granularity: 2 MiB.
 ///

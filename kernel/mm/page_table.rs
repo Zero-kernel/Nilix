@@ -29,6 +29,16 @@ pub const APIC_PHYS_ADDR: u64 = 0xfee0_0000;
 pub const APIC_MMIO_SIZE: usize = 0x1000;
 pub const APIC_VIRT_ADDR: u64 = 0xffff_ffff_fee0_0000; // PML4[511] unused slot
 
+/// LEAD-KSTACK-WINDOW-1: the per-PID kernel-stack region, PML4[511]
+/// PDPT[506..=507]: `[KSTACK_REGION_BASE, KSTACK_REGION_END)`. The fixed
+/// high-half windows (MMIO, framebuffer, boot and per-CPU stacks, kernel image,
+/// heap and direct map, HPET, APIC, firmware) all start at or above
+/// `KSTACK_REGION_END` (PDPT[508] onwards); each asserts it where it is defined.
+pub const KSTACK_REGION_BASE: u64 = 0xffff_fffe_8000_0000;
+pub const KSTACK_REGION_END: u64 = 0xffff_ffff_0000_0000;
+const _: () = assert!(KSTACK_REGION_END <= PHYSICAL_MEMORY_OFFSET);
+const _: () = assert!(KSTACK_REGION_END <= APIC_VIRT_ADDR);
+
 /// R67-5 FIX: Global page table lock for cross-CPU serialization.
 ///
 /// This lock ensures that page table modifications from different CPUs are serialized.
@@ -1752,6 +1762,73 @@ pub unsafe fn split_2m_entry(
     pd_entry.set_addr(pt_frame.start_address(), pd_flags);
 
     Ok(&mut *pt_ptr)
+}
+
+/// LEAD-KSTACK-WINDOW-1: in the active root, give every PDPT entry that
+/// covers `[start, end)` a supervisor, writable page directory if it has none,
+/// and return how many were created. An existing entry must already be one
+/// (present, writable, not user, not huge); anything else is an error, since
+/// `map_page` would only OR the missing bits into the kernel copy and leave
+/// every island with the stale entry.
+///
+/// A KPTI user root copies its entry-island PDPT entries by value when it is
+/// built, so a page directory created later under one of them would be missing
+/// from every older user root (a thread runs on its group's older root). With
+/// the directories created at boot, before any user root, every later leaf or
+/// page table in the range is visible in every root. The range must be in the
+/// high half, whose PML4 entries every root shares; leaves and PTs are not
+/// touched, and nothing prunes these directories later.
+///
+/// # Safety
+///
+/// Runs on the boot root before any user root exists; CR3 must not change.
+pub unsafe fn ensure_kernel_page_directories(
+    start: u64,
+    end: u64,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<usize, MapError> {
+    const PDPT_ENTRY_SPAN: u64 = 1 << 30;
+    let _pt_guard = lock_pt();
+    let phys_offset = get_phys_offset();
+    let pml4 = active_level_4_table(phys_offset);
+    let mut created = 0;
+    let mut addr = start & !(PDPT_ENTRY_SPAN - 1);
+    while addr < end {
+        let virt = VirtAddr::try_new(addr).map_err(|_| MapError::InvalidRange)?;
+        let pml4e = &mut pml4[virt.p4_index()];
+        if pml4e.is_unused() || pml4e.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+            return Err(MapError::InvalidRange);
+        }
+        let pdpt = &mut *(phys_offset + pml4e.addr().as_u64()).as_mut_ptr::<PageTable>();
+        let pdpte = &mut pdpt[virt.p3_index()];
+        let flags = pdpte.flags();
+        if flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Err(MapError::ParentEntryHugePage);
+        }
+        if !pdpte.is_unused() {
+            if !flags.contains(PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
+                || flags.contains(PageTableFlags::USER_ACCESSIBLE)
+            {
+                return Err(MapError::PageAlreadyMapped);
+            }
+        } else {
+            let pd_frame = frame_allocator
+                .allocate_frame()
+                .ok_or(MapError::FrameAllocationFailed)?;
+            let pd_virt = phys_offset + pd_frame.start_address().as_u64();
+            core::ptr::write_bytes(pd_virt.as_mut_ptr::<u8>(), 0, 4096);
+            pdpte.set_addr(
+                pd_frame.start_address(),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            );
+            created += 1;
+        }
+        addr = match addr.checked_add(PDPT_ENTRY_SPAN) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    Ok(created)
 }
 
 /// Ensure a virtual page is backed by a 4 KB PTE (allocate tables or demote 2 MB leaves).

@@ -92,7 +92,7 @@ pub use page_cache::{
 pub use page_table::{
     checked_physical_range, map_mmio, phys_to_virt, pt_lock_owner_cpu, unmap_mmio,
     with_current_manager, MapError, PageTableManager, UnmapError, UpdateFlagsError,
-    PHYSICAL_MEMORY_OFFSET,
+    KSTACK_REGION_BASE, KSTACK_REGION_END, PHYSICAL_MEMORY_OFFSET,
 };
 pub use tlb_shootdown::{
     flush_all_address_spaces, flush_current_as_all, flush_current_as_page, flush_current_as_range,

@@ -43,7 +43,7 @@ use mm::{
 };
 use spin::Mutex;
 
-use crate::process::{ProcessId, MAX_PID};
+use crate::process::ProcessId;
 
 // ============================================================================
 // Constants
@@ -51,6 +51,13 @@ use crate::process::{ProcessId, MAX_PID};
 
 /// Maximum PID namespace nesting depth (Linux default is 32)
 pub const MAX_PID_NS_LEVEL: u8 = 32;
+
+/// Largest namespace-local PID. Namespace PIDs are never reused (`next_pid`
+/// only grows), so this is a namespace's lifetime fork budget; they never
+/// index kernel stacks. LEAD-KSTACK-WINDOW-1 keeps it at the value the
+/// stack-address `process::MAX_PID` had before that bound shrank to the
+/// kernel-stack region.
+const MAX_NS_PID: ProcessId = 116_508;
 const PID_PATH_SLOTS: usize = MAX_PID_NS_LEVEL as usize + 1;
 
 /// Numeric exit identity survives removal of the live namespace memberships.
@@ -1104,7 +1111,7 @@ impl PidNamespace {
             return Err(PidNamespaceError::NamespaceShuttingDown);
         }
         let mut next = self.next_pid.lock();
-        if *next > MAX_PID {
+        if *next > MAX_NS_PID {
             return Err(PidNamespaceError::PidExhausted);
         }
         let ns_pid = *next;

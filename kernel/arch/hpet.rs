@@ -60,6 +60,8 @@ const HPET_MMIO_SIZE: usize = 0x1000;
 /// Dedicated high-half virtual address for HPET MMIO
 /// Uses an unused slot in the high-half address space (similar to APIC_VIRT_ADDR)
 const HPET_VIRT_BASE: u64 = 0xffff_ffff_fed0_0000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(HPET_VIRT_BASE >= mm::KSTACK_REGION_END);
 
 /// HPET register offsets (memory-mapped)
 pub mod regs {

@@ -118,7 +118,8 @@ fn checked_phys_add(base: PhysAddr, offset: u64) -> Option<PhysAddr> {
 
 /// 内核栈区域基址（高半区未映射区域）
 /// 位于 PML4[511] 但不在内核代码所在的 PDPT[510] 中
-/// Bootloader 只映射了 PDPT[510]，其他 PDPT 槽位未使用
+/// Bootloader 只映射了 PDPT[510]；PDPT[506..=507] 是进程内核栈区域
+/// (LEAD-KSTACK-WINDOW-1, `mm::KSTACK_REGION_BASE`)
 const KERNEL_STACK_REGION_BASE: u64 = 0xFFFF_FFFF_7000_0000;
 
 /// 双重错误栈区域基址
@@ -128,6 +129,9 @@ const DOUBLE_FAULT_STACK_REGION_BASE: u64 = 0xFFFF_FFFF_6F00_0000;
 /// D0-ISO-1 Approach A: the BSP's boot, shell and idle stack (guard page
 /// first). It is in PDPT[509], which the KPTI entry island shares.
 const BSP_STACK_REGION_BASE: u64 = 0xFFFF_FFFF_6E00_0000;
+// LEAD-KSTACK-WINDOW-1: the lowest of the three boot stack regions stays
+// above the kernel-stack region.
+const _: () = assert!(BSP_STACK_REGION_BASE >= mm::KSTACK_REGION_END);
 /// The firmware stack the BSP used to keep was 128 KiB under OVMF; boot runs
 /// every runtime test on this stack, so leave headroom.
 const BSP_STACK_SIZE: usize = 64 * PAGE_SIZE;

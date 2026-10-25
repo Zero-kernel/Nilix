@@ -47,6 +47,8 @@ const DIRECT_MAP_LIMIT: u64 = 1 << 30;
 /// (`0xffff_ffff_fed0_0000`) and LAPIC (`0xffff_ffff_fee0_0000`) windows, and
 /// in a PD slot of its own.
 const FIRMWARE_WINDOW: u64 = 0xffff_ffff_fe00_0000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(FIRMWARE_WINDOW >= crate::page_table::KSTACK_REGION_END);
 
 const PAGE_BYTES: u64 = 4096;
 

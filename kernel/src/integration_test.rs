@@ -105,6 +105,8 @@ pub fn test_fork_framework() {
     // satisfy. Run it in every ordinary guest and skip only that proof build.
     #[cfg(not(feature = "mitigation_probe"))]
     kernel_core::fork::run_cow_failure_cleanup_self_test();
+    // LEAD-KSTACK-WINDOW-1: a KPTI root needs the kernel-stack directories.
+    kernel_core::fork::run_kpti_island_fail_closed_self_test();
     kernel_core::syscall::run_cow_mprotect_self_test();
     kernel_core::pid_namespace::run_shutdown_creation_self_test();
     klog_always!("    ✓ Fork implementation compiled");

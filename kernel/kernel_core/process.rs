@@ -206,8 +206,11 @@ pub const DEFAULT_MMAP_BASE: usize = 0x10_0000_0000;
 /// 页大小
 const PAGE_SIZE: u64 = 0x1000;
 
-/// 每进程内核栈基址（PML4[511]/PDPT[508]，在共享内核空间内）
-pub const KSTACK_BASE: u64 = 0xFFFF_FFFF_0000_0000;
+/// 每进程内核栈基址（PML4[511]/PDPT[506..=507]，在共享内核空间内）
+///
+/// LEAD-KSTACK-WINDOW-1: was PDPT[508] (0xFFFF_FFFF_0000_0000), from where the
+/// slid region ran into the block and net MMIO windows in PDPT[509].
+pub const KSTACK_BASE: u64 = mm::KSTACK_REGION_BASE;
 
 /// 每进程内核栈步长（32KB 栈 + 4KB 守护页 = 36KB）
 // ST-K3 FIX (fork double-fault): 16 KiB per-process kernel stacks cannot host
@@ -783,11 +786,15 @@ pub enum ProcessCreateError {
 
 /// R29-5 FIX: Maximum PID before kernel stack address overflow
 ///
-/// Each process gets a kernel stack at KSTACK_BASE + pid * KSTACK_STRIDE.
-/// After this many PIDs, new stacks would overflow into other kernel memory.
-/// Calculation: (u64::MAX - KSTACK_BASE) / KSTACK_STRIDE ≈ 116,508
-/// (ST-K3: recomputed for the 0x9000 stride; was ≈209,715 at 0x5000)
-pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as ProcessId;
+/// Each process gets a kernel stack at KSTACK_BASE + slide + pid * KSTACK_STRIDE.
+/// LEAD-KSTACK-WINDOW-1: the largest PID whose slot still ends inside the
+/// kernel-stack region at the maximum KASLR slide:
+/// (KSTACK_REGION_END - KSTACK_BASE - KSTACK_MAX_SLIDE) / KSTACK_STRIDE - 1
+/// = 50,971 (was (u64::MAX - KSTACK_BASE) / KSTACK_STRIDE, which bounded only
+/// the arithmetic and let slots run into the fixed windows).
+pub const MAX_PID: ProcessId = ((mm::KSTACK_REGION_END - KSTACK_BASE - security::KSTACK_MAX_SLIDE)
+    / KSTACK_STRIDE
+    - 1) as ProcessId;
 
 /// R106-11 (P0-4): User-visible PID upper bound (Linux default: 32768).
 ///
@@ -795,6 +802,14 @@ pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as Pro
 /// recycling keeps the process table bounded and prevents PID exhaustion under
 /// fork/exit churn. Valid PIDs are in [1, PID_MAX].
 pub const PID_MAX: ProcessId = 32_768;
+
+// LEAD-KSTACK-WINDOW-1: every PID's slot, at every slide, stays inside the
+// kernel-stack region, which ends below every fixed high-half window.
+const _: () = assert!(PID_MAX <= MAX_PID);
+const _: () = assert!(
+    KSTACK_BASE + security::KSTACK_MAX_SLIDE + (PID_MAX as u64 + 1) * KSTACK_STRIDE
+        <= mm::KSTACK_REGION_END
+);
 
 /// R180-12: every valid PID has one dedicated RCU stack-lifecycle slot.
 /// This is an admission invariant, not a reduction of the PID/task capability.
@@ -929,14 +944,23 @@ pub(crate) fn tgid_reap_in_flight(tgid: ProcessId) -> bool {
 /// contract explicit and prevents kernel panics from propagating.
 #[inline]
 pub fn kernel_stack_slot(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelStackError> {
-    // R102-8 FIX: Use checked arithmetic to prevent silent wrapping on invalid PID.
-    // R103-I2 FIX: Propagate overflow as error instead of panicking.
-    //
     // H.2 Partial KASLR: Apply boot-time random slide to the kernel stack region
     // base. This prevents attackers from predicting per-process kernel stack addresses
     // even when the kernel text is at a fixed address.
+    kernel_stack_slot_at(pid, security::kernel_stack_slide())
+}
+
+/// `kernel_stack_slot` for an explicit slide (the layout test drives every
+/// PID at the extreme slides).
+#[inline]
+fn kernel_stack_slot_at(
+    pid: ProcessId,
+    slide: u64,
+) -> Result<(VirtAddr, VirtAddr), KernelStackError> {
+    // R102-8 FIX: Use checked arithmetic to prevent silent wrapping on invalid PID.
+    // R103-I2 FIX: Propagate overflow as error instead of panicking.
     let kstack_base = KSTACK_BASE
-        .checked_add(security::kernel_stack_slide())
+        .checked_add(slide)
         .ok_or(KernelStackError::AddressOverflow)?;
     let slot_offset = (pid as u64)
         .checked_mul(KSTACK_STRIDE)
@@ -954,6 +978,11 @@ pub fn kernel_stack_slot(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelS
     let stack_top_addr = stack_base_addr
         .checked_add(stack_bytes)
         .ok_or(KernelStackError::AddressOverflow)?;
+    // LEAD-KSTACK-WINDOW-1: never hand out a slot past the region (a PID
+    // above MAX_PID, or a slide past KSTACK_MAX_SLIDE).
+    if stack_top_addr > mm::KSTACK_REGION_END {
+        return Err(KernelStackError::AddressOverflow);
+    }
 
     Ok((
         VirtAddr::new(stack_base_addr),
@@ -5327,7 +5356,31 @@ pub fn alloc_wait_seq() -> u64 {
 pub fn init() {
     // 强制 BOOT_CR3 lazy_static 初始化，确保捕获当前（引导）CR3
     let _ = *BOOT_CR3;
+    prepare_kernel_stack_region();
     klog_always!("  Process subsystem initialized (boot CR3 cached)");
+}
+
+/// LEAD-KSTACK-WINDOW-1: create the kernel-stack region's page directories
+/// before any process, kernel stack or KPTI user root exists.
+///
+/// A user root's entry island copies PDPT[KPTI island..=511] by value when it
+/// is built. A stack mapped later under a PDPT entry that had no directory yet
+/// would be missing from older user roots, including the one a new thread
+/// shares with its group, and its first interrupt from ring 3 would fault
+/// pushing the frame. Boot fails closed if the directories cannot be made.
+fn prepare_kernel_stack_region() {
+    let mut frame_alloc = FrameAllocator::new();
+    // SAFETY: boot root, before any user root; no other CPU edits page tables yet.
+    let created = unsafe {
+        mm::page_table::ensure_kernel_page_directories(
+            KSTACK_BASE,
+            mm::KSTACK_REGION_END,
+            &mut frame_alloc,
+        )
+    };
+    if let Err(error) = created {
+        panic!("kernel-stack region page directories: {:?}", error);
+    }
 }
 
 /// GAP-6 pressure soak: PIDs are reused within this window before the
@@ -7119,7 +7172,7 @@ pub fn with_process_registry_txn<T>(
 /// instead of an infallible `.collect()`, which would abort the kernel on OOM.
 /// Returns `None` when the snapshot allocation fails so callers can degrade
 /// gracefully rather than panic. The reservation is exact (sized to the live
-/// slot count) and bounded by the process table length (≤ MAX_PID slots).
+/// slot count) and bounded by the process table length (≤ PID_MAX + 1 slots).
 pub fn process_table_snapshot() -> Option<alloc::vec::Vec<ProcessId>> {
     let table = PROCESS_TABLE.lock();
     let live = table.iter().filter(|slot| slot.is_some()).count();
@@ -8342,6 +8395,45 @@ impl Drop for CredentialMutationGuard<'_> {
     }
 }
 
+/// LEAD-KSTACK-WINDOW-1: every PID's kernel-stack slot, at no slide, the
+/// smallest slide and the largest, lies inside the kernel-stack region and in
+/// one of its PDPT entries; the first slot past the region is refused.
+#[cfg(test)]
+mod kstack_layout_tests {
+    use super::*;
+
+    fn pdpt_index(addr: u64) -> u64 {
+        (addr >> 30) & 0x1ff
+    }
+
+    #[test]
+    fn lead_kstack_window_1_every_slot_stays_in_the_region() {
+        let first_entry = pdpt_index(mm::KSTACK_REGION_BASE);
+        let last_entry = pdpt_index(mm::KSTACK_REGION_END - 1);
+        assert_eq!((first_entry, last_entry), (506, 507));
+        for slide in [0, 2 * 1024 * 1024, security::KSTACK_MAX_SLIDE] {
+            for pid in 0..=PID_MAX {
+                let (bottom, top) = kernel_stack_slot_at(pid, slide)
+                    .unwrap_or_else(|e| panic!("pid {pid} slide {slide:#x}: {e:?}"));
+                let guard = bottom.as_u64() - KSTACK_GUARD_PAGES as u64 * PAGE_SIZE;
+                let top = top.as_u64();
+                assert!(
+                    guard >= mm::KSTACK_REGION_BASE && top <= mm::KSTACK_REGION_END,
+                    "pid {pid} slide {slide:#x}: [{guard:#x}, {top:#x}) leaves the region"
+                );
+                for entry in [pdpt_index(guard), pdpt_index(top - 1)] {
+                    assert!((first_entry..=last_entry).contains(&entry));
+                }
+            }
+        }
+        assert!(kernel_stack_slot_at(MAX_PID, security::KSTACK_MAX_SLIDE).is_ok());
+        assert!(matches!(
+            kernel_stack_slot_at(MAX_PID + 1, security::KSTACK_MAX_SLIDE),
+            Err(KernelStackError::AddressOverflow)
+        ));
+    }
+}
+
 #[cfg(test)]
 mod standard_fd_tests {
     use super::*;
@@ -9400,7 +9492,7 @@ pub fn has_no_new_privs() -> bool {
 ///
 /// # Performance
 ///
-/// Linear scan of MAX_PID slots — intentionally kept out of the scheduler hot path.
+/// Linear scan of the process table — intentionally kept out of the scheduler hot path.
 fn lookup_user_memory_space(kernel_memory_space: usize) -> usize {
     let table = PROCESS_TABLE.lock();
     for slot in table.iter() {

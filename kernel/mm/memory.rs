@@ -301,6 +301,8 @@ static EMERGENCY_ALLOCATOR_READY: AtomicBool = AtomicBool::new(false);
 
 /// Default (fallback) heap base address when randomization is unavailable
 pub const HEAP_DEFAULT_BASE: usize = 0xffffffff80400000;
+// LEAD-KSTACK-WINDOW-1: fixed windows stay above the kernel-stack region.
+const _: () = assert!(HEAP_DEFAULT_BASE as u64 >= crate::page_table::KSTACK_REGION_END);
 
 /// Upper bound of heap randomization window (exclusive)
 /// This leaves room for the heap itself within the 1GB mapped region
