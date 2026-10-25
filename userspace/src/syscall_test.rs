@@ -3139,19 +3139,22 @@ unsafe fn raw_exit(syscall: u64, code: u64) -> ! {
 
 // ---------------------------------------------------------------------------
 // TD-LSM-1: runtime LSM denial oracle. The syscall_test kernel installs a test
-// policy that denies six hooks for one reserved real uid, and fails the first
-// subject lookup of every syscall made by a second reserved real uid. A child
-// takes the marker with setresuid(marker, 0, 0): it keeps euid 0, so each DAC
-// check before the LSM passes and only the LSM can refuse it.
+// policy that denies six hooks for one marked pid, and fails the first subject
+// lookup of every syscall made by a second marked pid. A child marks itself
+// with the kernel's test-only prctl option and stays root (the kernel has no
+// set*id syscall), so each DAC check before the LSM passes and only the LSM
+// can refuse it; the parent clears the marks after reaping it.
 // ---------------------------------------------------------------------------
 
 const SYS_EXEC: u64 = 59;
 const SYS_KILL: u64 = 62;
-const SYS_SETRESUID: u64 = 117;
+const SYS_PRCTL: u64 = 157;
 const SYS_UNLINK: u64 = 87;
-/// Keep in sync with `lsm::syscall_test::{DENY_UID, NO_SUBJECT_UID}`.
-const LSM_TEST_DENY_UID: u64 = 0x7E57_0001;
-const LSM_TEST_NO_SUBJECT_UID: u64 = 0x7E57_0002;
+/// Keep in sync with `lsm::syscall_test::{PR_SYSCALL_TEST_LSM_MARK, ARM_*}`.
+const PR_SYSCALL_TEST_LSM_MARK: u64 = 0x5A4C_534D;
+const LSM_ARM_NONE: u64 = 0;
+const LSM_ARM_DENY: u64 = 1;
+const LSM_ARM_NO_SUBJECT: u64 = 2;
 const ENOEXEC: i32 = 8;
 const EACCES: i32 = 13;
 /// One bit per checked call; a child exits with the calls that behaved.
@@ -3209,8 +3212,8 @@ unsafe fn lsm_denial_oracle() -> Result<(), (&'static str, u64)> {
 unsafe fn lsm_oracle_arms(stat_fd: u64, page: usize) -> Result<(), (&'static str, u64)> {
     for (marker, arm) in [
         (None, "control arm"),
-        (Some(LSM_TEST_DENY_UID), "policy-denial arm"),
-        (Some(LSM_TEST_NO_SUBJECT_UID), "missing-subject arm"),
+        (Some(LSM_ARM_DENY), "policy-denial arm"),
+        (Some(LSM_ARM_NO_SUBJECT), "missing-subject arm"),
     ] {
         let child = sys_fork();
         if is_error(child) {
@@ -3218,7 +3221,7 @@ unsafe fn lsm_oracle_arms(stat_fd: u64, page: usize) -> Result<(), (&'static str
         }
         if child == 0 {
             let code = match marker {
-                Some(uid) if syscall3(SYS_SETRESUID, uid, 0, 0) != 0 => 0x40,
+                Some(arm) if syscall2(SYS_PRCTL, PR_SYSCALL_TEST_LSM_MARK, arm) != 0 => 0x40,
                 _ => lsm_oracle_calls(marker.is_none(), stat_fd, page),
             };
             raw_exit(SYS_EXIT, code);
@@ -3227,6 +3230,9 @@ unsafe fn lsm_oracle_arms(stat_fd: u64, page: usize) -> Result<(), (&'static str
         let waited = sys_wait(&mut status as *mut i32);
         if is_error(waited) || waited != child {
             return Err(("wait", 0));
+        }
+        if syscall2(SYS_PRCTL, PR_SYSCALL_TEST_LSM_MARK, LSM_ARM_NONE) != 0 {
+            return Err(("clear the LSM marks", 0));
         }
         let code = ((status >> 8) & 0xff) as u64;
         if code != LSM_ALL_CALLS {

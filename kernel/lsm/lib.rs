@@ -74,29 +74,63 @@ pub use policy::{SyscallTestPolicy, SYSCALL_TEST_POLICY};
 
 /// TD-LSM-1: guest-oracle support, compiled only into `syscall_test` kernels.
 ///
-/// A child of the ring-3 oracle marks itself with a reserved *real* uid,
-/// `setresuid(marker, 0, 0)`. It keeps host euid 0, so every DAC check in front
-/// of the LSM (`get_robust_list`'s cross-group check, the exec bit, `kill`)
-/// still passes and only the LSM tells it apart.
+/// A child of the ring-3 oracle marks its own pid for one arm with the
+/// test-only `prctl` option [`PR_SYSCALL_TEST_LSM_MARK`]; the parent clears
+/// the marks after reaping it. The kernel has no `set*id` syscall, so the mark
+/// cannot be a credential; the child stays root, every DAC check in front of
+/// the LSM (`get_robust_list`'s cross-group check, the exec bit, `kill`) still
+/// passes, and only the LSM tells it apart.
 #[cfg(feature = "syscall_test")]
 pub mod syscall_test {
     use super::ProcessId;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    /// `SyscallTestPolicy` denies its oracle hooks for this real uid.
-    pub const DENY_UID: u32 = 0x7E57_0001;
-    /// For this real uid, the first `ProcessCtx::from_current` of each syscall
-    /// returns `None`, driving that site's missing-subject arm.
-    pub const NO_SUBJECT_UID: u32 = 0x7E57_0002;
+    /// `prctl(PR_SYSCALL_TEST_LSM_MARK, arm)`: mark the caller for `arm`, or
+    /// clear every mark with [`ARM_NONE`]. Outside Linux's option space.
+    pub const PR_SYSCALL_TEST_LSM_MARK: i32 = 0x5A4C_534D;
+    /// Clear both marks and any armed lookup.
+    pub const ARM_NONE: u64 = 0;
+    /// `SyscallTestPolicy` denies its oracle hooks for the marked pid.
+    pub const ARM_DENY: u64 = 1;
+    /// For the marked pid, the first `ProcessCtx::from_current` of each
+    /// syscall returns `None`, driving that site's missing-subject arm.
+    pub const ARM_NO_SUBJECT: u64 = 2;
 
+    /// Marked pids; 0 = none.
+    static DENY_PID: AtomicUsize = AtomicUsize::new(0);
+    static NO_SUBJECT_PID: AtomicUsize = AtomicUsize::new(0);
     /// Pid whose next `ProcessCtx::from_current` fails; 0 = none.
     static LOST_SUBJECT_PID: AtomicUsize = AtomicUsize::new(0);
+
+    /// The `prctl` option: mark `pid` (the caller) for `arm`, or clear.
+    pub fn mark(arm: u64, pid: ProcessId) -> Result<(), ()> {
+        match arm {
+            ARM_NONE => {
+                DENY_PID.store(0, Ordering::Release);
+                NO_SUBJECT_PID.store(0, Ordering::Release);
+                LOST_SUBJECT_PID.store(0, Ordering::Release);
+            }
+            ARM_DENY => DENY_PID.store(pid, Ordering::Release),
+            ARM_NO_SUBJECT => NO_SUBJECT_PID.store(pid, Ordering::Release),
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+
+    /// Whether `SyscallTestPolicy` denies this subject.
+    pub(crate) fn denied(pid: ProcessId) -> bool {
+        pid != 0 && DENY_PID.load(Ordering::Acquire) == pid
+    }
+
+    fn no_subject(pid: ProcessId) -> bool {
+        pid != 0 && NO_SUBJECT_PID.load(Ordering::Acquire) == pid
+    }
 
     /// Syscall entry (`SyscallCtx::from_current`, which itself never fails
     /// here): arm a marked caller for one lost lookup in this syscall. An
     /// unmarked caller clears an arm left for its pid (a recycled pid).
-    pub(crate) fn note_syscall_entry(pid: ProcessId, uid: u32) {
-        if uid == NO_SUBJECT_UID {
+    pub(crate) fn note_syscall_entry(pid: ProcessId) {
+        if no_subject(pid) {
             LOST_SUBJECT_PID.store(pid, Ordering::Release);
         } else if LOST_SUBJECT_PID.load(Ordering::Relaxed) == pid {
             let _ = LOST_SUBJECT_PID.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed);
@@ -104,8 +138,8 @@ pub mod syscall_test {
     }
 
     /// `ProcessCtx::from_current`: whether this is the armed lookup.
-    pub(crate) fn take_lost_subject(pid: ProcessId, uid: u32) -> bool {
-        uid == NO_SUBJECT_UID
+    pub(crate) fn take_lost_subject(pid: ProcessId) -> bool {
+        no_subject(pid)
             && LOST_SUBJECT_PID
                 .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
@@ -117,25 +151,37 @@ pub mod syscall_test {
         use crate::policy::{LsmPolicy, PermissivePolicy, SYSCALL_TEST_POLICY};
         use crate::{ProcessCtx, SignalCtx};
 
+        /// The marks are global; the two tests below must not interleave.
+        static MARKS: spin::Mutex<()> = spin::Mutex::new(());
+
         #[test]
         fn td_lsm_1_lost_subject_is_one_lookup_per_marked_syscall() {
-            note_syscall_entry(41, NO_SUBJECT_UID);
-            assert!(!take_lost_subject(42, NO_SUBJECT_UID), "another pid");
-            assert!(!take_lost_subject(41, 0), "an unmarked lookup");
-            assert!(take_lost_subject(41, NO_SUBJECT_UID));
-            assert!(!take_lost_subject(41, NO_SUBJECT_UID), "one lookup only");
-            note_syscall_entry(41, NO_SUBJECT_UID);
-            note_syscall_entry(41, 0);
+            let _marks = MARKS.lock();
+            mark(ARM_NO_SUBJECT, 41).unwrap();
+            note_syscall_entry(41);
+            assert!(!take_lost_subject(42), "another pid");
+            assert!(take_lost_subject(41));
+            assert!(!take_lost_subject(41), "one lookup only");
+            note_syscall_entry(41);
+            mark(ARM_NO_SUBJECT, 43).unwrap();
+            note_syscall_entry(41);
             assert!(
-                !take_lost_subject(41, NO_SUBJECT_UID),
+                !take_lost_subject(41),
                 "an unmarked entry clears its pid's arm"
             );
+            note_syscall_entry(43);
+            mark(ARM_NONE, 43).unwrap();
+            assert!(!take_lost_subject(43), "clearing drops an armed lookup");
+            assert!(mark(3, 43).is_err(), "unknown arm");
+            assert!(!no_subject(0) && !denied(0));
         }
 
         #[test]
         fn td_lsm_1_test_policy_denies_only_the_marker() {
-            let marked = ProcessCtx::new(7, 7, DENY_UID, 0, 0, 0);
-            let root = ProcessCtx::new(7, 7, 0, 0, 0, 0);
+            let _marks = MARKS.lock();
+            mark(ARM_DENY, 7).unwrap();
+            let marked = ProcessCtx::new(7, 7, 0, 0, 0, 0);
+            let root = ProcessCtx::new(8, 8, 0, 0, 0, 0);
             let signal = SignalCtx {
                 target_pid: 7,
                 sig: 0,
@@ -143,7 +189,7 @@ pub mod syscall_test {
             };
             let policy = &SYSCALL_TEST_POLICY;
             for subject in [&marked, &root] {
-                let denied = subject.uid == DENY_UID;
+                let denied = subject.pid == 7;
                 assert_eq!(policy.task_exec(subject, 1).is_err(), denied);
                 assert_eq!(policy.signal_send(subject, &signal).is_err(), denied);
                 assert_eq!(policy.ptrace(subject, &root, 0).is_err(), denied);
@@ -151,10 +197,7 @@ pub mod syscall_test {
                     policy.memory_mmap(subject, 0, 4096, 3, 0x22).is_err(),
                     denied
                 );
-                assert_eq!(
-                    policy.memory_mprotect(subject, 0, 4096, 1).is_err(),
-                    denied
-                );
+                assert_eq!(policy.memory_mprotect(subject, 0, 4096, 1).is_err(), denied);
                 assert_eq!(policy.file_permission(subject, 1, 0).is_err(), denied);
                 assert!(policy.kpatch_load(subject, 1).is_ok());
                 assert!(policy.kpatch_enable(subject, 1).is_ok());
@@ -527,7 +570,7 @@ impl SyscallCtx {
         let creds = current_credentials()?;
         let pid = current_pid()?;
         #[cfg(feature = "syscall_test")]
-        syscall_test::note_syscall_entry(pid, creds.uid);
+        syscall_test::note_syscall_entry(pid);
 
         Some(Self {
             pid,
@@ -573,7 +616,7 @@ impl ProcessCtx {
         let pid = current_pid()?;
         // TD-LSM-1: the guest oracle's missing-subject arm.
         #[cfg(feature = "syscall_test")]
-        if syscall_test::take_lost_subject(pid, creds.uid) {
+        if syscall_test::take_lost_subject(pid) {
             return None;
         }
 

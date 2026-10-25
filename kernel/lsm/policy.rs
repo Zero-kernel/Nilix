@@ -1067,8 +1067,8 @@ pub fn run_secure_baseline_self_test() {
 /// TD-LSM-1: the guest oracle's policy, compiled only into `syscall_test`
 /// kernels.
 ///
-/// Denies its six oracle hooks for a subject whose real uid is
-/// [`crate::syscall_test::DENY_UID`] and otherwise answers exactly as
+/// Denies its six oracle hooks for the pid marked with
+/// [`crate::syscall_test::ARM_DENY`] and otherwise answers exactly as
 /// `PermissivePolicy` (including `kpatch_*`, whose trait defaults deny).
 #[cfg(feature = "syscall_test")]
 pub struct SyscallTestPolicy;
@@ -1080,7 +1080,7 @@ pub static SYSCALL_TEST_POLICY: SyscallTestPolicy = SyscallTestPolicy;
 #[cfg(feature = "syscall_test")]
 impl SyscallTestPolicy {
     fn check(subject: &ProcessCtx) -> LsmResult {
-        if subject.uid == crate::syscall_test::DENY_UID {
+        if crate::syscall_test::denied(subject.pid) {
             Err(LsmError::Denied)
         } else {
             Ok(())

@@ -18720,6 +18720,13 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
         }
     }
     match option {
+        // TD-LSM-1: the guest oracle marks its own pid for one LSM arm.
+        #[cfg(feature = "syscall_test")]
+        lsm::syscall_test::PR_SYSCALL_TEST_LSM_MARK => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            lsm::syscall_test::mark(arg2, pid).map_err(|()| SyscallError::EINVAL)?;
+            Ok(0)
+        }
         PR_SET_NO_NEW_PRIVS => {
             // arg2 must be 1 to set, 0 is invalid (can't unset)
             if arg2 != 1 {
