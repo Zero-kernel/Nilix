@@ -9107,25 +9107,21 @@ impl SocketTable {
                     return None;
                 }
 
-                if !is_syn {
-                    // ACK without SYN in SYN-SENT is invalid per RFC 793
-                    // Send RST and abort connection
-                    tcp_state.control.state = TcpState::Closed;
-                    drop(guard);
-                    self.cleanup_tcp_connection(&sock);
-                    sock.wake_tcp_waiters();
-                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                }
-
-                // Validate ACK number: must acknowledge our SYN (ISS + 1)
+                // LEAD-SYNSENT-ACK-1 FIX: RFC 9293 §3.10.7.3. The ACK is
+                // acceptable only if SND.UNA < SEG.ACK <= SND.NXT, which in
+                // SYN-SENT (SND.UNA = ISS, SND.NXT = ISS + 1) is exactly
+                // SND.NXT. An unacceptable ACK gets <SEQ=SEG.ACK><CTL=RST>
+                // and the connection stays in SYN-SENT; an acceptable ACK
+                // without SYN is dropped (RST segments returned above).
+                // Aborting here let a blind peer that guessed the 4-tuple
+                // kill an outbound connect.
                 let expected_ack = tcp_state.control.snd_nxt;
                 if header.ack_num != expected_ack {
-                    // Invalid ACK - send RST and abort connection
-                    tcp_state.control.state = TcpState::Closed;
                     drop(guard);
-                    self.cleanup_tcp_connection(&sock);
-                    sock.wake_tcp_waiters();
                     return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                }
+                if !is_syn {
+                    return None;
                 }
 
                 // RF180-41 REVIEW FIX: prepare the mandatory third-handshake ACK
@@ -13945,6 +13941,136 @@ mod tests {
         assert_eq!(control.snd_wscale, 9);
         assert!(control.wscale_received);
         assert!(control.sack_received);
+    }
+
+    /// LEAD-SYNSENT-ACK-1: RFC 9293 §3.10.7.3 in SYN-SENT. An unacceptable
+    /// ACK, with or without SYN, is answered with <SEQ=SEG.ACK><CTL=RST> and an
+    /// acceptable bare ACK is dropped. Neither aborts the active open, and the
+    /// peer's valid SYN-ACK still completes the handshake.
+    #[test]
+    fn lead_synsent_ack_1_stray_ack_keeps_active_open() {
+        let table = SocketTable::new();
+        let namespace = NamespaceId(0x1931);
+        let local_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+        let local_port = 30_093;
+        let remote_port = 40_093;
+        let sock = test_socket_in_ns(0x1931, SocketType::Stream, SocketProtocol::Tcp, namespace);
+        sock.bind_local(local_ip, local_port);
+        sock.set_remote(remote_ip, remote_port);
+
+        let mut tcb = TcpControlBlock::new_client(local_ip, local_port, remote_ip, remote_port, 77);
+        tcb.state = TcpState::SynSent;
+        tcb.snd_nxt = tcb.iss.wrapping_add(1);
+        let iss = tcb.iss;
+        let expected_ack = tcb.snd_nxt;
+        sock.attach_tcp(tcb).expect("active-open waiter admission");
+
+        let key = tcp_map_key_from_parts(namespace, local_ip, local_port, remote_ip, remote_port);
+        {
+            let mut conns = table.tcp_conns.lock();
+            conns
+                .ensure_capacity_for(1)
+                .expect("connection-map admission");
+            conns
+                .insert_unique_reserved(key, Arc::downgrade(&sock))
+                .expect("active-open publication");
+        }
+        let options = TcpOptions::default();
+        let state = |sock: &SocketArc| {
+            sock.tcp
+                .lock()
+                .as_ref()
+                .expect("TCB retained in SYN-SENT")
+                .control
+                .state
+        };
+
+        for (ack, flags) in [
+            (iss, TCP_FLAG_ACK),
+            (iss.wrapping_sub(1000), TCP_FLAG_ACK),
+            (expected_ack.wrapping_add(1), TCP_FLAG_ACK),
+            (expected_ack.wrapping_add(7), TCP_FLAG_SYN | TCP_FLAG_ACK),
+        ] {
+            // The RST limiter is process-global; refill it so another test's
+            // RSTs cannot turn this reply into a rate-limited `None`.
+            RST_TOKENS.store(RST_RATE_LIMIT, Ordering::Release);
+            let header = TcpHeader::new(remote_port, local_port, 0x1234_5678, ack, flags, 32_000);
+            let rst = table
+                .process_tcp_segment(
+                    namespace,
+                    remote_ip,
+                    local_ip,
+                    &header,
+                    &[],
+                    &options,
+                    &mut None,
+                    &mut false,
+                )
+                .expect("an unacceptable ACK is answered with a RST");
+            let rst_header = crate::tcp::parse_tcp_header(&rst).expect("RST parses");
+            assert_eq!(rst_header.flags, TCP_FLAG_RST);
+            assert_eq!(rst_header.seq_num, ack);
+            assert_eq!(state(&sock), TcpState::SynSent, "ACK {:#x} aborted", ack);
+        }
+
+        let bare_ack = TcpHeader::new(
+            remote_port,
+            local_port,
+            0x1234_5678,
+            expected_ack,
+            TCP_FLAG_ACK,
+            32_000,
+        );
+        assert!(table
+            .process_tcp_segment(
+                namespace,
+                remote_ip,
+                local_ip,
+                &bare_ack,
+                &[],
+                &options,
+                &mut None,
+                &mut false,
+            )
+            .is_none());
+        assert_eq!(state(&sock), TcpState::SynSent);
+
+        let syn_ack = TcpHeader::new(
+            remote_port,
+            local_port,
+            0x1234_5678,
+            expected_ack,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            32_000,
+        );
+        let mut reply_binding = None;
+        let ack = table
+            .process_tcp_segment(
+                namespace,
+                remote_ip,
+                local_ip,
+                &syn_ack,
+                &[],
+                &options,
+                &mut reply_binding,
+                &mut false,
+            )
+            .expect("the valid SYN-ACK is answered");
+        let ack_header = crate::tcp::parse_tcp_header(&ack).expect("final ACK parses");
+        assert_eq!(ack_header.flags, TCP_FLAG_ACK);
+        assert_eq!(ack_header.ack_num, syn_ack.seq_num.wrapping_add(1));
+        let mut operation = table
+            .lock_tcp_reply_operation(
+                reply_binding
+                    .as_ref()
+                    .expect("final ACK has an identity binding"),
+                &ack_header,
+            )
+            .expect("final ACK binding remains current");
+        assert!(operation.commit(&ack_header, 0));
+        drop(operation);
+        assert_eq!(state(&sock), TcpState::Established);
     }
 
     #[test]
