@@ -71,9 +71,10 @@ struct EgressReservation {
     victim: Option<DetachedEgressVictim>,
 }
 
-/// Serializes only conntrack *growth preparation*. The owner performs all heap
-/// reservation/allocation with no metadata lock held; ordinary lookup/update,
-/// removal, and existing-flow egress never wait on this flag.
+/// Serializes conntrack creation through publication and egress settlement.
+/// The owner performs heap preparation and queue callbacks without metadata
+/// locks; ordinary lookup/update, removal, and existing-flow egress never wait
+/// on this flag. Competing creators fail closed instead of waiting.
 struct ConntrackCapacityPermit<'a> {
     flag: &'a AtomicBool,
 }
@@ -715,6 +716,12 @@ impl ConntrackTable {
         })
     }
 
+    /// Whether a flow is tracked, including an unresolved egress transaction.
+    /// Unlike `lookup`, this does not expose or require committed state.
+    pub fn contains_flow(&self, key: &FlowKey) -> bool {
+        self.entries.read().contains_key(key)
+    }
+
     /// Update conntrack state on packet arrival.
     ///
     /// This is the main entry point for packet processing.
@@ -873,8 +880,8 @@ impl ConntrackTable {
 
         // Existing flows need no collection growth and stay fully concurrent.
         // An absent/expired flow, however, owns the preparation token from its
-        // first capacity snapshot through publication so detached backing
-        // cannot be invalidated by another creator.
+        // first capacity snapshot through queue settlement so neither detached
+        // backing nor a rollback victim can be claimed by another creator.
         let needs_capacity_transaction = {
             let entries = self.entries.read();
             entries
@@ -1413,14 +1420,16 @@ impl ConntrackTable {
             }
         };
 
-        // Physical frees and admission release are deliberately after both
-        // conntrack locks and the preparation token have left the publication
-        // critical section.
+        // Physical frees are after both conntrack locks leave publication.
+        // RF192-1 FIX: retain the creation permit through queue settlement.
+        // Otherwise another creator can reuse the detached victim's key (or
+        // namespace-row slot), making a failed send's rollback lose its owner.
+        // The permit never holds a metadata lock or waits for another creator;
+        // RAII releases it on every failure return below.
         drop(retired_ns.take());
         drop(retired_entries.take());
         drop(prepared_ns.take());
         drop(prepared_entries.take());
-        drop(capacity_permit);
 
         if let Err(error) = queue() {
             if !self.rollback_egress_reservation(&mut reservation) {
@@ -1433,6 +1442,7 @@ impl ConntrackTable {
         let Some(result) = self.finalize_egress_reservation(&mut reservation) else {
             return CtEgressResult::StateLost { queued: true };
         };
+        drop(capacity_permit);
         if owner_committed {
             CtEgressResult::Committed(result)
         } else {
@@ -3480,6 +3490,120 @@ mod tests {
             table.ns_entry_counts.lock().get(&5).copied(),
             Some(CT_MAX_ENTRIES_PER_NS)
         );
+        assert_eq!(table.drain_ns(5), CT_MAX_ENTRIES_PER_NS);
+    }
+
+    #[test]
+    fn rf192_1_replacement_keeps_rollback_ownership_during_queue() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let udp = L4Meta::new(0, 0);
+        for index in 0..CT_MAX_ENTRIES_PER_NS {
+            let seen = if index == 0 { 2 } else { 3 };
+            assert!(
+                !table
+                    .update_on_packet(
+                        5,
+                        IPPROTO_UDP,
+                        local,
+                        remote,
+                        10_000 + index as u16,
+                        53,
+                        &udp,
+                        seen
+                    )
+                    .resource_exhausted
+            );
+        }
+        let victim = FlowKey::from_packet(5, IPPROTO_UDP, local, remote, 10_000, 53).0;
+        let requested = FlowKey::from_packet(5, IPPROTO_UDP, local, remote, 12_000, 53).0;
+        let before = table.lookup(&victim).expect("victim present");
+        let competing_creation_rejected = Cell::new(false);
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_UDP,
+            local,
+            remote,
+            12_000,
+            53,
+            &udp,
+            4,
+            || {
+                // Model a packet on another CPU recreating the detached victim
+                // while the new entry's send has not yet committed.
+                competing_creation_rejected.set(
+                    table
+                        .update_on_packet(5, IPPROTO_UDP, local, remote, 10_000, 53, &udp, 5)
+                        .resource_exhausted,
+                );
+                Err(QueueFault::Full)
+            },
+        );
+        assert!(
+            matches!(outcome, CtEgressResult::QueueFailed(QueueFault::Full)),
+            "{outcome:?}"
+        );
+        assert!(competing_creation_rejected.get());
+        let after = table.lookup(&victim).expect("original victim restored");
+        assert_eq!(after.last_seen_ms, before.last_seen_ms);
+        assert_eq!(after.packets_orig, before.packets_orig);
+        assert!(table.lookup(&requested).is_none());
+        assert_eq!(table.entries.read().len(), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(table.len(), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&5).copied(),
+            Some(CT_MAX_ENTRIES_PER_NS)
+        );
+        assert!(!table.capacity_preparing.load(Ordering::Acquire));
+        // The permit is released after settlement, so the next creator can
+        // replace an entry normally instead of permanently losing admission.
+        assert!(
+            !table
+                .update_on_packet(5, IPPROTO_UDP, local, remote, 13_000, 53, &udp, 6)
+                .resource_exhausted
+        );
+        let committed = table.update_on_egress_transaction(
+            5,
+            IPPROTO_UDP,
+            local,
+            remote,
+            14_000,
+            53,
+            &udp,
+            7,
+            || {
+                // Keeping the creation permit must not serialize an existing
+                // flow's independent egress, even when it re-enters this table.
+                assert!(matches!(
+                    table.update_on_egress_transaction(
+                        5,
+                        IPPROTO_UDP,
+                        local,
+                        remote,
+                        13_000,
+                        53,
+                        &udp,
+                        8,
+                        || Ok::<(), QueueFault>(()),
+                    ),
+                    CtEgressResult::Committed(_)
+                ));
+                assert!(
+                    table
+                        .update_on_packet(5, IPPROTO_UDP, local, remote, 15_000, 53, &udp, 8,)
+                        .resource_exhausted
+                );
+                Ok::<(), QueueFault>(())
+            },
+        );
+        assert!(matches!(committed, CtEgressResult::Committed(_)));
+        assert_eq!(table.entries.read().len(), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(table.len(), CT_MAX_ENTRIES_PER_NS);
+        assert_eq!(
+            table.ns_entry_counts.lock().get(&5).copied(),
+            Some(CT_MAX_ENTRIES_PER_NS)
+        );
+        assert!(!table.capacity_preparing.load(Ordering::Acquire));
         assert_eq!(table.drain_ns(5), CT_MAX_ENTRIES_PER_NS);
     }
 

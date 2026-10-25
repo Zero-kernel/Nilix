@@ -2734,7 +2734,10 @@ where
             // An explicit firewall RST for an untracked packet is intentionally
             // stateless. Every state-advancing TCP reply has an ingress-created
             // flow and must use the transaction below.
-            if conntrack_table().lookup(&key).is_none() && tcp.flags & TCP_FLAG_RST != 0 {
+            // RF192-3 FIX: lookup hides pending egress, which is still tracked.
+            // Let the transaction return the owner for retry while it is busy;
+            // a stateless send here would skip the tracked flow's Close commit.
+            if !conntrack_table().contains_flow(&key) && tcp.flags & TCP_FLAG_RST != 0 {
                 let queued = queue();
                 return match queued {
                     Ok(()) => {
@@ -4091,6 +4094,124 @@ mod tests {
         assert_eq!(committed.packets_reply, 1);
 
         assert_eq!(ct_drain_ns(NS), 1);
+    }
+
+    #[cfg(feature = "conntrack")]
+    #[test]
+    fn rf192_3_prepared_rst_retries_a_pending_tracked_flow() {
+        use crate::conntrack::{
+            conntrack_table, ct_drain_ns, CtEgressResult, CtProtoState, FlowKey, L4Meta,
+            TcpCtState, IPPROTO_TCP,
+        };
+        use core::cell::Cell;
+
+        const NS: u64 = 0x7e57_1923_0001;
+        let _serial = crate::conntrack::GLOBAL_CONNTRACK_TEST_LOCK.lock();
+        let table = conntrack_table();
+        let local = Ipv4Addr::new(192, 0, 2, 192);
+        let peer = Ipv4Addr::new(192, 0, 2, 193);
+        let stats = NetStats::new();
+        ct_drain_ns(NS);
+        for outer_succeeds in [true, false] {
+            let seeded = table.update_on_packet(
+                NS,
+                IPPROTO_TCP,
+                peer,
+                local,
+                40_192,
+                8080,
+                &L4Meta::new(TCP_FLAG_SYN, 0),
+                1,
+            );
+            assert_eq!(seeded.state, CtProtoState::Tcp(TcpCtState::SynSent));
+            let syn_ack = table.update_on_egress_transaction(
+                NS,
+                IPPROTO_TCP,
+                local,
+                peer,
+                8080,
+                40_192,
+                &L4Meta::new(TCP_FLAG_SYN | TCP_FLAG_ACK, 0),
+                2,
+                || Ok::<(), TxError>(()),
+            );
+            assert!(matches!(syn_ack, CtEgressResult::Committed(_)));
+            assert!(table.commit_tcp_ingress_handshake(NS, peer, local, 40_192, 8080));
+            let key = FlowKey::from_packet(NS, IPPROTO_TCP, local, peer, 8080, 40_192).0;
+            let rst = build_tcp_segment(
+                local,
+                peer,
+                8080,
+                40_192,
+                1,
+                2,
+                TCP_FLAG_RST | TCP_FLAG_ACK,
+                0,
+                &[],
+            );
+            let frame = try_prepare_tcp_reply_frame(
+                EthAddr::new(0x02, 0, 0, 0, 0, 193),
+                EthAddr::new(0x02, 0, 0, 0, 0, 192),
+                peer,
+                local,
+                rst,
+            )
+            .expect("RST frame");
+            let mut reply = PreparedReply::new(frame);
+            reply.authorize(NS, 3);
+            let rst_queued = Cell::new(false);
+            let mut retry = None;
+            let outer = table.update_on_egress_transaction(
+                NS,
+                IPPROTO_TCP,
+                local,
+                peer,
+                8080,
+                40_192,
+                &L4Meta::new(TCP_FLAG_ACK, 0),
+                3,
+                || {
+                    // A committed-state lookup deliberately hides this flow.
+                    assert!(table.lookup(&key).is_none());
+                    if let Err(PreparedReplyTxError::Retryable(TxError::InvalidBuffer, owner)) =
+                        complete_prepared_reply_transaction(reply, 4, NS, &stats, || {
+                            rst_queued.set(true);
+                            Ok(())
+                        })
+                    {
+                        retry = Some(owner);
+                    }
+                    if outer_succeeds {
+                        Ok(())
+                    } else {
+                        Err(TxError::QueueFull)
+                    }
+                },
+            );
+            if outer_succeeds {
+                assert!(matches!(outer, CtEgressResult::Committed(_)));
+            } else {
+                assert!(matches!(
+                    outer,
+                    CtEgressResult::QueueFailed(TxError::QueueFull)
+                ));
+            }
+            assert!(
+                !rst_queued.get(),
+                "pending tracking must not use stateless RST egress"
+            );
+            assert_eq!(
+                table.lookup(&key).unwrap().state,
+                CtProtoState::Tcp(TcpCtState::Established)
+            );
+            let reply = retry.expect("contention preserves the prepared retry owner");
+            assert!(complete_prepared_reply_transaction(reply, 5, NS, &stats, || Ok(())).is_ok());
+            assert_eq!(
+                table.lookup(&key).unwrap().state,
+                CtProtoState::Tcp(TcpCtState::Close)
+            );
+            assert_eq!(ct_drain_ns(NS), 1);
+        }
     }
 
     #[cfg(feature = "conntrack")]

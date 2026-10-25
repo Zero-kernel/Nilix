@@ -54,6 +54,15 @@ fn translate(
     None
 }
 
+fn assert_low_mapping_safe(mapping: Option<(u64, bool)>) {
+    // RF192-2 FIX: Approach A permits user allocations at low virtual addresses.
+    // Only a retained supervisor alias violates this probe's boundary contract.
+    assert!(
+        !mapping.is_some_and(|(_, accessible)| !accessible),
+        "low supervisor alias retained"
+    );
+}
+
 /// Inspect roots before publication, while the constructor still owns their
 /// allocation and the shared hierarchy has the constructor's existing lifetime.
 /// No pointer, table borrow or physical ownership escapes this observation.
@@ -99,10 +108,7 @@ pub(crate) unsafe fn inspect(kernel: u64, user: u64) {
         );
     }
     let low_mapping = translate(user, 0x10_0000, |table, index| word(table, index));
-    assert!(
-        !low_mapping.is_some_and(|(_, accessible)| accessible),
-        "low identity alias became user accessible"
-    );
+    assert_low_mapping_safe(low_mapping);
     // D0-ISO-1 Approach A: a supervisor translation here is the identity alias;
     // a user page a task mapped at 1 MiB is not.
     let low_alias = low_mapping.is_some_and(|(_, accessible)| !accessible);
@@ -137,7 +143,33 @@ mod tests {
 
     #[test]
     fn missing_level_is_not_a_mapping() {
-        assert_eq!(translate(0x1000, 0, |_, _| 0), None);
+        let mapping = translate(0x1000, 0, |_, _| 0);
+        assert_eq!(mapping, None);
+        assert_low_mapping_safe(mapping);
+    }
+
+    #[test]
+    fn rf192_2_low_user_mapping_is_valid_after_identity_removal() {
+        let mapping = translate(0x1000, 0x10_0000, |table, _| match table {
+            0x1000 => 0x2000 | PRESENT | USER,
+            0x2000 => 0x3000 | PRESENT | USER,
+            0x3000 => 0x4000 | PRESENT | USER,
+            _ => 0x9000 | PRESENT | USER,
+        });
+        assert_eq!(mapping, Some((0x9000, true)));
+        assert_low_mapping_safe(mapping);
+    }
+
+    #[test]
+    #[should_panic(expected = "low supervisor alias retained")]
+    fn rf192_2_low_supervisor_huge_identity_alias_is_rejected() {
+        let mapping = translate(0x1000, 0x10_0000, |table, _| match table {
+            0x1000 => 0x2000 | PRESENT,
+            0x2000 => 0x3000 | PRESENT,
+            _ => PRESENT | HUGE,
+        });
+        assert_eq!(mapping, Some((0x10_0000, false)));
+        assert_low_mapping_safe(mapping);
     }
 
     #[test]
