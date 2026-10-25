@@ -25437,13 +25437,13 @@ struct MremapTx {
 
 /// ST-K2-MREMAP: undo a failed relocation install.
 ///
-/// `installed` holds the `(page, frame)` pairs of relocated source frames in
-/// install order.  The destination range is always built from scratch by this
-/// call, so unmapping it cannot disturb any pre-existing mapping; that is
-/// precisely why the whole install step runs before the source is touched.  A
-/// relocated frame's reference travelled with its PTE and is still held by the
-/// untouched source PTE, so it is deliberately NOT released here.  (The fresh
-/// growth tail is populated before this hold and rolled back by its populator.)
+/// `installed` counts the relocated pages, mapped in order from `base`.  The
+/// destination range is always built from scratch by this call, so unmapping
+/// it cannot disturb any pre-existing mapping; that is precisely why the whole
+/// install step runs before the source is touched.  A relocated frame's
+/// reference travelled with its PTE and is still held by the untouched source
+/// PTE, so it is deliberately NOT released here.  (The fresh growth tail is
+/// populated before this hold and rolled back by its populator.)
 ///
 /// LEAD-MREMAP-ROLLBACK-FLUSH-1 FIX: another CPU may cache a destination
 /// translation, so the destination is flushed on every CPU whenever a leaf was
@@ -25495,8 +25495,9 @@ fn relocation_table_bound(dst: usize, len: usize) -> usize {
     spans(21) + spans(30) + spans(39)
 }
 
-/// R192-RES-2a: free-list entries a shrink reserves before its hold; past
-/// them each frame is flushed and freed on its own.
+/// R192-RES-2a: free-list entries a shrink reserves before its hold. A full
+/// list is flushed and freed as one batch inside the hold and then reused, so
+/// a shrink of N pages takes about N / 512 range flushes.
 const MREMAP_FREE_RESERVE: usize = 512;
 
 /// R192-RES-2a: what the mremap PTE hold uses, all taken before it.
@@ -25923,8 +25924,10 @@ fn sys_mremap(
     // failure undoes just the tail.  The relocation install and the source
     // removal then run in ONE hold: between holds a sibling's COW fault on the
     // still-live source could split it from an already-installed destination
-    // PTE.  That hold maps no fresh frames; it is bounded by `old_len`
-    // (residual R192-RES-2a).
+    // PTE.  That hold maps no fresh data frames and allocates nothing:
+    // R192-RES-2a stages its page tables and lists before it
+    // (`stage_mremap_hold`).  It is bounded by `old_len`; the syscall_test
+    // marker measures it.
     //
     // Ordering matters.  A relocation installs every destination PTE BEFORE
     // any source PTE is touched, so a failure here rolls back by undoing only
@@ -25996,6 +25999,10 @@ fn sys_mremap(
             };
             #[cfg(feature = "syscall_test")]
             let staged_tables = stage.tables.len();
+            // Every table the hold takes is recorded here, so the growth of
+            // this list counts the used ones independently of the returns.
+            #[cfg(feature = "syscall_test")]
+            let recorded_before = frame_alloc.pt_frames.len();
             #[cfg(feature = "syscall_test")]
             let mut hold_tsc = 0u64;
             let hold = unsafe {
@@ -26116,13 +26123,26 @@ fn sys_mremap(
                                                 .release(frame.start_address().as_u64() as usize)
                                                 .should_free_unmapped();
                                         if should_free {
-                                            if stage.frames_to_free.len()
-                                                < stage.frames_to_free.capacity()
-                                            {
-                                                stage.frames_to_free.push(frame);
-                                            } else {
+                                            let batch = &mut stage.frames_to_free;
+                                            if batch.capacity() == 0 {
+                                                // Its reservation failed: flush and
+                                                // free this frame on its own.
                                                 mm::flush_current_as_page(page.start_address());
                                                 frame_alloc.deallocate_frame(frame);
+                                            } else {
+                                                if batch.len() == batch.capacity() {
+                                                    // R192-RES-2a: full: flush every
+                                                    // page removed so far once, free
+                                                    // the batch and reuse the list.
+                                                    mm::flush_current_as_range(
+                                                        VirtAddr::new(removed_start as u64),
+                                                        offset,
+                                                    );
+                                                    for freed in batch.drain(..) {
+                                                        frame_alloc.deallocate_frame(freed);
+                                                    }
+                                                }
+                                                batch.push(frame);
                                             }
                                         }
                                     }
@@ -26179,7 +26199,7 @@ fn sys_mremap(
                     "R192-RES-2a mremap relocation pages={} staged={} used={} returned={} hold_tsc={} cycles_per_ms={} hold_us~={} result={}",
                     tx.old_len / 0x1000,
                     staged_tables,
-                    staged_tables - _returned,
+                    frame_alloc.pt_frames.len() - recorded_before,
                     _returned,
                     hold_tsc,
                     per_ms,

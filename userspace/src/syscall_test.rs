@@ -876,7 +876,9 @@ unsafe fn mremap_large_relocation() -> Result<usize, &'static str> {
         core::ptr::read_volatile((moved + index * PAGE) as *const u64)
             == (a + index * PAGE) as u64 ^ LARGE_RELOC_MAGIC
     });
-    if munmap(moved, len + PAGE) != 0 || munmap(b as usize, PAGE) != 0 {
+    let moved_unmapped = munmap(moved, len + PAGE) == 0;
+    let b_unmapped = munmap(b as usize, PAGE) == 0;
+    if !moved_unmapped || !b_unmapped {
         return Err("cleanup munmap");
     }
     if !kept {

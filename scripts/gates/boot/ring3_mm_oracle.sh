@@ -18,6 +18,10 @@
 # handled faults.
 #
 # Exit: 0 = oracle passed, 1 = failed, 2 = blocked, 3 = qualified (migration skipped).
+#
+# The R192-RES-2a large-memory lane runs this gate as
+# `KERNEL_TEST_MEM=3G RING3_MM_MIN_RELOC_PAGES=131072 make test-ring3-mm`, so the
+# guest's large relocation must move at least 512 MiB (section 7).
 set -u
 
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
@@ -174,9 +178,12 @@ if [ "$markers" -ne "$clean" ]; then
 fi
 
 # 7. R192-RES-2a: exactly one large relocation, moved in one hold with every
-# page table staged before it. Each staged table was used or given back, the
-# move used at least one per 2 MiB, and with RING3_MM_MIN_RELOC_PAGES (the
-# large-memory lane) it moved at least that many pages.
+# page table staged before it. Each staged table was used (counted as the
+# tables the hold recorded) or given back. The move built at least one table
+# per 2 MiB but one: the destination starts a page above the populated
+# blocking neighbour, and the grown tail populated before the hold, so the
+# PTs of both edge regions can already exist. With RING3_MM_MIN_RELOC_PAGES
+# (the large-memory lane) it moved at least that many pages.
 reloc=$(grep -oE 'R192-RES-2a mremap relocation pages=[0-9]+ staged=[0-9]+ used=[0-9]+ returned=[0-9]+ hold_tsc=[0-9]+ cycles_per_ms=[0-9]+ hold_us~=[0-9]+ result=[a-z]+' "$serial" || true)
 reloc_field() { printf '%s\n' "$reloc" | sed -E "s/.* $1=([0-9]+).*/\1/"; }
 if [ "$(printf '%s' "$reloc" | grep -c 'result=ok$' || true)" -ne 1 ] || [ "$(printf '%s' "$reloc" | grep -c . || true)" -ne 1 ]; then
@@ -186,7 +193,7 @@ else
     reloc_staged=$(reloc_field staged)
     reloc_used=$(reloc_field used)
     reloc_returned=$(reloc_field returned)
-    if [ $((reloc_used + reloc_returned)) -ne "$reloc_staged" ] || [ "$reloc_used" -lt $((reloc_pages / 512)) ]; then
+    if [ $((reloc_used + reloc_returned)) -ne "$reloc_staged" ] || [ $((reloc_used + 1)) -lt $((reloc_pages / 512)) ]; then
         report_fail "R192-RES-2a relocation tables do not add up: pages=$reloc_pages staged=$reloc_staged used=$reloc_used returned=$reloc_returned"
     fi
     if [ -n "${RING3_MM_MIN_RELOC_PAGES:-}" ]; then
