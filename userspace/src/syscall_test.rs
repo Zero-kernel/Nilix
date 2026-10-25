@@ -307,6 +307,10 @@ pub extern "C" fn _start() -> ! {
     // LEAD-MREMAP-RELOC-UAF-1: a relocation keeps the frames it moved.
     test_mremap_relocation_keeps_frames(&mut results);
 
+    // R192-RES-2a: the largest relocation that fits moves in one hold with its
+    // page tables staged before it. Automatic placement only.
+    test_mremap_large_relocation(&mut results);
+
     // LEAD-KPTI-PML4-1: last, because its hinted mappings move the automatic
     // mmap base past 1 TiB.
     test_kpti_fresh_pml4_slots(&mut results);
@@ -802,6 +806,86 @@ unsafe fn mremap_relocation_keeps_frames() -> Result<(), &'static str> {
         );
     }
     Ok(())
+}
+
+/// R192-RES-2a: relocation sizes, tried in order until a private mapping of
+/// that size fits (managed RAM is below 1 GiB; the 256 MiB guest takes 64).
+const LARGE_RELOC_SIZES_MIB: [usize; 3] = [512, 256, 64];
+const LARGE_RELOC_MAGIC: u64 = 0x5245_5332_4152_454C;
+
+fn test_mremap_large_relocation(results: &mut TestResult) {
+    print("Testing a large mremap relocation... ");
+    let name = "mremap relocation of the largest mapping that fits moves every page in one hold, its page tables staged before it";
+    match unsafe { mremap_large_relocation() } {
+        Ok(mib) => {
+            let mut buf = [0u8; 20];
+            println_parts(&["  relocated MiB: ", decimal(mib, &mut buf)]);
+            results.pass(name);
+        }
+        Err(reason) => {
+            print("  large relocation leg: ");
+            println(reason);
+            results.fail(name);
+        }
+    }
+}
+
+unsafe fn mremap_large_relocation() -> Result<usize, &'static str> {
+    let Some(before) = read_memory_current() else {
+        return Err("memory.current is not readable");
+    };
+    let mut chosen = None;
+    for mib in LARGE_RELOC_SIZES_MIB {
+        let mapped = mmap_anon(mib << 20, false);
+        if mapped >= 0 {
+            chosen = Some((mib, mapped as usize));
+            break;
+        }
+        if err_of(mapped) != ENOMEM {
+            return Err("mmap of the mapping to relocate");
+        }
+    }
+    let Some((mib, a)) = chosen else {
+        return Err("no relocation size fits");
+    };
+    let len = mib << 20;
+    for page in (a..a + len).step_by(PAGE) {
+        core::ptr::write_volatile(page as *mut u64, page as u64 ^ LARGE_RELOC_MAGIC);
+    }
+    // A neighbour in the growth window forces the one-page grow to relocate.
+    let b = mmap_anon(PAGE, false);
+    if b < 0 || b as usize != a + len {
+        munmap(a, len);
+        if b >= 0 {
+            munmap(b as usize, PAGE);
+        }
+        return Err("the blocking neighbour is not adjacent");
+    }
+    let moved = mremap(a, len, len + PAGE, MREMAP_MAYMOVE);
+    if moved < 0 || moved as usize == a {
+        if moved >= 0 {
+            munmap(moved as usize, len + PAGE);
+        } else {
+            munmap(a, len);
+        }
+        munmap(b as usize, PAGE);
+        return Err("the blocked grow did not relocate");
+    }
+    let moved = moved as usize;
+    let kept = (0..len / PAGE).all(|index| {
+        core::ptr::read_volatile((moved + index * PAGE) as *const u64)
+            == (a + index * PAGE) as u64 ^ LARGE_RELOC_MAGIC
+    });
+    if munmap(moved, len + PAGE) != 0 || munmap(b as usize, PAGE) != 0 {
+        return Err("cleanup munmap");
+    }
+    if !kept {
+        return Err("the relocation lost a page's content");
+    }
+    if read_memory_current() != Some(before) {
+        return Err("the relocation left a charge behind");
+    }
+    Ok(mib)
 }
 
 /// Test gettid syscall

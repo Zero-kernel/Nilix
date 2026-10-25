@@ -4,6 +4,8 @@
 # KERNEL_TEST_DISK requires the production JBD2 write probe.
 # KERNEL_TEST_KEEP_LOGS=1 retains serial, process diagnostics and JSON counts.
 # KERNEL_TEST_CPUS=2|4|8|16 boots that many vCPUs (default: QEMU's single CPU).
+# KERNEL_TEST_MEM is the guest RAM as a QEMU size (default 256M; e.g. 3G for the
+# large-memory ring3-mm lane).
 set -u
 
 # Resolve the repo root from this script's own location so it runs from any
@@ -18,6 +20,11 @@ case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 TO="${KERNEL_TEST_TIMEOUT:-900}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
     echo "KERNEL-TEST BLOCKED: KERNEL_TEST_TIMEOUT must be an integer from 1 to 900"
+    exit 2
+fi
+MEM="${KERNEL_TEST_MEM:-256M}"
+if [[ ! "$MEM" =~ ^[1-9][0-9]{0,4}[MG]$ ]]; then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_MEM must be a QEMU size such as 256M or 3G"
     exit 2
 fi
 CPUS="${KERNEL_TEST_CPUS:-1}"
@@ -97,7 +104,7 @@ LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" 
     "${disk_args[@]}" \
     -netdev user,id=net0,restrict=on,ipv6=off \
     -device virtio-net-pci,netdev=net0,romfile= \
-    -m 256M "${smp_args[@]}" -vga std -no-reboot -no-shutdown \
+    -m "$MEM" "${smp_args[@]}" -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
     -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"

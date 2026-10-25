@@ -3154,7 +3154,54 @@ fn verify_user_memory(ptr: *const u8, len: usize, require_write: bool) -> Result
 /// uncharged lane) equals exactly what the call has charged.
 #[cfg(test)]
 mod r192_res_2_mremap_tests {
-    use super::mremap_uncharged_reserve;
+    use super::{mremap_uncharged_reserve, relocation_table_bound, StagedTables};
+    use alloc::vec::Vec;
+    use x86_64::structures::paging::{FrameAllocator, PhysFrame};
+    use x86_64::PhysAddr;
+
+    const MIB: usize = 1 << 20;
+    const GIB: usize = 1 << 30;
+
+    #[test]
+    fn r192_res_2a_relocation_table_bound_covers_every_region() {
+        assert_eq!(relocation_table_bound(0x10_0000_0000, 0), 0);
+        // One page: its PT, PD and PDPT.
+        assert_eq!(relocation_table_bound(0x10_0000_0000, 0x1000), 3);
+        // An aligned 2 MiB region, then the same length straddling a 2 MiB line.
+        assert_eq!(relocation_table_bound(0x10_0000_0000, 2 * MIB), 3);
+        assert_eq!(relocation_table_bound(0x10_0010_0000, 2 * MIB), 4);
+        // 1 GiB aligned: 512 PTs, one PD, one PDPT; off by a page: one more PT and PD.
+        assert_eq!(relocation_table_bound(0x10_0000_0000, GIB), 514);
+        assert_eq!(relocation_table_bound(0x10_0000_1000, GIB), 516);
+        // Across a 512 GiB line as well: the worst case for 1 GiB.
+        assert_eq!(relocation_table_bound(0x80_0000_0000 - 0x1000, GIB), 517);
+        // 512 MiB at a page-aligned base inside one 1 GiB region (the large guest leg).
+        assert_eq!(
+            relocation_table_bound(0x10_0000_1000, 512 * MIB),
+            257 + 1 + 1
+        );
+    }
+
+    #[test]
+    fn r192_res_2a_staged_tables_hand_out_each_frame_once_and_record_it() {
+        let frame = |n: u64| PhysFrame::containing_address(PhysAddr::new(n * 0x1000));
+        let mut pool = [Some(frame(1)), None, Some(frame(2)), Some(frame(3))];
+        let mut recorded = Vec::with_capacity(2);
+        let mut tables = StagedTables::new(&mut pool, &mut recorded);
+        assert_eq!(tables.allocate_frame(), Some(frame(1)));
+        assert_eq!(tables.allocate_frame(), Some(frame(2)));
+        // The record is full: refuse rather than hand out an unrecorded table.
+        assert_eq!(tables.allocate_frame(), None);
+        assert_eq!(recorded, [frame(1), frame(2)]);
+        assert_eq!(pool, [None, None, None, Some(frame(3))]);
+
+        let mut recorded = Vec::with_capacity(4);
+        let mut tables = StagedTables::new(&mut pool, &mut recorded);
+        assert_eq!(tables.allocate_frame(), Some(frame(3)));
+        // The pool is empty.
+        assert_eq!(tables.allocate_frame(), None);
+        assert_eq!(recorded, [frame(3)]);
+    }
 
     #[test]
     fn lead_mremap_migrate_1_snapshot_counts_only_charged_bytes() {
@@ -16115,10 +16162,7 @@ impl crate::populate::PopulateBackend for EagerPopulator {
 
             #[cfg(feature = "syscall_test")]
             self.note_hold(frames.len() - done);
-            let mut tables = StagedTables {
-                pool: &mut self.tables,
-                recorded: &mut self.recorder.pt_frames,
-            };
+            let mut tables = StagedTables::new(&mut self.tables, &mut self.recorder.pt_frames);
             let data = &mut self.recorder.inner;
             let pruned = &mut self.pruned;
             // SAFETY: the pages are this operation's reservation in the
@@ -16249,8 +16293,24 @@ enum MapHold {
 /// handling cannot run under `PT_LOCK`. `map_page` zeroes each frame before
 /// `map_to` links it (LEAD-PT-ZERO-LINK-1).
 struct StagedTables<'a> {
-    pool: &'a mut [Option<x86_64::structures::paging::PhysFrame>; POPULATE_TABLE_POOL],
+    pool: &'a mut [Option<x86_64::structures::paging::PhysFrame>],
+    /// Slots before this index are spent (R192-RES-2a: O(1) per frame for the
+    /// relocation's pool of hundreds).
+    next: usize,
     recorded: &'a mut Vec<x86_64::structures::paging::PhysFrame>,
+}
+
+impl<'a> StagedTables<'a> {
+    fn new(
+        pool: &'a mut [Option<x86_64::structures::paging::PhysFrame>],
+        recorded: &'a mut Vec<x86_64::structures::paging::PhysFrame>,
+    ) -> Self {
+        Self {
+            pool,
+            next: 0,
+            recorded,
+        }
+    }
 }
 
 unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::paging::Size4KiB>
@@ -16262,9 +16322,14 @@ unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::pagin
         if self.recorded.len() == self.recorded.capacity() {
             return None;
         }
-        let frame = self.pool.iter_mut().find_map(Option::take)?;
-        self.recorded.push(frame);
-        Some(frame)
+        while let Some(slot) = self.pool.get_mut(self.next) {
+            self.next += 1;
+            if let Some(frame) = slot.take() {
+                self.recorded.push(frame);
+                return Some(frame);
+            }
+        }
+        None
     }
 }
 
@@ -25391,17 +25456,19 @@ struct MremapTx {
 unsafe fn mremap_rollback_install(
     manager: &mut mm::page_table::PageTableManager,
     base: usize,
+    installed: usize,
     len: usize,
-    installed: &mut vec::Vec<(
-        x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>,
-        x86_64::structures::paging::PhysFrame,
-    )>,
     pruned: &mut vec::Vec<x86_64::structures::paging::PhysFrame>,
 ) {
+    use x86_64::structures::paging::{Page, Size4KiB};
     use x86_64::VirtAddr;
 
+    // R192-RES-2a: the install maps pages in order from `base`, so a count
+    // names them (it used to be a heap list built under the lock).
     let mut removed_leaf = false;
-    for (page, _frame) in installed.drain(..) {
+    for index in 0..installed {
+        let page =
+            Page::<Size4KiB>::containing_address(VirtAddr::new((base + index * 0x1000) as u64));
         removed_leaf |= manager.unmap_page(page).is_ok();
     }
     if removed_leaf {
@@ -25412,6 +25479,116 @@ unsafe fn mremap_rollback_install(
     // that still backs live leaves (the populated tail) is not empty and is
     // correctly left alone.
     manager.prune_empty_tables_in_range(VirtAddr::new(base as u64), len, pruned);
+}
+
+/// R192-RES-2a: the most page tables `map_page` can create for `[dst, dst +
+/// len)`: one PT per 2 MiB region, one PD per 1 GiB region and one PDPT per
+/// 512 GiB region it touches. Under `PT_LOCK` nothing prunes a table between
+/// the pages of one hold, so this bounds the hold whatever already exists.
+fn relocation_table_bound(dst: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let last = dst + (len - 1);
+    let spans = |shift: u32| (last >> shift) - (dst >> shift) + 1;
+    spans(21) + spans(30) + spans(39)
+}
+
+/// R192-RES-2a: free-list entries a shrink reserves before its hold; past
+/// them each frame is flushed and freed on its own.
+const MREMAP_FREE_RESERVE: usize = 512;
+
+/// R192-RES-2a: what the mremap PTE hold uses, all taken before it.
+struct MremapHoldStage {
+    /// Page-table frames for a relocation, `relocation_table_bound` of them.
+    tables: vec::Vec<Option<x86_64::structures::paging::PhysFrame>>,
+    /// A shrink's frames to free after the flush (capped).
+    frames_to_free: vec::Vec<x86_64::structures::paging::PhysFrame>,
+    /// Tables the source removal prunes.
+    reclaimed: vec::Vec<x86_64::structures::paging::PhysFrame>,
+}
+
+impl MremapHoldStage {
+    /// Give back the staged tables the hold did not take. They were never
+    /// linked, so they need no flush. Returns how many.
+    fn return_unused(&mut self) -> usize {
+        let mut allocator = mm::memory::FrameAllocator::new();
+        let mut returned = 0;
+        for frame in self.tables.drain(..).flatten() {
+            allocator.deallocate_frame(frame);
+            returned += 1;
+        }
+        returned
+    }
+}
+
+impl Drop for MremapHoldStage {
+    fn drop(&mut self) {
+        self.return_unused();
+    }
+}
+
+/// R192-RES-2a: stage the mremap hold. A relocation of `[dst, dst + len)`
+/// takes every page table the move can need (with the allocator's OOM
+/// handling: the single hold cannot retry), their record slots and its prune
+/// lists here, so the hold allocates nothing. It never frees a moved frame
+/// (LEAD-MREMAP-RELOC-UAF-1), so it needs no free list. An in-place shrink
+/// keeps its best-effort lists.
+fn stage_mremap_hold(
+    process: &crate::process::ProcessArc,
+    frame_alloc: &mut RecordingFrameAllocator,
+    carried: &mut vec::Vec<x86_64::structures::paging::PhysFrame>,
+    relocation: Option<(usize, usize)>,
+    removed_len: usize,
+    tail_pages: usize,
+) -> Result<MremapHoldStage, SyscallError> {
+    let removed_pages = removed_len / 0x1000;
+    let mut stage = MremapHoldStage {
+        tables: vec::Vec::new(),
+        frames_to_free: vec::Vec::new(),
+        reclaimed: vec::Vec::new(),
+    };
+    let Some((dst, len)) = relocation else {
+        if removed_len != 0 {
+            let _ = stage
+                .frames_to_free
+                .try_reserve_exact(removed_pages.min(MREMAP_FREE_RESERVE));
+            let _ = stage
+                .reclaimed
+                .try_reserve_exact(populate_prune_reserve(removed_pages));
+        }
+        return Ok(stage);
+    };
+    if process.lock().pending_kill.load(AtomicOrdering::Acquire) {
+        return Err(SyscallError::EINTR);
+    }
+    let bound = relocation_table_bound(dst, len);
+    // RES-2 decision 2b: an impossible request never wakes the OOM killer.
+    if mm::buddy_allocator::get_allocator_stats().is_some_and(|stats| stats.free_pages < bound) {
+        return Err(SyscallError::ENOMEM);
+    }
+    // The install rollback prunes the destination and the tail rollback after
+    // it the tail, into the same carried list: reserve both, as `try_reserve`
+    // counts from the current length.
+    let carry = populate_prune_reserve(len / 0x1000) + populate_prune_reserve(tail_pages);
+    if stage.tables.try_reserve_exact(bound).is_err()
+        || stage
+            .reclaimed
+            .try_reserve_exact(populate_prune_reserve(removed_pages))
+            .is_err()
+        || carried.try_reserve(carry).is_err()
+        || frame_alloc.pt_frames.try_reserve(bound).is_err()
+    {
+        return Err(SyscallError::ENOMEM);
+    }
+    for _ in 0..bound {
+        let frame = frame_alloc
+            .inner
+            .allocate_frame()
+            .ok_or(SyscallError::ENOMEM)?;
+        stage.tables.push(Some(frame));
+    }
+    Ok(stage)
 }
 
 /// mremap(2) - remap a virtual memory address
@@ -25770,182 +25947,249 @@ fn sys_mremap(
     );
     let phase2: Result<MremapPhase2, (SyscallError, FailedPopulate)> = match populator.populate() {
         Err(error) => Err((populate_errno(error), populator.into_failure(error))),
-        Ok(()) => {
+        Ok(()) => 'phase2: {
+            let relocating = tx.moved && !prot_none;
+            // The range step 2 removes: the whole source of a move, the tail of
+            // a shrink.
+            let (removed_start, removed_len) = if tx.moved {
+                (tx.old_base, tx.old_len)
+            } else if tx.new_len < tx.old_len {
+                (tx.old_base + tx.new_len, tx.old_len - tx.new_len)
+            } else {
+                (0, 0)
+            };
             // The relocation's tables are recorded with the tail's, and any it
-            // prunes are carried with them.
+            // prunes are carried with them. R192-RES-2a: they, their record
+            // slots and the prune lists are all taken before the hold.
             let (frame_alloc, carried) = populator.parts();
-            if tx.moved && !prot_none {
-                let _ = carried.try_reserve(populate_prune_reserve(tx.old_len / 0x1000));
-            }
+            let staged = stage_mremap_hold(
+                &process,
+                frame_alloc,
+                carried,
+                relocating.then_some((tx.new_base, tx.old_len)),
+                removed_len,
+                tail_pages,
+            );
+            let mut stage = match staged {
+                Ok(stage) => stage,
+                Err(error) => {
+                    #[cfg(feature = "syscall_test")]
+                    if relocating && tx.old_len / 0x1000 >= POPULATE_REPORT_PAGES {
+                        klog_always!(
+                            "R192-RES-2a mremap relocation pages={} staged=0 used=0 returned=0 hold_tsc=0 cycles_per_ms=0 hold_us~=0 result={}",
+                            tx.old_len / 0x1000,
+                            if error == SyscallError::EINTR { "eintr" } else { "enomem" }
+                        );
+                    }
+                    populator.rollback_all();
+                    let cause = if error == SyscallError::EINTR {
+                        crate::populate::PopulateError::Interrupted
+                    } else {
+                        crate::populate::PopulateError::NoMemory(
+                            crate::populate::PopulateStage::MapPage,
+                        )
+                    };
+                    let failed = populator.into_failure(cause);
+                    break 'phase2 Err((error, failed));
+                }
+            };
+            #[cfg(feature = "syscall_test")]
+            let staged_tables = stage.tables.len();
+            #[cfg(feature = "syscall_test")]
+            let mut hold_tsc = 0u64;
             let hold = unsafe {
                 with_current_manager(
                     VirtAddr::new(0),
                     |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-                        // ---- Step 1: install the relocated pages. ----
-                        //
-                        // Relocate: reuse each source frame verbatim, flags
-                        // included, so protection and COW state travel with
-                        // the PTE and NO refcount transition occurs.
-                        let mut installed: vec::Vec<(
-                            Page<x86_64::structures::paging::Size4KiB>,
-                            PhysFrame,
-                        )> = vec::Vec::new();
-                        if tx.moved && !prot_none {
-                            let _ = installed.try_reserve(tx.old_len / 0x1000);
-                            for offset in (0..tx.old_len).step_by(0x1000) {
-                                let src_page =
+                        #[cfg(feature = "syscall_test")]
+                        let hold_start = crate::time::read_tsc();
+                        let result = (|| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                            // ---- Step 1: install the relocated pages. ----
+                            //
+                            // Relocate: reuse each source frame verbatim, flags
+                            // included, so protection and COW state travel with
+                            // the PTE and NO refcount transition occurs.
+                            let mut installed = 0usize;
+                            if relocating {
+                                // R192-RES-2a: every table comes from the stage;
+                                // if it ever ran short, `map_page` fails and the
+                                // rollback below prunes the partial chain.
+                                let mut tables = StagedTables::new(
+                                    &mut stage.tables,
+                                    &mut frame_alloc.pt_frames,
+                                );
+                                for offset in (0..tx.old_len).step_by(0x1000) {
+                                    let src_page =
                                     Page::<x86_64::structures::paging::Size4KiB>::containing_address(
                                         VirtAddr::new((tx.old_base + offset) as u64),
                                     );
-                                let dst_page = Page::containing_address(VirtAddr::new(
-                                    (tx.new_base + offset) as u64,
-                                ));
+                                    let dst_page = Page::containing_address(VirtAddr::new(
+                                        (tx.new_base + offset) as u64,
+                                    ));
 
-                                let Some((phys, leaf_flags)) =
-                                    manager.translate_with_flags(src_page.start_address())
-                                else {
-                                    // The VMA and the page table disagree about a
-                                    // page inside the mapping.
-                                    mremap_rollback_install(
-                                        manager,
-                                        tx.new_base,
-                                        tx.old_len,
-                                        &mut installed,
-                                        carried,
-                                    );
-                                    return Err(SyscallError::EFAULT);
-                                };
-                                let frame = PhysFrame::containing_address(phys);
+                                    let Some((phys, leaf_flags)) =
+                                        manager.translate_with_flags(src_page.start_address())
+                                    else {
+                                        // The VMA and the page table disagree about a
+                                        // page inside the mapping.
+                                        mremap_rollback_install(
+                                            manager,
+                                            tx.new_base,
+                                            installed,
+                                            tx.old_len,
+                                            carried,
+                                        );
+                                        return Err(SyscallError::EFAULT);
+                                    };
+                                    let frame = PhysFrame::containing_address(phys);
 
-                                if installed.try_reserve(1).is_err()
-                                    || manager
-                                        .map_page(dst_page, frame, leaf_flags, &mut *frame_alloc)
+                                    if manager
+                                        .map_page(dst_page, frame, leaf_flags, &mut tables)
                                         .is_err()
-                                {
-                                    mremap_rollback_install(
-                                        manager,
-                                        tx.new_base,
-                                        tx.old_len,
-                                        &mut installed,
-                                        carried,
-                                    );
-                                    return Err(SyscallError::ENOMEM);
-                                }
-                                installed.push((dst_page, frame));
-                            }
-                        }
-
-                        // ---- Step 2: remove the source range. ----
-                        //
-                        // Runs only after every destination PTE is in place.
-                        // Removal mirrors sys_munmap's sweep: a pending/unmapped
-                        // leaf yields its frame, and the reference is released
-                        // through the one ownership ledger.
-                        let (removed_start, removed_len) = if tx.moved {
-                            (tx.old_base, tx.old_len)
-                        } else if tx.new_len < tx.old_len {
-                            (tx.old_base + tx.new_len, tx.old_len - tx.new_len)
-                        } else {
-                            (0, 0)
-                        };
-
-                        let mut frames_to_free: vec::Vec<PhysFrame> = vec::Vec::new();
-                        let _ = frames_to_free.try_reserve(removed_len / 0x1000);
-                        let mut reclaimed: vec::Vec<PhysFrame> = vec::Vec::new();
-                        let mut removed_leaf = false;
-                        // Counts every leaf the sweep reclaimed, present or not,
-                        // so the PROT_NONE premise below is checked against
-                        // real evidence.
-                        #[cfg(debug_assertions)]
-                        let mut removed_frames: usize = 0;
-
-                        if removed_len != 0 {
-                            for offset in (0..removed_len).step_by(0x1000) {
-                                let page = Page::containing_address(VirtAddr::new(
-                                    (removed_start + offset) as u64,
-                                ));
-                                // R141-9 shape: a PROT_NONE leaf keeps its frame in
-                                // a non-present entry, so fall back to the raw PTE.
-                                let frame_opt = match manager.unmap_page(page) {
-                                    Ok(frame) => Some(frame),
-                                    Err(mm::page_table::UnmapError::PageNotMapped) => {
-                                        manager.take_nonpresent_leaf_frame(page)
-                                    }
-                                    Err(_) => None,
-                                };
-
-                                if let Some(frame) = frame_opt {
-                                    removed_leaf = true;
-                                    #[cfg(debug_assertions)]
                                     {
-                                        removed_frames += 1;
+                                        mremap_rollback_install(
+                                            manager,
+                                            tx.new_base,
+                                            installed,
+                                            tx.old_len,
+                                            carried,
+                                        );
+                                        return Err(SyscallError::ENOMEM);
                                     }
-                                    // LEAD-MREMAP-RELOC-UAF-1 FIX: a RELOCATED
-                                    // frame's reference moved to the destination
-                                    // PTE in step 1; it is neither released nor
-                                    // freed here (this test used to read
-                                    // `relocated || release`, freeing every moved
-                                    // frame while the destination still mapped
-                                    // it).  A PROT_NONE reservation never
-                                    // relocates (its range is rebuilt as a bare
-                                    // reservation with no destination PTEs), so
-                                    // any stray leaf it owns is released, keeping
-                                    // the refcount ledger consistent with the
-                                    // buddy even for the defensive non-present
-                                    // case.
-                                    let relocated = tx.moved && !prot_none;
-                                    let should_free = !relocated
-                                        && PAGE_REF_COUNT
-                                            .release(frame.start_address().as_u64() as usize)
-                                            .should_free_unmapped();
-                                    if should_free {
-                                        if frames_to_free.try_reserve(1).is_ok() {
-                                            frames_to_free.push(frame);
-                                        } else {
-                                            mm::flush_current_as_page(page.start_address());
-                                            frame_alloc.deallocate_frame(frame);
+                                    installed += 1;
+                                }
+                            }
+
+                            // ---- Step 2: remove the source range. ----
+                            //
+                            // Runs only after every destination PTE is in place.
+                            // Removal mirrors sys_munmap's sweep: a pending/unmapped
+                            // leaf yields its frame, and the reference is released
+                            // through the one ownership ledger. R192-RES-2a: its
+                            // lists were reserved before the hold and never grow
+                            // here.
+                            let mut removed_leaf = false;
+                            // Counts every leaf the sweep reclaimed, present or not,
+                            // so the PROT_NONE premise below is checked against
+                            // real evidence.
+                            #[cfg(debug_assertions)]
+                            let mut removed_frames: usize = 0;
+
+                            if removed_len != 0 {
+                                for offset in (0..removed_len).step_by(0x1000) {
+                                    let page = Page::containing_address(VirtAddr::new(
+                                        (removed_start + offset) as u64,
+                                    ));
+                                    // R141-9 shape: a PROT_NONE leaf keeps its frame in
+                                    // a non-present entry, so fall back to the raw PTE.
+                                    let frame_opt = match manager.unmap_page(page) {
+                                        Ok(frame) => Some(frame),
+                                        Err(mm::page_table::UnmapError::PageNotMapped) => {
+                                            manager.take_nonpresent_leaf_frame(page)
+                                        }
+                                        Err(_) => None,
+                                    };
+
+                                    if let Some(frame) = frame_opt {
+                                        removed_leaf = true;
+                                        #[cfg(debug_assertions)]
+                                        {
+                                            removed_frames += 1;
+                                        }
+                                        // LEAD-MREMAP-RELOC-UAF-1 FIX: a RELOCATED
+                                        // frame's reference moved to the destination
+                                        // PTE in step 1; it is neither released nor
+                                        // freed here (this test used to read
+                                        // `relocated || release`, freeing every moved
+                                        // frame while the destination still mapped
+                                        // it).  A PROT_NONE reservation never
+                                        // relocates (its range is rebuilt as a bare
+                                        // reservation with no destination PTEs), so
+                                        // any stray leaf it owns is released, keeping
+                                        // the refcount ledger consistent with the
+                                        // buddy even for the defensive non-present
+                                        // case.
+                                        let relocated = tx.moved && !prot_none;
+                                        let should_free = !relocated
+                                            && PAGE_REF_COUNT
+                                                .release(frame.start_address().as_u64() as usize)
+                                                .should_free_unmapped();
+                                        if should_free {
+                                            if stage.frames_to_free.len()
+                                                < stage.frames_to_free.capacity()
+                                            {
+                                                stage.frames_to_free.push(frame);
+                                            } else {
+                                                mm::flush_current_as_page(page.start_address());
+                                                frame_alloc.deallocate_frame(frame);
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            // A relocated leaf is not freed, but another CPU may
-                            // still cache the source translation of a frame that
-                            // now lives at the destination: flush whenever a leaf
-                            // was removed, as sys_munmap does, before any free.
-                            if removed_leaf {
-                                mm::flush_current_as_range(
+                                // A relocated leaf is not freed, but another CPU may
+                                // still cache the source translation of a frame that
+                                // now lives at the destination: flush whenever a leaf
+                                // was removed, as sys_munmap does, before any free.
+                                if removed_leaf {
+                                    mm::flush_current_as_range(
+                                        VirtAddr::new(removed_start as u64),
+                                        removed_len,
+                                    );
+                                }
+                                for frame in stage.frames_to_free.drain(..) {
+                                    frame_alloc.deallocate_frame(frame);
+                                }
+
+                                manager.prune_empty_tables_in_range(
                                     VirtAddr::new(removed_start as u64),
                                     removed_len,
+                                    &mut stage.reclaimed,
                                 );
                             }
-                            for frame in frames_to_free {
-                                frame_alloc.deallocate_frame(frame);
-                            }
 
-                            let _ = reclaimed.try_reserve((removed_len / 0x20_0000) + 2);
-                            manager.prune_empty_tables_in_range(
-                                VirtAddr::new(removed_start as u64),
-                                removed_len,
-                                &mut reclaimed,
+                            // Falsify the "a PROT_NONE reservation owns no frames"
+                            // premise with the REAL sweep above — it sees present and
+                            // non-present leaves alike, so a demoted region that ever
+                            // left a frame behind makes this fire instead of leaking
+                            // silently.
+                            #[cfg(debug_assertions)]
+                            debug_assert!(
+                                !prot_none || removed_frames == 0,
+                                "PROT_NONE reservation owned {removed_frames} leaf frame(s)"
                             );
+
+                            Ok(core::mem::take(&mut stage.reclaimed))
+                        })();
+                        #[cfg(feature = "syscall_test")]
+                        {
+                            hold_tsc = crate::time::read_tsc().wrapping_sub(hold_start);
                         }
-
-                        // Falsify the "a PROT_NONE reservation owns no frames"
-                        // premise with the REAL sweep above — it sees present and
-                        // non-present leaves alike, so a demoted region that ever
-                        // left a frame behind makes this fire instead of leaking
-                        // silently.
-                        #[cfg(debug_assertions)]
-                        debug_assert!(
-                            !prot_none || removed_frames == 0,
-                            "PROT_NONE reservation owned {removed_frames} leaf frame(s)"
-                        );
-
-                        Ok(reclaimed)
+                        result
                     },
                 )
             };
+            // Unused staged tables go back now, outside the lock.
+            let _returned = stage.return_unused();
+            #[cfg(feature = "syscall_test")]
+            if relocating && tx.old_len / 0x1000 >= POPULATE_REPORT_PAGES {
+                let per_ms = crate::time::tsc_since_boot() / crate::time::get_ticks().max(1);
+                klog_always!(
+                    "R192-RES-2a mremap relocation pages={} staged={} used={} returned={} hold_tsc={} cycles_per_ms={} hold_us~={} result={}",
+                    tx.old_len / 0x1000,
+                    staged_tables,
+                    staged_tables - _returned,
+                    _returned,
+                    hold_tsc,
+                    per_ms,
+                    hold_tsc.saturating_mul(1000) / per_ms.max(1),
+                    match &hold {
+                        Ok(_) => "ok",
+                        Err(SyscallError::EFAULT) => "efault",
+                        Err(_) => "enomem",
+                    }
+                );
+            }
             match hold {
                 Ok(reclaimed_tables) => Ok(MremapPhase2 {
                     new_pt_frames: populator.into_commit(),

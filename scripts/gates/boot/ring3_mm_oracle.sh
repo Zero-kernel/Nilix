@@ -102,6 +102,7 @@ LSM denial and missing-subject arms fail closed at exec, kill, get_robust_list, 
 mmap: an unusable hint is placed elsewhere, MAP_FIXED_NOREPLACE maps exactly or refuses without replacing, MAP_FIXED stays rejected
 R192-RES-2: 64 MiB brk, mmap, mprotect and mremap populate in bounded holds; an injected failure rolls back to the baseline charge
 mremap relocation keeps the moved frames: relocated data survives a 32 MiB allocation
+mremap relocation of the largest mapping that fits moves every page in one hold, its page tables staged before it
 KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them
 LEGS
 
@@ -170,6 +171,31 @@ markers=$(grep -cE 'R192-RES-2 populate ' "$serial" || true)
 clean=$(grep -cE 'R192-RES-2 populate .* leaked=0([^0-9]|$)' "$serial" || true)
 if [ "$markers" -ne "$clean" ]; then
     report_fail "population markers with a leaked data frame or no leak count: $((markers - clean)) of $markers"
+fi
+
+# 7. R192-RES-2a: exactly one large relocation, moved in one hold with every
+# page table staged before it. Each staged table was used or given back, the
+# move used at least one per 2 MiB, and with RING3_MM_MIN_RELOC_PAGES (the
+# large-memory lane) it moved at least that many pages.
+reloc=$(grep -oE 'R192-RES-2a mremap relocation pages=[0-9]+ staged=[0-9]+ used=[0-9]+ returned=[0-9]+ hold_tsc=[0-9]+ cycles_per_ms=[0-9]+ hold_us~=[0-9]+ result=[a-z]+' "$serial" || true)
+reloc_field() { printf '%s\n' "$reloc" | sed -E "s/.* $1=([0-9]+).*/\1/"; }
+if [ "$(printf '%s' "$reloc" | grep -c 'result=ok$' || true)" -ne 1 ] || [ "$(printf '%s' "$reloc" | grep -c . || true)" -ne 1 ]; then
+    report_fail "expected exactly one R192-RES-2a relocation marker, with result=ok"
+else
+    reloc_pages=$(reloc_field pages)
+    reloc_staged=$(reloc_field staged)
+    reloc_used=$(reloc_field used)
+    reloc_returned=$(reloc_field returned)
+    if [ $((reloc_used + reloc_returned)) -ne "$reloc_staged" ] || [ "$reloc_used" -lt $((reloc_pages / 512)) ]; then
+        report_fail "R192-RES-2a relocation tables do not add up: pages=$reloc_pages staged=$reloc_staged used=$reloc_used returned=$reloc_returned"
+    fi
+    if [ -n "${RING3_MM_MIN_RELOC_PAGES:-}" ]; then
+        if [[ ! "$RING3_MM_MIN_RELOC_PAGES" =~ ^[1-9][0-9]*$ ]]; then
+            report_fail "RING3_MM_MIN_RELOC_PAGES must be a positive integer"
+        elif [ "$reloc_pages" -lt "$RING3_MM_MIN_RELOC_PAGES" ]; then
+            report_fail "the large relocation moved $reloc_pages pages, below RING3_MM_MIN_RELOC_PAGES=$RING3_MM_MIN_RELOC_PAGES"
+        fi
+    fi
 fi
 
 if [ "$fail" -ne 0 ]; then
