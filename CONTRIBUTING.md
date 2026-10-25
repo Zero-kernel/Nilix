@@ -81,7 +81,7 @@ See [README: Build and run](README.md#build-and-run) for the complete list.
 | `make test-hosted-subcrates` | count-pinned hosted tests and compile checks (set `HOSTED_TEST_PROFILE=release` for optimized tests) |
 | `make musl-check`| static-musl libc conformance gate |
 
-The [CI map](docs/ci-testing.md) lists the required groups, local commands,
+The [CI map](https://github.com/Zero-kernel/Nilix-docs/blob/main/ci-testing.md) lists the required groups, local commands,
 scheduled coverage and report formats. `CI result` aggregates the required jobs;
 qualified runtime results retain their deferred checks and are not strict passes.
 

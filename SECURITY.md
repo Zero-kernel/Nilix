@@ -66,7 +66,7 @@ documented threat boundaries, including:
   state or resources.
 
 The current threat model and explicit residual gaps are documented in
-[docs/roadmap.md](docs/roadmap.md#32-threat-model).
+[docs/roadmap.md](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#32-threat-model).
 
 ## Usually not a vulnerability
 

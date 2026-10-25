@@ -64,7 +64,8 @@ International license <LICENSE-CC-BY> or
 <https://creativecommons.org/licenses/by/4.0/>:
 
 * every Markdown file (*.md), wherever it is, including the README files;
-* everything under docs/, including the logo and diagrams in docs/assets/.
+* everything under docs/ (the Nilix-docs submodule), and the logo and diagrams
+  in assets/.
 
 CODE_OF_CONDUCT.md is adapted from the Contributor Covenant, which is also
 licensed under CC-BY-4.0; its attribution is kept in that file.

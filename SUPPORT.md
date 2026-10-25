@@ -22,7 +22,7 @@ support contract, or private consulting channel.
 ## Before filing
 
 Read [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), the
-[documentation index](docs/README.md), and the [roadmap and threat model](docs/roadmap.md).
+[documentation index](https://github.com/Zero-kernel/Nilix-docs/blob/main/README.md), and the [roadmap and threat model](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md).
 Search open and closed issues, update to current `main`, and reduce the problem to
 the smallest repeatable case.
 

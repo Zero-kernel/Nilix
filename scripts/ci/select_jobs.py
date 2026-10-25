@@ -26,9 +26,10 @@ ALWAYS = ('license',)
 RULES = (
     ('Python harness', ('scripts/tests/*', 'scripts/fixtures/*', 'pytest.ini',
                         'requirements-ci.txt', '.coveragerc'), ('quality',)),
-    ('documentation', ('*.md', 'docs/*', 'LICENSES/*', 'LICENSE-*', 'COPYRIGHT',
-                       'REUSE.toml', '.gitignore', '.github/ISSUE_TEMPLATE/*',
-                       '.github/CODEOWNERS', '.validation/*'), ()),
+    # docs is the Nilix-docs submodule: a pointer bump lists the bare path.
+    ('documentation', ('*.md', 'docs', 'docs/*', '.gitmodules', 'assets/*', 'LICENSES/*',
+                       'LICENSE-*', 'COPYRIGHT', 'REUSE.toml', '.gitignore',
+                       '.github/ISSUE_TEMPLATE/*', '.github/CODEOWNERS', '.validation/*'), ()),
     ('fuzz tools', ('fuzz/*', 'tools/*', 'userspace/fuzzer/*',
                     'userspace/nilix-syz-fuzzer/*'), ('tools', 'qemu')),
 )

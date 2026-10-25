@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/nilix.png" alt="Nilix" width="420">
+<img src="assets/nilix.png" alt="Nilix" width="420">
 
 # Nilix
 
@@ -66,9 +66,9 @@ already run.
 | **Not qualified yet** | Complete Linux compatibility, guest musl/usercopy/teardown breadth, physical hardware and physical VT-d, full KPTI isolation, compiler retpoline, production livepatch |
 | **Release work** | R188 review-lineage reconciliation, strict supported-profile tests and all seven stress-v2 profiles; the clean full-audit streak stands at **0/3** |
 
-Details: [security status](docs/security-audit-status.md) ·
-[release conditions](docs/roadmap.md#8-10-preview-release-gate) ·
-[current handoff](docs/review/design/next-handoff-2026-10-20.md).
+Details: [security status](https://github.com/Zero-kernel/Nilix-docs/blob/main/security-audit-status.md) ·
+[release conditions](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#8-10-preview-release-gate) ·
+[current handoff](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/next-handoff-2026-10-20.md).
 
 ## Capabilities
 
@@ -82,7 +82,7 @@ just because its API or source files exist.
 | UEFI and boot | PIE kernel loading/relocation, memory-map handoff, KASLR placement, console initialization; boots with 2 GiB or more and reads ACPI tables above 1 GiB | x86_64 platform scope; broader firmware/hardware and early-boot W+X qualification |
 | Memory | Buddy/global heap, charged fallible containers, guards, anonymous mmap/munmap/mprotect/brk, COW fork, cache/OOM machinery; mmap flag allowlist, demand-paged shared-anonymous regions, private-anonymous `mremap` (in-place grow/shrink + `MREMAP_MAYMOVE`) and bounded slab/NUMA/swap/THP primitives | Independent review of the MM slice (its remote gates and the Ring-3 oracle pass); MAP_FIXED/file mappings, shared-anonymous `mremap`, and integrated slab/NUMA/swap/THP backends remain unqualified |
 | Process lifecycle | Static ELF, fork/exec/exit/wait4, zombie/namespace identity and teardown tests; `waitid` (`P_ALL`/`P_PID`, `WNOHANG`/`WNOWAIT`, `siginfo_t` copyout) sharing one reap engine with `wait4`; root PID-namespace init registered through the normal PID chain; WNOWAIT-then-reap, copyout faults, ROOT-INIT orphan adoption and fork refusal under `pids.max` are guest-verified | `waitid` `P_PGID` and `WUNTRACED`/`WCONTINUED` fail closed with EINVAL; PID1 exit, reaper races and the attach-time/fd-charge rollback paths are uncovered |
-| Threads and TLS | Thread groups in every build (CLONE_VM/SIGHAND/THREAD/FILES/FS): shared signal table with a group pending set, fs context and fd table; group exit, fatal signals and stop; tkill/tgkill; exactly-once reaping and group-wide children; exec from the leader or any thread; procfs `task/` lists. FS/user-GS restoration across SMP migration. musl `pthread_create`/`join`/mutex/condition variables/TLS/signals pass on 1-16 CPUs | A handler signal waits while a thread is blocked in LOCK_PI (no restart); no sigaltstack or rt_tgsigqueueinfo; sigframes only on the main or an mmap'd stack; reviewed D3-D5 debt in the [design](docs/review/design/gap-5-slice4-thread-group-design.md) |
+| Threads and TLS | Thread groups in every build (CLONE_VM/SIGHAND/THREAD/FILES/FS): shared signal table with a group pending set, fs context and fd table; group exit, fatal signals and stop; tkill/tgkill; exactly-once reaping and group-wide children; exec from the leader or any thread; procfs `task/` lists. FS/user-GS restoration across SMP migration. musl `pthread_create`/`join`/mutex/condition variables/TLS/signals pass on 1-16 CPUs | A handler signal waits while a thread is blocked in LOCK_PI (no restart); no sigaltstack or rt_tgsigqueueinfo; sigframes only on the main or an mmap'd stack; reviewed D3-D5 debt in the [design](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/gap-5-slice4-thread-group-design.md) |
 | Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing from every CPU, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering, guard-free SCHED-TRAP and a switch sentinel; `/proc/schedstat` per-CPU switch/migration counters; memory/cpu/smp/thread stress soaks qualify on 4 vCPUs | Process/block/combined soak profiles, physical and longer high-core qualification; 64 CPUs boot in QEMU as a reject ceiling, not a tested workload |
 
 ### IPC, files, storage and networking
@@ -113,10 +113,10 @@ just because its API or source files exist.
 | Userspace and compatibility | Native libc helpers/development shell, static ET_EXEC/musl/SysV auxv and selected ABI layouts; musl pthreads | ET_DYN/dynamic loader/vDSO, glibc, general application/OCI and userspace personality |
 | Tests and fuzzing | Hosted debug/release, harness JUnit/coverage, real KCOV/two-seed QEMU smoke, scheduled fuzz/extended groups | Deferred guest tests, seven-profile stress acceptance and real performance/thermal evidence |
 
-The [full roadmap](docs/roadmap.md#4-kernel-composition) covers all **25 kernel library
+The [full roadmap](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#4-kernel-composition) covers all **25 kernel library
 crates**, implementation evidence, threat boundaries, Linux comparison, phase history and
-named backlog owners. The [VT-d matrix](docs/vtd-support-matrix.md) and
-[livepatch status](docs/livepatch-support.md) define their support limits.
+named backlog owners. The [VT-d matrix](https://github.com/Zero-kernel/Nilix-docs/blob/main/vtd-support-matrix.md) and
+[livepatch status](https://github.com/Zero-kernel/Nilix-docs/blob/main/livepatch-support.md) define their support limits.
 
 ## Architecture
 
@@ -125,7 +125,7 @@ hardware. The Cargo split organizes the code; most services do not yet run in se
 privilege domains.
 
 <p align="center">
-  <img src="docs/assets/architecture-at-a-glance.svg" alt="Nilix kernel component and execution map" width="960">
+  <img src="assets/architecture-at-a-glance.svg" alt="Nilix kernel component and execution map" width="960">
 </p>
 
 | Path | Source entrypoints | Responsibility |
@@ -138,7 +138,7 @@ privilege domains.
 | Network | [stack](kernel/net/src/stack.rs), [socket](kernel/net/src/socket.rs) | Protocol/RX work, policy, queues and wakeup |
 | Security / devices | [security](kernel/security/lib.rs), [LSM](kernel/lsm/lib.rs), [VT-d](kernel/iommu/lib.rs) | Enforce/report supported protections and device authority |
 
-See [architecture.md](docs/architecture.md) for layering, boot flow and subsystem
+See [architecture.md](https://github.com/Zero-kernel/Nilix-docs/blob/main/architecture.md) for layering, boot flow and subsystem
 narratives; the roadmap is the current capability and qualification reference.
 
 ## Quick Start
@@ -193,7 +193,7 @@ bash scripts/ci/entrypoint.sh musl      # musl guest on 1 and 4 CPUs
 
 | Workflow | When | Coverage |
 | --- | --- | --- |
-| `CI` | Push/PR to main; manual | License (REUSE), quality, hosted debug/release, tools, kernel build, boot/SMP, musl, IOMMU, KCOV/executor; each change runs only the jobs it can affect ([selection](docs/ci-testing.md#change-based-job-selection)); one `CI result` |
+| `CI` | Push/PR to main; manual | License (REUSE), quality, hosted debug/release, tools, kernel build, boot/SMP, musl, IOMMU, KCOV/executor; each change runs only the jobs it can affect ([selection](https://github.com/Zero-kernel/Nilix-docs/blob/main/ci-testing.md#change-based-job-selection)); one `CI result` |
 | `Extended tests` | Sunday 03:00 UTC; manual | Ubuntu 22.04/24.04, 8/16-CPU SMP, Ext3/JBD2, seven 900-second stress profiles, IOMMU compatibility |
 | `Fuzzing` | Daily 02:00 UTC; manual | 11 private libFuzzer campaigns with validated public result manifests |
 
@@ -203,7 +203,7 @@ strict passes, and guest gates retry one failed or incomplete QEMU attempt by de
 keeping both attempts in the report. Full stress acceptance is still blocked by kernel and
 workload gaps, and fuzz sampling is not proof of completeness.
 
-[CI guide](docs/ci-testing.md) · [Quality gates](docs/quality-gates.md) ·
+[CI guide](https://github.com/Zero-kernel/Nilix-docs/blob/main/ci-testing.md) · [Quality gates](https://github.com/Zero-kernel/Nilix-docs/blob/main/quality-gates.md) ·
 [Script categories](scripts/README.md)
 
 ## Roadmap
@@ -218,9 +218,9 @@ workload gaps, and fuzz sampling is not proof of completeness.
 4. **After qualification**: native capability/IPC, static ABI residuals,
    personality/dynamic linking, container networking and measured operations/performance.
 
-Dependencies and acceptance: [roadmap](docs/roadmap.md#10-forward-roadmap) ·
-[current plan](docs/next-phase-plan.md) ·
-[current handoff](docs/review/design/next-handoff-2026-10-20.md). Completed audit repairs
+Dependencies and acceptance: [roadmap](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#10-forward-roadmap) ·
+[current plan](https://github.com/Zero-kernel/Nilix-docs/blob/main/next-phase-plan.md) ·
+[current handoff](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/next-handoff-2026-10-20.md). Completed audit repairs
 stay as regressions; they are not rescheduled.
 
 ## FAQ
@@ -272,11 +272,11 @@ Privately, as described in [SECURITY](SECURITY.md). Please do not open a public 
 
 | Goal | Reference |
 | --- | --- |
-| Capabilities, gaps and release conditions | [Roadmap](docs/roadmap.md) |
-| Prioritized work and handoff | [Next-phase plan](docs/next-phase-plan.md) |
-| Architecture and documentation index | [Architecture](docs/architecture.md) · [Docs](docs/README.md) |
-| CI, tests and fuzzing | [CI](docs/ci-testing.md) · [Quality gates](docs/quality-gates.md) |
-| Audit evidence and recent changes | [Security status](docs/security-audit-status.md) · [Commit history](https://github.com/Zero-kernel/Nilix/commits/main/) |
+| Capabilities, gaps and release conditions | [Roadmap](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md) |
+| Prioritized work and handoff | [Next-phase plan](https://github.com/Zero-kernel/Nilix-docs/blob/main/next-phase-plan.md) |
+| Architecture and documentation index | [Architecture](https://github.com/Zero-kernel/Nilix-docs/blob/main/architecture.md) · [Docs](https://github.com/Zero-kernel/Nilix-docs/blob/main/README.md) |
+| CI, tests and fuzzing | [CI](https://github.com/Zero-kernel/Nilix-docs/blob/main/ci-testing.md) · [Quality gates](https://github.com/Zero-kernel/Nilix-docs/blob/main/quality-gates.md) |
+| Audit evidence and recent changes | [Security status](https://github.com/Zero-kernel/Nilix-docs/blob/main/security-audit-status.md) · [Commit history](https://github.com/Zero-kernel/Nilix/commits/main/) |
 
 ## Contributing
 

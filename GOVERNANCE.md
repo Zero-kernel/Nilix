@@ -102,7 +102,7 @@ time permits, and the decision must be documented after the embargo ends.
 
 Maintainers classify new issues by subsystem, evidence, risk, and priority.
 CRITICAL and HIGH findings follow the definitions in
-[docs/review/remediation/README.md](docs/review/remediation/README.md) and block
+[docs/review/remediation/README.md](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/remediation/README.md) and block
 the applicable release gate. Accepted multi-step work uses a tracking issue with
 explicit dependencies and completion criteria.
 
@@ -112,7 +112,7 @@ pull requests do not expire solely with time.
 
 ## Releases
 
-Release readiness follows the current gates in [docs/roadmap.md](docs/roadmap.md):
+Release readiness follows the current gates in [docs/roadmap.md](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md):
 no unresolved release-blocking security findings, green required CI and runtime
 gates, coherent documentation, and recorded residual risks. Scheduled stress,
 fuzzing, or hardware evidence supplements but does not silently weaken a failed

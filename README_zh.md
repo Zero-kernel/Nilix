@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/nilix.png" alt="Nilix" width="420">
+<img src="assets/nilix.png" alt="Nilix" width="420">
 
 # Nilix
 
@@ -58,9 +58,9 @@ Nilix 以“一次验证一个契约”的方式逐步实现 Linux 兼容，始�
 | **尚未验收** | 完整 Linux 兼容、guest musl/usercopy/teardown 的覆盖广度、物理硬件与物理 VT-d、完整 KPTI 隔离、编译器 retpoline、生产级 livepatch |
 | **发布前工作** | 核对 R188 评审证据、严格的受支持配置测试与全部七种 stress-v2 场景；历史零 HIGH 完整审计连续记录为 **0/3** |
 
-详情：[安全状态](docs/security-audit-status.md) ·
-[发布条件](docs/roadmap.md#8-10-preview-release-gate) ·
-[当前交接文档](docs/review/design/next-handoff-2026-10-20.md)。
+详情：[安全状态](https://github.com/Zero-kernel/Nilix-docs/blob/main/security-audit-status.md) ·
+[发布条件](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#8-10-preview-release-gate) ·
+[当前交接文档](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/next-handoff-2026-10-20.md)。
 
 ## 能力一览
 
@@ -73,7 +73,7 @@ Nilix 以“一次验证一个契约”的方式逐步实现 Linux 兼容，始�
 | UEFI 与启动 | PIE 内核加载/重定位、内存图交接、KASLR 放置、基础控制台；支持 2 GiB 及以上内存启动，可读取 1 GiB 以上的 ACPI 表 | x86_64 平台范围；更多固件/物理平台及早期 W+X 转换验证 |
 | 内存管理 | buddy/全局堆、准入计费容器、保护页、匿名 mmap/munmap/mprotect/brk、COW fork、缓存/OOM 机制；mmap flag 白名单、按需分页的共享匿名区域、私有匿名 `mremap`（原地扩缩 + `MREMAP_MAYMOVE`）以及有界的 slab/NUMA/swap/THP 原语 | MM 切片的独立评审（远程门禁与 Ring-3 oracle 已通过）；MAP_FIXED/文件映射、共享匿名 `mremap`，以及集成的 slab/NUMA/swap/THP 后端尚未验收 |
 | 进程生命周期 | 静态 ELF、fork/exec/exit/wait4、僵尸与 PID namespace 身份保留、清理路径测试；`waitid`（`P_ALL`/`P_PID`、`WNOHANG`/`WNOWAIT`、`siginfo_t` 回写）与 `wait4` 共用同一套收割引擎；根 PID namespace 的 init 通过正常 PID 链路注册；WNOWAIT 后续收割、copyout 故障、ROOT-INIT 孤儿收养与 `pids.max` 下的 fork 拒绝已经 guest 验证 | `waitid` 的 `P_PGID` 与 `WUNTRACED`/`WCONTINUED` 按失败关闭返回 EINVAL；PID1 退出、reaper 竞态以及 attach 阶段与 fd 计费回滚路径尚无覆盖 |
-| 线程与 TLS | 所有构建均支持线程组（CLONE_VM/SIGHAND/THREAD/FILES/FS）：共享信号表与组级待决集、fs 上下文与 fd 表；组退出、致命信号与停止；tkill/tgkill；恰好一次收割与组共享子进程；leader 或任一线程 exec；procfs `task/` 列表。SMP 迁移时 FS/user-GS 恢复。musl `pthread_create`/`join`/互斥量/条件变量/TLS/信号于 1-16 CPU 通过 | 阻塞在 LOCK_PI 中的线程要等调用返回才运行信号处理函数（无重启）；无 sigaltstack 与 rt_tgsigqueueinfo；信号帧仅限主栈或 mmap 栈；已评审的 D3-D5 债务见[设计](docs/review/design/gap-5-slice4-thread-group-design.md) |
+| 线程与 TLS | 所有构建均支持线程组（CLONE_VM/SIGHAND/THREAD/FILES/FS）：共享信号表与组级待决集、fs 上下文与 fd 表；组退出、致命信号与停止；tkill/tgkill；恰好一次收割与组共享子进程；leader 或任一线程 exec；procfs `task/` 列表。SMP 迁移时 FS/user-GS 恢复。musl `pthread_create`/`join`/互斥量/条件变量/TLS/信号于 1-16 CPU 通过 | 阻塞在 LOCK_PI 中的线程要等调用返回才运行信号处理函数（无重启）；无 sigaltstack 与 rt_tgsigqueueinfo；信号帧仅限主栈或 mmap 栈；已评审的 D3-D5 债务见[设计](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/gap-5-slice4-thread-group-design.md) |
 | 调度与 SMP | 每 CPU MLFQ、抢占、从所有 CPU 工作窃取/平衡、亲和性/cpuset、APIC/IPI/TLB、RCU/锁序、锁外格式化的 SCHED-TRAP 与切换哨兵；`/proc/schedstat` 每 CPU 切换/迁移计数；memory/cpu/smp/thread 压力浸泡在 4 vCPU 上合格 | process/block/combined 浸泡配置、物理与更长时间高核数验证；64 核可在 QEMU 启动且为拒绝上限，不是已验证负载 |
 
 ### IPC、文件、存储与网络
@@ -104,10 +104,10 @@ Nilix 以“一次验证一个契约”的方式逐步实现 Linux 兼容，始�
 | 用户态与 Linux ABI | 原生 libc 辅助/开发 shell、静态 ET_EXEC/musl/SysV auxv、部分布局 oracle；musl pthread | ET_DYN/动态加载器/vDSO、glibc、通用应用/OCI、用户态人格服务 |
 | 测试与 fuzz | hosted debug/release、Python JUnit/覆盖报告、真实 KCOV/双 seed QEMU、定时 fuzz/extended | deferred guest 场景、七种压力场景验收和真实性能/热稳定性验收 |
 
-[完整 roadmap](docs/roadmap.md#4-kernel-composition) 记录了 **25 个内核库 crate**
+[完整 roadmap](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#4-kernel-composition) 记录了 **25 个内核库 crate**
 的职责和证据入口，以及信任边界、Linux 差距、历史阶段和欠账归属。
-[VT-d 支持矩阵](docs/vtd-support-matrix.md) 与
-[livepatch 状态](docs/livepatch-support.md) 单独说明各自的支持范围。
+[VT-d 支持矩阵](https://github.com/Zero-kernel/Nilix-docs/blob/main/vtd-support-matrix.md) 与
+[livepatch 状态](https://github.com/Zero-kernel/Nilix-docs/blob/main/livepatch-support.md) 单独说明各自的支持范围。
 
 ## 架构
 
@@ -115,7 +115,7 @@ Ring 3 → 架构入口/usercopy → 策略门 → kernel_core → 内核服务 
 Cargo 模块划分用于组织职责，大多数服务尚未运行在独立的权限域中。
 
 <p align="center">
-  <img src="docs/assets/architecture-at-a-glance.svg" alt="Nilix 内核组件与执行路径" width="960">
+  <img src="assets/architecture-at-a-glance.svg" alt="Nilix 内核组件与执行路径" width="960">
 </p>
 
 | 路径 | 源码入口 | 职责 |
@@ -128,7 +128,7 @@ Cargo 模块划分用于组织职责，大多数服务尚未运行在独立的�
 | 网络 | [stack](kernel/net/src/stack.rs)、[socket](kernel/net/src/socket.rs) | 协议/RX、策略、队列和唤醒 |
 | 安全/设备 | [security](kernel/security/lib.rs)、[LSM](kernel/lsm/lib.rs)、[VT-d](kernel/iommu/lib.rs) | 执行并报告已支持的防护与设备权限 |
 
-分层与启动流程详见 [architecture.md](docs/architecture.md)；当前能力与验收以 roadmap 为准。
+分层与启动流程详见 [architecture.md](https://github.com/Zero-kernel/Nilix-docs/blob/main/architecture.md)；当前能力与验收以 roadmap 为准。
 
 ## 快速开始
 
@@ -181,7 +181,7 @@ bash scripts/ci/entrypoint.sh musl      # 1 与 4 CPU 的 musl guest
 
 | 工作流 | 触发 | 覆盖 |
 | --- | --- | --- |
-| `CI` | 推送或 PR 到 main；手动 | 许可证（REUSE）、quality、hosted debug/release、工具、内核构建、boot/SMP、musl、IOMMU、KCOV/executor；每次改动只运行它可能影响的任务（[选择规则](docs/ci-testing.md#change-based-job-selection)）；汇总为一个 `CI result` |
+| `CI` | 推送或 PR 到 main；手动 | 许可证（REUSE）、quality、hosted debug/release、工具、内核构建、boot/SMP、musl、IOMMU、KCOV/executor；每次改动只运行它可能影响的任务（[选择规则](https://github.com/Zero-kernel/Nilix-docs/blob/main/ci-testing.md#change-based-job-selection)）；汇总为一个 `CI result` |
 | `Extended tests` | 每周日 03:00 UTC；手动 | Ubuntu 22.04/24.04、8/16 CPU SMP、Ext3/JBD2、七种 900 秒压力场景、IOMMU 兼容性 |
 | `Fuzzing` | 每天 02:00 UTC；手动 | 11 个私有 libFuzzer campaign，发布经过校验的公开结果清单 |
 
@@ -189,7 +189,7 @@ JUnit、Markdown 摘要、原始日志及源码/镜像身份共同保留每次�
 qualified 的诊断结果与严格 PASS 分开记录。guest 门禁默认对失败或不完整的 QEMU 首次尝试重试一次，
 并在报告中保留两次结果。完整的压力验收仍被内核与 workload 缺口阻塞；fuzz 抽样不能证明没有漏洞。
 
-[CI 说明](docs/ci-testing.md) · [门禁细节](docs/quality-gates.md) ·
+[CI 说明](https://github.com/Zero-kernel/Nilix-docs/blob/main/ci-testing.md) · [门禁细节](https://github.com/Zero-kernel/Nilix-docs/blob/main/quality-gates.md) ·
 [脚本目录](scripts/README.md)
 
 ## 路线图
@@ -201,9 +201,9 @@ qualified 的诊断结果与严格 PASS 分开记录。guest 门禁默认对失�
    与 `open` 模式）、严格的网络/SMP/安全矩阵，以及新的完整审计发布条件。
 4. **验收之后**：原生 capability/IPC、静态 ABI 缺项、personality/动态链接、容器网络和可测量的运维/性能工作。
 
-依赖与验收：[roadmap](docs/roadmap.md#10-forward-roadmap) ·
-[当前计划](docs/next-phase-plan.md) ·
-[当前交接文档](docs/review/design/next-handoff-2026-10-20.md)。已通过验收的审计修复保留为回归测试，
+依赖与验收：[roadmap](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#10-forward-roadmap) ·
+[当前计划](https://github.com/Zero-kernel/Nilix-docs/blob/main/next-phase-plan.md) ·
+[当前交接文档](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/next-handoff-2026-10-20.md)。已通过验收的审计修复保留为回归测试，
 不重新排期。
 
 ## 常见问题
@@ -252,11 +252,11 @@ qualified 结果与严格通过分开记录，并且 make 会以非零状态退�
 
 | 目标 | 入口 |
 | --- | --- |
-| 当前能力、缺口与发布条件 | [Roadmap](docs/roadmap.md) · [中文路线图](docs/roadmap_zh.md) |
-| 优先级与交接 | [下一阶段计划](docs/next-phase-plan.md) |
-| 架构与文档索引 | [Architecture](docs/architecture.md) · [Docs](docs/README.md) |
-| CI、测试与 fuzz | [CI](docs/ci-testing.md) · [Quality gates](docs/quality-gates.md) |
-| 审计证据与近期变更 | [安全状态](docs/security-audit-status.md) · [提交历史](https://github.com/Zero-kernel/Nilix/commits/main/) |
+| 当前能力、缺口与发布条件 | [Roadmap](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md) · [中文路线图](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap_zh.md) |
+| 优先级与交接 | [下一阶段计划](https://github.com/Zero-kernel/Nilix-docs/blob/main/next-phase-plan.md) |
+| 架构与文档索引 | [Architecture](https://github.com/Zero-kernel/Nilix-docs/blob/main/architecture.md) · [Docs](https://github.com/Zero-kernel/Nilix-docs/blob/main/README.md) |
+| CI、测试与 fuzz | [CI](https://github.com/Zero-kernel/Nilix-docs/blob/main/ci-testing.md) · [Quality gates](https://github.com/Zero-kernel/Nilix-docs/blob/main/quality-gates.md) |
+| 审计证据与近期变更 | [安全状态](https://github.com/Zero-kernel/Nilix-docs/blob/main/security-audit-status.md) · [提交历史](https://github.com/Zero-kernel/Nilix/commits/main/) |
 
 ## 参与贡献
 

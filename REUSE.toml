@@ -90,6 +90,7 @@ SPDX-License-Identifier = "Apache-2.0 AND GPL-3.0-or-later AND MIT AND GPL-3.0-o
 path = [
     "**/*.md",
     "docs/**",
+    "assets/**",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "The Nilix Contributors (see the version control history)"

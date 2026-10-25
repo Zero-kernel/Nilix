@@ -21,6 +21,8 @@ class SelectTests(unittest.TestCase):
         self.assertEqual(self.jobs('README.md', 'docs/roadmap.md', 'docs/assets/nilix.png',
                                    'kernel/README.md', 'COPYRIGHT', 'REUSE.toml',
                                    'LICENSES/MIT.txt', 'LICENSE-APACHE'), ['license'])
+        # The docs submodule pointer, its .gitmodules entry and the README images.
+        self.assertEqual(self.jobs('docs', '.gitmodules', 'assets/nilix.png'), ['license'])
 
     def test_harness_changes_run_quality(self):
         self.assertEqual(self.jobs('scripts/tests/ci_select_test.py', 'requirements-ci.txt'),

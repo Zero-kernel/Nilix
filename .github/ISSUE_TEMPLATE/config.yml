@@ -8,5 +8,5 @@ contact_links:
     url: https://github.com/Zero-kernel/Nilix/blob/main/CONTRIBUTING.md
     about: Review the build, test, kernel-safety, and pull request requirements before contributing.
   - name: Review the architecture and roadmap
-    url: https://github.com/Zero-kernel/Nilix/blob/main/docs/roadmap.md
+    url: https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md
     about: Check current trust boundaries, non-goals, release gates, and planned work.

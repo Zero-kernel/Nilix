@@ -32,15 +32,6 @@ userspace/clippy-userspace-target
 /fuzz/artifacts/*.log
 /hosted-subcrate-review-target/
 
-#docs
-docs/fuzzing
-docs/cabifunc
-docs/skills
-docs/testing
-docs/overview
-docs/review
-docs/design
-
 #no_need
 *.backup
 *.md
@@ -63,4 +54,3 @@ core
 !.github/pull_request_template.md
 !roadmap.md
 !roadmap-enterprise.md
-!docs/**/*.md

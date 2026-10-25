@@ -27,7 +27,7 @@ Tests syscall entry points with focus on R173/R174 fixes:
 run against the KCOV guest. `make fuzz-qemu-smoke` covers nonzero coverage for the
 instrumented `getpid`/`uname` seeds and zero coverage for `sched_yield`; full
 campaign acceptance remains verification pending. See the
-[handoff](../docs/review/fixes/ksa-2026-09-06-handoff-2026-09-10.md) for historical context.
+[handoff](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/fixes/ksa-2026-09-06-handoff-2026-09-10.md) for historical context.
 
 Uses the production `nilix-syz-fuzzer` executor and its 20-syscall allowlist, including
 process identity, read-only filesystem queries, time and bounded output buffers.
