@@ -292,6 +292,9 @@ pub extern "C" fn _start() -> ! {
     // GAP-6: the scheduler/RCU counters pressure runs retain.
     test_proc_schedstat(&mut results);
 
+    // TD-LSM-1: LSM policy denial and missing-subject arms at six hook sites.
+    test_lsm_denial_oracle(&mut results);
+
     // R192-RES-2: every eager population site in bounded holds, and the boot-armed
     // injected failure's rollback. Auto-placed mappings only, freed before the next.
     test_bounded_population(&mut results);
@@ -3132,6 +3135,144 @@ fn group_stack_top() -> usize {
 
 unsafe fn raw_exit(syscall: u64, code: u64) -> ! {
     core::arch::asm!("syscall", in("rax") syscall, in("rdi") code, options(noreturn));
+}
+
+// ---------------------------------------------------------------------------
+// TD-LSM-1: runtime LSM denial oracle. The syscall_test kernel installs a test
+// policy that denies six hooks for one reserved real uid, and fails the first
+// subject lookup of every syscall made by a second reserved real uid. A child
+// takes the marker with setresuid(marker, 0, 0): it keeps euid 0, so each DAC
+// check before the LSM passes and only the LSM can refuse it.
+// ---------------------------------------------------------------------------
+
+const SYS_EXEC: u64 = 59;
+const SYS_KILL: u64 = 62;
+const SYS_SETRESUID: u64 = 117;
+const SYS_UNLINK: u64 = 87;
+/// Keep in sync with `lsm::syscall_test::{DENY_UID, NO_SUBJECT_UID}`.
+const LSM_TEST_DENY_UID: u64 = 0x7E57_0001;
+const LSM_TEST_NO_SUBJECT_UID: u64 = 0x7E57_0002;
+const ENOEXEC: i32 = 8;
+const EACCES: i32 = 13;
+/// One bit per checked call; a child exits with the calls that behaved.
+const LSM_ALL_CALLS: u64 = 0x3F;
+/// A regular, executable, non-ELF file: exec reaches its LSM hook and then
+/// fails the header pre-flight with ENOEXEC.
+const LSM_EXEC_PATH: &[u8] = b"/td_lsm_1_exec\0";
+
+fn test_lsm_denial_oracle(results: &mut TestResult) {
+    print("Testing LSM denial and missing-subject arms... ");
+    let name = "LSM denial and missing-subject arms fail closed at exec, kill, get_robust_list, mmap, mprotect and fstat";
+    match unsafe { lsm_denial_oracle() } {
+        Ok(()) => results.pass(name),
+        Err((reason, mask)) => {
+            print("  TD-LSM-1 leg: ");
+            print(reason);
+            print(" mask=");
+            print_hex(mask);
+            println("");
+            results.fail(name);
+        }
+    }
+}
+
+unsafe fn lsm_denial_oracle() -> Result<(), (&'static str, u64)> {
+    let fd = sys_open(LSM_EXEC_PATH.as_ptr(), 0o101, 0o755); // O_CREAT | O_WRONLY
+    if is_error(fd) {
+        return Err(("create the exec fixture", 0));
+    }
+    let body = b"not an executable\n";
+    let written = syscall3(SYS_WRITE, fd, body.as_ptr() as u64, body.len() as u64);
+    sys_close(fd);
+    if written != body.len() as u64 {
+        return Err(("write the exec fixture", 0));
+    }
+    let stat_fd = sys_open(LSM_EXEC_PATH.as_ptr(), 0, 0);
+    let page = mmap_anon(PAGE, false);
+    let result = if is_error(stat_fd) || page < 0 {
+        Err(("open the fstat fd or map the mprotect page", 0))
+    } else {
+        lsm_oracle_arms(stat_fd, page as usize)
+    };
+    if !is_error(stat_fd) {
+        sys_close(stat_fd);
+    }
+    if page >= 0 {
+        munmap(page as usize, PAGE);
+    }
+    syscall1(SYS_UNLINK, LSM_EXEC_PATH.as_ptr() as u64);
+    result
+}
+
+/// Root first (the control: every call succeeds, exec fails only its header
+/// check), then the policy-denial and missing-subject markers.
+unsafe fn lsm_oracle_arms(stat_fd: u64, page: usize) -> Result<(), (&'static str, u64)> {
+    for (marker, arm) in [
+        (None, "control arm"),
+        (Some(LSM_TEST_DENY_UID), "policy-denial arm"),
+        (Some(LSM_TEST_NO_SUBJECT_UID), "missing-subject arm"),
+    ] {
+        let child = sys_fork();
+        if is_error(child) {
+            return Err(("fork", 0));
+        }
+        if child == 0 {
+            let code = match marker {
+                Some(uid) if syscall3(SYS_SETRESUID, uid, 0, 0) != 0 => 0x40,
+                _ => lsm_oracle_calls(marker.is_none(), stat_fd, page),
+            };
+            raw_exit(SYS_EXIT, code);
+        }
+        let mut status: i32 = 0;
+        let waited = sys_wait(&mut status as *mut i32);
+        if is_error(waited) || waited != child {
+            return Err(("wait", 0));
+        }
+        let code = ((status >> 8) & 0xff) as u64;
+        if code != LSM_ALL_CALLS {
+            return Err((arm, code));
+        }
+    }
+    Ok(())
+}
+
+/// In the forked child: one bit per call that returned what its arm expects.
+/// Nothing here allocates or writes to the console.
+unsafe fn lsm_oracle_calls(control: bool, stat_fd: u64, page: usize) -> u64 {
+    let (fail, stat_fail) = if control { (0, 0) } else { (EPERM, EACCES) };
+    let argv = [LSM_EXEC_PATH.as_ptr() as u64, 0];
+    let envp = [0u64];
+    let exec = err_of(syscall3(
+        SYS_EXEC,
+        LSM_EXEC_PATH.as_ptr() as u64,
+        argv.as_ptr() as u64,
+        envp.as_ptr() as u64,
+    ) as i64);
+    let kill = err_of(syscall2(SYS_KILL, sys_getpid(), 0) as i64);
+    let (mut head, mut len) = (0u64, 0u64);
+    let robust = err_of(syscall3(
+        SYS_GET_ROBUST_LIST,
+        1,
+        &mut head as *mut u64 as u64,
+        &mut len as *mut u64 as u64,
+    ) as i64);
+    let mapped = mmap_anon(PAGE, false);
+    let mmap = err_of(mapped);
+    let mprotect = err_of(syscall3(SYS_MPROTECT, page as u64, PAGE as u64, PROT_READ) as i64);
+    let mut stat = [0u64; 18];
+    let fstat = err_of(syscall2(SYS_FSTAT, stat_fd, stat.as_mut_ptr() as u64) as i64);
+    let expected_exec = if control { ENOEXEC } else { EPERM };
+    [
+        exec == expected_exec,
+        kill == fail,
+        robust == fail,
+        mmap == fail,
+        mprotect == fail,
+        fstat == stat_fail,
+    ]
+    .iter()
+    .enumerate()
+    .fold(0, |mask, (bit, ok)| mask | ((*ok as u64) << bit))
 }
 
 /// Thread entry: record the identity the kernel reports, then leave the

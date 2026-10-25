@@ -1063,3 +1063,91 @@ pub fn run_secure_baseline_self_test() {
         "secure-baseline: kpatch_enable must stay denied even for root"
     );
 }
+
+/// TD-LSM-1: the guest oracle's policy, compiled only into `syscall_test`
+/// kernels.
+///
+/// Denies its six oracle hooks for a subject whose real uid is
+/// [`crate::syscall_test::DENY_UID`] and otherwise answers exactly as
+/// `PermissivePolicy` (including `kpatch_*`, whose trait defaults deny).
+#[cfg(feature = "syscall_test")]
+pub struct SyscallTestPolicy;
+
+/// The installed instance of [`SyscallTestPolicy`].
+#[cfg(feature = "syscall_test")]
+pub static SYSCALL_TEST_POLICY: SyscallTestPolicy = SyscallTestPolicy;
+
+#[cfg(feature = "syscall_test")]
+impl SyscallTestPolicy {
+    fn check(subject: &ProcessCtx) -> LsmResult {
+        if subject.uid == crate::syscall_test::DENY_UID {
+            Err(LsmError::Denied)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "syscall_test")]
+impl LsmPolicy for SyscallTestPolicy {
+    fn name(&self) -> &'static str {
+        "syscall-test"
+    }
+
+    fn priority(&self) -> u32 {
+        PermissivePolicy.priority()
+    }
+
+    fn task_exec(&self, task: &ProcessCtx, path_hash: u64) -> LsmResult {
+        Self::check(task)?;
+        PermissivePolicy.task_exec(task, path_hash)
+    }
+
+    fn signal_send(&self, task: &ProcessCtx, ctx: &SignalCtx) -> LsmResult {
+        Self::check(task)?;
+        PermissivePolicy.signal_send(task, ctx)
+    }
+
+    fn ptrace(&self, tracer: &ProcessCtx, target: &ProcessCtx, op: u32) -> LsmResult {
+        Self::check(tracer)?;
+        PermissivePolicy.ptrace(tracer, target, op)
+    }
+
+    fn memory_mmap(
+        &self,
+        task: &ProcessCtx,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        flags: u32,
+    ) -> LsmResult {
+        Self::check(task)?;
+        PermissivePolicy.memory_mmap(task, addr, len, prot, flags)
+    }
+
+    fn memory_mprotect(&self, task: &ProcessCtx, addr: u64, len: u64, prot: u32) -> LsmResult {
+        Self::check(task)?;
+        PermissivePolicy.memory_mprotect(task, addr, len, prot)
+    }
+
+    fn file_permission(&self, task: &ProcessCtx, inode: u64, access_mask: u32) -> LsmResult {
+        Self::check(task)?;
+        PermissivePolicy.file_permission(task, inode, access_mask)
+    }
+
+    fn kpatch_load(&self, task: &ProcessCtx, patch_len: usize) -> LsmResult {
+        PermissivePolicy.kpatch_load(task, patch_len)
+    }
+
+    fn kpatch_enable(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
+        PermissivePolicy.kpatch_enable(task, patch_id)
+    }
+
+    fn kpatch_disable(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
+        PermissivePolicy.kpatch_disable(task, patch_id)
+    }
+
+    fn kpatch_unload(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
+        PermissivePolicy.kpatch_unload(task, patch_id)
+    }
+}

@@ -19,7 +19,14 @@ cap = { path = "../cap" }
 audit = { path = "../audit" }
 drivers = { path = "../drivers" }
 
+# TD-LSM-1: hosted tests link `mm` (through `cap`) without its kernel
+# #[global_allocator].
+[dev-dependencies]
+mm = { path = "../mm", features = ["host_harness"] }
+
 [features]
 default = []
 # Enable LSM policy enforcement (otherwise all hooks are no-ops)
 lsm = []
+# TD-LSM-1: guest-oracle policy and missing-subject probe (syscall_test kernels only)
+syscall_test = []

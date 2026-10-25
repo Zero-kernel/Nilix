@@ -12,7 +12,7 @@ default = []
 # Enable interactive shell instead of hello test program
 shell = []
 # Enable syscall test program
-syscall_test = ["kernel_core/syscall_test", "arch/syscall_test"]
+syscall_test = ["kernel_core/syscall_test", "arch/syscall_test", "lsm/syscall_test"]
 # Enable musl libc test program (its pthread workload needs the thread
 # clone flags, which every build accepts since GAP-5 slice 4 step 7)
 musl_test = []

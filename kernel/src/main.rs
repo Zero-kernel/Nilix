@@ -642,6 +642,13 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
                 // minimal enforcing secure-baseline policy under the Secure
                 // profile — fail closed if the installation did not take.
                 lsm::init();
+                // TD-LSM-1: the ring-3 oracle's test policy (denies six hooks for
+                // a reserved real uid, otherwise permissive); syscall_test kernels
+                // only, never under Secure.
+                #[cfg(feature = "syscall_test")]
+                if policy.profile != compliance::HardeningProfile::Secure {
+                    lsm::set_policy(&lsm::SYSCALL_TEST_POLICY);
+                }
                 if policy.profile == compliance::HardeningProfile::Secure {
                     lsm::set_policy(&lsm::SECURE_BASELINE);
                     if lsm::active_policy_name() != "secure-baseline" {

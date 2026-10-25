@@ -425,6 +425,7 @@ dependencies = [
  "audit",
  "cap",
  "drivers",
+ "mm",
  "spin 0.9.9",
 ]
 

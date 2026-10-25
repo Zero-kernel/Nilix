@@ -150,6 +150,13 @@ run_suite drivers 13 0 \
     --features cpu_local/host_harness \
     --lib --locked
 
+# TD-LSM-1: the syscall_test-only guest-oracle policy and missing-subject probe.
+run_suite lsm-syscall-test 2 0 \
+    --manifest-path kernel/lsm/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features lsm,syscall_test \
+    --lib --locked
+
 run_suite cpu-local 11 0 \
     --manifest-path kernel/cpu_local/Cargo.toml \
     --target x86_64-unknown-linux-gnu \

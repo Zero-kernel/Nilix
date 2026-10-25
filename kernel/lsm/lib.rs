@@ -69,6 +69,102 @@ pub use policy::{
     run_secure_baseline_self_test, DenyAllPolicy, LsmError, LsmPolicy, LsmResult, PermissivePolicy,
     SecureBaselinePolicy, SECURE_BASELINE,
 };
+#[cfg(feature = "syscall_test")]
+pub use policy::{SyscallTestPolicy, SYSCALL_TEST_POLICY};
+
+/// TD-LSM-1: guest-oracle support, compiled only into `syscall_test` kernels.
+///
+/// A child of the ring-3 oracle marks itself with a reserved *real* uid,
+/// `setresuid(marker, 0, 0)`. It keeps host euid 0, so every DAC check in front
+/// of the LSM (`get_robust_list`'s cross-group check, the exec bit, `kill`)
+/// still passes and only the LSM tells it apart.
+#[cfg(feature = "syscall_test")]
+pub mod syscall_test {
+    use super::ProcessId;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `SyscallTestPolicy` denies its oracle hooks for this real uid.
+    pub const DENY_UID: u32 = 0x7E57_0001;
+    /// For this real uid, the first `ProcessCtx::from_current` of each syscall
+    /// returns `None`, driving that site's missing-subject arm.
+    pub const NO_SUBJECT_UID: u32 = 0x7E57_0002;
+
+    /// Pid whose next `ProcessCtx::from_current` fails; 0 = none.
+    static LOST_SUBJECT_PID: AtomicUsize = AtomicUsize::new(0);
+
+    /// Syscall entry (`SyscallCtx::from_current`, which itself never fails
+    /// here): arm a marked caller for one lost lookup in this syscall. An
+    /// unmarked caller clears an arm left for its pid (a recycled pid).
+    pub(crate) fn note_syscall_entry(pid: ProcessId, uid: u32) {
+        if uid == NO_SUBJECT_UID {
+            LOST_SUBJECT_PID.store(pid, Ordering::Release);
+        } else if LOST_SUBJECT_PID.load(Ordering::Relaxed) == pid {
+            let _ = LOST_SUBJECT_PID.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+
+    /// `ProcessCtx::from_current`: whether this is the armed lookup.
+    pub(crate) fn take_lost_subject(pid: ProcessId, uid: u32) -> bool {
+        uid == NO_SUBJECT_UID
+            && LOST_SUBJECT_PID
+                .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::policy::{LsmPolicy, PermissivePolicy, SYSCALL_TEST_POLICY};
+        use crate::{ProcessCtx, SignalCtx};
+
+        #[test]
+        fn td_lsm_1_lost_subject_is_one_lookup_per_marked_syscall() {
+            note_syscall_entry(41, NO_SUBJECT_UID);
+            assert!(!take_lost_subject(42, NO_SUBJECT_UID), "another pid");
+            assert!(!take_lost_subject(41, 0), "an unmarked lookup");
+            assert!(take_lost_subject(41, NO_SUBJECT_UID));
+            assert!(!take_lost_subject(41, NO_SUBJECT_UID), "one lookup only");
+            note_syscall_entry(41, NO_SUBJECT_UID);
+            note_syscall_entry(41, 0);
+            assert!(
+                !take_lost_subject(41, NO_SUBJECT_UID),
+                "an unmarked entry clears its pid's arm"
+            );
+        }
+
+        #[test]
+        fn td_lsm_1_test_policy_denies_only_the_marker() {
+            let marked = ProcessCtx::new(7, 7, DENY_UID, 0, 0, 0);
+            let root = ProcessCtx::new(7, 7, 0, 0, 0, 0);
+            let signal = SignalCtx {
+                target_pid: 7,
+                sig: 0,
+                cap: None,
+            };
+            let policy = &SYSCALL_TEST_POLICY;
+            for subject in [&marked, &root] {
+                let denied = subject.uid == DENY_UID;
+                assert_eq!(policy.task_exec(subject, 1).is_err(), denied);
+                assert_eq!(policy.signal_send(subject, &signal).is_err(), denied);
+                assert_eq!(policy.ptrace(subject, &root, 0).is_err(), denied);
+                assert_eq!(
+                    policy.memory_mmap(subject, 0, 4096, 3, 0x22).is_err(),
+                    denied
+                );
+                assert_eq!(
+                    policy.memory_mprotect(subject, 0, 4096, 1).is_err(),
+                    denied
+                );
+                assert_eq!(policy.file_permission(subject, 1, 0).is_err(), denied);
+                assert!(policy.kpatch_load(subject, 1).is_ok());
+                assert!(policy.kpatch_enable(subject, 1).is_ok());
+                assert!(policy.kpatch_disable(subject, 1).is_ok());
+                assert!(policy.kpatch_unload(subject, 1).is_ok());
+            }
+            assert_eq!(policy.priority(), PermissivePolicy.priority());
+        }
+    }
+}
 
 // ============================================================================
 // Local Type Definitions (to avoid cyclic dependency with kernel_core/vfs)
@@ -430,6 +526,8 @@ impl SyscallCtx {
     pub fn from_current(syscall_nr: u64, args: &[u64; 6]) -> Option<Self> {
         let creds = current_credentials()?;
         let pid = current_pid()?;
+        #[cfg(feature = "syscall_test")]
+        syscall_test::note_syscall_entry(pid, creds.uid);
 
         Some(Self {
             pid,
@@ -473,6 +571,11 @@ impl ProcessCtx {
     pub fn from_current() -> Option<Self> {
         let creds = current_credentials()?;
         let pid = current_pid()?;
+        // TD-LSM-1: the guest oracle's missing-subject arm.
+        #[cfg(feature = "syscall_test")]
+        if syscall_test::take_lost_subject(pid, creds.uid) {
+            return None;
+        }
 
         Some(Self {
             pid,
