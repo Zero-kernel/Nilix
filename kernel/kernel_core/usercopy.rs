@@ -95,6 +95,8 @@ __zero_os_usercopy_get_u8:
     // Returns 0 on success, 1 on fault.
     .global __zero_os_usercopy_get_u32
 __zero_os_usercopy_get_u32:
+    .global __zero_os_usercopy_get_u32_access
+__zero_os_usercopy_get_u32_access:
 .Lget_u32_access:
     mov eax, dword ptr [rsi] // Aligned atomic user load - may fault here
     mov dword ptr [rdi], eax
@@ -161,6 +163,8 @@ __zero_os_usercopy_put_u8:
 __zero_os_usercopy_cmpxchg_u32:
     mov eax, esi
 .Lcmpxchg_u32_access:
+    .global __zero_os_usercopy_cmpxchg_u32_access
+__zero_os_usercopy_cmpxchg_u32_access:
     lock cmpxchg dword ptr [rdi], edx
     ret
 .Lcmpxchg_u32_fixup:
@@ -197,6 +201,18 @@ extern "C" {
     /// Returns 0 on success, 1 on fault.
     fn __zero_os_usercopy_put_u8(dst: *mut u8, val: u8) -> u32;
 
+    /// TD-USERCOPY-1: the user-access instructions of the two helpers the
+    /// no-fault readers run (labels inside the helpers; never read or called).
+    static __zero_os_usercopy_get_u32_access: u8;
+    static __zero_os_usercopy_cmpxchg_u32_access: u8;
+}
+
+/// TD-USERCOPY-1 FIX: whether `ip` is the user-access instruction of
+/// `__zero_os_usercopy_get_u32` or `__zero_os_usercopy_cmpxchg_u32`, the only
+/// helpers that run with `nofault` set.
+fn nofault_access_ip(ip: usize) -> bool {
+    ip == core::ptr::addr_of!(__zero_os_usercopy_get_u32_access) as usize
+        || ip == core::ptr::addr_of!(__zero_os_usercopy_cmpxchg_u32_access) as usize
 }
 
 /// H-26 FIX: Exception-safe byte read from user space
@@ -1203,8 +1219,14 @@ pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
 /// ([`read_user_u32_atomic_nofault`], [`compare_exchange_user_u32_nofault`]).
 /// The page-fault handler then takes the exception-table fixup at once,
 /// without resolving copy-on-write or demand faults.
-pub fn nofault_usercopy_fault(fault_addr: usize) -> bool {
-    try_handle_usercopy_fault(fault_addr)
+///
+/// TD-USERCOPY-1 FIX: only a fault raised by those helpers' access
+/// instruction (`fault_ip`) qualifies. Another exception-table instruction
+/// faulting on the range while the flag is set takes the ordinary path, so its
+/// fault is resolved instead of turned into a spurious `EFAULT`.
+pub fn nofault_usercopy_fault(fault_addr: usize, fault_ip: usize) -> bool {
+    nofault_access_ip(fault_ip)
+        && try_handle_usercopy_fault(fault_addr)
         && USER_COPY_STATE.with(|s| s.nofault.load(Ordering::SeqCst))
 }
 
@@ -1834,6 +1856,25 @@ mod robust_usercopy_tests {
         let observed = unsafe { __zero_os_usercopy_cmpxchg_u32(&mut word, 17, 0) };
         assert_eq!(observed, 17);
         assert_eq!(word, 0);
+    }
+
+    #[test]
+    fn td_usercopy_1_nofault_arm_matches_only_the_access_instructions() {
+        let get_u32 = __zero_os_usercopy_get_u32 as *const () as usize;
+        let cmpxchg_u32 = __zero_os_usercopy_cmpxchg_u32 as *const () as usize;
+        // get_u32's load is its first instruction; cmpxchg_u32's follows the
+        // 2-byte `mov eax, esi`.
+        assert!(nofault_access_ip(get_u32));
+        assert!(nofault_access_ip(cmpxchg_u32 + 2));
+        assert!(!nofault_access_ip(cmpxchg_u32));
+        for other in [
+            __zero_os_usercopy_get_u8 as *const () as usize,
+            __zero_os_usercopy_get_u64 as *const () as usize,
+            __zero_os_usercopy_put_u8 as *const () as usize,
+            get_u32 + 2,
+        ] {
+            assert!(!nofault_access_ip(other));
+        }
     }
 
     #[test]

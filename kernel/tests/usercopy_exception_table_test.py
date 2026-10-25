@@ -19,6 +19,9 @@ EXPECTED = {
     "put_u8": bytes.fromhex("408837"),
     "cmpxchg_u32": bytes.fromhex("f00fb117"),
 }
+# TD-USERCOPY-1: the page-fault handler's no-fault arm matches these exported
+# labels, so each must be its helper's exception-table fault RIP.
+NOFAULT_ACCESS = ("get_u32", "cmpxchg_u32")
 
 
 def run(command):
@@ -59,6 +62,12 @@ def verify_table(path, objdump):
         table = rodata[table_base - rodata_base:table_end - rodata_base]
     assert len(table) == 8 * len(EXPECTED), "unexpected entry count"
     disassembly = run([str(objdump), "--disassemble", "--no-show-raw-insn", str(path)])
+    symbols = run([str(objdump), "--syms", str(path)])
+    access_labels = {}
+    for name in NOFAULT_ACCESS:
+        label = re.search(rf"^([0-9a-f]+).*\b__zero_os_usercopy_{name}_access$", symbols, re.M)
+        assert label, f"{name}: no-fault access label __zero_os_usercopy_{name}_access missing"
+        access_labels[name] = int(label.group(1), 16)
     instructions = {int(match.group(1), 16): match.group(2).strip()
                     for match in re.finditer(r"^\s*([0-9a-f]+):\s+(.*)$", disassembly, re.M)}
     for index, (name, opcode) in enumerate(EXPECTED.items()):
@@ -69,6 +78,8 @@ def verify_table(path, objdump):
         assert fixup in instructions, f"{name}: fixup RIP not an instruction boundary"
         actual = text[fault - text_base:fault - text_base + len(opcode)]
         assert actual == opcode, f"{name}: table points to {actual.hex()}, expected {opcode.hex()}"
+        if name in access_labels:
+            assert access_labels[name] == fault, f"{name}: no-fault access label is not the table RIP"
         print(f"{name}: table RIP == disassembled memory instruction ({instructions[fault]})")
 
 
@@ -119,6 +130,18 @@ def main():
             print("KSA-002: original misplaced-label mutation rejected")
         else:
             raise AssertionError("original misplaced label unexpectedly passed")
+        # TD-USERCOPY-1: a no-fault label moved off the access instruction.
+        label = "    .global __zero_os_usercopy_cmpxchg_u32_access\n__zero_os_usercopy_cmpxchg_u32_access:\n"
+        moved = assembly.replace(label, "").replace(
+            "    mov eax, esi\n.Lcmpxchg_u32_access:", label + "    mov eax, esi\n.Lcmpxchg_u32_access:")
+        assert moved != assembly and moved.count(label) == 1, "label mutation did not apply"
+        try:
+            verify_table(build_elf(moved, directory, rustc, linker, "moved_label"), objdump)
+        except AssertionError as error:
+            assert "cmpxchg_u32: no-fault access label is not the table RIP" in str(error), str(error)
+            print("TD-USERCOPY-1: misplaced no-fault label rejected")
+        else:
+            raise AssertionError("misplaced no-fault label unexpectedly passed")
         if options.runtime:
             assert platform.system() == "Linux" and platform.machine() == "x86_64"
             compiler = shutil.which("cc")

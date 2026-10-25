@@ -1214,10 +1214,10 @@ extern "x86-interrupt" fn page_fault_handler(
     // exception-table fixup at once. The futex code drops its locks, faults
     // the page in and retries, so the COW and demand paths below (PT_LOCK,
     // frame allocation, TLB-shootdown waits) never run under a futex lock.
+    let fault_ip = stack_frame.instruction_pointer.as_u64() as usize;
     if !error_code.contains(PageFaultErrorCode::USER_MODE)
-        && usercopy::nofault_usercopy_fault(fault_addr)
+        && usercopy::nofault_usercopy_fault(fault_addr, fault_ip)
     {
-        let fault_ip = stack_frame.instruction_pointer.as_u64() as usize;
         if let Some(fixup_ip) = exception_table::lookup(fault_ip) {
             unsafe {
                 stack_frame.as_mut().update(|frame| {
