@@ -295,6 +295,11 @@ pub extern "C" fn _start() -> ! {
     // TD-LSM-1: LSM policy denial and missing-subject arms at six hook sites.
     test_lsm_denial_oracle(&mut results);
 
+    // R192-RES-3: an unusable mmap hint falls back, MAP_FIXED_NOREPLACE places
+    // exactly or refuses, MAP_FIXED stays rejected. Addresses in a 16 GiB block;
+    // everything it maps is unmapped again.
+    test_mmap_placement_contract(&mut results);
+
     // R192-RES-2: every eager population site in bounded holds, and the boot-armed
     // injected failure's rollback. Auto-placed mappings only, freed before the next.
     test_bounded_population(&mut results);
@@ -3226,15 +3231,13 @@ unsafe fn lsm_oracle_arms(stat_fd: u64, page: usize) -> Result<(), (&'static str
             };
             raw_exit(SYS_EXIT, code);
         }
-        let mut status: i32 = 0;
-        let waited = sys_wait(&mut status as *mut i32);
-        if is_error(waited) || waited != child {
+        // By pid: a child another leg left behind must not be taken for ours.
+        let Some(code) = reap_pid(child) else {
             return Err(("wait", 0));
-        }
+        };
         if syscall2(SYS_PRCTL, PR_SYSCALL_TEST_LSM_MARK, LSM_ARM_NONE) != 0 {
             return Err(("clear the LSM marks", 0));
         }
-        let code = ((status >> 8) & 0xff) as u64;
         if code != LSM_ALL_CALLS {
             return Err((arm, code));
         }
@@ -3279,6 +3282,280 @@ unsafe fn lsm_oracle_calls(control: bool, stat_fd: u64, page: usize) -> u64 {
     .iter()
     .enumerate()
     .fold(0, |mask, (bit, ok)| mask | ((*ok as u64) << bit))
+}
+
+// ---------------------------------------------------------------------------
+// R192-RES-3: the mmap placement contract. A non-zero address without a FIXED
+// flag is a hint: used when its range is free, otherwise the mapping is placed
+// automatically. MAP_FIXED_NOREPLACE maps exactly or fails (EEXIST when taken,
+// EPERM below MMAP_MIN_ADDR, ENOMEM past the top, EINVAL unaligned) and never
+// replaces anything. MAP_FIXED is still EOPNOTSUPP.
+// ---------------------------------------------------------------------------
+
+const MAP_FIXED: u64 = 0x10;
+const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+const EEXIST: i32 = 17;
+/// Below the randomized automatic base (64 GiB) and clear of the other legs'
+/// fixed addresses (R192 probes below 4 GiB, its free hint at 32 GiB).
+const PLACEMENT_BASE: usize = 0x4_0000_0000;
+const PLACEMENT_USER_TOP: usize = 0x0000_8000_0000_0000;
+const PLACEMENT_MIN_ADDR: usize = 0x1_0000;
+const PLACEMENT_SHARED_WORD: u64 = 0x5245_5333_5348_5244;
+
+fn test_mmap_placement_contract(results: &mut TestResult) {
+    print("Testing the mmap placement contract... ");
+    let name = "mmap: an unusable hint is placed elsewhere, MAP_FIXED_NOREPLACE maps exactly or refuses without replacing, MAP_FIXED stays rejected";
+    match unsafe { mmap_placement_contract() } {
+        Ok(()) => results.pass(name),
+        Err(reason) => {
+            print("  placement leg: ");
+            println(reason);
+            results.fail(name);
+        }
+    }
+}
+
+unsafe fn mmap_raw(addr: usize, len: usize, flags: u64) -> i64 {
+    syscall6(
+        SYS_MMAP,
+        addr as u64,
+        len as u64,
+        PROT_READ | PROT_WRITE,
+        flags,
+        u64::MAX,
+        0,
+    ) as i64
+}
+
+/// A hint at `hint` that cannot be used: the mapping must land at another
+/// aligned address at or above the minimum, clear of `[lo, hi)`. Unmapped.
+unsafe fn expect_hint_fallback(
+    hint: usize,
+    len: usize,
+    lo: usize,
+    hi: usize,
+    what: &'static str,
+) -> Result<(), &'static str> {
+    let got = mmap_raw(hint, len, MAP_PRIVATE | MAP_ANONYMOUS);
+    if got < 0 {
+        return Err(what);
+    }
+    let got = got as usize;
+    let placed_elsewhere = got != hint & !0xfff
+        && got & 0xfff == 0
+        && got >= PLACEMENT_MIN_ADDR
+        && got
+            .checked_add(len)
+            .is_some_and(|end| end <= PLACEMENT_USER_TOP)
+        && (got >= hi || got + len <= lo);
+    if munmap(got, len) != 0 || !placed_elsewhere {
+        return Err(what);
+    }
+    Ok(())
+}
+
+/// `MAP_FIXED_NOREPLACE` at `addr` must fail with `errno` and map nothing.
+unsafe fn expect_exact_refused(
+    addr: usize,
+    len: usize,
+    errno: i32,
+    what: &'static str,
+) -> Result<(), &'static str> {
+    let got = mmap_raw(addr, len, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE);
+    if err_of(got) != errno {
+        if got >= 0 {
+            munmap(got as usize, len);
+        }
+        return Err(what);
+    }
+    Ok(())
+}
+
+unsafe fn mmap_placement_contract() -> Result<(), &'static str> {
+    let private = MAP_PRIVATE | MAP_ANONYMOUS;
+    let exact = private | MAP_FIXED_NOREPLACE;
+    let a = PLACEMENT_BASE;
+    let len = 2 * PAGE;
+    if mmap_raw(a, len, exact) != a as i64 {
+        return Err("MAP_FIXED_NOREPLACE at a free address");
+    }
+    fill_pattern(a, len);
+    let result = placement_around(a, len);
+    let kept = pattern_holds(a, len);
+    if munmap(a, len) != 0 {
+        return Err("munmap of the exact mapping");
+    }
+    result?;
+    if !kept {
+        return Err("a refused or placed-elsewhere request changed the occupant");
+    }
+    placement_free_ranges()?;
+    placement_shared_exact()
+}
+
+/// With `[a, a + len)` mapped: occupied, stack, image, low and high requests.
+unsafe fn placement_around(a: usize, len: usize) -> Result<(), &'static str> {
+    expect_exact_refused(
+        a,
+        len,
+        EEXIST,
+        "MAP_FIXED_NOREPLACE over a mapping was not EEXIST",
+    )?;
+    expect_exact_refused(
+        a + PAGE,
+        len,
+        EEXIST,
+        "MAP_FIXED_NOREPLACE over a mapping's tail was not EEXIST",
+    )?;
+    expect_exact_refused(
+        a - PAGE,
+        len,
+        EEXIST,
+        "MAP_FIXED_NOREPLACE over a mapping's head was not EEXIST",
+    )?;
+    expect_hint_fallback(
+        a,
+        PAGE,
+        a,
+        a + len,
+        "an occupied hint was not placed elsewhere",
+    )?;
+    expect_hint_fallback(
+        a + PAGE,
+        len,
+        a,
+        a + len,
+        "a partly occupied hint was not placed elsewhere",
+    )?;
+
+    let local = 0u64;
+    let stack = &local as *const u64 as usize & !0xfff;
+    expect_hint_fallback(
+        stack,
+        PAGE,
+        stack,
+        stack + PAGE,
+        "a hint in the stack window was not placed elsewhere",
+    )?;
+    expect_exact_refused(
+        stack,
+        PAGE,
+        EEXIST,
+        "MAP_FIXED_NOREPLACE in the stack window was not EEXIST",
+    )?;
+
+    let image = mmap_placement_contract as *const () as usize & !0xfff;
+    expect_hint_fallback(
+        image,
+        PAGE,
+        image,
+        image + PAGE,
+        "a hint over the program image was not placed elsewhere",
+    )?;
+    expect_exact_refused(
+        image,
+        PAGE,
+        EEXIST,
+        "MAP_FIXED_NOREPLACE over the program image was not EEXIST",
+    )?;
+
+    expect_hint_fallback(
+        0x1000,
+        PAGE,
+        0,
+        PLACEMENT_MIN_ADDR,
+        "a hint below MMAP_MIN_ADDR was not placed elsewhere",
+    )?;
+    expect_exact_refused(
+        0x1000,
+        PAGE,
+        EPERM,
+        "MAP_FIXED_NOREPLACE below MMAP_MIN_ADDR was not EPERM",
+    )?;
+    expect_exact_refused(0, PAGE, EPERM, "MAP_FIXED_NOREPLACE at 0 was not EPERM")?;
+
+    let high = PLACEMENT_USER_TOP - PAGE;
+    expect_hint_fallback(
+        high,
+        2 * PAGE,
+        high,
+        PLACEMENT_USER_TOP,
+        "a hint past the top was not placed elsewhere",
+    )?;
+    expect_exact_refused(
+        high,
+        2 * PAGE,
+        ENOMEM,
+        "MAP_FIXED_NOREPLACE past the top was not ENOMEM",
+    )
+}
+
+/// Free ranges: an unaligned hint, an unaligned exact request, MAP_FIXED.
+unsafe fn placement_free_ranges() -> Result<(), &'static str> {
+    let private = MAP_PRIVATE | MAP_ANONYMOUS;
+    let free = PLACEMENT_BASE + 0x10_0000;
+    if mmap_raw(free + 0x123, PAGE, private) != free as i64 {
+        return Err("an unaligned free hint was not mapped at its page");
+    }
+    if munmap(free, PAGE) != 0 {
+        return Err("munmap of the unaligned hint's page");
+    }
+    expect_exact_refused(
+        free + 0x123,
+        PAGE,
+        EINVAL,
+        "an unaligned MAP_FIXED_NOREPLACE was not EINVAL",
+    )?;
+
+    let fixed = PLACEMENT_BASE + 0x20_0000;
+    for flags in [
+        private | MAP_FIXED,
+        private | MAP_FIXED | MAP_FIXED_NOREPLACE,
+    ] {
+        let got = mmap_raw(fixed, PAGE, flags);
+        if err_of(got) != EOPNOTSUPP {
+            if got >= 0 {
+                munmap(got as usize, PAGE);
+            }
+            return Err("MAP_FIXED was not EOPNOTSUPP");
+        }
+    }
+    // Nothing was mapped: the exact request for the same page succeeds.
+    if mmap_raw(fixed, PAGE, private | MAP_FIXED_NOREPLACE) != fixed as i64 {
+        return Err("MAP_FIXED left something behind");
+    }
+    if munmap(fixed, PAGE) != 0 {
+        return Err("munmap after the MAP_FIXED checks");
+    }
+    Ok(())
+}
+
+/// A shared exact mapping is shared: a fork child's write reaches the parent.
+unsafe fn placement_shared_exact() -> Result<(), &'static str> {
+    let shared = PLACEMENT_BASE + 0x30_0000;
+    let flags = MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
+    if mmap_raw(shared, PAGE, flags) != shared as i64 {
+        return Err("shared MAP_FIXED_NOREPLACE at a free address");
+    }
+    core::ptr::write_volatile(shared as *mut u64, 0);
+    let child = sys_fork();
+    if is_error(child) {
+        munmap(shared, PAGE);
+        return Err("fork for the shared exact mapping");
+    }
+    if child == 0 {
+        core::ptr::write_volatile(shared as *mut u64, PLACEMENT_SHARED_WORD);
+        raw_exit(SYS_EXIT, 0);
+    }
+    let reaped = reap_pid(child);
+    let seen = core::ptr::read_volatile(shared as *const u64);
+    if munmap(shared, PAGE) != 0 {
+        return Err("munmap of the shared exact mapping");
+    }
+    if reaped != Some(0) || seen != PLACEMENT_SHARED_WORD {
+        return Err("a shared MAP_FIXED_NOREPLACE mapping was not shared with the fork child");
+    }
+    Ok(())
 }
 
 /// Thread entry: record the identity the kernel reports, then leave the

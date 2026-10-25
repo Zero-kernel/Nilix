@@ -1641,6 +1641,12 @@ pub fn hook_file_umount(task: &ProcessCtx, target_hash: u64, flags: u64) -> LsmR
 ///
 /// This hook is called for memory mappings not backed by a file.
 /// Policies can use this to enforce W^X or other memory protection rules.
+///
+/// `addr` and `flags` are the request, checked before placement: with
+/// `MAP_FIXED_NOREPLACE` (`0x100000` in `flags`) the mapping lands exactly at
+/// `addr` or not at all, otherwise `addr` is a hint and the mapping may land
+/// elsewhere (R192-RES-3). The audit object records the requested address.
+/// (`mremap`'s call passes its final relocation address.)
 #[inline]
 pub fn hook_memory_mmap(
     task: &ProcessCtx,

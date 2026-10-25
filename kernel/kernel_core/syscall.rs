@@ -13798,22 +13798,40 @@ const PAGE_SIZE: usize = 0x1000;
 
 // ST-K2: mmap flag values and the supported private/shared-anonymous shapes.
 // Keep these values in one place so the syscall, its oracle, and the userspace
-// ABI agree on the fail-closed boundary. `addr != 0` remains a validated hint;
-// MAP_FIXED replacement is deliberately not enabled.
+// ABI agree on the fail-closed boundary. R192-RES-3: `addr != 0` is a hint
+// that falls back to automatic placement when it cannot be used, and
+// MAP_FIXED_NOREPLACE places exactly or fails; MAP_FIXED replacement is
+// deliberately not enabled, alone or combined.
 const MAP_SHARED: i32 = 0x01;
 const MAP_PRIVATE: i32 = 0x02;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANONYMOUS: i32 = 0x20;
+const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
 const MAP_SHARED_VALIDATE: i32 = 0x03;
 const SUPPORTED_MMAP_FLAGS: i32 = MAP_PRIVATE | MAP_ANONYMOUS;
 const SUPPORTED_SHARED_MMAP_FLAGS: i32 = MAP_SHARED | MAP_ANONYMOUS;
 
+/// The mapping a supported flag word asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MmapShape {
+    shared: bool,
+    /// `MAP_FIXED_NOREPLACE`: exactly at `addr`, or fail.
+    exact: bool,
+}
+
 #[inline]
-fn validate_mmap_flags(flags: i32) -> Result<(), SyscallError> {
-    if flags == SUPPORTED_MMAP_FLAGS || flags == SUPPORTED_SHARED_MMAP_FLAGS {
-        Ok(())
-    } else {
-        Err(SyscallError::EOPNOTSUPP)
+fn validate_mmap_flags(flags: i32) -> Result<MmapShape, SyscallError> {
+    let exact = flags & MAP_FIXED_NOREPLACE != 0;
+    match flags & !MAP_FIXED_NOREPLACE {
+        SUPPORTED_MMAP_FLAGS => Ok(MmapShape {
+            shared: false,
+            exact,
+        }),
+        SUPPORTED_SHARED_MMAP_FLAGS => Ok(MmapShape {
+            shared: true,
+            exact,
+        }),
+        _ => Err(SyscallError::EOPNOTSUPP),
     }
 }
 
@@ -13821,14 +13839,32 @@ fn validate_mmap_flags(flags: i32) -> Result<(), SyscallError> {
 /// The production path invokes the same validator after the LSM hook, before
 /// any address-space state is changed.
 pub fn run_mmap_flags_self_test() {
-    assert!(validate_mmap_flags(MAP_PRIVATE | MAP_ANONYMOUS).is_ok());
-    assert!(validate_mmap_flags(MAP_SHARED | MAP_ANONYMOUS).is_ok());
+    for (flags, shared, exact) in [
+        (MAP_PRIVATE | MAP_ANONYMOUS, false, false),
+        (MAP_SHARED | MAP_ANONYMOUS, true, false),
+        (
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+            false,
+            true,
+        ),
+        (MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, true, true),
+    ] {
+        assert_eq!(
+            validate_mmap_flags(flags),
+            Ok(MmapShape { shared, exact }),
+            "supported mmap flags: {flags:#x}"
+        );
+    }
     for flags in [
         0,
         MAP_PRIVATE,
         MAP_SHARED,
         MAP_SHARED_VALIDATE,
+        MAP_FIXED_NOREPLACE,
+        MAP_PRIVATE | MAP_FIXED_NOREPLACE,
         MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+        MAP_SHARED | MAP_FIXED | MAP_ANONYMOUS,
+        MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
         MAP_PRIVATE | MAP_ANONYMOUS | 0x4000,
         -1,
     ] {
@@ -13838,8 +13874,31 @@ pub fn run_mmap_flags_self_test() {
             "unsupported mmap flags must fail closed: {flags:#x}"
         );
     }
-    // A non-zero address remains a hint; MAP_FIXED replacement is still outside
-    // the supported set. Address checks stay in sys_mmap's transaction.
+    // R192-RES-3: what each placement arm does with a range it cannot use.
+    use MmapRangeError::{BelowMin, Corrupt, Occupied, PastTop, Unaligned};
+    for (arm, error, expected) in [
+        (MmapArm::Auto, PastTop, Some(SyscallError::EFAULT)),
+        (MmapArm::Auto, Unaligned, Some(SyscallError::EINVAL)),
+        (MmapArm::Auto, BelowMin, Some(SyscallError::EPERM)),
+        (MmapArm::Auto, Occupied, Some(SyscallError::EINVAL)),
+        (MmapArm::Auto, Corrupt, Some(SyscallError::EFAULT)),
+        (MmapArm::Hint, PastTop, None),
+        (MmapArm::Hint, Unaligned, None),
+        (MmapArm::Hint, BelowMin, None),
+        (MmapArm::Hint, Occupied, None),
+        (MmapArm::Hint, Corrupt, Some(SyscallError::EFAULT)),
+        (MmapArm::Exact, PastTop, Some(SyscallError::ENOMEM)),
+        (MmapArm::Exact, Unaligned, Some(SyscallError::EINVAL)),
+        (MmapArm::Exact, BelowMin, Some(SyscallError::EPERM)),
+        (MmapArm::Exact, Occupied, Some(SyscallError::EEXIST)),
+        (MmapArm::Exact, Corrupt, Some(SyscallError::EFAULT)),
+    ] {
+        assert_eq!(
+            mmap_range_errno(arm, error),
+            expected,
+            "{arm:?} placement of a {error:?} range"
+        );
+    }
     assert_ne!(MAP_FIXED, 0);
 }
 
@@ -16319,6 +16378,139 @@ fn resolve_auto_mmap_base(
     }
 }
 
+/// R192-RES-3: how `sys_mmap` chooses its address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MmapArm {
+    /// `addr == 0`: the bump pointer `next_mmap_addr`.
+    Auto,
+    /// `addr != 0` without `MAP_FIXED_NOREPLACE`: try the hint's page, else
+    /// place automatically.
+    Hint,
+    /// `MAP_FIXED_NOREPLACE`: exactly `addr`, never replacing anything.
+    Exact,
+}
+
+/// R192-RES-3: why `[base, base + len)` cannot take a new mapping, in the
+/// order Linux checks a fixed address (`__get_unmapped_area`, then the
+/// `MAP_FIXED_NOREPLACE` overlap in `do_mmap`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MmapRangeError {
+    /// The end overflows or passes `USER_SPACE_TOP`.
+    PastTop,
+    Unaligned,
+    /// Below `MMAP_MIN_ADDR`.
+    BelowMin,
+    /// The stack window, a VMA (pending ones too), an in-flight `brk` grow
+    /// or an untracked translation.
+    Occupied,
+    /// A VMA record whose end overflows: never a fallback.
+    Corrupt,
+}
+
+/// R192-RES-3: the errno of an arm whose candidate failed, or `None` when a
+/// hint falls back to automatic placement. Pure, so the boot oracle pins it.
+fn mmap_range_errno(arm: MmapArm, error: MmapRangeError) -> Option<SyscallError> {
+    use MmapRangeError::{BelowMin, Corrupt, Occupied, PastTop, Unaligned};
+    Some(match (arm, error) {
+        (_, Corrupt) => SyscallError::EFAULT,
+        (MmapArm::Hint, _) => return None,
+        // The automatic arm's errors predate R192-RES-3 (Linux: ENOMEM for no room).
+        (MmapArm::Auto, PastTop) => SyscallError::EFAULT,
+        (MmapArm::Auto, BelowMin) => SyscallError::EPERM,
+        (MmapArm::Auto, Unaligned | Occupied) => SyscallError::EINVAL,
+        (MmapArm::Exact, PastTop) => SyscallError::ENOMEM,
+        (MmapArm::Exact, Unaligned) => SyscallError::EINVAL,
+        (MmapArm::Exact, BelowMin) => SyscallError::EPERM,
+        (MmapArm::Exact, Occupied) => SyscallError::EEXIST,
+    })
+}
+
+/// The automatic arm's candidate: the bump pointer, page aligned, at least
+/// `MMAP_MIN_ADDR` (R65-11), moved past the reserved stack window.
+fn auto_mmap_base(mm: &crate::process::MmState, length: usize) -> Result<usize, SyscallError> {
+    let candidate = mm
+        .next_mmap_addr
+        .checked_add(0xfff)
+        .ok_or(SyscallError::EINVAL)?
+        & !0xfff;
+    let candidate = candidate.max(crate::usercopy::MMAP_MIN_ADDR);
+    // M0-7 slice 2 (SLICE 1): auto-placement must SKIP the reserved stack window,
+    // not fail INSIDE it. A single large PROT_NONE reservation (no RAM, no cgroup
+    // charge) can advance next_mmap_addr up to the window base in ONE VMA (Codex
+    // impl-diff: reachable, not the theoretical 128-TiB case), so without this a
+    // later small auto-mmap would get a FALSE ENOMEM while the tail gap
+    // [USER_STACK_TOP, USER_SPACE_TOP) is still free. Jump past the window; an
+    // over-large request is still rejected by the USER_SPACE_TOP check.
+    let (win_start, win_end) = crate::elf_loader::user_mapping_reserved_window();
+    Ok(resolve_auto_mmap_base(
+        candidate, length, win_start, win_end,
+    ))
+}
+
+/// R192-RES-3: whether `[base, base + len)` can take a new mapping; its end.
+/// Called under the `MmState` lock of Phase 1, so the answer holds until the
+/// caller's `PENDING_MAP` insert.
+fn check_mmap_range(
+    mm: &crate::process::MmState,
+    base: usize,
+    len: usize,
+) -> Result<usize, MmapRangeError> {
+    let end = base
+        .checked_add(len)
+        .filter(|&end| end <= USER_SPACE_TOP)
+        .ok_or(MmapRangeError::PastTop)?;
+    if base & 0xfff != 0 {
+        return Err(MmapRangeError::Unaligned);
+    }
+    // R65-11 FIX: no mapping below MMAP_MIN_ADDR (NULL dereference exploitation).
+    if base < crate::usercopy::MMAP_MIN_ADDR {
+        return Err(MmapRangeError::BelowMin);
+    }
+
+    // M0-7 slice 2 (SLICE 1): the reserved user-stack window [stack_base,
+    // USER_STACK_TOP) (guard-INCLUSIVE) is the "third door": USER_SPACE_TOP lies
+    // 0x1FFFE000 ABOVE it, and the stack is NEVER in `mmap_regions` (that would
+    // make free_address_space/munmap double-free it, R123-1). A mapping there
+    // would alias the stack. Half-open intersection with a fixed VA range
+    // (TOCTOU-free); the automatic candidate has already skipped it.
+    let (win_start, win_end) = crate::elf_loader::user_mapping_reserved_window();
+    if base < win_end && end > win_start {
+        return Err(MmapRangeError::Occupied);
+    }
+
+    // Existing mappings; pending entries count as occupied.
+    for (&region_base, &region_len_with_flags) in mm.mmap_regions.iter() {
+        let region_end = region_base
+            .checked_add(mmap_region_len(region_len_with_flags))
+            .ok_or(MmapRangeError::Corrupt)?;
+        if base < region_end && end > region_base {
+            return Err(MmapRangeError::Occupied);
+        }
+    }
+
+    // R172-16: a sibling sys_brk grow on this shared MmState (CLONE_VM /
+    // CLONE_THREAD) reserves its in-flight [old_top, new_top) heap-grow range
+    // while it drops the MmState lock for page-table work; a mapping there
+    // would be adopted into the heap. Inactive ⇔ lo == hi.
+    if mm.brk_grow_resv_lo < mm.brk_grow_resv_hi
+        && base < mm.brk_grow_resv_hi
+        && end > mm.brk_grow_resv_lo
+    {
+        return Err(MmapRangeError::Occupied);
+    }
+
+    // R192-2 FIX (D0-ISO-1) + LEAD-MMAP-OWN-1: nothing in mmap_regions records
+    // the ELF image or the committed heap. A VMA over either would let
+    // munmap/mprotect/mremap/exit treat those pages as this mapping's (a
+    // PROT_NONE reservation followed by munmap removed the task's own text). The
+    // checks above passed, so any translation in the range belongs to one of
+    // them. Lock-free walk (see `first_occupied_user_page`).
+    if mm::page_table::first_occupied_user_page(base as u64, len as u64).is_some() {
+        return Err(MmapRangeError::Occupied);
+    }
+    Ok(end)
+}
+
 /// M0-7 slice 2 (SLICE 1) self-test: pin the third-door stack-window exclusion logic used
 /// by `sys_mmap` (half-open `[base,end)` intersection) and `sys_brk` (`page_align_up(addr)
 /// > window_start`). PURE — it exercises the SAME `user_stack_window()` const + the SAME
@@ -16537,13 +16729,16 @@ fn sys_mmap(
     // This includes MAP_SHARED without MAP_ANONYMOUS, MAP_SHARED_VALIDATE,
     // MAP_FIXED, missing MAP_ANONYMOUS, and unknown bits. The check is before
     // any VMA/cgroup/page-table mutation and after the LSM hook above.
-    if let Err(error) = validate_mmap_flags(flags) {
-        #[cfg(feature = "kcov")]
-        {
-            coverage::trace_pc(1052); // sys_mmap unsupported flags
+    let shape = match validate_mmap_flags(flags) {
+        Ok(shape) => shape,
+        Err(error) => {
+            #[cfg(feature = "kcov")]
+            {
+                coverage::trace_pc(1052); // sys_mmap unsupported flags
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
 
     // File-backed mappings remain outside this phase even when the flag word is
     // otherwise valid.  Keep the stable EOPNOTSUPP boundary after LSM/flags.
@@ -16555,7 +16750,7 @@ fn sys_mmap(
         return Err(SyscallError::EOPNOTSUPP);
     }
 
-    let is_shared = flags == SUPPORTED_SHARED_MMAP_FLAGS;
+    let is_shared = shape.shared;
 
     #[cfg(feature = "kcov")]
     {
@@ -16599,10 +16794,16 @@ fn sys_mmap(
     // Phase 2 (no Process lock): populate through EagerPopulator, whose bounded
     //   with_current_manager() holds acquire PT_LOCK (R192-RES-2).
     // Phase 3 (Process lock): commit (clear pending flag), or rollback on failure.
-    let update_next = addr == 0;
+    let arm = if shape.exact {
+        MmapArm::Exact
+    } else if addr == 0 {
+        MmapArm::Auto
+    } else {
+        MmapArm::Hint
+    };
 
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
-    let (base, end, cgroup_id, old_next_mmap_addr, mm_arc, shared_region) = {
+    let (base, end, update_next, cgroup_id, old_next_mmap_addr, mm_arc, shared_region) = {
         let mut proc = process.lock();
         let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
@@ -16611,79 +16812,11 @@ fn sys_mmap(
             return Err(SyscallError::EAGAIN);
         }
 
-        // 选择起始虚拟地址（使用 checked_add 防止溢出）
-        // R65-11 FIX: Ensure auto-selected address is at least MMAP_MIN_ADDR
-        let base = if addr == 0 {
-            let candidate = mm
-                .next_mmap_addr
-                .checked_add(0xfff)
-                .ok_or(SyscallError::EINVAL)?
-                & !0xfff;
-            // Ensure we don't auto-select addresses below MMAP_MIN_ADDR
-            let candidate = if candidate < crate::usercopy::MMAP_MIN_ADDR {
-                crate::usercopy::MMAP_MIN_ADDR
-            } else {
-                candidate
-            };
-            // M0-7 slice 2 (SLICE 1): auto-placement must SKIP the reserved stack window,
-            // not fail INSIDE it. A single large PROT_NONE reservation (no RAM, no cgroup
-            // charge) can advance next_mmap_addr up to the window base in ONE VMA (Codex
-            // impl-diff: reachable, not the theoretical 128-TiB case), so without this a
-            // later small auto-mmap would get a FALSE ENOMEM while the tail gap
-            // [USER_STACK_TOP, USER_SPACE_TOP) is still free. Jump past the window; an
-            // over-large request is still rejected by the USER_SPACE_TOP check below.
-            let (win_start, win_end) = crate::elf_loader::user_mapping_reserved_window();
-            resolve_auto_mmap_base(candidate, length_aligned, win_start, win_end)
-        } else {
-            addr
-        };
-
-        // 检查地址对齐
-        if base & 0xfff != 0 {
-            return Err(SyscallError::EINVAL);
-        }
-
-        // R65-11 FIX: Reject mappings below MMAP_MIN_ADDR to prevent NULL dereference exploitation
-        if base < crate::usercopy::MMAP_MIN_ADDR {
-            return Err(SyscallError::EPERM);
-        }
-
-        // 计算结束地址并检查用户空间边界
-        let end = base
-            .checked_add(length_aligned)
-            .ok_or(SyscallError::EFAULT)?;
-
-        if end > USER_SPACE_TOP {
-            return Err(SyscallError::EFAULT);
-        }
-
-        // M0-7 slice 2 (SLICE 1): reject any mapping that intersects the reserved
-        // user-stack window [stack_base, USER_STACK_TOP) (guard-INCLUSIVE). This is the
-        // "third door": the checks above bound only on USER_SPACE_TOP (0x1FFFE000 ABOVE
-        // the window) and the overlap loop below scans only `mmap_regions` (the stack is
-        // NEVER inserted there — that would make free_address_space/munmap double-free it,
-        // R123-1), so a hinted OR MAP_FIXED mmap can currently land inside the stack window
-        // and alias it (and, once demand-grow lands, let a stack fault grow over an
-        // existing mapping). `base` here is the FINAL resolved address for BOTH the
-        // auto-select and the fixed arm, so this single half-open test covers both. The
-        // static architectural-constant check is TOCTOU-free (the window is a fixed VA
-        // range, not `mmap_regions` state).
-        {
-            // M0-7 slice 2 (SLICE 1): reject a user-specified FIXED/hinted address whose
-            // [base,end) intersects the reserved user-stack window [stack_base,
-            // USER_STACK_TOP) (guard-INCLUSIVE) — an invalid address (EINVAL). The
-            // auto-placement arm (addr==0) cannot reach this: `resolve_auto_mmap_base`
-            // already skipped the window above, so `base` is either below win_start or at
-            // win_end (==USER_STACK_TOP, not `< win_end`). Half-open intersection test.
-            let (win_start, win_end) = crate::elf_loader::user_mapping_reserved_window();
-            if base < win_end && end > win_start {
-                return Err(SyscallError::EINVAL);
-            }
-        }
-
         // R130-1 FIX: Bound mmap_regions to prevent kernel heap exhaustion DoS.
         // Without this check, unlimited PROT_NONE (or normal) mmaps can grow
-        // the BTreeMap until alloc_error_handler panics the kernel.
+        // the BTreeMap until alloc_error_handler panics the kernel. R192-RES-3:
+        // checked before placement for every arm, as Linux checks map_count
+        // before choosing the address.
         if mm.mmap_regions.len() >= MAX_MAP_COUNT {
             // ST-K3 Phase D: permanent debug-build site tag (E1). No addresses,
             // no data beyond the requested size — R159-17 gating style.
@@ -16696,42 +16829,43 @@ fn sys_mmap(
             return Err(SyscallError::ENOMEM);
         }
 
-        // 检查与现有映射的重叠（pending entries also count as occupied）
-        for (&region_base, &region_len_with_flags) in mm.mmap_regions.iter() {
-            let region_len = mmap_region_len(region_len_with_flags);
-            let region_end = region_base
-                .checked_add(region_len)
-                .ok_or(SyscallError::EFAULT)?;
-            if base < region_end && end > region_base {
-                return Err(SyscallError::EINVAL);
+        // R192-RES-3: place the mapping. A hint is tried at its page (rounded
+        // down, as Linux's round_hint_to_min) and, when that range is unusable,
+        // the mapping is placed automatically instead; MAP_FIXED_NOREPLACE
+        // takes exactly `addr` or fails without touching anything. Only the
+        // automatic placement moves the bump pointer in this phase.
+        let first = match arm {
+            MmapArm::Auto => auto_mmap_base(&mm, length_aligned)?,
+            MmapArm::Hint => addr & !0xfff,
+            MmapArm::Exact => addr,
+        };
+        let (base, end, update_next) = match check_mmap_range(&mm, first, length_aligned) {
+            Ok(end) => {
+                #[cfg(feature = "kcov")]
+                if arm == MmapArm::Exact {
+                    coverage::trace_pc(1056); // sys_mmap exact placement
+                }
+                (first, end, arm == MmapArm::Auto)
             }
-        }
-
-        // R172-16: a sibling sys_brk grow on this shared MmState (CLONE_VM / CLONE_THREAD)
-        // reserves its in-flight [old_top, new_top) heap-grow VA range here while it drops
-        // the MmState lock for page-table work. Reject any mmap intersecting that window
-        // (EINVAL, matching the existing-region and stack-window arms) so the brk grow
-        // cannot silently adopt this mapping's page into the heap. Read under this same
-        // Phase-1 MmState lock as a fixed VA range (TOCTOU-free); inactive ⇔ lo == hi.
-        if mm.brk_grow_resv_lo < mm.brk_grow_resv_hi
-            && base < mm.brk_grow_resv_hi
-            && end > mm.brk_grow_resv_lo
-        {
-            return Err(SyscallError::EINVAL);
-        }
-
-        // R192-2 FIX (D0-ISO-1) + LEAD-MMAP-OWN-1: nothing in mmap_regions
-        // records the ELF image or the committed heap (nor, before Approach A,
-        // the low identity map that every user address space carried). A VMA
-        // over any of them would let munmap/mprotect/mremap/exit treat those
-        // pages as this mapping's (a PROT_NONE reservation followed by munmap
-        // removed the shared framebuffer leaves, or the task's own text). The
-        // overlap checks above passed, so any translation in the range belongs
-        // to one of them: reject it with the EINVAL of the other occupied-range
-        // arms. Lock-free walk (see `first_occupied_user_page`).
-        if mm::page_table::first_occupied_user_page(base as u64, length_aligned as u64).is_some() {
-            return Err(SyscallError::EINVAL);
-        }
+            Err(error) => {
+                if let Some(errno) = mmap_range_errno(arm, error) {
+                    #[cfg(feature = "kcov")]
+                    if arm == MmapArm::Exact {
+                        coverage::trace_pc(1057); // sys_mmap exact placement refused
+                    }
+                    return Err(errno);
+                }
+                #[cfg(feature = "kcov")]
+                {
+                    coverage::trace_pc(1055); // sys_mmap hint fallback
+                }
+                let base = auto_mmap_base(&mm, length_aligned)?;
+                let end = check_mmap_range(&mm, base, length_aligned).map_err(|error| {
+                    mmap_range_errno(MmapArm::Auto, error).unwrap_or(SyscallError::EINVAL)
+                })?;
+                (base, end, true)
+            }
+        };
 
         // ST-K2-P2: shared mappings reserve only bounded region metadata here;
         // their DATA charge is taken by the first page fault.  Private mappings
@@ -16827,6 +16961,7 @@ fn sys_mmap(
         (
             base,
             end,
+            update_next,
             cgroup_id,
             old_next_mmap_addr,
             mm_arc,

@@ -99,6 +99,7 @@ futex PI: a dead non-robust owner hands the lock to its waiter with OWNER_DIED
 futex PI: a word naming a task of another address space is EPERM for LOCK_PI and CMP_REQUEUE_PI; a CLONE_VM owner still attaches
 /proc/schedstat reports per-CPU switches and migrations and the RCU backlog
 LSM denial and missing-subject arms fail closed at exec, kill, get_robust_list, mmap, mprotect and fstat
+mmap: an unusable hint is placed elsewhere, MAP_FIXED_NOREPLACE maps exactly or refuses without replacing, MAP_FIXED stays rejected
 R192-RES-2: 64 MiB brk, mmap, mprotect and mremap populate in bounded holds; an injected failure rolls back to the baseline charge
 mremap relocation keeps the moved frames: relocated data survives a 32 MiB allocation
 KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them

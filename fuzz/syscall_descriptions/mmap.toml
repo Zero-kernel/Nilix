@@ -47,6 +47,7 @@ constraints = [
         "MAP_PRIVATE",   # 0x02
         "MAP_FIXED",     # 0x10
         "MAP_ANONYMOUS", # 0x20
+        "MAP_FIXED_NOREPLACE", # 0x100000 (R192-RES-3: exact or EEXIST; MAP_FIXED is EOPNOTSUPP)
     ]},
     { type = "required_one_of", values = ["MAP_SHARED", "MAP_PRIVATE"] },
 ]
@@ -72,7 +73,7 @@ constraints = [
 # Return value specification
 [syscall.returns]
 success = { type = "ptr", range = [4096, 0xFFFFFFFFFFFF] }
-error = { type = "errno", values = ["ENOMEM", "EBADF", "EINVAL", "EACCES", "EOVERFLOW"] }
+error = { type = "errno", values = ["ENOMEM", "EBADF", "EINVAL", "EACCES", "EOVERFLOW", "EEXIST", "EPERM", "EOPNOTSUPP", "EFAULT"] }
 
 # Coverage hints: edges to instrument
 [syscall.coverage]
