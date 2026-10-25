@@ -916,7 +916,7 @@ pub(crate) const fn user_stack_layout() -> (usize, usize, usize, usize) {
 ///
 /// Returned as the half-open `(window_start, window_end)`. Consumed by the runtime
 /// stack-window exclusion in `sys_mmap` and `sys_brk` (the "third door": today both bound
-/// only on `USER_SPACE_TOP`, which is `0x1FFFE000` ABOVE the window, so a hinted/MAP_FIXED
+/// only on `USER_SPACE_TOP`, which is `0x2000` ABOVE the window, so a hinted/MAP_FIXED
 /// mmap or a brk grow can land INSIDE the reserved stack region and alias it). Routing both
 /// through this one const fn keeps the exclusion bound from drifting to `guard_top` (which
 /// would re-open `[stack_base, guard_top)` and the guard page itself to aliasing).

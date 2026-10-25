@@ -3578,7 +3578,11 @@ unsafe fn placement_around(a: usize, len: usize) -> Result<(), &'static str> {
 unsafe fn placement_free_ranges() -> Result<(), &'static str> {
     let private = MAP_PRIVATE | MAP_ANONYMOUS;
     let free = PLACEMENT_BASE + 0x10_0000;
-    if mmap_raw(free + 0x123, PAGE, private) != free as i64 {
+    let got = mmap_raw(free + 0x123, PAGE, private);
+    if got != free as i64 {
+        if got >= 0 {
+            munmap(got as usize, PAGE);
+        }
         return Err("an unaligned free hint was not mapped at its page");
     }
     if munmap(free, PAGE) != 0 {

@@ -14657,7 +14657,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
         }
         // M0-7 slice 2 (SLICE 1): a brk grow must never enter the reserved user-stack
         // window [stack_base, USER_STACK_TOP) (guard-INCLUSIVE). sys_brk previously bounded
-        // ONLY on USER_SPACE_TOP (0x1FFFE000 ABOVE the window) — runtime-blind to the stack
+        // ONLY on USER_SPACE_TOP (0x2000 ABOVE the window) — runtime-blind to the stack
         // ceiling the elf_loader OverlapWithStack segment guards already enforce. The
         // page-aligned new break (same `page_align_up(addr)` used to compute new_top below)
         // must not exceed the window base. Refusal contract: return the break UNCHANGED
@@ -16534,7 +16534,7 @@ fn check_mmap_range(
 
     // M0-7 slice 2 (SLICE 1): the reserved user-stack window [stack_base,
     // USER_STACK_TOP) (guard-INCLUSIVE) is the "third door": USER_SPACE_TOP lies
-    // 0x1FFFE000 ABOVE it, and the stack is NEVER in `mmap_regions` (that would
+    // 0x2000 ABOVE it, and the stack is NEVER in `mmap_regions` (that would
     // make free_address_space/munmap double-free it, R123-1). A mapping there
     // would alias the stack. Half-open intersection with a fixed VA range
     // (TOCTOU-free); the automatic candidate has already skipped it.
@@ -17695,12 +17695,13 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // relaxation, or any non-stack mmap_regions entry overlapping the window, would let
     // mprotect flip stack/guard PTEs to PROT_EXEC-only or PROT_NONE (the W^X reject below
     // blocks only literal W+X, not EXEC-only / PROT_NONE on the stack). Make stack/guard
-    // permission immutability STRUCTURAL via the SAME single-sourced half-open window and
-    // the SAME EINVAL the sys_mmap FIXED/hinted arm returns (an architecturally-reserved
-    // invalid VA, never a missing-mapping ENOMEM). TOCTOU-free (a fixed VA range, not
-    // mmap_regions state); `addr` is page-aligned and `end == addr + len_aligned`, both
-    // computed above; `len == 0` already returned Ok(0). Complementary to (not redundant
-    // with) the Phase-0 coverage<end ENOMEM gap-reject below.
+    // permission immutability STRUCTURAL via the SAME single-sourced half-open window
+    // sys_mmap refuses (its exact arm as occupied, a hint by falling back), with EINVAL:
+    // an architecturally-reserved invalid VA, never a missing-mapping ENOMEM. TOCTOU-free
+    // (a fixed VA range, not mmap_regions state); `addr` is page-aligned and
+    // `end == addr + len_aligned`, both computed above; `len == 0` already returned
+    // Ok(0). Complementary to (not redundant with) the Phase-0 coverage<end ENOMEM
+    // gap-reject below.
     {
         let (win_start, win_end) = crate::elf_loader::user_stack_window();
         if addr < win_end && end > win_start {
