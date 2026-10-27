@@ -75,8 +75,8 @@ pub use policy::{SyscallTestPolicy, SYSCALL_TEST_POLICY};
 /// TD-LSM-1: guest-oracle support, compiled only into `syscall_test` kernels.
 ///
 /// A child of the ring-3 oracle marks its own pid for one arm with the
-/// test-only `prctl` option [`PR_SYSCALL_TEST_LSM_MARK`]; the parent clears
-/// the marks after reaping it. The kernel has no `set*id` syscall, so the mark
+/// test-only `prctl` option [`PR_SYSCALL_TEST_LSM_MARK`]; task teardown clears
+/// its marks before PID reuse. The kernel has no `set*id` syscall, so the mark
 /// cannot be a credential; the child stays root, every DAC check in front of
 /// the LSM (`get_robust_list`'s cross-group check, the exec bit, `kill`) still
 /// passes, and only the LSM tells it apart.
@@ -117,6 +117,14 @@ pub mod syscall_test {
         Ok(())
     }
 
+    /// Clear only this exiting task's marks, before it can be reaped/reused.
+    /// A concurrent oracle may have marked a different task; preserve it.
+    pub fn clear_task(pid: ProcessId) {
+        for mark in [&DENY_PID, &NO_SUBJECT_PID, &LOST_SUBJECT_PID] {
+            let _ = mark.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
     /// Whether `SyscallTestPolicy` denies this subject.
     pub(crate) fn denied(pid: ProcessId) -> bool {
         pid != 0 && DENY_PID.load(Ordering::Acquire) == pid
@@ -153,6 +161,25 @@ pub mod syscall_test {
 
         /// The marks are global; the two tests below must not interleave.
         static MARKS: spin::Mutex<()> = spin::Mutex::new(());
+
+        #[test]
+        fn exiting_task_clears_marks_before_pid_reuse() {
+            let _marks = MARKS.lock();
+            mark(ARM_DENY, 41).unwrap();
+            mark(ARM_NO_SUBJECT, 41).unwrap();
+            note_syscall_entry(41);
+            clear_task(42);
+            assert!(denied(41) && no_subject(41));
+            clear_task(41);
+            assert!(!denied(41) && !no_subject(41));
+            assert_eq!(LOST_SUBJECT_PID.load(Ordering::Acquire), 0);
+            note_syscall_entry(41);
+            assert!(!take_lost_subject(41), "recycled PID starts unmarked");
+            mark(ARM_DENY, 42).unwrap();
+            clear_task(41);
+            assert!(denied(42), "another task's mark survives");
+            clear_task(42);
+        }
 
         #[test]
         fn td_lsm_1_lost_subject_is_one_lookup_per_marked_syscall() {

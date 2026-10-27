@@ -272,7 +272,17 @@ pub extern "C" fn _start() -> ! {
 
     // GAP-5 G8: group-wide wait, children of an exiting thread, getppid of a
     // thread's child, get_robust_list.
-    test_thread_group_children(&mut results);
+    // Compile-time opt-in for the audit's stochastic reproducer. Normal gates
+    // run once; NILIX_G8_REPEATS=300 also tests repeated fork/exit/PID lifetimes.
+    let g8_repeats = option_env!("NILIX_G8_REPEATS")
+        .unwrap_or("1")
+        .parse::<usize>()
+        .expect("NILIX_G8_REPEATS must be an integer");
+    assert!((1..=1000).contains(&g8_repeats));
+    for _ in 0..g8_repeats {
+        test_thread_group_children(&mut results);
+    }
+    test_cow_sibling_read(&mut results);
 
     // GAP-5 G8: /proc lists group leaders; /proc/<pid>/task lists members.
     test_proc_thread_listing(&mut results);
@@ -4841,6 +4851,154 @@ fn test_thread_group_children(results: &mut TestResult) {
         }
     }
     results.pass("a thread group shares its children: any thread waits for them and a dying thread hands them on");
+}
+
+// LEAD-G8-CHILDREN-SEGV-1: the writer pauses in the shared-COW resolver;
+// a sibling on CPU 1 invalidates its local TLB and reads the still-present
+// leaf before allowing the swap. The fork child retains the old frame.
+const PR_COW_TEST: u64 = 0x5a43_4f57;
+static COW_TEST_CONTROL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COW_TEST_DATA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const COW_TEST_OLD: u64 = 0x1234_5678;
+
+#[repr(C)]
+struct CowTestControl {
+    ready: core::sync::atomic::AtomicU32,
+    observed: core::sync::atomic::AtomicU32,
+    release: core::sync::atomic::AtomicU32,
+}
+
+unsafe fn cow_test_command(op: u64, addr: u64) -> u64 {
+    syscall3(SYS_PRCTL, PR_COW_TEST, op, addr)
+}
+
+fn cow_test_pin(mask: u64) -> bool {
+    unsafe { syscall3(203, 0, 8, &mask as *const u64 as u64) == 0 }
+}
+
+extern "C" fn cow_test_reader() -> ! {
+    use core::sync::atomic::Ordering;
+    let control = unsafe { &*(COW_TEST_CONTROL.load(Ordering::Acquire) as *const CowTestControl) };
+    if !cow_test_pin(2) {
+        control.ready.store(2, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    control.ready.store(1, Ordering::Release);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if unsafe { cow_test_command(2, 0) } == 3 {
+            let value = unsafe {
+                core::ptr::read_volatile(COW_TEST_DATA.load(Ordering::Acquire) as *const u64)
+            };
+            if value == COW_TEST_OLD && unsafe { cow_test_command(3, 0) } == 0 {
+                control.observed.store(1, Ordering::Release);
+            }
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn cow_sibling_read_leg() -> u64 {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    if !cow_test_pin(1) {
+        return 0xc0;
+    }
+    let shared = unsafe { mmap_anon(PAGE, true) };
+    let data = unsafe { mmap_anon(PAGE, false) };
+    if shared < 0 || data < 0 {
+        return 0xc1;
+    }
+    let control = unsafe {
+        let ptr = shared as *mut CowTestControl;
+        ptr.write(CowTestControl {
+            ready: AtomicU32::new(0),
+            observed: AtomicU32::new(0),
+            release: AtomicU32::new(0),
+        });
+        core::ptr::write_volatile(data as *mut u64, COW_TEST_OLD);
+        &*ptr
+    };
+    COW_TEST_CONTROL.store(shared as u64, Ordering::Release);
+    COW_TEST_DATA.store(data as u64, Ordering::Release);
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        return 0xc2;
+    }
+    if child == 0 {
+        for _ in 0..THREAD_POLL_YIELDS {
+            if control.release.load(Ordering::Acquire) != 0 {
+                let unchanged =
+                    unsafe { core::ptr::read_volatile(data as *const u64) } == COW_TEST_OLD;
+                unsafe { raw_exit(SYS_EXIT_GROUP, if unchanged { GROUP_LEG_OK } else { 0xc3 }) };
+            }
+            unsafe { userspace::syscall::sys_yield() };
+        }
+        unsafe { raw_exit(SYS_EXIT_GROUP, 0xc4) };
+    }
+    // Even setup failures release the old-frame holder before ending the host.
+    struct Release<'a>(&'a CowTestControl);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.release.store(1, Ordering::Release);
+        }
+    }
+    let release = Release(control);
+    if unsafe { cow_test_command(1, data as u64) } != 0 {
+        return 0xc5;
+    }
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let reader = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            cow_test_reader,
+        )
+    };
+    if is_error(reader) || reader == 0 {
+        return 0xc6;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if control.ready.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if control.ready.load(Ordering::Acquire) != 1 {
+        return 0xc7;
+    }
+    unsafe { core::ptr::write_volatile(data as *mut u64, COW_TEST_OLD + 1) };
+    let complete = unsafe { cow_test_command(4, 0) } == 5;
+    let joined = g8_join_thread();
+    let observed = control.observed.load(Ordering::Acquire) == 1;
+    let written = unsafe { core::ptr::read_volatile(data as *const u64) } == COW_TEST_OLD + 1;
+    drop(release);
+    let isolated = reap_pid(child) == Some(GROUP_LEG_OK);
+    let disarmed = unsafe { cow_test_command(5, 0) } == 0;
+    if complete && joined && observed && written && isolated && disarmed {
+        GROUP_LEG_OK
+    } else {
+        0xc8
+    }
+}
+
+fn test_cow_sibling_read(results: &mut TestResult) {
+    let cpus = unsafe { cow_test_command(0, 0) };
+    if !is_error(cpus) && cpus & 3 != 3 {
+        println("[SKIP] COW sibling cold read: requires CPUs 0 and 1");
+        return;
+    }
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, cow_sibling_read_leg()) };
+    }
+    if !is_error(host) && reap_pid(host) == Some(GROUP_LEG_OK) {
+        results.pass("COW replacement keeps a sibling's cold read present and the fork child's frame private");
+    } else {
+        results.fail("COW sibling cold read during the paused PTE replacement");
+    }
 }
 
 // ---------------------------------------------------------------------------

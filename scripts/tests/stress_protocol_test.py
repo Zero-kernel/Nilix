@@ -9,6 +9,8 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -121,6 +123,45 @@ def make_ext3_image(path: Path, *, recover: bool, zero_intent: bool, start: int)
     features = protocol.JBD2_FEATURE_INCOMPAT_ZERO_INTENT if zero_intent else 0
     struct.pack_into(">I", image, journal_offset + 40, features)
     path.write_bytes(image)
+
+
+class ThreadAccountingTests(unittest.TestCase):
+    @unittest.skipUnless(Path("/proc/self/task").is_dir(), "requires Linux task accounting")
+    def test_busy_worker_does_not_credit_the_idle_observer(self) -> None:
+        ready = threading.Event()
+        start = threading.Event()
+        finished = threading.Event()
+        release = threading.Event()
+        worker_id: list[int] = []
+
+        def busy_worker() -> None:
+            worker_id.append(threading.get_native_id())
+            ready.set()
+            if not start.wait(10):
+                return
+            deadline = time.thread_time() + 0.25
+            while time.thread_time() < deadline:
+                pass
+            finished.set()
+            release.wait(10)
+
+        worker = threading.Thread(target=busy_worker, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(10))
+            observer_id = threading.get_native_id()
+            observer_before = protocol.read_linux_thread_ticks(observer_id)
+            worker_before = protocol.read_linux_thread_ticks(worker_id[0])
+            start.set()
+            self.assertTrue(finished.wait(10))
+            worker_delta = protocol.read_linux_thread_ticks(worker_id[0]) - worker_before
+            observer_delta = protocol.read_linux_thread_ticks(observer_id) - observer_before
+            self.assertGreater(worker_delta, 0)
+            self.assertLess(observer_delta, worker_delta)
+        finally:
+            start.set()
+            release.set()
+            worker.join(10)
 
 
 class ConfigTests(unittest.TestCase):

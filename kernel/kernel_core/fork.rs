@@ -1504,7 +1504,7 @@ pub unsafe fn copy_page_table_cow_with_shared(
 /// `COW_FAULT_LOCK` was **strictly redundant**: every mutation below runs inside
 /// `with_current_manager`, which holds the single global `PT_LOCK`
 /// (`mm/page_table.rs`) across the whole closure — translate, refcount claim,
-/// frame allocation, copy, unmap, remap, shootdown and release. Two concurrent
+/// frame allocation, copy, atomic replacement, shootdown and release. Two concurrent
 /// COW faults were therefore already serialized by `PT_LOCK` before this lock was
 /// ever consulted; it added a second contention point and no ordering. It is gone,
 /// which eliminates the DoS class rather than mitigating it.
@@ -1565,10 +1565,15 @@ pub enum CowFaultFailure {
     /// COW marker present without consistent refcount metadata, or the
     /// ownership ledger could not be advanced. Never guess at ownership.
     MetadataCorrupt,
-    /// The page-table update (unmap/remap/flag change) failed; the previous
-    /// mapping was restored where possible.
+    /// The page-table replacement/flag change failed; the previous mapping
+    /// remains installed.
     MappingFailed,
 }
+
+// The deterministic sibling-reader oracle is absent from production kernels.
+#[cfg(feature = "syscall_test")]
+#[path = "cow_test.rs"]
+pub(crate) mod cow_test;
 
 pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFaultResult {
     use mm::page_table::try_with_current_manager;
@@ -1679,12 +1684,6 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
         let new_virt = mm::phys_to_virt(new_frame.start_address());
         core::ptr::copy_nonoverlapping(old_virt.as_ptr::<u8>(), new_virt.as_mut_ptr::<u8>(), 4096);
 
-        // H-35 fix: Check unmap result - if it fails, deallocate the new frame and return error
-        if manager.unmap_page(page).is_err() {
-            frame_alloc.deallocate_frame(new_frame);
-            return CowFaultResult::Fatal(CowFaultFailure::MappingFailed);
-        }
-
         // 设置新标志：移除 COW，添加 WRITABLE
         // R114-3 FIX: `flags` is guaranteed fresh — read under PT_LOCK above.
         let mut new_flags = flags;
@@ -1692,14 +1691,16 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
         new_flags.remove(cow_readonly_flag());
         new_flags.insert(PageTableFlags::WRITABLE);
 
-        // H-35 fix: If map fails, try to restore the old mapping to avoid page loss
-        if let Err(_) = manager.map_page(page, new_frame, new_flags, &mut frame_alloc) {
-            // Attempt to restore the old mapping
-            let _ = manager.map_page(page, old_frame, flags, &mut frame_alloc);
-            // R68-4 FIX: Flush TLB on all CPUs sharing this address space.
-            // Use cross-CPU shootdown to ensure the restored mapping is visible.
-            mm::flush_current_as_page(virt);
-            // Deallocate the new frame we allocated
+        #[cfg(feature = "syscall_test")]
+        cow_test::before_replace(pid, page.start_address().as_u64() as usize);
+
+        // LEAD-G8-CHILDREN-SEGV-1: keep PRESENT set throughout the replacement.
+        // A sibling's hardware page walk sees either complete mapping. Failure
+        // leaves the old leaf untouched; no remap/rollback allocation is needed.
+        if manager
+            .replace_page(page, old_frame, new_frame, new_flags)
+            .is_err()
+        {
             frame_alloc.deallocate_frame(new_frame);
             return CowFaultResult::Fatal(CowFaultFailure::MappingFailed);
         }
@@ -3693,7 +3694,7 @@ pub fn create_kpti_user_pml4(
         // All entries are supervisor-only (USER_ACCESSIBLE removed at both PML4
         // and PDPT levels) to prevent normal Ring 3 access and limit Meltdown-style
         // speculative exposure to 6 GiB instead of 512 GiB.
-        if !kernel_pml4[ENTRY_ISLAND_INDEX].is_unused() {
+        if kernel_stack_pdpt_entry_ready(&kernel_pml4[ENTRY_ISLAND_INDEX]) {
             let mut island_flags = kernel_pml4[ENTRY_ISLAND_INDEX].flags();
             island_flags.remove(PageTableFlags::USER_ACCESSIBLE);
             user_pml4[ENTRY_ISLAND_INDEX].set_frame(entry_island_pdpt_frame, island_flags);
@@ -3713,7 +3714,7 @@ pub fn create_kpti_user_pml4(
                 }
             }
             stacks_reachable = (KPTI_ISLAND_FIRST_PDPT..=KSTACK_LAST_PDPT)
-                .all(|i| kernel_stack_pdpt_entry_ready(&island_pdpt[i]));
+                .all(|i| kernel_stack_pdpt_entry_ready(&kernel_pdpt[i]));
         }
     }
     // LEAD-KSTACK-WINDOW-1: every kernel stack must be reachable from this
@@ -3750,6 +3751,7 @@ pub(crate) fn kernel_stack_pdpt_entry_ready(entry: &PageTableEntry) -> bool {
     let flags = entry.flags();
     flags.contains(PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
         && !flags.intersects(PageTableFlags::HUGE_PAGE | PageTableFlags::USER_ACCESSIBLE)
+        && mm::page_table::page_table_frame_address_valid(entry.addr().as_u64())
 }
 
 /// H.3 KPTI: Free a user PML4 root created by `create_kpti_user_pml4()`.

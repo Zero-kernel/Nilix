@@ -18921,6 +18921,15 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
         }
     }
     match option {
+        #[cfg(feature = "syscall_test")]
+        crate::fork::cow_test::PR_COW_TEST => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let root = process.lock().memory_space;
+            crate::fork::cow_test::command(arg2, arg3, pid, root)
+                .map(|value| value as usize)
+                .map_err(|()| SyscallError::EINVAL)
+        }
         // TD-LSM-1: the guest oracle marks its own pid for one LSM arm.
         #[cfg(feature = "syscall_test")]
         lsm::syscall_test::PR_SYSCALL_TEST_LSM_MARK => {
@@ -25502,6 +25511,9 @@ const MREMAP_FREE_RESERVE: usize = 512;
 
 /// R192-RES-2a: what the mremap PTE hold uses, all taken before it.
 struct MremapHoldStage {
+    /// Retained through Drop so detached tables lose their ledger entries
+    /// before their physical addresses can be reused. Drop runs outside PT_LOCK.
+    process: crate::process::ProcessArc,
     /// Page-table frames for a relocation, `relocation_table_bound` of them.
     tables: vec::Vec<Option<x86_64::structures::paging::PhysFrame>>,
     /// A shrink's frames to free after the flush (capped).
@@ -25526,6 +25538,31 @@ impl MremapHoldStage {
 
 impl Drop for MremapHoldStage {
     fn drop(&mut self) {
+        // Ordinarily these lists are drained/transferred by step 2. Cover a
+        // future early exit too: leaves may not yet have had their final flush,
+        // and a detached table may still be named in the address-space ledger.
+        if !self.frames_to_free.is_empty() || !self.reclaimed.is_empty() {
+            mm::flush_current_as_all();
+            if !self.reclaimed.is_empty() {
+                let proc = self.process.lock();
+                let mut space = proc.mm.lock();
+                if space.pt_ledger_authoritative {
+                    let bytes = space.reclaim_pt_charges(
+                        self.reclaimed.iter().map(|f| f.start_address().as_u64()),
+                    );
+                    space.pt_charged_bytes = space.pt_charged_bytes.saturating_sub(bytes);
+                    cgroup::uncharge_memory(proc.cgroup_id, bytes);
+                }
+            }
+            let mut allocator = mm::memory::FrameAllocator::new();
+            for frame in self
+                .frames_to_free
+                .drain(..)
+                .chain(self.reclaimed.drain(..))
+            {
+                allocator.deallocate_frame(frame);
+            }
+        }
         self.return_unused();
     }
 }
@@ -25546,6 +25583,7 @@ fn stage_mremap_hold(
 ) -> Result<MremapHoldStage, SyscallError> {
     let removed_pages = removed_len / 0x1000;
     let mut stage = MremapHoldStage {
+        process: Arc::clone(process),
         tables: vec::Vec::new(),
         frames_to_free: vec::Vec::new(),
         reclaimed: vec::Vec::new(),

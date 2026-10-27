@@ -211,8 +211,26 @@ extern "C" {
 /// `__zero_os_usercopy_get_u32` or `__zero_os_usercopy_cmpxchg_u32`, the only
 /// helpers that run with `nofault` set.
 fn nofault_access_ip(ip: usize) -> bool {
-    ip == core::ptr::addr_of!(__zero_os_usercopy_get_u32_access) as usize
-        || ip == core::ptr::addr_of!(__zero_os_usercopy_cmpxchg_u32_access) as usize
+    nofault_access_ips().contains(&ip)
+}
+
+/// One binding list for the handler, hosted test and linked-ELF verifier.
+fn nofault_access_ips() -> [usize; 2] {
+    [
+        core::ptr::addr_of!(__zero_os_usercopy_get_u32_access) as usize,
+        core::ptr::addr_of!(__zero_os_usercopy_cmpxchg_u32_access) as usize,
+    ]
+}
+
+/// Exercise the Rust symbol bindings in the booted, relocated kernel too.
+#[cfg(feature = "syscall_test")]
+pub fn verify_nofault_bindings() {
+    for access in nofault_access_ips() {
+        assert!(nofault_access_ip(access));
+        assert!(crate::exception_table::lookup(access).is_some());
+        assert!(!nofault_access_ip(access - 1) && !nofault_access_ip(access + 1));
+    }
+    klog_always!("TD-USERCOPY-1: runtime nofault bindings verified");
 }
 
 /// H-26 FIX: Exception-safe byte read from user space
@@ -1862,16 +1880,18 @@ mod robust_usercopy_tests {
     fn td_usercopy_1_nofault_arm_matches_only_the_access_instructions() {
         let get_u32 = __zero_os_usercopy_get_u32 as *const () as usize;
         let cmpxchg_u32 = __zero_os_usercopy_cmpxchg_u32 as *const () as usize;
-        // get_u32's load is its first instruction; cmpxchg_u32's follows the
-        // 2-byte `mov eax, esi`.
-        assert!(nofault_access_ip(get_u32));
-        assert!(nofault_access_ip(cmpxchg_u32 + 2));
+        // Bind to assembler labels rather than an assumed instruction length.
+        for access in nofault_access_ips() {
+            assert!(nofault_access_ip(access));
+            assert!(!nofault_access_ip(access - 1));
+            assert!(!nofault_access_ip(access + 1));
+        }
         assert!(!nofault_access_ip(cmpxchg_u32));
         for other in [
             __zero_os_usercopy_get_u8 as *const () as usize,
             __zero_os_usercopy_get_u64 as *const () as usize,
             __zero_os_usercopy_put_u8 as *const () as usize,
-            get_u32 + 2,
+            get_u32 + 1,
         ] {
             assert!(!nofault_access_ip(other));
         }

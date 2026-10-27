@@ -348,7 +348,10 @@ enum SerialHold {
 /// break the gates' serial markers (musl-check at 8 CPUs). The holder masks
 /// IRQs, and `write` only copies at most `SERIAL_CHUNK` buffered bytes to the
 /// port: no lock, allocation, fault or wait, so every hold ends and the lock
-/// is a leaf that may be taken under any other lock. Masking is what makes
+/// is a terminal leaf. A caller holding a lock also used by a local IRQ must
+/// already have masked IRQs: waiters restore the caller's IRQ state, so taking
+/// such a lock with IRQs enabled is not made safe by this console lock.
+/// Masking is what makes
 /// that true: an IRQ handler on the holder's CPU spinning on an IRQ-safe lock
 /// whose owner waits here would otherwise keep the hold open forever. Only an
 /// NMI or exception can still interrupt a holder; a print from it sees its own
@@ -432,16 +435,24 @@ fn serial_emit(stream: SerialStream, chunk: &[u8]) {
     });
 }
 
-/// TD-SERIAL-1: the IRQ-masked serial holds so far.
-pub fn serial_hold_stats() -> SerialHoldStats {
-    SerialHoldStats {
-        max_tsc: SERIAL_MAX_HOLD_TSC.load(Ordering::Relaxed),
-        max_bytes: SERIAL_MAX_HOLD_BYTES.load(Ordering::Relaxed),
-        holds: SERIAL_HOLDS.load(Ordering::Relaxed),
-        bytes: SERIAL_HOLD_BYTES.load(Ordering::Relaxed),
-        tsc: SERIAL_HOLD_TSC.load(Ordering::Relaxed),
-        over: core::array::from_fn(|i| SERIAL_HOLDS_OVER[i].load(Ordering::Relaxed)),
-    }
+/// A consistent snapshot, under the same lock as the writers. Reentry from
+/// an exception/NMI cannot wait for the interrupted writer; omit that sample.
+/// Taking a snapshot does not itself count as a serial write/hold.
+pub fn serial_hold_stats() -> Option<SerialHoldStats> {
+    let mut stats = None;
+    with_serial(|_, locked| {
+        if locked {
+            stats = Some(SerialHoldStats {
+                max_tsc: SERIAL_MAX_HOLD_TSC.load(Ordering::Relaxed),
+                max_bytes: SERIAL_MAX_HOLD_BYTES.load(Ordering::Relaxed),
+                holds: SERIAL_HOLDS.load(Ordering::Relaxed),
+                bytes: SERIAL_HOLD_BYTES.load(Ordering::Relaxed),
+                tsc: SERIAL_HOLD_TSC.load(Ordering::Relaxed),
+                over: core::array::from_fn(|i| SERIAL_HOLDS_OVER[i].load(Ordering::Relaxed)),
+            });
+        }
+    });
+    stats
 }
 
 /// Exchange attempts before a panic writes without the serial lock.
@@ -814,7 +825,34 @@ mod tests {
         assert_eq!(port_log(), b"xnmi\n", "no line handling without the lock");
         assert_eq!(SERIAL_OWNER_CPU.load(Ordering::SeqCst), me);
         assert_eq!(SERIAL_OPEN_LINE.load(Ordering::SeqCst), SHELL_STREAM);
+        assert_eq!(
+            serial_hold_stats(),
+            None,
+            "reentry cannot sample a half-written record"
+        );
         SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn td_serial_1_stats_wait_for_a_complete_record() {
+        let _guard = serial_test_state();
+        SERIAL_OWNER_CPU.store(console_owner_token() + 1, Ordering::SeqCst);
+        SERIAL_MAX_HOLD_TSC.store(123456, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || tx.send(serial_hold_stats()).unwrap());
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
+        SERIAL_MAX_HOLD_BYTES.store(42, Ordering::Relaxed);
+        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+        let sample = rx.recv().unwrap().unwrap();
+        reader.join().unwrap();
+        assert_eq!((sample.max_tsc, sample.max_bytes), (123456, 42));
+        assert_eq!(
+            serial_hold_stats(),
+            Some(sample),
+            "sampling does not change statistics"
+        );
     }
 
     #[test]

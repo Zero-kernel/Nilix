@@ -144,14 +144,14 @@ run_suite audit 16 0 \
 # control-character sanitizer are pure logic over the drivers crate.
 # TD-SERIAL-1: serial chunking, lock, line state and panic claim (the port
 # and IRQ masking are compiled out under cfg(test)).
-run_suite drivers 13 0 \
+run_suite drivers 14 0 \
     --manifest-path kernel/drivers/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features cpu_local/host_harness \
     --lib --locked
 
 # TD-LSM-1: the syscall_test-only guest-oracle policy and missing-subject probe.
-run_suite lsm-syscall-test 2 0 \
+run_suite lsm-syscall-test 3 0 \
     --manifest-path kernel/lsm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features lsm,syscall_test \
@@ -172,7 +172,7 @@ run_suite livepatch 3 0 \
     --manifest-path kernel/livepatch/Cargo.toml \
     --target x86_64-unknown-linux-gnu --lib --locked
 
-run_suite mm 34 0 \
+run_suite mm 38 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \

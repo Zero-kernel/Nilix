@@ -1637,6 +1637,12 @@ unsafe impl X64FrameAllocator<Size4KiB> for FrameAllocator {
     }
 }
 
+impl x86_64::structures::paging::FrameDeallocator<Size4KiB> for FrameAllocator {
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        self.deallocate_frame(frame);
+    }
+}
+
 /// 内存统计信息
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {

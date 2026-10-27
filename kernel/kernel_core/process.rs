@@ -5371,13 +5371,7 @@ pub fn init() {
 fn prepare_kernel_stack_region() {
     let mut frame_alloc = FrameAllocator::new();
     // SAFETY: boot root, before any user root; no other CPU edits page tables yet.
-    let created = unsafe {
-        mm::page_table::ensure_kernel_page_directories(
-            KSTACK_BASE,
-            mm::KSTACK_REGION_END,
-            &mut frame_alloc,
-        )
-    };
+    let created = unsafe { mm::page_table::ensure_kernel_stack_directories(&mut frame_alloc) };
     if let Err(error) = created {
         panic!("kernel-stack region page directories: {:?}", error);
     }
@@ -8431,6 +8425,23 @@ mod kstack_layout_tests {
             kernel_stack_slot_at(MAX_PID + 1, security::KSTACK_MAX_SLIDE),
             Err(KernelStackError::AddressOverflow)
         ));
+        use x86_64::structures::paging::{page_table::PageTableEntry, PageTableFlags as F};
+        let mut entry = PageTableEntry::new();
+        let ready = crate::fork::kernel_stack_pdpt_entry_ready;
+        for addr in [0, 1 << 30] {
+            entry.set_addr(PhysAddr::new(addr), F::PRESENT | F::WRITABLE);
+            assert!(!ready(&entry), "unreachable directory must fail closed");
+        }
+        entry.set_addr(PhysAddr::new(0x1000), F::PRESENT | F::WRITABLE);
+        assert!(ready(&entry));
+        for bad in [
+            F::PRESENT,
+            F::PRESENT | F::WRITABLE | F::USER_ACCESSIBLE,
+            F::PRESENT | F::WRITABLE | F::HUGE_PAGE,
+        ] {
+            entry.set_flags(bad);
+            assert!(!ready(&entry));
+        }
     }
 }
 
@@ -11449,6 +11460,14 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // never-scheduled-child cleanups that are never deferred).
         clear_irq_kill_nonrunnable(pid);
 
+        // Test marks belong to this task lifetime, not a future recycled PID.
+        // Only the teardown winner gets here, before teardown_done/reaping.
+        #[cfg(feature = "syscall_test")]
+        {
+            lsm::syscall_test::clear_task(pid);
+            crate::fork::cow_test::clear(pid);
+        }
+
         // GAP-5 slice 4 G2: a fatal outcome ends the whole thread group. Publish
         // `exiting` (no new thread can join) and post the same exit to every
         // other live member, as exit_group does. Process context, no lock held;
@@ -11502,9 +11521,9 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // (cycles per ms from the TSC over the BSP's serviced ticks; masked
         // intervals that lose ticks make this an upper bound).
         if pid == 1 {
-            let stats = drivers::vga_buffer::serial_hold_stats();
-            let per_ms = crate::time::tsc_since_boot() / crate::time::get_ticks().max(1);
-            klog_always!(
+            if let Some(stats) = drivers::vga_buffer::serial_hold_stats() {
+                let per_ms = crate::time::tsc_since_boot() / crate::time::get_ticks().max(1);
+                klog_always!(
                 "TD-SERIAL-1: longest serial hold {} TSC cycles (~{} us, {} bytes); {} holds, {} bytes, {} cycles/byte; holds >= 2^18/2^20/2^22/2^24 cycles: {}/{}/{}/{}; {} cycles/ms",
                 stats.max_tsc,
                 stats.max_tsc.saturating_mul(1000) / per_ms.max(1),
@@ -11518,6 +11537,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 stats.over[3],
                 per_ms
             );
+            }
         }
 
         // GAP-5 G8: the group's last live member takes over a leader identity

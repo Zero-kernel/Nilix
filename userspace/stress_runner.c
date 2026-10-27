@@ -1167,6 +1167,14 @@ static void process_round_body(ProfileReport *report) {
          */
         cgroup_set_limit(CGROUP_LIMIT_PIDS_MAX, stats.nr_tasks + config.churn_fanout);
 
+        /* Keep every child alive until the overflow fork has been checked.
+         * Exiting releases its pids charge before waitpid reaps the zombie,
+         * so immediate _exit children cannot prove a saturated live-task cap.
+         * EOF releases the whole wave, including when this worker fails. */
+        int release_pipe[2];
+        if (pipe(release_pipe) != 0) {
+            fail("process_release_pipe", errno, wave);
+        }
         uint32_t started = 0;
         for (uint32_t index = 0; index < config.churn_fanout; ++index) {
             const pid_t child = fork();
@@ -1174,6 +1182,16 @@ static void process_round_body(ProfileReport *report) {
                 fail("process_fork", errno, index);
             }
             if (child == 0) {
+                (void)close(release_pipe[1]);
+                uint8_t byte;
+                ssize_t received;
+                do {
+                    received = read(release_pipe[0], &byte, sizeof(byte));
+                } while (received < 0 && errno == EINTR);
+                if (received != 0) {
+                    fail("process_release_read", received < 0 ? errno : 0, wave);
+                }
+                (void)close(release_pipe[0]);
                 _exit(0);
             }
             children[started++] = child;
@@ -1196,6 +1214,10 @@ static void process_round_body(ProfileReport *report) {
             fail("process_limit_not_enforced", 0, wave);
         }
 
+        (void)close(release_pipe[0]);
+        if (close(release_pipe[1]) != 0) {
+            fail("process_release_close", errno, wave);
+        }
         for (uint32_t index = 0; index < started; ++index) {
             int status = 0;
             while (waitpid(children[index], &status, 0) < 0) {

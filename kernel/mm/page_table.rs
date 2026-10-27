@@ -5,7 +5,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::{
     instructions::interrupts,
@@ -799,6 +799,50 @@ impl PageTableManager {
         Ok(())
     }
 
+    /// Replace a present 4 KiB leaf without ever making it non-present.
+    ///
+    /// LEAD-G8-CHILDREN-SEGV-1: readers do not acquire PT_LOCK. An unmap/map
+    /// pair therefore kills a sibling that walks the page during the gap.
+    /// Validate the entire walk first, then publish frame and flags with one
+    /// aligned atomic store. No allocation or fallible work follows the store.
+    ///
+    /// The caller holds PT_LOCK, owns `new_frame`, and must synchronously flush
+    /// all CPUs sharing this address space BEFORE releasing `expected_frame`.
+    /// On error the old mapping and both frames' ownership are unchanged.
+    pub fn replace_page(
+        &mut self,
+        page: Page<Size4KiB>,
+        expected_frame: PhysFrame<Size4KiB>,
+        new_frame: PhysFrame<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), ReplacePageError> {
+        if self.lower_half_kernel_owned(page) {
+            return Err(ReplacePageError::KernelOwned);
+        }
+        let addr = page.start_address();
+        let mut table = self.mapper.level_4_table_mut();
+        for index in [addr.p4_index(), addr.p3_index(), addr.p2_index()] {
+            let entry = &table[index];
+            if !entry.flags().contains(PageTableFlags::PRESENT) {
+                return Err(ReplacePageError::PageNotMapped);
+            }
+            if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                return Err(ReplacePageError::ParentEntryHugePage);
+            }
+            if !page_table_frame_address_valid(entry.addr().as_u64()) {
+                return Err(ReplacePageError::InvalidFrameAddress);
+            }
+            // SAFETY: PT_LOCK protects this present, direct-mapped table.
+            table = unsafe { &mut *phys_to_virt(entry.addr()).as_mut_ptr::<PageTable>() };
+        }
+        replace_present_leaf(
+            &mut table[addr.p1_index()],
+            expected_frame,
+            new_frame,
+            flags,
+        )
+    }
+
     /// 取消映射虚拟页
     pub fn unmap_page(&mut self, page: Page) -> Result<PhysFrame, UnmapError> {
         use x86_64::structures::paging::mapper::UnmapError as X64UnmapError;
@@ -1548,6 +1592,49 @@ pub enum MapError {
     KernelOwned,
 }
 
+/// Errors from replacing a present leaf; none changes the mapping.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplacePageError {
+    PageNotMapped,
+    ParentEntryHugePage,
+    InvalidFrameAddress,
+    FrameMismatch,
+    InvalidFlags,
+    KernelOwned,
+}
+
+/// A page-table frame must be nonzero and wholly reachable by the direct map.
+pub fn page_table_frame_address_valid(addr: u64) -> bool {
+    addr != 0 && addr & 0xfff == 0 && addr < DIRECT_MAP_LIMIT
+}
+
+fn replace_present_leaf(
+    entry: &mut PageTableEntry,
+    expected_frame: PhysFrame<Size4KiB>,
+    new_frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), ReplacePageError> {
+    if !flags.contains(PageTableFlags::PRESENT) || flags.contains(PageTableFlags::HUGE_PAGE) {
+        return Err(ReplacePageError::InvalidFlags);
+    }
+    if !entry.flags().contains(PageTableFlags::PRESENT) {
+        return Err(ReplacePageError::PageNotMapped);
+    }
+    if entry.addr() != expected_frame.start_address() {
+        return Err(ReplacePageError::FrameMismatch);
+    }
+    // PageTableEntry is repr(transparent) over u64. The Release store also
+    // publishes the copied data before a hardware walk can reach the new frame.
+    const _: () = assert!(core::mem::size_of::<PageTableEntry>() == 8);
+    const _: () = assert!(core::mem::align_of::<PageTableEntry>() >= 8);
+    let slot = unsafe { &*(entry as *mut PageTableEntry).cast::<AtomicU64>() };
+    slot.store(
+        new_frame.start_address().as_u64() | flags.bits(),
+        Ordering::Release,
+    );
+    Ok(())
+}
+
 /// 页表取消映射错误
 #[derive(Debug)]
 pub enum UnmapError {
@@ -1764,69 +1851,97 @@ pub unsafe fn split_2m_entry(
     Ok(&mut *pt_ptr)
 }
 
-/// LEAD-KSTACK-WINDOW-1: in the active root, give every PDPT entry that
-/// covers `[start, end)` a supervisor, writable page directory if it has none,
-/// and return how many were created. An existing entry must already be one
-/// (present, writable, not user, not huge); anything else is an error, since
-/// `map_page` would only OR the missing bits into the kernel copy and leave
-/// every island with the stale entry.
-///
-/// A KPTI user root copies its entry-island PDPT entries by value when it is
-/// built, so a page directory created later under one of them would be missing
-/// from every older user root (a thread runs on its group's older root). With
-/// the directories created at boot, before any user root, every later leaf or
-/// page table in the range is visible in every root. The range must be in the
-/// high half, whose PML4 entries every root shares; leaves and PTs are not
-/// touched, and nothing prunes these directories later.
+/// Create the two kernel-stack page directories transactionally, before
+/// any user root copies these PDPT entries into its KPTI entry island.
+/// On error no entry is changed and every newly allocated frame is returned.
 ///
 /// # Safety
-///
 /// Runs on the boot root before any user root exists; CR3 must not change.
-pub unsafe fn ensure_kernel_page_directories(
-    start: u64,
-    end: u64,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+pub unsafe fn ensure_kernel_stack_directories(
+    frame_allocator: &mut (impl FrameAllocator<Size4KiB>
+              + x86_64::structures::paging::FrameDeallocator<Size4KiB>),
 ) -> Result<usize, MapError> {
-    const PDPT_ENTRY_SPAN: u64 = 1 << 30;
     let _pt_guard = lock_pt();
-    let phys_offset = get_phys_offset();
-    let pml4 = active_level_4_table(phys_offset);
-    let mut created = 0;
-    let mut addr = start & !(PDPT_ENTRY_SPAN - 1);
-    while addr < end {
-        let virt = VirtAddr::try_new(addr).map_err(|_| MapError::InvalidRange)?;
-        let pml4e = &mut pml4[virt.p4_index()];
-        if pml4e.is_unused() || pml4e.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-            return Err(MapError::InvalidRange);
-        }
-        let pdpt = &mut *(phys_offset + pml4e.addr().as_u64()).as_mut_ptr::<PageTable>();
-        let pdpte = &mut pdpt[virt.p3_index()];
-        let flags = pdpte.flags();
+    let pml4 = active_level_4_table(get_phys_offset());
+    let entry = &pml4[VirtAddr::new(KSTACK_REGION_BASE).p4_index()];
+    let flags = entry.flags();
+    if !flags.contains(PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
+        || flags.intersects(PageTableFlags::USER_ACCESSIBLE | PageTableFlags::HUGE_PAGE)
+        || !page_table_frame_address_valid(entry.addr().as_u64())
+    {
+        return Err(MapError::InvalidRange);
+    }
+    let pdpt = &mut *phys_to_virt(entry.addr()).as_mut_ptr::<PageTable>();
+    stage_kernel_stack_directories(pdpt, frame_allocator, |frame| {
+        core::ptr::write_bytes(
+            phys_to_virt(frame.start_address()).as_mut_ptr::<u8>(),
+            0,
+            4096,
+        );
+    })
+}
+
+/// Validate first, allocate all missing directories, zero all of them, then
+/// publish. Keeping the staging fixed to the stack region bounds boot-stack
+/// usage and avoids a heap allocation while PT_LOCK is held.
+fn stage_kernel_stack_directories(
+    pdpt: &mut PageTable,
+    allocator: &mut (impl FrameAllocator<Size4KiB>
+              + x86_64::structures::paging::FrameDeallocator<Size4KiB>),
+    mut zero: impl FnMut(PhysFrame<Size4KiB>),
+) -> Result<usize, MapError> {
+    const FIRST: usize = ((KSTACK_REGION_BASE >> 30) & 0x1ff) as usize;
+    const COUNT: usize = ((KSTACK_REGION_END - KSTACK_REGION_BASE) >> 30) as usize;
+    const _: () = assert!(COUNT == 2 && FIRST + COUNT <= 512);
+    for entry in pdpt
+        .iter()
+        .skip(FIRST)
+        .take(COUNT)
+        .filter(|entry| !entry.is_unused())
+    {
+        let flags = entry.flags();
         if flags.contains(PageTableFlags::HUGE_PAGE) {
             return Err(MapError::ParentEntryHugePage);
         }
-        if !pdpte.is_unused() {
-            if !flags.contains(PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
-                || flags.contains(PageTableFlags::USER_ACCESSIBLE)
-            {
-                return Err(MapError::PageAlreadyMapped);
+        if !flags.contains(PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
+            || flags.contains(PageTableFlags::USER_ACCESSIBLE)
+            || !page_table_frame_address_valid(entry.addr().as_u64())
+        {
+            return Err(MapError::PageAlreadyMapped);
+        }
+    }
+    let mut staged = [None; COUNT];
+    for (entry, slot) in pdpt.iter().skip(FIRST).take(COUNT).zip(staged.iter_mut()) {
+        if entry.is_unused() {
+            *slot = allocator.allocate_frame();
+            if slot.is_none() {
+                for frame in staged.into_iter().flatten() {
+                    // No staged directory has been linked yet.
+                    unsafe { allocator.deallocate_frame(frame) };
+                }
+                return Err(MapError::FrameAllocationFailed);
             }
-        } else {
-            let pd_frame = frame_allocator
-                .allocate_frame()
-                .ok_or(MapError::FrameAllocationFailed)?;
-            let pd_virt = phys_offset + pd_frame.start_address().as_u64();
-            core::ptr::write_bytes(pd_virt.as_mut_ptr::<u8>(), 0, 4096);
-            pdpte.set_addr(
-                pd_frame.start_address(),
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-            );
+        }
+    }
+    if staged
+        .iter()
+        .flatten()
+        .any(|frame| !page_table_frame_address_valid(frame.start_address().as_u64()))
+    {
+        for frame in staged.into_iter().flatten() {
+            unsafe { allocator.deallocate_frame(frame) };
+        }
+        return Err(MapError::InvalidRange);
+    }
+    for frame in staged.iter().flatten() {
+        zero(*frame);
+    }
+    let mut created = 0;
+    for (entry, frame) in pdpt.iter_mut().skip(FIRST).take(COUNT).zip(staged) {
+        if let Some(frame) = frame {
+            entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
             created += 1;
         }
-        addr = match addr.checked_add(PDPT_ENTRY_SPAN) {
-            Some(next) => next,
-            None => break,
-        };
     }
     Ok(created)
 }
@@ -2000,6 +2115,151 @@ unsafe impl FrameAllocator<Size4KiB> for MmioPtRecorder<'_> {
         *self.tracked_len += 1;
         self.fault.allocations += 1;
         Some(frame)
+    }
+}
+
+#[cfg(test)]
+mod cow_replace_tests {
+    use super::*;
+
+    fn frame(addr: u64) -> PhysFrame {
+        PhysFrame::from_start_address(PhysAddr::new(addr)).unwrap()
+    }
+
+    #[test]
+    fn present_replacement_publishes_frame_and_final_permissions() {
+        let mut entry = PageTableEntry::new();
+        let old = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE
+            | PageTableFlags::BIT_9;
+        let new = (old & !PageTableFlags::BIT_9) | PageTableFlags::WRITABLE;
+        entry.set_frame(frame(0x1000), old);
+        replace_present_leaf(&mut entry, frame(0x1000), frame(0x2000), new).unwrap();
+        assert_eq!(entry.frame().unwrap(), frame(0x2000));
+        assert_eq!(entry.flags(), new);
+    }
+
+    #[test]
+    fn replacement_errors_leave_the_old_leaf_untouched() {
+        let flags =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::BIT_9;
+        for (old_flags, expected, new_flags, error) in [
+            (flags, 0x3000, flags, ReplacePageError::FrameMismatch),
+            (
+                flags,
+                0x1000,
+                PageTableFlags::WRITABLE,
+                ReplacePageError::InvalidFlags,
+            ),
+            (
+                flags,
+                0x1000,
+                flags | PageTableFlags::HUGE_PAGE,
+                ReplacePageError::InvalidFlags,
+            ),
+            (
+                flags & !PageTableFlags::PRESENT,
+                0x1000,
+                flags,
+                ReplacePageError::PageNotMapped,
+            ),
+        ] {
+            let mut entry = PageTableEntry::new();
+            entry.set_addr(PhysAddr::new(0x1000), old_flags);
+            assert_eq!(
+                replace_present_leaf(&mut entry, frame(expected), frame(0x2000), new_flags),
+                Err(error)
+            );
+            assert_eq!(entry.addr(), PhysAddr::new(0x1000));
+            assert_eq!(entry.flags(), old_flags);
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_stack_directory_tests {
+    use super::*;
+    use x86_64::structures::paging::FrameDeallocator;
+
+    struct Frames {
+        remaining: usize,
+        allocated: usize,
+        freed: usize,
+    }
+    // Synthetic frame identities; the injected zero callback never dereferences them.
+    unsafe impl FrameAllocator<Size4KiB> for Frames {
+        fn allocate_frame(&mut self) -> Option<PhysFrame> {
+            if self.remaining == 0 {
+                return None;
+            }
+            self.remaining -= 1;
+            self.allocated += 1;
+            Some(
+                PhysFrame::from_start_address(PhysAddr::new((self.allocated as u64) << 12))
+                    .unwrap(),
+            )
+        }
+    }
+    impl FrameDeallocator<Size4KiB> for Frames {
+        unsafe fn deallocate_frame(&mut self, _: PhysFrame) {
+            self.freed += 1;
+        }
+    }
+
+    #[test]
+    fn directory_allocation_failure_rolls_back_before_publication() {
+        for budget in 0..=2 {
+            let mut pdpt = PageTable::new();
+            let mut frames = Frames {
+                remaining: budget,
+                allocated: 0,
+                freed: 0,
+            };
+            let mut zeroed = 0;
+            let result = stage_kernel_stack_directories(&mut pdpt, &mut frames, |_| zeroed += 1);
+            if budget < 2 {
+                assert!(matches!(result, Err(MapError::FrameAllocationFailed)));
+                assert!(pdpt.iter().all(PageTableEntry::is_unused));
+                assert_eq!(frames.freed, frames.allocated);
+                assert_eq!(zeroed, 0);
+            } else {
+                assert_eq!(result.unwrap(), 2);
+                assert_eq!(zeroed, 2);
+                assert_eq!(frames.freed, 0);
+                assert_eq!(pdpt[506].addr(), PhysAddr::new(0x1000));
+                assert_eq!(pdpt[507].addr(), PhysAddr::new(0x2000));
+            }
+        }
+    }
+
+    #[test]
+    fn directory_validation_precedes_allocation_and_preserves_existing_entries() {
+        let mut pdpt = PageTable::new();
+        let mut frames = Frames {
+            remaining: 2,
+            allocated: 0,
+            freed: 0,
+        };
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        for bad_addr in [0, DIRECT_MAP_LIMIT] {
+            pdpt[507].set_addr(PhysAddr::new(bad_addr), flags);
+            assert!(
+                stage_kernel_stack_directories(&mut pdpt, &mut frames, |_| panic!(
+                    "zero before validation"
+                ))
+                .is_err()
+            );
+            assert!(pdpt[506].is_unused());
+            assert_eq!(frames.allocated, 0);
+        }
+        pdpt[507].set_addr(PhysAddr::new(0x8000), flags);
+        assert_eq!(
+            stage_kernel_stack_directories(&mut pdpt, &mut frames, |_| {}).unwrap(),
+            1
+        );
+        assert_eq!(pdpt[507].addr(), PhysAddr::new(0x8000));
+        assert_eq!(frames.allocated, 1);
     }
 }
 

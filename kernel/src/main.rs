@@ -1612,6 +1612,8 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
         let pid = process.lock().pid;
         #[cfg(feature = "syscall_test")]
         kernel_core::fork::arm_shared_fault_busy_usercopy_probe();
+        #[cfg(feature = "syscall_test")]
+        kernel_core::usercopy::verify_nofault_bindings();
         // R192-RES-2: one injected data-frame failure for the ring3-mm rollback leg.
         #[cfg(feature = "syscall_test")]
         kernel_core::syscall::arm_populate_fault_probe();

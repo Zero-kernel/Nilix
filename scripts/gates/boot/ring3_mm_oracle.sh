@@ -111,6 +111,17 @@ KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a s
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.
+if [ "$(grep -cFx 'TD-USERCOPY-1: runtime nofault bindings verified' "$serial" || true)" -ne 1 ]; then
+    report_fail "missing or duplicate runtime no-fault binding check"
+fi
+if [ "${KERNEL_TEST_CPUS:-1}" -gt 1 ]; then
+    if ! grep -Fq "[PASS] COW replacement keeps a sibling's cold read present and the fork child's frame private" "$serial"; then
+        report_fail "missing deterministic shared-COW sibling read oracle"
+    fi
+    if grep -Fq '[SKIP] COW sibling cold read:' "$serial"; then
+        report_fail "shared-COW sibling read oracle skipped on SMP"
+    fi
+fi
 if grep -Eq '^\[FAIL\]' "$serial"; then
     report_fail "the guest reported a failing leg"
 fi

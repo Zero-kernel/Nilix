@@ -759,13 +759,16 @@ class QmpClient:
 def read_linux_thread_ticks(thread_id: int) -> int:
     if thread_id <= 0:
         raise StressProtocolError("QMP returned a non-positive thread id")
-    raw = Path(f"/proc/{thread_id}/stat").read_text(encoding="ascii")
+    # The top-level /proc/<tid>/stat view can report thread-group totals.
+    # The task directory is required to prove progress of this exact vCPU.
+    stat_path = Path(f"/proc/{thread_id}/task/{thread_id}/stat")
+    raw = stat_path.read_text(encoding="ascii")
     closing = raw.rfind(")")
     if closing < 0:
-        raise StressProtocolError(f"/proc/{thread_id}/stat has no command terminator")
+        raise StressProtocolError(f"{stat_path} has no command terminator")
     fields = raw[closing + 2 :].split()
     if len(fields) < 13:
-        raise StressProtocolError(f"/proc/{thread_id}/stat is truncated")
+        raise StressProtocolError(f"{stat_path} is truncated")
     return int(fields[11], 10) + int(fields[12], 10)
 
 

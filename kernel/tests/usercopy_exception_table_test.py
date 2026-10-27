@@ -19,9 +19,14 @@ EXPECTED = {
     "put_u8": bytes.fromhex("408837"),
     "cmpxchg_u32": bytes.fromhex("f00fb117"),
 }
-# TD-USERCOPY-1: the page-fault handler's no-fault arm matches these exported
-# labels, so each must be its helper's exception-table fault RIP.
-NOFAULT_ACCESS = ("get_u32", "cmpxchg_u32")
+def nofault_bindings(source):
+    """Read the handler's binding list instead of maintaining a second list."""
+    body = re.search(r"fn nofault_access_ips\(\).*?\{(.*?)\n\}", source, re.S)
+    assert body, "Rust no-fault binding list missing"
+    names = re.findall(r"addr_of!\(__zero_os_usercopy_(\w+)_access\)", body.group(1))
+    assert names and len(names) == len(set(names)), "missing or duplicate no-fault bindings"
+    assert set(names) <= set(EXPECTED), "unverified no-fault helper"
+    return names
 
 
 def run(command):
@@ -48,7 +53,7 @@ def elf_sections(path):
     }
 
 
-def verify_table(path, objdump):
+def verify_table(path, objdump, nofault_access):
     sections = elf_sections(path)
     text_base, text = sections[".text"]
     if ".ex_table" in sections:
@@ -64,7 +69,7 @@ def verify_table(path, objdump):
     disassembly = run([str(objdump), "--disassemble", "--no-show-raw-insn", str(path)])
     symbols = run([str(objdump), "--syms", str(path)])
     access_labels = {}
-    for name in NOFAULT_ACCESS:
+    for name in nofault_access:
         label = re.search(rf"^([0-9a-f]+).*\b__zero_os_usercopy_{name}_access$", symbols, re.M)
         assert label, f"{name}: no-fault access label __zero_os_usercopy_{name}_access missing"
         access_labels[name] = int(label.group(1), 16)
@@ -106,6 +111,7 @@ def main():
     root = Path(__file__).resolve().parents[2]
     usercopy = root / "kernel/kernel_core/usercopy.rs"
     source = usercopy.read_text(encoding="utf8")
+    nofault_access = nofault_bindings(source)
     match = re.search(r'core::arch::global_asm!\(\s*r#"(.*?)"#\s*\);', source, re.S)
     assert match, "production assembly not found"
     assembly = match.group(1)
@@ -115,16 +121,16 @@ def main():
     tools = rustc.parent.parent / "lib/rustlib" / host / "bin"
     linker, objdump = tools / f"rust-lld{suffix}", tools / f"llvm-objdump{suffix}"
     if options.kernel_elf:
-        verify_table(options.kernel_elf, objdump)
+        verify_table(options.kernel_elf, objdump, nofault_access)
         print(f"Kernel ELF SHA256={hashlib.sha256(options.kernel_elf.read_bytes()).hexdigest()}")
     with tempfile.TemporaryDirectory(prefix="ksa002-") as temporary:
         directory = Path(temporary)
-        verify_table(build_elf(assembly, directory, rustc, linker, "usercopy"), objdump)
+        verify_table(build_elf(assembly, directory, rustc, linker, "usercopy"), objdump, nofault_access)
         old = assembly.replace("    mov eax, esi\n.Lcmpxchg_u32_access:",
                                ".Lcmpxchg_u32_access:\n    mov eax, esi")
         assert old != assembly, "mutation did not recreate the original defect"
         try:
-            verify_table(build_elf(old, directory, rustc, linker, "old_usercopy"), objdump)
+            verify_table(build_elf(old, directory, rustc, linker, "old_usercopy"), objdump, nofault_access)
         except AssertionError as error:
             assert "cmpxchg_u32: table points to" in str(error), str(error)
             print("KSA-002: original misplaced-label mutation rejected")
@@ -136,7 +142,7 @@ def main():
             "    mov eax, esi\n.Lcmpxchg_u32_access:", label + "    mov eax, esi\n.Lcmpxchg_u32_access:")
         assert moved != assembly and moved.count(label) == 1, "label mutation did not apply"
         try:
-            verify_table(build_elf(moved, directory, rustc, linker, "moved_label"), objdump)
+            verify_table(build_elf(moved, directory, rustc, linker, "moved_label"), objdump, nofault_access)
         except AssertionError as error:
             assert "cmpxchg_u32: no-fault access label is not the table RIP" in str(error), str(error)
             print("TD-USERCOPY-1: misplaced no-fault label rejected")
