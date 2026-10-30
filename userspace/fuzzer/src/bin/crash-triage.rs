@@ -51,6 +51,10 @@ struct Args {
     #[clap(long)]
     output_dir: PathBuf,
 
+    /// Private candidate-to-input index; must be outside the public output directory
+    #[clap(long)]
+    private_index: Option<PathBuf>,
+
     /// Finding count observed by the producer (required cross-check)
     #[clap(long)]
     expected_findings: usize,
@@ -64,6 +68,8 @@ struct Args {
 struct Candidate {
     file_path: PathBuf,
     candidate_id: String,
+    target: String,
+    kind: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +122,9 @@ fn run(args: Args, key: &[u8]) -> TriageResult<Summary> {
         candidates
     };
 
+    if let Some(path) = &args.private_index {
+        write_private_index(path, &args.output_dir, &args.crash_dir, &final_candidates)?;
+    }
     for (index, candidate) in final_candidates.iter().enumerate() {
         write_candidate_report(&args.output_dir, index + 1, &candidate.candidate_id)?;
     }
@@ -221,6 +230,8 @@ fn collect_candidates(root: &Path, key: &[u8]) -> TriageResult<Vec<Candidate>> {
             candidates.push(Candidate {
                 file_path: entry.path(),
                 candidate_id,
+                target: target.to_owned(),
+                kind,
             });
         }
     }
@@ -295,6 +306,49 @@ fn write_candidate_report(output_dir: &Path, index: usize, candidate_id: &str) -
     Ok(())
 }
 
+fn write_private_index(
+    path: &Path,
+    public_dir: &Path,
+    input_root: &Path,
+    candidates: &[Candidate],
+) -> TriageResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_layout("private index has no parent"))?;
+    fs::create_dir_all(parent)?;
+    if fs::canonicalize(parent)?.starts_with(fs::canonicalize(public_dir)?) {
+        return Err(invalid_layout(
+            "private index must not enter the public output directory",
+        ));
+    }
+    let entries = candidates
+        .iter()
+        .map(|candidate| {
+            Ok(serde_json::json!({
+                "candidate_id": candidate.candidate_id,
+                "target": candidate.target,
+                "kind": candidate.kind,
+                "input": candidate.file_path.strip_prefix(input_root)?,
+            }))
+        })
+        .collect::<TriageResult<Vec<_>>>()?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    serde_json::to_writer_pretty(
+        file,
+        &serde_json::json!({
+            "schema": "nilix-private-candidates-v1", "candidates": entries,
+        }),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +393,7 @@ mod tests {
         Args {
             crash_dir: root.join("input"),
             output_dir: root.join("output"),
+            private_index: None,
             expected_findings,
             dedup: true,
         }
@@ -359,6 +414,58 @@ mod tests {
         assert!(validate_key(&[]).is_err());
         assert!(validate_key(&[0; MIN_KEY_BYTES - 1]).is_err());
         assert!(validate_key(&[0; MIN_KEY_BYTES]).is_ok());
+    }
+
+    #[test]
+    fn private_index_maps_public_ids_to_retained_inputs_without_changing_public_schema() {
+        let directory = TestDir::new("private-index");
+        let root = directory.path();
+        write_artifact(
+            &root.join("input"),
+            "fuzz_syscall_qemu",
+            "crash-one",
+            b"private input",
+        );
+        let mut options = args(root, 1);
+        let index = root.join("private/candidate-index.json");
+        options.private_index = Some(index.clone());
+        run(options, TEST_KEY).unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&fs::read(&index).unwrap()).unwrap();
+        let entry = &data["candidates"][0];
+        assert_eq!(
+            entry["input"],
+            "cargo-fuzz-crashes-fuzz_syscall_qemu/crash-one"
+        );
+        assert_eq!(entry["kind"], "crash");
+        assert_eq!(entry["target"], "fuzz_syscall_qemu");
+        let report = fs::read_to_string(root.join("output/candidate-001.txt")).unwrap();
+        assert_eq!(report.lines().count(), 2);
+        assert!(report.contains(entry["candidate_id"].as_str().unwrap()));
+        assert!(!report.contains("private input"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(index).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn private_index_cannot_be_written_into_public_artifacts() {
+        let directory = TestDir::new("private-index-public");
+        let root = directory.path();
+        write_artifact(
+            &root.join("input"),
+            "fuzz_syscall_qemu",
+            "crash-one",
+            b"private input",
+        );
+        let mut options = args(root, 1);
+        options.private_index = Some(root.join("output/candidate-index.json"));
+        assert!(run(options, TEST_KEY).is_err());
+        assert_eq!(fs::read_dir(root.join("output")).unwrap().count(), 0);
     }
 
     #[test]

@@ -42,10 +42,49 @@ nonzero coverage checks for the seeds that prove the KCOV data path. There is no
 measured executions-per-second claim.
 
 Build with `make build-syz-kcov` and enable `qemu-executor`. Guest startup has a
-90-second bound; use `-timeout=120` or larger for libFuzzer. Optional
+900-second bound; keep libFuzzer's per-input timeout above that bound (the private
+campaign runner passes `-timeout=1200` for this target). Optional
 `NILIX_FUZZ_KERNEL`, `NILIX_FUZZ_QEMU`, `OVMF_PATH` and `NILIX_FUZZ_ARTIFACTS`
 override the image, emulator, firmware and retained-evidence directory. Artifact
 retention is intended for finite validation runs because it keeps each guest disk.
+
+For campaigns, use `NILIX_FUZZ_FAILURE_ARTIFACTS` instead. It retains only failed
+executions, including execution/protocol errors, and removes successful guest
+disks. Each retained directory includes the submitted program, private guest
+image, disk, serial output, QEMU stderr and `outcome.json`. The receipt distinguishes
+crashes (with their observed classification), boot timeout, guest hang and
+execution errors; an execution error alone does not establish a kernel defect.
+Do not set both artifact-retention variables.
+
+### Private campaign evidence
+
+The scheduled workflow requires the repository variable `FUZZ_EVIDENCE_RECIPIENTS`
+to contain one or more native age public keys, one per line. Generate and retain
+the corresponding private identities on a maintainer-controlled machine. Never
+put those private identities in CI or in this repository. The workflow verifies
+the public recipients before running a fuzzer.
+
+`scripts/fuzz/private_evidence.py run` records the exact command, source revision
+and hashes, source changes, guest-image hashes, tool versions, exit status and raw
+libFuzzer output in a private directory. Findings use a fresh private artifact
+prefix. QEMU failures also retain their per-execution evidence. The triage tool's
+`--private-index` maps public candidate IDs to the inputs inside that directory;
+the public candidate format remains two fields and contains no reproducer.
+
+After the campaign, `private_evidence.py seal` streams a tar/gzip archive directly
+into age. Only `campaign.tar.gz.age` is uploaded, under `fuzz-evidence-<index>`.
+Raw files are never uploaded or cached. Encryption or upload failure makes the
+campaign incomplete and prevents automatic issue creation. The plaintext archive
+size is bounded to 1 GiB; successful execution disks are cleaned up. Archives are
+retained for 90 days, so maintainers should copy relevant ciphertext before expiry.
+
+Decrypt on a trusted machine with `age -d -i /path/to/identity.agekey -o evidence.tar.gz
+campaign.tar.gz.age`. Keep the decrypted evidence private under `SECURITY.md`.
+Inspect `run.json`, `candidate-index.json` and `guests/*/outcome.json` before replay.
+The index's `input` paths are relative to `finding-input/`; the copy preserves the
+exact libFuzzer input bytes. Candidate IDs deduplicate inputs, not root causes:
+different IDs can still refer to the same defect. Historical ID-only reports cannot
+recover their lost inputs.
 
 ### 2. `fuzz_vfs_path` - VFS Path Operations
 Tests filesystem operations:
