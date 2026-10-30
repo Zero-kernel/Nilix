@@ -8,6 +8,8 @@
 #![allow(clippy::manual_contains)]
 #![allow(clippy::doc_lazy_continuation)]
 extern crate alloc;
+#[cfg(feature = "host_harness")]
+extern crate std;
 
 // 导入 drivers crate 的宏
 extern crate drivers;

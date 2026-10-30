@@ -2626,8 +2626,9 @@ impl FdState {
 /// identity is the group identity (RF178-35): a tgid is a reusable number.
 #[derive(Debug)]
 pub struct ThreadGroup {
-    /// All threads share this stable budget; exec retains it. Charges keep it
-    /// alive after the group exits, so descriptor sharing cannot erase usage.
+    /// Threads share the local ceiling and all groups of the host real UID
+    /// share an aggregate ceiling. Fork/clone inherit that host principal;
+    /// exec and user-namespace changes retain it. Charges pin both after exit.
     pub heap_owner: Arc<mm::heap_admission::HeapOwner>,
     /// R153-3: set by exit_group() before sibling marking begins;
     /// sys_clone(CLONE_THREAD) refuses while it is set.
@@ -2663,8 +2664,12 @@ impl ThreadGroup {
     }
 
     pub fn try_new() -> Result<Self, mm::HeapAdmissionError> {
+        Self::try_new_for_uid(65534)
+    }
+
+    fn try_new_for_uid(host_uid: u32) -> Result<Self, mm::HeapAdmissionError> {
         Ok(Self::with_heap_owner(
-            mm::heap_admission::HeapOwner::try_new()?,
+            mm::heap_admission::HeapOwner::try_new_for_uid(host_uid)?,
         ))
     }
 
@@ -3433,7 +3438,14 @@ impl Process {
             DEFAULT_MMAP_BASE,
         ))));
         let cap_table = Arc::new(CapTable::new());
-        let thread_group = Arc::new(ThreadGroup::new());
+        let thread_group = Arc::new(
+            ThreadGroup::try_new_for_uid(if ppid == 0 {
+                0
+            } else {
+                mm::heap_admission::current_host_uid().unwrap_or(65534)
+            })
+            .expect("process UID heap owner"),
+        );
         let files = Arc::new(FilesTable::new());
         let sigactions = Arc::new(crate::signal::SignalTable::new());
         let fs = Arc::new(crate::fs_context::FsContextHandle::new(
@@ -3523,9 +3535,15 @@ impl Process {
         ))))
         .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let cap_table = CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?;
-        let thread_group =
-            Arc::try_new(ThreadGroup::try_new().map_err(|_| ProcessCreateError::OutOfMemory)?)
-                .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let thread_group = Arc::try_new(
+            ThreadGroup::try_new_for_uid(if ppid == 0 {
+                0
+            } else {
+                mm::heap_admission::current_host_uid().unwrap_or(65534)
+            })
+            .map_err(|_| ProcessCreateError::OutOfMemory)?,
+        )
+        .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let files = Arc::try_new(FilesTable::new()).map_err(|_| ProcessCreateError::OutOfMemory)?;
         let sigactions = Arc::try_new(crate::signal::SignalTable::new())
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
@@ -9891,6 +9909,31 @@ mod pid_window_tests {
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
 mod thread_group_tests {
     use super::*;
+
+    #[test]
+    fn process_construction_inherits_host_uid_without_resetting_aggregate_usage() {
+        let parent = mm::heap_admission::HeapOwner::try_new_for_uid(52001).unwrap();
+        mm::heap_admission::set_current_owner(Some(parent.clone()));
+        let first = pcb(52001, 1);
+        let first_owner = first.lock().thread_group.heap_owner.clone();
+        assert_eq!(first_owner.host_uid(), Some(52001));
+        assert!(!Arc::ptr_eq(&first_owner, &parent));
+        let before = parent.uid_snapshot().unwrap().used_bytes;
+        assert!(before > 0, "PCB construction belongs to the caller's UID");
+        mm::heap_admission::set_current_owner(Some(first_owner.clone()));
+        let second = pcb(52002, 52001);
+        let second_owner = second.lock().thread_group.heap_owner.clone();
+        assert_eq!(second_owner.host_uid(), Some(52001));
+        assert!(!Arc::ptr_eq(&first_owner, &second_owner));
+        assert!(parent.uid_snapshot().unwrap().used_bytes > before);
+        // New namespace mappings or an exec cannot alter the stable principal
+        // stored in a thread group. CLONE_THREAD shares this exact handle.
+        let thread = second.lock().thread_group.clone();
+        assert!(Arc::ptr_eq(&thread.heap_owner, &second_owner));
+        mm::heap_admission::set_current_owner(None);
+        drop((first, second, first_owner, second_owner, thread));
+        assert_eq!(parent.uid_snapshot().unwrap().used_bytes, 0);
+    }
 
     fn pcb(pid: ProcessId, ppid: ProcessId) -> ProcessArc {
         Process::try_new_pcb(
