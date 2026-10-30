@@ -14,3 +14,6 @@ x86_64 = "0.15"
 security = { path = "../security" }
 audit = { path = "../audit" }
 livepatch = { path = "../livepatch" }
+
+[dev-dependencies]
+mm = { path = "../mm", features = ["host_harness"] }

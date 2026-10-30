@@ -325,6 +325,8 @@ pub extern "C" fn _start() -> ! {
     // mmap base past 1 TiB.
     test_kpti_fresh_pml4_slots(&mut results);
 
+    test_heap_owner_isolation(&mut results);
+
     // Print summary
     println("");
     println("================================");
@@ -6974,4 +6976,100 @@ fn test_proc_schedstat(results: &mut TestResult) {
         }
     }
     results.pass("/proc/schedstat reports per-CPU switches and migrations and the RCU backlog");
+}
+
+/// Exercise real admission through pipe2/read/fork/open, including a holder
+/// that remains alive at its quota while an unrelated process makes progress.
+fn test_heap_owner_isolation(results: &mut TestResult) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const NAME: &str =
+        "heap owner isolation: oversized read refused, pipe holder cannot starve another process";
+    unsafe {
+        let buffer = mmap_anon(1024 * 1024, false);
+        let shared = mmap_anon(PAGE, true);
+        if buffer < 0 || shared < 0 {
+            if buffer >= 0 {
+                munmap(buffer as usize, 1024 * 1024);
+            }
+            if shared >= 0 {
+                munmap(shared as usize, PAGE);
+            }
+            results.fail("heap isolation: mapping failed");
+            return;
+        }
+        let state = &*(shared as *const AtomicU32);
+        let release = &*((shared as usize + 4) as *const AtomicU32);
+        state.store(0, Ordering::SeqCst);
+        release.store(0, Ordering::SeqCst);
+        let mut pipe = [-1i32; 2];
+        let made = syscall2(SYS_PIPE2, pipe.as_mut_ptr() as u64, 0x800) as i64;
+        let large_read = if made == 0 {
+            syscall3(SYS_READ, pipe[0] as u64, buffer as u64, 1024 * 1024) as i64
+        } else {
+            made
+        };
+        if made == 0 {
+            sys_close(pipe[0] as u64);
+            sys_close(pipe[1] as u64);
+        }
+        munmap(buffer as usize, 1024 * 1024);
+        if err_of(large_read) != ENOMEM {
+            munmap(shared as usize, PAGE);
+            results.fail("heap isolation: oversized read was not ENOMEM");
+            return;
+        }
+        let holder = sys_fork();
+        if is_error(holder) {
+            munmap(shared as usize, PAGE);
+            results.fail("heap isolation: holder fork failed");
+            return;
+        }
+        if holder == 0 {
+            let mut pipes = [[-1i32; 2]; 124];
+            let mut count = 0;
+            let mut denied = false;
+            while count < pipes.len() {
+                let result = syscall2(SYS_PIPE2, pipes[count].as_mut_ptr() as u64, 0) as i64;
+                if result != 0 {
+                    denied = err_of(result) == ENOMEM;
+                    break;
+                }
+                count += 1;
+            }
+            state.store(if denied && count > 8 { 1 } else { 2 }, Ordering::SeqCst);
+            while release.load(Ordering::SeqCst) == 0 {
+                userspace::syscall::sys_yield();
+            }
+            for pair in &pipes[..count] {
+                sys_close(pair[0] as u64);
+                sys_close(pair[1] as u64);
+            }
+            raw_exit(SYS_EXIT, 0);
+        }
+        for _ in 0..20000 {
+            if state.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            userspace::syscall::sys_yield();
+        }
+        let held = state.load(Ordering::SeqCst) == 1;
+        let fd = sys_open(b"/proc/schedstat\0".as_ptr(), 0, 0);
+        let opened = !is_error(fd);
+        if opened {
+            sys_close(fd);
+        }
+        let another = sys_fork();
+        if another == 0 {
+            raw_exit(SYS_EXIT, 0);
+        }
+        let forked = !is_error(another) && reap_pid(another) == Some(0);
+        release.store(1, Ordering::SeqCst);
+        let finished = reap_pid(holder) == Some(0);
+        munmap(shared as usize, PAGE);
+        if held && opened && forked && finished {
+            results.pass(NAME);
+        } else {
+            results.fail(NAME);
+        }
+    }
 }

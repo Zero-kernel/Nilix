@@ -2626,6 +2626,9 @@ impl FdState {
 /// identity is the group identity (RF178-35): a tgid is a reusable number.
 #[derive(Debug)]
 pub struct ThreadGroup {
+    /// All threads share this stable budget; exec retains it. Charges keep it
+    /// alive after the group exits, so descriptor sharing cannot erase usage.
+    pub heap_owner: Arc<mm::heap_admission::HeapOwner>,
     /// R153-3: set by exit_group() before sibling marking begins;
     /// sys_clone(CLONE_THREAD) refuses while it is set.
     pub exiting: AtomicBool,
@@ -2655,8 +2658,19 @@ pub struct ThreadGroup {
 }
 
 impl ThreadGroup {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::try_new().expect("thread-group heap owner allocation")
+    }
+
+    pub fn try_new() -> Result<Self, mm::HeapAdmissionError> {
+        Ok(Self::with_heap_owner(
+            mm::heap_admission::HeapOwner::try_new()?,
+        ))
+    }
+
+    fn with_heap_owner(heap_owner: Arc<mm::heap_admission::HeapOwner>) -> Self {
         Self {
+            heap_owner,
             exiting: AtomicBool::new(false),
             exec_draining: AtomicBool::new(false),
             members: AtomicUsize::new(1),
@@ -3362,6 +3376,7 @@ pub struct Process {
     /// until the final `ProcessWeak` deallocates the control block (RF180-40).
     /// Declared last so all payload-owned allocations are destroyed before this
     /// payload charge is released.
+    _name_heap_charge: Option<HeapCharge>,
     _heap_charge: Option<HeapCharge>,
 }
 
@@ -3509,7 +3524,8 @@ impl Process {
         .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let cap_table = CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?;
         let thread_group =
-            Arc::try_new(ThreadGroup::new()).map_err(|_| ProcessCreateError::OutOfMemory)?;
+            Arc::try_new(ThreadGroup::try_new().map_err(|_| ProcessCreateError::OutOfMemory)?)
+                .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let files = Arc::try_new(FilesTable::new()).map_err(|_| ProcessCreateError::OutOfMemory)?;
         let sigactions = Arc::try_new(crate::signal::SignalTable::new())
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
@@ -3684,18 +3700,18 @@ impl Process {
         let old_bytes = vec_charge_bytes::<u8>(self.name.capacity())
             .expect("live process-name capacity charge must be representable");
         let PreparedProcessName { name, reservation } = prepared;
-        let charge = self
-            ._heap_charge
-            .as_mut()
-            .expect("production process must own aggregate heap charge");
-        charge
-            .absorb(reservation)
-            .expect("prepared process-name charge must match PCB class");
+        let new_charge = reservation.commit().expect("prepared process-name charge");
         let old = core::mem::replace(&mut self.name, name);
         drop(old);
-        charge
-            .release_after_deallocation(old_bytes)
-            .expect("process-name charge release must match old allocation");
+        if let Some(old_charge) = self._name_heap_charge.replace(new_charge) {
+            drop(old_charge);
+        } else {
+            self._heap_charge
+                .as_mut()
+                .expect("production PCB charge")
+                .release_after_deallocation(old_bytes)
+                .expect("initial process-name charge");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3847,6 +3863,7 @@ impl Process {
             // KCOV: coverage not initialized at birth
             #[cfg(feature = "kcov")]
             kcov: None,
+            _name_heap_charge: None,
             _heap_charge: heap_charge,
         }
     }
@@ -9411,7 +9428,7 @@ use seccomp::SeccompVerdict;
 pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
     let pid = match current_pid() {
         Some(p) => p,
-        None => return SeccompVerdict::allow(),
+        None => return SeccompVerdict::kill(0),
     };
 
     // R148-I1 FIX: Use get_process() instead of holding PROCESS_TABLE lock
@@ -9421,7 +9438,7 @@ pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
     // global contention point on every syscall.
     let proc_arc = match get_process(pid) {
         Some(p) => p,
-        None => return SeccompVerdict::allow(),
+        None => return SeccompVerdict::kill(0),
     };
     let proc = proc_arc.lock();
 
@@ -9573,7 +9590,10 @@ pub fn activate_memory_space(memory_space: usize, user_memory_space: Option<usiz
 
     // 只有当目标页表与当前不同时才切换（避免不必要的 TLB 刷新）
     if need_cr3_switch {
-        unsafe { Cr3::write(target_frame, target_flags) };
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            mm::tlb_shootdown::track_cr3_switch(target_cr3_phys);
+            unsafe { Cr3::write(target_frame, target_flags) };
+        });
     }
 
     // H.3 KPTI: Keep per-CPU KPTI context in sync with the active address space.
@@ -9602,23 +9622,6 @@ pub fn activate_memory_space(memory_space: usize, user_memory_space: Option<usiz
             };
             notify_kpti_cr3_update(user_cr3_val, target_cr3_phys);
         });
-    }
-
-    if need_cr3_switch {
-        // R68 Architecture Improvement: Update per-address-space TLB tracking.
-        //
-        // This allows TLB shootdown to target only CPUs that might have TLB entries
-        // for the affected address space, rather than broadcasting to all CPUs.
-        // The tracking is used by collect_target_cpus() in tlb_shootdown.rs.
-        //
-        // # Race Condition Safety
-        //
-        // There's a window between the CR3 write and map update where another CPU's
-        // shootdown for this CR3 could miss us. This is SAFE because:
-        // - Writing CR3 flushes all non-global TLB entries on this CPU
-        // - We have no stale entries to flush since our TLB is fresh
-        // - Any subsequent TLB entries will be populated after the shootdown
-        mm::tlb_shootdown::track_cr3_switch(target_cr3_phys);
     }
 }
 
@@ -11610,28 +11613,18 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             // 注意：需要在正确的地址空间中执行
             let cleared = unsafe {
                 use crate::usercopy::copy_to_user_safe;
-                use x86_64::registers::control::Cr3;
                 use x86_64::structures::paging::PhysFrame;
                 use x86_64::PhysAddr;
 
-                // R102-4 FIX: Disable interrupts around CR3 switch to prevent:
-                // 1. Interrupt handlers running with the wrong page tables
-                // 2. Timer interrupts triggering rescheduling in foreign address space
-                // 3. KPTI context mismatch if interrupts load incorrect CR3
-                x86_64::instructions::interrupts::without_interrupts(|| {
-                    // 切换到目标进程的地址空间
-                    let current_cr3 = Cr3::read();
-                    let target_frame =
-                        PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
-                    Cr3::write(target_frame, current_cr3.1);
-
-                    // P1-6 FIX: copy_to_user_safe creates its own UserAccessGuard.
-                    let zero = 0i32.to_ne_bytes();
-                    let written = copy_to_user_safe(tid_addr as *mut u8, &zero).is_ok();
-
-                    // 恢复原来的地址空间
-                    Cr3::write(current_cr3.0, current_cr3.1);
-                    written
+                let target = PhysAddr::try_new(memory_space as u64)
+                    .ok()
+                    .filter(|_| memory_space & 0xfff == 0)
+                    .map(PhysFrame::containing_address);
+                target.is_some_and(|target| {
+                    mm::tlb_shootdown::with_temporary_address_space(target, || {
+                        let zero = 0i32.to_ne_bytes();
+                        copy_to_user_safe(tid_addr as *mut u8, &zero).is_ok()
+                    })
                 })
             };
 

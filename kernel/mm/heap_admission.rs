@@ -8,7 +8,7 @@
 //! * reservations are acquired before allocation or externally visible work;
 //! * reservations convert to committed charges without changing aggregate use;
 //! * both states are released by RAII on every error and lifetime end;
-//! * global and per-class limits are enforced with checked lock-free CAS loops;
+//! * owner, blocking-I/O-owner, global and per-class limits are enforced with checked lock-free CAS loops;
 //! * no bookkeeping path allocates from the heap it protects.
 //!
 //! The ledger is deliberately conservative.  It accounts requested allocator
@@ -16,6 +16,7 @@
 //! fragmentation can still make a fallible allocation fail after admission;
 //! callers must propagate that failure and let the reservation roll back.
 
+use alloc::sync::Arc;
 use core::fmt;
 use core::mem::{align_of, size_of};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -128,8 +129,8 @@ impl HeapClass {
             Self::Procfs => 512 * 1024,
             // Preserve the historical 1 MiB payload contract plus the complete
             // allocator charge for a 1024-entry iovec staging vector. The
-            // global ledger, rather than an artificial per-call reduction,
-            // remains authoritative for concurrent blocked callers.
+            // class ceiling is a kernel-wide bound; each thread group's
+            // independent BlockingIo sub-budget limits concurrent callers.
             Self::BlockingIo => 1024 * 1024 + 32 * 1024,
             // One exec transaction includes the image, pathname, argv/envp,
             // pointer arrays, loader scratch, and initial-stack staging.
@@ -180,6 +181,10 @@ pub enum HeapAdmissionError {
     ArithmeticOverflow,
     GlobalLimit,
     ClassLimit,
+    OwnerLimit,
+    OwnerClassLimit,
+    BlockingIoOwnerLimit,
+    AllocationFailed,
     CorruptState,
 }
 
@@ -451,8 +456,187 @@ pub fn is_published() -> bool {
     PUBLISHED.load(Ordering::Acquire)
 }
 
+/// Ordinary allocations from one thread group share 512 KiB, including an
+/// independent 128 KiB blocking-I/O ceiling. Exec needs its existing 1 MiB
+/// conservative transaction reservation before copying any user data. Allow
+/// that reservation, but bound ALL classes together to 1 MiB + 128 KiB: one
+/// owner still leaves at least 256 KiB of global admission for other groups.
+/// These are ceilings, not entitlements; class/global gates still apply.
+pub const OWNER_NON_EXEC_BYTES: usize = 512 * 1024;
+pub const OWNER_HEAP_BYTES: usize = crate::heap_budget::EXEC_TRANSACTION_PEAK_BYTES + 128 * 1024;
+pub const OWNER_BLOCKING_IO_BYTES: usize = 128 * 1024;
+const _: () = assert!(OWNER_HEAP_BYTES + 256 * 1024 <= ADMITTED_HEAP_BYTES);
+const _: () = assert!(OWNER_NON_EXEC_BYTES < ADMITTED_HEAP_BYTES / 2);
+
+/// Stable allocation identity, independent of reusable PIDs and CPU migration.
+/// Reservations retain this Arc until the actual allocation is released.
+pub struct HeapOwner {
+    total: NsByteBudget,
+    non_exec: NsByteBudget,
+    classes: [AtomicU64; HEAP_CLASS_COUNT],
+    blocking_io: NsByteBudget,
+    _allocation_charge: HeapCharge,
+}
+
+impl fmt::Debug for HeapOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeapOwner")
+            .field("total", &self.total.snapshot())
+            .field("non_exec", &self.non_exec.snapshot())
+            .field("blocking_io", &self.blocking_io.snapshot())
+            .finish()
+    }
+}
+
+impl HeapOwner {
+    pub fn try_new() -> Result<Arc<Self>, HeapAdmissionError> {
+        // The accounting control block must not retain the creator's owner:
+        // a long fork/exit lineage would otherwise retain every ancestor and
+        // recursively destroy them on one kernel stack. Process construction
+        // is already charged to its caller; this small control block remains
+        // bounded by the global CoreProcess ledger without a parent reference.
+        let charge = try_reserve_owned(HeapClass::CoreProcess, arc_charge_bytes::<Self>()?, None)?
+            .commit()?;
+        Arc::try_new(Self {
+            total: NsByteBudget::new(OWNER_HEAP_BYTES),
+            non_exec: NsByteBudget::new(OWNER_NON_EXEC_BYTES),
+            classes: [const { AtomicU64::new(0) }; HEAP_CLASS_COUNT],
+            blocking_io: NsByteBudget::new(OWNER_BLOCKING_IO_BYTES),
+            _allocation_charge: charge,
+        })
+        .map_err(|_| HeapAdmissionError::AllocationFailed)
+    }
+
+    pub fn snapshot(&self) -> NsBudgetSnapshot {
+        self.total.snapshot()
+    }
+
+    fn reserve(&self, class: HeapClass, bytes: usize) -> Result<(), HeapAdmissionError> {
+        self.total
+            .try_charge(bytes)
+            .map_err(|_| HeapAdmissionError::OwnerLimit)?;
+        if class != HeapClass::Exec && self.non_exec.try_charge(bytes).is_err() {
+            self.total.release(bytes);
+            return Err(HeapAdmissionError::OwnerLimit);
+        }
+        // Leave room in each ordinary class too: spending the entire ordinary
+        // budget on CoreProcess must not deny unrelated forks. Exec is already
+        // serialized by its full-transaction class reservation; it remains
+        // covered by the combined owner ceiling above.
+        let class_limit = if class == HeapClass::Exec {
+            class.limit_bytes()
+        } else {
+            class.limit_bytes() / 4 * 3
+        };
+        if add_reserved(&self.classes[class.index()], bytes, class_limit).is_err() {
+            self.release_total(class, bytes);
+            return Err(HeapAdmissionError::OwnerClassLimit);
+        }
+        if class == HeapClass::BlockingIo && self.blocking_io.try_charge(bytes).is_err() {
+            subtract_reserved(&self.classes[class.index()], bytes).expect("owner class rollback");
+            self.release_total(class, bytes);
+            return Err(HeapAdmissionError::BlockingIoOwnerLimit);
+        }
+        Ok(())
+    }
+
+    fn release_total(&self, class: HeapClass, bytes: usize) {
+        if class != HeapClass::Exec {
+            self.non_exec.release(bytes);
+        }
+        self.total.release(bytes);
+    }
+
+    fn release(&self, class: HeapClass, bytes: usize) {
+        if class == HeapClass::BlockingIo {
+            self.blocking_io.release(bytes);
+        }
+        subtract_reserved(&self.classes[class.index()], bytes).expect("owner class release");
+        self.release_total(class, bytes);
+    }
+}
+
+// Static storage: the admission fast path must never lazily allocate. Only the
+// local CPU accesses its slot, with interrupts disabled to exclude scheduling
+// and IRQ reentry. No PCB/table lock is acquired from an allocation path.
+static CURRENT_OWNERS: [spin::Mutex<Option<Arc<HeapOwner>>>; cpu_local::MAX_CPUS] =
+    [const { spin::Mutex::new(None) }; cpu_local::MAX_CPUS];
+
+fn with_owner_slot<R>(f: impl FnOnce(&spin::Mutex<Option<Arc<HeapOwner>>>) -> R) -> R {
+    let access = || f(&CURRENT_OWNERS[cpu_local::current_cpu_id()]);
+    #[cfg(feature = "host_harness")]
+    {
+        access()
+    }
+    #[cfg(not(feature = "host_harness"))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(access)
+    }
+}
+
+/// Scheduler publication, including clearing the owner on an idle handoff.
+/// The supplied Arc is the selected task's thread-group budget.
+pub fn set_current_owner(owner: Option<Arc<HeapOwner>>) {
+    // Drop the old reference outside the slot lock: its last release may itself
+    // release an admitted owner allocation.
+    let old = with_owner_slot(|slot| core::mem::replace(&mut *slot.lock(), owner));
+    drop(old);
+}
+
+fn current_owner() -> Option<Arc<HeapOwner>> {
+    with_owner_slot(|slot| {
+        let owner = slot.lock().clone();
+        // An interrupt or deferred network/RCU drain is not work requested by
+        // the interrupted task. Keep subsystem accounting there rather than
+        // charging an unrelated thread group's quota. No CPU-local allocation
+        // is reachable at boot: a task owner exists only after scheduler init.
+        if owner.is_some() {
+            let cpu = cpu_local::current_cpu();
+            if cpu.in_irq() || cpu.in_soft_progress() {
+                return None;
+            }
+        }
+        owner
+    })
+}
+
+fn same_owner(left: &Option<Arc<HeapOwner>>, right: &Option<Arc<HeapOwner>>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        _ => false,
+    }
+}
+
+fn reserve_owned_pair(
+    class: HeapClass,
+    bytes: usize,
+    owner: &Option<Arc<HeapOwner>>,
+) -> Result<(), HeapAdmissionError> {
+    if let Some(owner) = owner {
+        owner.reserve(class, bytes)?;
+    }
+    if let Err(error) = reserve_pair(class, bytes) {
+        if let Some(owner) = owner {
+            owner.release(class, bytes);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Reserve bytes before a fallible allocation or side effect.
 pub fn try_reserve(class: HeapClass, bytes: usize) -> Result<HeapReservation, HeapAdmissionError> {
+    try_reserve_owned(class, bytes, current_owner())
+}
+
+/// Preserve the allocation's owner when growing a retained aggregate. Passing
+/// None is reserved for objects originally constructed by kernel/boot work.
+pub fn try_reserve_owned(
+    class: HeapClass,
+    bytes: usize,
+    owner: Option<Arc<HeapOwner>>,
+) -> Result<HeapReservation, HeapAdmissionError> {
     // RF187-6 FIX: hosted sub-crate tests link `mm` as a dependency, so the
     // kernel's normal boot publication hook is not executed before an admitted
     // container is exercised. Keep the production contract strict (the feature
@@ -466,8 +650,9 @@ pub fn try_reserve(class: HeapClass, bytes: usize) -> Result<HeapReservation, He
     if !is_published() {
         return Err(HeapAdmissionError::NotPublished);
     }
-    reserve_pair(class, bytes)?;
+    reserve_owned_pair(class, bytes, &owner)?;
     Ok(HeapReservation {
+        owner,
         class,
         bytes,
         armed: true,
@@ -476,6 +661,7 @@ pub fn try_reserve(class: HeapClass, bytes: usize) -> Result<HeapReservation, He
 
 #[must_use = "dropping a reservation rolls admission back"]
 pub struct HeapReservation {
+    owner: Option<Arc<HeapOwner>>,
     class: HeapClass,
     bytes: usize,
     armed: bool,
@@ -504,7 +690,7 @@ impl HeapReservation {
                 let additional = new_bytes
                     .checked_sub(self.bytes)
                     .ok_or(HeapAdmissionError::ArithmeticOverflow)?;
-                reserve_pair(self.class, additional)?;
+                reserve_owned_pair(self.class, additional, &self.owner)?;
                 self.bytes = new_bytes;
                 Ok(())
             }
@@ -514,6 +700,9 @@ impl HeapReservation {
                     .checked_sub(new_bytes)
                     .ok_or(HeapAdmissionError::ArithmeticOverflow)?;
                 release_reserved_pair(self.class, excess)?;
+                if let Some(owner) = &self.owner {
+                    owner.release(self.class, excess);
+                }
                 self.bytes = new_bytes;
                 Ok(())
             }
@@ -526,6 +715,7 @@ impl HeapReservation {
         commit_pair(self.class, self.bytes)?;
         self.armed = false;
         Ok(HeapCharge {
+            owner: self.owner.take(),
             class: self.class,
             bytes: self.bytes,
             armed: true,
@@ -538,6 +728,9 @@ impl Drop for HeapReservation {
         if self.armed {
             release_reserved_pair(self.class, self.bytes)
                 .unwrap_or_else(|error| panic!("heap reservation accounting corrupt: {error:?}"));
+            if let Some(owner) = &self.owner {
+                owner.release(self.class, self.bytes);
+            }
             self.armed = false;
         }
     }
@@ -556,6 +749,7 @@ impl fmt::Debug for HeapReservation {
 /// A committed charge embedded in, or owned alongside, the retained object.
 #[must_use = "a HeapCharge must live exactly as long as the charged allocation"]
 pub struct HeapCharge {
+    owner: Option<Arc<HeapOwner>>,
     class: HeapClass,
     bytes: usize,
     armed: bool,
@@ -573,13 +767,20 @@ impl HeapCharge {
     }
 
     pub fn try_reserve_more(&self, bytes: usize) -> Result<HeapReservation, HeapAdmissionError> {
-        try_reserve(self.class, bytes)
+        try_reserve_owned(self.class, bytes, self.owner.clone())
+    }
+
+    pub fn owner(&self) -> Option<Arc<HeapOwner>> {
+        self.owner.clone()
     }
 
     /// Merge a successfully allocated growth reservation into this object's
     /// lifetime charge immediately before the new capacity becomes reachable.
     pub fn absorb(&mut self, reservation: HeapReservation) -> Result<(), HeapAdmissionError> {
-        if !self.armed || reservation.class != self.class {
+        if !self.armed
+            || reservation.class != self.class
+            || !same_owner(&self.owner, &reservation.owner)
+        {
             return Err(HeapAdmissionError::CorruptState);
         }
         let new_total = self
@@ -590,6 +791,7 @@ impl HeapCharge {
         // `_additional` must not run Drop: its bytes are now owned by `self`.
         let mut additional = core::mem::ManuallyDrop::new(_additional);
         additional.armed = false;
+        drop(additional.owner.take());
         self.bytes = new_total;
         Ok(())
     }
@@ -602,6 +804,9 @@ impl HeapCharge {
             return Err(HeapAdmissionError::CorruptState);
         }
         release_committed_pair(self.class, bytes)?;
+        if let Some(owner) = &self.owner {
+            owner.release(self.class, bytes);
+        }
         self.bytes -= bytes;
         Ok(())
     }
@@ -612,6 +817,9 @@ impl Drop for HeapCharge {
         if self.armed {
             release_committed_pair(self.class, self.bytes)
                 .unwrap_or_else(|error| panic!("heap charge accounting corrupt: {error:?}"));
+            if let Some(owner) = &self.owner {
+                owner.release(self.class, self.bytes);
+            }
             self.armed = false;
         }
     }
@@ -1200,6 +1408,14 @@ impl NsByteBudget {
         self: &alloc::sync::Arc<Self>,
         bytes: usize,
     ) -> Result<NsBudgetLease, NsBudgetError> {
+        self.try_charge(bytes)?;
+        Ok(NsBudgetLease {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    fn try_charge(&self, bytes: usize) -> Result<(), NsBudgetError> {
         // Closed check FIRST — before the zero-byte fast path — so teardown
         // observability can rely on a closed budget admitting NOTHING new.
         if self.closed.load(Ordering::Acquire) {
@@ -1207,10 +1423,7 @@ impl NsByteBudget {
             return Err(NsBudgetError::Closed);
         }
         if bytes == 0 {
-            return Ok(NsBudgetLease {
-                budget: alloc::sync::Arc::clone(self),
-                bytes: 0,
-            });
+            return Ok(());
         }
         let bytes_u64 = bytes as u64;
         let limit = self.limit_bytes as u64;
@@ -1234,10 +1447,7 @@ impl NsByteBudget {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Ok(NsBudgetLease {
-                        budget: alloc::sync::Arc::clone(self),
-                        bytes,
-                    });
+                    return Ok(());
                 }
                 Err(observed) => current = observed,
             }
@@ -1306,6 +1516,186 @@ impl Drop for NsBudgetLease {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn one_owner_cannot_exhaust_the_shared_pool_across_classes() {
+        let _guard = TEST_LEDGER_LOCK.lock();
+        publish();
+        let before = snapshot();
+        {
+            let holder = HeapOwner::try_new().unwrap();
+            let victim = HeapOwner::try_new().unwrap();
+            // Original audit's first 1 MiB read is refused before allocation.
+            assert!(matches!(
+                try_reserve_owned(HeapClass::BlockingIo, 1024 * 1024, Some(holder.clone())),
+                Err(HeapAdmissionError::OwnerLimit)
+            ));
+            let read = try_reserve_owned(
+                HeapClass::BlockingIo,
+                OWNER_BLOCKING_IO_BYTES,
+                Some(holder.clone()),
+            )
+            .unwrap();
+            let pipes = try_reserve_owned(
+                HeapClass::Pipe,
+                OWNER_NON_EXEC_BYTES - OWNER_BLOCKING_IO_BYTES,
+                Some(holder.clone()),
+            )
+            .unwrap()
+            .commit()
+            .unwrap();
+            assert_eq!(holder.snapshot().used_bytes, OWNER_NON_EXEC_BYTES);
+            let exhausted = snapshot();
+            for class in HeapClass::ALL {
+                let bytes = if class == HeapClass::Exec {
+                    crate::heap_budget::EXEC_TRANSACTION_PEAK_BYTES
+                } else {
+                    128
+                };
+                assert!(matches!(
+                    try_reserve_owned(class, bytes, Some(holder.clone())),
+                    Err(HeapAdmissionError::OwnerLimit)
+                ));
+            }
+            assert_eq!(
+                snapshot(),
+                exhausted,
+                "owner rejection must not charge the global pool"
+            );
+            let process =
+                try_reserve_owned(HeapClass::CoreProcess, 128, Some(victim.clone())).unwrap();
+            let open = try_reserve_owned(HeapClass::Vfs, 4096, Some(victim.clone())).unwrap();
+            let pipe = try_reserve_owned(HeapClass::Pipe, 8192, Some(victim.clone())).unwrap();
+            drop((read, pipes, process, open, pipe));
+            assert_eq!(holder.snapshot().used_bytes, 0);
+            assert_eq!(victim.snapshot().used_bytes, 0);
+        }
+        assert_eq!(snapshot(), before);
+    }
+
+    #[test]
+    fn complete_exec_transaction_fits_without_consuming_other_owners_headroom() {
+        let _guard = TEST_LEDGER_LOCK.lock();
+        publish();
+        let before = snapshot();
+        {
+            let holder = HeapOwner::try_new().unwrap();
+            let victim = HeapOwner::try_new().unwrap();
+            let retained =
+                try_reserve_owned(HeapClass::Pipe, 128 * 1024, Some(holder.clone())).unwrap();
+            let exec = try_reserve_owned(
+                HeapClass::Exec,
+                crate::heap_budget::EXEC_TRANSACTION_PEAK_BYTES,
+                Some(holder.clone()),
+            )
+            .unwrap();
+            assert_eq!(holder.snapshot().used_bytes, OWNER_HEAP_BYTES);
+            assert!(matches!(
+                try_reserve_owned(HeapClass::BlockingIo, 1, Some(holder.clone())),
+                Err(HeapAdmissionError::OwnerLimit)
+            ));
+            let process =
+                try_reserve_owned(HeapClass::CoreProcess, 128, Some(victim.clone())).unwrap();
+            let open = try_reserve_owned(HeapClass::Vfs, 4096, Some(victim.clone())).unwrap();
+            drop((retained, exec, process, open));
+            assert_eq!(holder.snapshot().used_bytes, 0);
+            assert_eq!(holder.non_exec.snapshot().used_bytes, 0);
+            assert_eq!(victim.snapshot().used_bytes, 0);
+        }
+        assert_eq!(snapshot(), before);
+    }
+
+    #[test]
+    fn an_owner_cannot_monopolize_the_process_class() {
+        let _guard = TEST_LEDGER_LOCK.lock();
+        publish();
+        let before = snapshot();
+        {
+            let holder = HeapOwner::try_new().unwrap();
+            let victim = HeapOwner::try_new().unwrap();
+            let limit = HeapClass::CoreProcess.limit_bytes() / 4 * 3;
+            let held =
+                try_reserve_owned(HeapClass::CoreProcess, limit, Some(holder.clone())).unwrap();
+            assert!(matches!(
+                try_reserve_owned(HeapClass::CoreProcess, 1, Some(holder.clone())),
+                Err(HeapAdmissionError::OwnerClassLimit)
+            ));
+            let other =
+                try_reserve_owned(HeapClass::CoreProcess, 128, Some(victim.clone())).unwrap();
+            drop((held, other));
+            assert_eq!(holder.snapshot().used_bytes, 0);
+        }
+        assert_eq!(snapshot(), before);
+    }
+
+    #[test]
+    fn owner_resize_growth_failure_and_final_drop_balance() {
+        let _guard = TEST_LEDGER_LOCK.lock();
+        publish();
+        let before = snapshot();
+        {
+            let owner = HeapOwner::try_new().unwrap();
+            let mut reservation = try_reserve_owned(
+                HeapClass::BlockingIo,
+                OWNER_BLOCKING_IO_BYTES,
+                Some(owner.clone()),
+            )
+            .unwrap();
+            let live = snapshot();
+            assert_eq!(
+                reservation.resize(OWNER_BLOCKING_IO_BYTES + 1),
+                Err(HeapAdmissionError::BlockingIoOwnerLimit)
+            );
+            assert_eq!(owner.snapshot().used_bytes, OWNER_BLOCKING_IO_BYTES);
+            assert_eq!(snapshot(), live);
+            reservation.resize(4096).unwrap();
+            let mut charge = reservation.commit().unwrap();
+            let growth = charge.try_reserve_more(2048).unwrap();
+            charge.absorb(growth).unwrap();
+            assert_eq!(owner.snapshot().used_bytes, 6144);
+            charge.release_after_deallocation(1024).unwrap();
+            assert_eq!(owner.snapshot().used_bytes, 5120);
+            let weak = Arc::downgrade(&owner);
+            drop(owner);
+            assert!(
+                weak.upgrade().is_some(),
+                "a retained object pins its exited owner"
+            );
+            drop(charge);
+            assert!(weak.upgrade().is_none());
+        }
+        assert_eq!(snapshot(), before);
+    }
+
+    #[test]
+    fn class_failure_rolls_back_owner_and_cross_owner_absorb_is_rejected() {
+        let _guard = TEST_LEDGER_LOCK.lock();
+        publish();
+        let before = snapshot();
+        {
+            let a = HeapOwner::try_new().unwrap();
+            let b = HeapOwner::try_new().unwrap();
+            let full_class =
+                try_reserve_owned(HeapClass::Futex, HeapClass::Futex.limit_bytes(), None).unwrap();
+            assert!(matches!(
+                try_reserve_owned(HeapClass::Futex, 1, Some(a.clone())),
+                Err(HeapAdmissionError::ClassLimit)
+            ));
+            drop(full_class);
+            assert_eq!(a.snapshot().used_bytes, 0);
+            let mut charge = try_reserve_owned(HeapClass::Pipe, 256, Some(a.clone()))
+                .unwrap()
+                .commit()
+                .unwrap();
+            let other = try_reserve_owned(HeapClass::Pipe, 128, Some(b.clone())).unwrap();
+            assert_eq!(charge.absorb(other), Err(HeapAdmissionError::CorruptState));
+            assert_eq!(b.snapshot().used_bytes, 0);
+            assert_eq!(a.snapshot().used_bytes, 256);
+        }
+        assert_eq!(snapshot(), before);
+    }
+
     #[test]
     fn admitted_reservations_round_trip_without_drift() {
         let _guard = super::TEST_LEDGER_LOCK.lock();

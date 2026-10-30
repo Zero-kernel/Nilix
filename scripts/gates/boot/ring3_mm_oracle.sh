@@ -108,6 +108,7 @@ R192-RES-2: 64 MiB brk, mmap, mprotect and mremap populate in bounded holds; an 
 mremap relocation keeps the moved frames: relocated data survives a 32 MiB allocation
 mremap relocation of the largest mapping that fits moves every page in one hold, its page tables staged before it
 KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them
+heap owner isolation: oversized read refused, pipe holder cannot starve another process
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.

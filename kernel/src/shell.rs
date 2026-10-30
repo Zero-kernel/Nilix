@@ -658,8 +658,16 @@ static SHELL: spin::Once<Shell> = spin::Once::new();
 
 /// Initialize and run the shell
 pub fn init_and_run() -> ! {
-    let shell = SHELL.call_once(|| Shell::new());
-    shell.run();
+    if compliance::policy().debug_interfaces_enabled {
+        let shell = SHELL.call_once(|| Shell::new());
+        shell.run();
+    } else {
+        klog_always!("Ring-0 debug shell disabled by hardening policy");
+        sched::enhanced_scheduler::Scheduler::reschedule_now(
+            true,
+            kernel_core::ReschedOrigin::Process,
+        );
+    }
 
     // If shell exits, return to idle loop
     loop {

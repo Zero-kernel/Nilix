@@ -133,75 +133,12 @@ unsafe fn serial_write_str(s: &str) {
 
 /// P1-1: Parse the hardening profile from the UEFI boot command line.
 ///
-/// Scans `boot_info.cmdline[..cmdline_len]` for a whitespace-delimited token
-/// of the form `profile=<value>` (case-insensitive prefix match). The value
-/// is parsed via [`compliance::HardeningProfile::from_str`], which accepts
-/// "secure", "balanced", "performance" and several aliases.
-///
-/// If multiple `profile=` tokens appear, the **last valid** one wins (this
-/// mirrors Linux kernel cmdline semantics where later values override earlier
-/// ones). Returns `None` when no valid profile token is found.
+/// Invalid explicit security policy is a boot error, never a default downgrade.
 fn parse_hardening_profile_from_cmdline(
     boot_info: &BootInfo,
 ) -> Option<compliance::HardeningProfile> {
-    let len = boot_info.cmdline_len.min(boot_info.cmdline.len());
-    let mut cmdline = &boot_info.cmdline[..len];
-
-    // Trim at first NUL byte if present (belt-and-suspenders with cmdline_len).
-    if let Some(nul_pos) = cmdline.iter().position(|&b| b == 0) {
-        cmdline = &cmdline[..nul_pos];
-    }
-
-    const PREFIX: &[u8] = b"profile=";
-    let mut result: Option<compliance::HardeningProfile> = None;
-
-    let mut pos = 0usize;
-    while pos < cmdline.len() {
-        // Skip whitespace
-        while pos < cmdline.len() && cmdline[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= cmdline.len() {
-            break;
-        }
-
-        // Find end of token
-        let token_start = pos;
-        while pos < cmdline.len() && !cmdline[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        let token = &cmdline[token_start..pos];
-
-        // Check for case-insensitive "profile=" prefix
-        if token.len() > PREFIX.len() {
-            let mut prefix_match = true;
-            for i in 0..PREFIX.len() {
-                if token[i].to_ascii_lowercase() != PREFIX[i] {
-                    prefix_match = false;
-                    break;
-                }
-            }
-            if prefix_match {
-                let value = &token[PREFIX.len()..];
-                if let Ok(s) = core::str::from_utf8(value) {
-                    if let Some(profile) = compliance::HardeningProfile::from_str(s) {
-                        result = Some(profile);
-                    } else {
-                        // Operator typo detection: profile= token found but value
-                        // is not recognized. Log a warning so the operator knows
-                        // their intent was not applied.
-                        // P1-1: Use klog_force! — typo warnings must always be visible.
-                        klog_force!(
-                            "      ! WARNING: Unrecognized profile value '{}', ignoring",
-                            s
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    result
+    compliance::parse_boot_profile(&boot_info.cmdline, boot_info.cmdline_len)
+        .unwrap_or_else(|reason| panic!("invalid boot security policy: {reason}"))
 }
 
 /// Test one whole logical sector and restore its original contents.
@@ -562,7 +499,7 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
 
         // G.fin.1: Initialize boot-time locked PolicySurface as single source of truth.
         // P1-1: Profile is now wired from the UEFI boot command line ("profile=secure").
-        // Falls back to Balanced if no valid profile= token is found.
+        // Balanced is the default only when no profile= token was supplied.
         let (profile, profile_source) = boot_info
             .and_then(|info| parse_hardening_profile_from_cmdline(info))
             .map(|p| (p, compliance::ProfileSource::BootCmdline))
@@ -1650,7 +1587,7 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
     // Enter interactive shell after all tests complete
     // The shell runs on the BSP and provides a Linux-compatible command-line interface
     klog_always!();
-    klog_always!("All runtime tests complete. Entering interactive shell...");
+    klog_always!("All runtime tests complete. Entering console/idle policy...");
     klog_always!();
 
     // Transfer control to the shell (never returns unless exited explicitly)

@@ -209,7 +209,7 @@ impl FileState {
         let old_charge = string_buffer_charge(old_capacity)?;
 
         let estimated_new = string_buffer_charge(new_len)?;
-        let mut reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, estimated_new))?;
+        let mut reservation = heap_no_space(self.heap_charge.try_reserve_more(estimated_new))?;
         let mut replacement = Vec::new();
         replacement
             .try_reserve_exact(new_len)
@@ -284,9 +284,16 @@ struct PreparedDirectoryKey {
 }
 
 impl PreparedDirectoryKey {
-    fn try_new(name: &str) -> Result<Self, FsError> {
+    fn try_new(
+        name: &str,
+        owner: Option<Arc<mm::heap_admission::HeapOwner>>,
+    ) -> Result<Self, FsError> {
         let estimated = string_buffer_charge(name.len())?;
-        let mut reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, estimated))?;
+        let mut reservation = heap_no_space(mm::heap_admission::try_reserve_owned(
+            HeapClass::RamFs,
+            estimated,
+            owner,
+        ))?;
         let mut key = String::new();
         key.try_reserve_exact(name.len())
             .map_err(|_| FsError::NoSpace)?;
@@ -314,9 +321,16 @@ struct AdmittedDirectoryCapacity {
 }
 
 impl PreparedDirectoryCapacity {
-    fn try_new(required_capacity: usize) -> Result<Self, FsError> {
+    fn try_new(
+        required_capacity: usize,
+        owner: Option<Arc<mm::heap_admission::HeapOwner>>,
+    ) -> Result<Self, FsError> {
         let estimated = directory_backing_charge(required_capacity)?;
-        let mut reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, estimated))?;
+        let mut reservation = heap_no_space(mm::heap_admission::try_reserve_owned(
+            HeapClass::RamFs,
+            estimated,
+            owner,
+        ))?;
         let backing = DirectoryMap::try_prepare_backing_exact(required_capacity)
             .map_err(|_| FsError::NoSpace)?;
         let actual = directory_backing_charge(backing.capacity())?;
@@ -373,11 +387,12 @@ fn prepare_directory_insert(
     entry_len: usize,
     capacity: usize,
     name: &str,
+    owner: Option<Arc<mm::heap_admission::HeapOwner>>,
 ) -> Result<(PreparedDirectoryKey, Option<PreparedDirectoryCapacity>), FsError> {
-    let key = PreparedDirectoryKey::try_new(name)?;
+    let key = PreparedDirectoryKey::try_new(name, owner.clone())?;
     let target_len = entry_len.checked_add(1).ok_or(FsError::NoSpace)?;
     let backing = if capacity < target_len {
-        Some(PreparedDirectoryCapacity::try_new(target_len)?)
+        Some(PreparedDirectoryCapacity::try_new(target_len, owner)?)
     } else {
         None
     };
@@ -442,8 +457,11 @@ fn commit_directory_remove(
 /// Prepare compaction without turning a resource-releasing mutation into an
 /// allocation-dependent operation. A zero-entry backing performs no allocation
 /// and must always be available once heap admission is published.
-fn prepare_directory_compaction(target_len: usize) -> Option<PreparedDirectoryCapacity> {
-    match PreparedDirectoryCapacity::try_new(target_len) {
+fn prepare_directory_compaction(
+    target_len: usize,
+    owner: Option<Arc<mm::heap_admission::HeapOwner>>,
+) -> Option<PreparedDirectoryCapacity> {
+    match PreparedDirectoryCapacity::try_new(target_len, owner) {
         Ok(prepared) => Some(prepared),
         Err(_) if target_len == 0 => {
             panic!("R180 RAMFS zero-capacity compaction unexpectedly failed")
@@ -674,15 +692,19 @@ impl RamFsInode {
                 // allocation-free publication step; retry if a nonstandard
                 // direct caller changed capacity outside the topology mutex.
                 loop {
-                    let (entry_len, capacity) = {
+                    let (entry_len, capacity, owner) = {
                         let state = state.read();
                         if state.entries.contains_key(name) {
                             return Err(FsError::Exists);
                         }
-                        (state.entries.len(), state.entries.capacity())
+                        (
+                            state.entries.len(),
+                            state.entries.capacity(),
+                            state.heap_charge.owner(),
+                        )
                     };
                     let (prepared_key, prepared_backing) =
-                        prepare_directory_insert(entry_len, capacity, name)?;
+                        prepare_directory_insert(entry_len, capacity, name, owner)?;
 
                     let mut state = state.write();
                     if state.entries.contains_key(name) {
@@ -1475,7 +1497,8 @@ impl FileSystem for RamFs {
             .len()
             .checked_sub(1)
             .ok_or(FsError::NotFound)?;
-        let prepared = prepare_directory_compaction(target_len);
+        let owner = entries.read().heap_charge.owner();
+        let prepared = prepare_directory_compaction(target_len, owner);
         let mut parent_state = entries.write();
         let removed = commit_directory_remove(&mut parent_state, name, prepared);
         drop(parent_state);
@@ -1563,7 +1586,10 @@ impl FileSystem for RamFs {
         };
         let is_move = matches!(decision, RenameDecision::Move);
         let prepared_key = if is_move {
-            Some(PreparedDirectoryKey::try_new(new_name)?)
+            Some(PreparedDirectoryKey::try_new(
+                new_name,
+                new_entries.read().heap_charge.owner(),
+            )?)
         } else {
             None
         };
@@ -1571,7 +1597,10 @@ impl FileSystem for RamFs {
             let state = new_entries.read();
             let target = state.entries.len().checked_add(1).ok_or(FsError::NoSpace)?;
             if state.entries.capacity() < target {
-                Some(PreparedDirectoryCapacity::try_new(target)?)
+                Some(PreparedDirectoryCapacity::try_new(
+                    target,
+                    state.heap_charge.owner(),
+                )?)
             } else {
                 None
             }
@@ -1581,14 +1610,18 @@ impl FileSystem for RamFs {
         let old_compact = if same_parent && is_move {
             None
         } else {
-            prepare_directory_compaction(
-                old_entries
-                    .read()
-                    .entries
-                    .len()
-                    .checked_sub(1)
-                    .ok_or(FsError::NotFound)?,
-            )
+            let (target, owner) = {
+                let state = old_entries.read();
+                (
+                    state
+                        .entries
+                        .len()
+                        .checked_sub(1)
+                        .ok_or(FsError::NotFound)?,
+                    state.heap_charge.owner(),
+                )
+            };
+            prepare_directory_compaction(target, owner)
         };
         let victim = if same_parent {
             let mut state = old_entries.write();

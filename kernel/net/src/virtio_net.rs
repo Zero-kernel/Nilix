@@ -160,6 +160,25 @@ struct RxInflight {
     capacity: usize,
 }
 
+/// A device-supplied ID is authority only for a driver-recorded outstanding
+/// chain head, never for an arbitrary allocated descriptor. Validate both
+/// ownership records before consuming either; malformed completions leave all
+/// DMA owners pinned for reset/quarantine.
+fn take_completed_chain<T>(
+    id: u32,
+    links: &mut [Option<u16>],
+    inflight: &mut [Option<T>],
+) -> Option<(u16, T)> {
+    let head = usize::try_from(id).ok()?;
+    let next = links.get(head).copied().flatten()?;
+    if next as usize == head || next as usize >= links.len() || inflight.get(head)?.is_none() {
+        return None;
+    }
+    let buffer = inflight[head].take()?;
+    links[head] = None;
+    Some((next, buffer))
+}
+
 // SAFETY: VirtioNetDevice manages virtqueue and transport resources
 // which are accessed through synchronized mechanisms.
 unsafe impl Send for VirtioNetDevice {}
@@ -487,6 +506,9 @@ impl VirtioNetDevice {
     /// # R43-1 FIX: Validates used.id from device before use as array index
     /// # R44-2 FIX: Validates length and re-arms buffer on error instead of leaking
     fn pop_rx_used(&mut self, pool: Option<&BufPool>) -> Result<Option<NetBuf>, RxError> {
+        if self.queue_fault_pending {
+            return Err(RxError::LinkDown);
+        }
         let used = match self.rx_queue.pop_used() {
             Some(u) => u,
             None => return Ok(None),
@@ -498,6 +520,7 @@ impl VirtioNetDevice {
         let head_raw = used.id;
         if head_raw >= qsize {
             self.stats.rx_errors += 1;
+            self.queue_fault_pending = true;
             // Log the invalid descriptor for debugging
             kprintln!(
                 "[net] WARNING: device returned invalid used.id {} >= {}",
@@ -508,32 +531,14 @@ impl VirtioNetDevice {
         }
         let head = head_raw as u16;
 
-        // R44-1 FIX: Get driver-owned chain metadata before freeing
-        let data_idx = self
-            .rx_chain_next
-            .get_mut(head as usize)
-            .and_then(Option::take);
-
-        // Retrieve the buffer and its posted capacity
-        // R65-24 FIX: Extract driver-tracked capacity for length clamping
-        // R96-4 FIX: Release descriptors even if inflight tracking is lost
-        let RxInflight { buf, capacity } = match self
-            .rx_inflight
-            .get_mut(head as usize)
-            .and_then(Option::take)
-        {
-            Some(inflight) => inflight,
-            None => {
-                // R96-4 FIX: Bookkeeping mismatch - still release descriptors to
-                // avoid leaking RX queue entries and causing queue stalls.
-                self.stats.rx_errors += 1;
-                if let Some(next) = data_idx {
-                    self.rx_queue.free_desc(next);
-                }
-                self.rx_queue.free_desc(head);
-                return Err(RxError::BufferError);
-            }
+        let Some((next, RxInflight { buf, capacity })) =
+            take_completed_chain(head_raw, &mut self.rx_chain_next, &mut self.rx_inflight)
+        else {
+            self.stats.rx_errors += 1;
+            self.queue_fault_pending = true;
+            return Err(RxError::BufferError);
         };
+        let data_idx = Some(next);
 
         // Calculate payload length (total - header)
         let total_len = used.len as usize;
@@ -864,46 +869,37 @@ impl NetDevice for VirtioNetDevice {
     }
 
     fn reclaim_tx(&mut self) -> usize {
-        if self.teardown_complete {
+        if self.teardown_complete || self.queue_fault_pending {
             return 0;
         }
         let mut reclaimed = 0;
         let qsize = self.tx_queue.size() as u32;
 
         while let Some(used) = self.tx_queue.pop_used() {
-            // R43-1 FIX: Validate used.id from device to prevent OOB access
-            let head_raw = used.id;
-            if head_raw >= qsize {
+            let completion = if used.id < qsize {
+                take_completed_chain(used.id, &mut self.tx_chain_next, &mut self.tx_inflight)
+            } else {
+                None
+            };
+            let Some((next, buf)) = completion else {
                 self.stats.tx_errors += 1;
-                kprintln!(
-                    "[net] WARNING: TX device returned invalid used.id {} >= {}",
-                    head_raw,
-                    qsize
-                );
-                continue;
-            }
-            let head = head_raw as u16;
-
-            // R44-1 FIX: Free descriptor chain using driver-owned metadata
-            self.free_tx_chain(head);
-
-            // Release buffer
-            if let Some(buf) = self
-                .tx_inflight
-                .get_mut(head as usize)
-                .and_then(Option::take)
-            {
-                self.stats.tx_packets += 1;
-                self.stats.tx_bytes += buf.len() as u64;
-                reclaimed += 1;
-                // Buffer is dropped here, returning memory to pool would require pool reference
-            }
+                self.queue_fault_pending = true;
+                break;
+            };
+            self.tx_queue.free_desc(next);
+            self.tx_queue.free_desc(used.id as u16);
+            self.stats.tx_packets += 1;
+            self.stats.tx_bytes += buf.len() as u64;
+            reclaimed += 1;
         }
 
         reclaimed
     }
 
     fn tx_queue_space(&self) -> usize {
+        if self.queue_fault_pending || self.teardown_complete {
+            return 0;
+        }
         // Each TX needs 2 descriptors
         self.tx_queue.available_descs() / 2
     }
@@ -923,7 +919,7 @@ impl NetDevice for VirtioNetDevice {
 
         // Poll for new packets (no pool for returning buffers in simple receive path)
         let result = self.pop_rx_used(None);
-        if self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
+        if self.queue_fault_pending || self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
             self.quarantine_after_queue_fault();
             return Err(RxError::LinkDown);
         }
@@ -1051,11 +1047,11 @@ impl NetDevice for VirtioNetDevice {
     }
 
     fn poll(&mut self) -> bool {
-        if self.teardown_complete {
+        if self.teardown_complete || self.queue_fault_pending {
             return false;
         }
         let tx_done = self.reclaim_tx();
-        if self.tx_queue.is_fatal() {
+        if self.queue_fault_pending || self.tx_queue.is_fatal() {
             // RF188-4 FIX: Once either device-owned ring is malformed, do not
             // consume entries from the sibling ring before process-context
             // quarantine runs.
@@ -1081,7 +1077,7 @@ impl NetDevice for VirtioNetDevice {
             }
         }
 
-        if self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
+        if self.queue_fault_pending || self.rx_queue.is_fatal() || self.tx_queue.is_fatal() {
             // `poll` is also called by `handle_interrupt`; reset/allocator
             // work is therefore deferred to receive/replenish in process
             // context rather than running with IRQs disabled.
@@ -1133,3 +1129,33 @@ impl NetDevice for VirtioNetDevice {
 // R95-7 FIX: Removed alloc_dma_memory() function that used mem::forget().
 // DMA buffers are now allocated directly in setup_queue() and stored in the
 // VirtioNetDevice struct for proper lifetime management.
+
+#[cfg(test)]
+mod completion_tests {
+    use super::take_completed_chain;
+
+    #[test]
+    fn forged_payload_and_duplicate_ids_cannot_release_live_chains() {
+        let mut links = [Some(1), None, Some(3), None];
+        let mut buffers = [Some(100), None, Some(200), None];
+        for id in [1, 3, 4, u32::MAX] {
+            assert_eq!(take_completed_chain(id, &mut links, &mut buffers), None);
+            assert_eq!(links, [Some(1), None, Some(3), None]);
+            assert_eq!(buffers, [Some(100), None, Some(200), None]);
+        }
+        assert_eq!(
+            take_completed_chain(0, &mut links, &mut buffers),
+            Some((1, 100))
+        );
+        assert_eq!(take_completed_chain(0, &mut links, &mut buffers), None);
+        assert_eq!(buffers[2], Some(200));
+        assert_eq!(
+            take_completed_chain(2, &mut links, &mut buffers),
+            Some((3, 200))
+        );
+        // An orphaned metadata half is not a completion either.
+        links[0] = Some(1);
+        assert_eq!(take_completed_chain(0, &mut links, &mut buffers), None);
+        assert_eq!(links[0], Some(1));
+    }
+}

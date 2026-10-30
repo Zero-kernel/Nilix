@@ -78,7 +78,7 @@ pub struct BootInfo {
     /// R167-C: in-memory size of the kernel image in bytes.
     pub kernel_phys_size: u64,
     /// R167-C: BootInfo ABI version (must equal `BOOT_INFO_VERSION`). A mismatch
-    /// means a stale bootloader; the kernel then ignores the version-gated image
+    /// means a stale bootloader; the kernel must stop before using its image
     /// fields above and still applies the always-valid heap + UEFI reservations.
     pub version: u64,
     /// RF180-32: placement provenance flags, appended after the v1 layout so a
@@ -210,6 +210,13 @@ const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 /// R167-C: BootInfo ABI version shared with the bootloader mirror. Bump on any
 /// layout change to `BootInfo`.
 const BOOT_INFO_VERSION: u64 = 2;
+
+fn require_boot_info_version(version: u64) {
+    assert_eq!(
+        version, BOOT_INFO_VERSION,
+        "BootInfo ABI mismatch: cannot safely reserve the live kernel image"
+    );
+}
 
 /// Must match `BOOT_INFO_KASLR_RANDOMIZED` in the bootloader mirror.
 const BOOT_INFO_KASLR_RANDOMIZED: u64 = 1 << 0;
@@ -425,6 +432,7 @@ const HIGH_HALF_MAP_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
 /// Heap base is now validated against the UEFI memory map before selection,
 /// ensuring the chosen address falls within EFI_CONVENTIONAL_MEMORY regions.
 pub fn init_with_bootinfo(boot_info: &BootInfo) {
+    require_boot_info_version(boot_info.version);
     // F9 (review D4): remember which physical ranges hold firmware tables, so
     // ACPI reads above the direct map are confined to them.
     record_firmware_ranges(boot_info);
@@ -1382,8 +1390,8 @@ impl<'a> ReservedRangeBuilder<'a> {
 /// buddy window `[pmm_base, pmm_base + pmm_size)`:
 ///   1. the kernel heap `[heap_phys, HEAP_SIZE)` — kernel-computed, ALWAYS valid;
 ///   2. the framebuffer `[base, size)` — an existing BootInfo field, always valid;
-///   3. the kernel image `[kernel_phys_base, kernel_phys_size)` — only when the
-///      BootInfo version matches (the field is otherwise from a stale bootloader);
+///   3. the kernel image `[kernel_phys_base, kernel_phys_size)` — an ABI mismatch
+///      stops boot before any frames may enter the free pool;
 ///   4. every non-`CONVENTIONAL` UEFI descriptor that intersects the window —
 ///      defends against a mis-typed UEFI map and covers boot-services / loader /
 ///      ACPI / framebuffer-MMIO / page-table frames implicitly.
@@ -1398,15 +1406,7 @@ fn build_buddy_reservations(
     heap_phys: u64,
     out: &mut [(u64, u64); MAX_RESERVED_RANGES],
 ) -> usize {
-    let version_ok = boot_info.version == BOOT_INFO_VERSION;
-    if !version_ok {
-        klog!(
-            Warn,
-            "  Warning: BootInfo version {} != expected {}; ignoring kernel-image reservation",
-            boot_info.version,
-            BOOT_INFO_VERSION
-        );
-    }
+    require_boot_info_version(boot_info.version);
 
     // Build the reservation set inside a scope so the builder's borrow of `out`
     // ends before the fail-closed path may overwrite `out`.
@@ -1420,10 +1420,8 @@ fn build_buddy_reservations(
             boot_info.framebuffer.base,
             boot_info.framebuffer.size as u64,
         );
-        // (3) Kernel image — only trust the new fields when the ABI version matches.
-        if version_ok {
-            builder.push(boot_info.kernel_phys_base, boot_info.kernel_phys_size);
-        }
+        // (3) The running kernel image must never enter the free-frame pool.
+        builder.push(boot_info.kernel_phys_base, boot_info.kernel_phys_size);
         // (4) Every non-conventional UEFI range intersecting the window.
         add_non_conventional_uefi_reservations(&mut builder, &boot_info.memory_map);
 
@@ -1727,6 +1725,12 @@ pub fn heap_validated() -> bool {
 
 #[cfg(all(test, feature = "host_harness"))]
 mod tests {
+    #[test]
+    #[should_panic(expected = "BootInfo ABI mismatch")]
+    fn stale_bootinfo_cannot_drop_the_live_kernel_reservation() {
+        super::require_boot_info_version(super::BOOT_INFO_VERSION - 1);
+    }
+
     use super::*;
 
     fn descriptor(typ: u32, phys_start: u64, page_count: u64) -> EfiMemoryDescriptor {

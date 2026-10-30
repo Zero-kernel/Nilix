@@ -118,6 +118,7 @@ version = "0.1.0"
 dependencies = [
  "audit",
  "livepatch",
+ "mm",
  "security",
  "spin 0.9.9",
  "x86_64",
