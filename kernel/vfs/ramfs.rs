@@ -9,6 +9,30 @@
 //! - MAX_TOTAL_BYTES: Maximum total bytes across all ramfs instances (64 MiB)
 //!
 //! These limits prevent memory exhaustion DoS attacks.
+//!
+//! # Heap ownership
+//!
+//! A file's mutable storage charge follows the last successful writer/grower,
+//! including the inode and ALL allocated buffer capacity. Directory key/backing
+//! storage similarly follows the successful inserter or rename destination.
+//! This is aggregate ownership, not per-byte provenance: a writer must be able
+//! to admit the whole affected aggregate. Inherited/duplicated descriptors and
+//! hard links therefore cannot spend the original creator's remaining quota.
+//!
+//! A transfer first reserves the destination owner/UID for existing capacity,
+//! without adding it to the global ledger again. Detached growth is separately
+//! admitted for its full peak allocation. Only after every fallible preparation
+//! succeeds are ownership and contents committed; old allocations are freed
+//! before their charges are released. Failed adoption leaves contents, metadata,
+//! the previous owner, and every ledger unchanged.
+//!
+//! Boot-created capacity has no free baseline after adoption: an in-place write
+//! also claims the complete existing file charge. Directory adoption includes
+//! existing keys/backing and the inode/control-block charge retained by Weak
+//! parents. Untouched kernel objects stay kernel-owned. Pure deletion/shrink
+//! keeps the old owner, so reclaim is not conditional on a new owner's budget;
+//! non-empty directory compaction remains best-effort. No cgroup/DAC ownership
+//! or file access permissions are changed by an accounting transfer.
 
 // R172-22: ramfs directory entries use the allocation-fallible `FallibleOrderedMap`
 // (mm/fallible_map.rs) instead of `BTreeMap` — stable no_std `BTreeMap::insert` allocates a
@@ -196,8 +220,19 @@ impl FileState {
             None
         };
 
-        // Growing inside already charged capacity requires no allocation.
+        let owner = if new_len > old_len {
+            self.heap_charge.growth_owner()
+        } else {
+            // Shrinking must not require taking over another user's storage.
+            self.heap_charge.owner()
+        };
+        let transfer = heap_no_space(self.heap_charge.prepare_owner_transfer(owner.clone()))?;
+
+        // Existing boot capacity is also admitted to the caller before use.
         if new_len > old_len && new_len <= self.data.capacity() {
+            transfer
+                .commit(&mut self.heap_charge)
+                .expect("RAMFS stable owner transfer");
             self.data.resize(new_len, 0);
             growth_quota
                 .expect("RAMFS growth quota guard missing")
@@ -209,7 +244,11 @@ impl FileState {
         let old_charge = string_buffer_charge(old_capacity)?;
 
         let estimated_new = string_buffer_charge(new_len)?;
-        let mut reservation = heap_no_space(self.heap_charge.try_reserve_more(estimated_new))?;
+        let mut reservation = heap_no_space(mm::heap_admission::try_reserve_owned(
+            HeapClass::RamFs,
+            estimated_new,
+            owner,
+        ))?;
         let mut replacement = Vec::new();
         replacement
             .try_reserve_exact(new_len)
@@ -220,6 +259,9 @@ impl FileState {
         let preserved = core::cmp::min(old_len, new_len);
         replacement[..preserved].copy_from_slice(&self.data[..preserved]);
 
+        transfer
+            .commit(&mut self.heap_charge)
+            .expect("RAMFS stable owner transfer");
         absorb_prepared(&mut self.heap_charge, reservation);
         let retired = core::mem::replace(&mut self.data, replacement);
         drop(retired);
@@ -232,10 +274,24 @@ impl FileState {
         }
         Ok(())
     }
+
+    /// In-place writes must adopt existing boot capacity as well. All fallible
+    /// preparation is complete before the caller changes any file bytes.
+    fn claim_for_write(&mut self) -> Result<(), FsError> {
+        let transfer = heap_no_space(
+            self.heap_charge
+                .prepare_owner_transfer(self.heap_charge.growth_owner()),
+        )?;
+        transfer
+            .commit(&mut self.heap_charge)
+            .expect("RAMFS stable owner transfer");
+        Ok(())
+    }
 }
 
-/// Directory storage and its aggregate lifetime charge. The charge covers the
-/// inode Arc, the map backing Vec, and every retained String-key buffer.
+/// Directory storage and its aggregate lifetime charge: map backing plus every
+/// retained String-key buffer. The inode/control-block charge is held separately
+/// by `allocation_owner` so Weak parent links preserve its exact lifetime.
 struct DirectoryState {
     entries: DirectoryMap,
     heap_charge: HeapCharge,
@@ -483,7 +539,7 @@ pub struct RamFsInode {
     self_weak: spin::Once<Weak<RamFsInode>>,
     retirement: Option<Arc<Retirement<RamFsInode>>>,
     /// Weak parent references retain this charge through the allocation's tail.
-    allocation_owner: Option<Arc<HeapCharge>>,
+    allocation_owner: Option<Arc<spin::Mutex<HeapCharge>>>,
 }
 
 struct ParentState {
@@ -491,7 +547,52 @@ struct ParentState {
     name: mm::AdmittedString,
     retained: Option<Edge<RamFsInode>>,
     // Declared after Weak so the allocation is freed before this owner releases.
-    _parent_allocation: Arc<HeapCharge>,
+    _parent_allocation: Arc<spin::Mutex<HeapCharge>>,
+}
+
+/// Aggregate ownership follows a successful inserting/growing task. Reserve
+/// both directory storage and an ownerless inode control block before either
+/// charge changes. Parent Weak references continue to pin the allocation charge.
+struct DirectoryOwnerTransfer {
+    contents: mm::heap_admission::HeapOwnerTransfer,
+    allocation: mm::heap_admission::HeapOwnerTransfer,
+}
+
+impl DirectoryOwnerTransfer {
+    fn prepare(
+        inode: &RamFsInode,
+        state: &DirectoryState,
+        owner: Option<Arc<mm::heap_admission::HeapOwner>>,
+    ) -> Result<Self, FsError> {
+        let contents = heap_no_space(state.heap_charge.prepare_owner_transfer(owner.clone()))?;
+        let allocation = inode
+            .allocation_owner
+            .as_ref()
+            .ok_or(FsError::NotDir)?
+            .lock();
+        // An existing inode allocation does not grow. Only boot-owned metadata
+        // needs adoption; the mutable contents above follow the current writer.
+        let allocation =
+            heap_no_space(allocation.prepare_owner_transfer(allocation.owner().or(owner)))?;
+        Ok(Self {
+            contents,
+            allocation,
+        })
+    }
+
+    fn commit(self, inode: &RamFsInode, state: &mut DirectoryState) {
+        let mut allocation = inode
+            .allocation_owner
+            .as_ref()
+            .expect("directory allocation")
+            .lock();
+        self.allocation
+            .commit(&mut allocation)
+            .expect("RAMFS stable allocation transfer");
+        self.contents
+            .commit(&mut state.heap_charge)
+            .expect("RAMFS stable contents transfer");
+    }
 }
 
 impl RamFsInode {
@@ -539,13 +640,13 @@ impl RamFsInode {
     ) -> Result<Arc<Self>, FsError> {
         let mode = FileMode::directory(perm);
         let arc_bytes = heap_no_space(arc_charge_bytes::<Self>())?;
-        let owner_bytes = heap_no_space(arc_charge_bytes::<HeapCharge>())?;
+        let owner_bytes = heap_no_space(arc_charge_bytes::<spin::Mutex<HeapCharge>>())?;
         let allocation = heap_no_space(try_reserve_heap(
             HeapClass::RamFs,
             checked_charge_add(arc_bytes, owner_bytes)?,
         ))?;
-        let allocation_owner =
-            Arc::try_new(heap_no_space(allocation.commit())?).map_err(|_| FsError::NoSpace)?;
+        let allocation_owner = Arc::try_new(spin::Mutex::new(heap_no_space(allocation.commit())?))
+            .map_err(|_| FsError::NoSpace)?;
         let charge = heap_no_space(heap_no_space(try_reserve_heap(HeapClass::RamFs, 0))?.commit())?;
         let inode = Arc::try_new(Self {
             fs_id,
@@ -704,7 +805,7 @@ impl RamFsInode {
                         )
                     };
                     let (prepared_key, prepared_backing) =
-                        prepare_directory_insert(entry_len, capacity, name, owner)?;
+                        prepare_directory_insert(entry_len, capacity, name, owner.clone())?;
 
                     let mut state = state.write();
                     if state.entries.contains_key(name) {
@@ -723,6 +824,8 @@ impl RamFsInode {
                         continue;
                     }
 
+                    let transfer = DirectoryOwnerTransfer::prepare(self, &state, owner)?;
+                    transfer.commit(self, &mut state);
                     commit_directory_insert(&mut state, prepared_key, prepared_backing, edge)?;
                     *child.parent.write() = prepared_parent;
                     break;
@@ -1183,6 +1286,8 @@ impl Inode for RamFsInode {
 
                 if required_len > current_len {
                     state.resize_data(required_len)?;
+                } else if !data_in.is_empty() {
+                    state.claim_for_write()?;
                 }
 
                 // Write data (in-place, no allocation)
@@ -1585,11 +1690,9 @@ impl FileSystem for RamFs {
             None
         };
         let is_move = matches!(decision, RenameDecision::Move);
+        let new_owner = new_entries.read().heap_charge.growth_owner();
         let prepared_key = if is_move {
-            Some(PreparedDirectoryKey::try_new(
-                new_name,
-                new_entries.read().heap_charge.growth_owner(),
-            )?)
+            Some(PreparedDirectoryKey::try_new(new_name, new_owner.clone())?)
         } else {
             None
         };
@@ -1599,7 +1702,7 @@ impl FileSystem for RamFs {
             if state.entries.capacity() < target {
                 Some(PreparedDirectoryCapacity::try_new(
                     target,
-                    state.heap_charge.growth_owner(),
+                    new_owner.clone(),
                 )?)
             } else {
                 None
@@ -1625,6 +1728,10 @@ impl FileSystem for RamFs {
         };
         let victim = if same_parent {
             let mut state = old_entries.write();
+            if is_move {
+                let transfer = DirectoryOwnerTransfer::prepare(new_parent, &state, new_owner)?;
+                transfer.commit(new_parent, &mut state);
+            }
             let source = commit_directory_remove(&mut state, old_name, old_compact);
             if is_move {
                 commit_directory_insert(&mut state, prepared_key.unwrap(), None, source)
@@ -1649,6 +1756,10 @@ impl FileSystem for RamFs {
                 let old = old_entries.write();
                 (old, new)
             };
+            if is_move {
+                let transfer = DirectoryOwnerTransfer::prepare(new_parent, &new_state, new_owner)?;
+                transfer.commit(new_parent, &mut new_state);
+            }
             let source = commit_directory_remove(&mut old_state, old_name, old_compact);
             if is_move {
                 commit_directory_insert(&mut new_state, prepared_key.unwrap(), new_backing, source)
@@ -2163,3 +2274,7 @@ mod tests {
         assert_eq!(owner.snapshot().used_bytes, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "ramfs_owner_tests.rs"]
+mod owner_tests;

@@ -172,7 +172,7 @@ run_suite livepatch 3 0 \
     --manifest-path kernel/livepatch/Cargo.toml \
     --target x86_64-unknown-linux-gnu --lib --locked
 
-run_suite mm 45 0 \
+run_suite mm 50 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -226,13 +226,13 @@ run_suite ipc-robust-futex 24 17 \
     --features mm/host_harness \
     --lib --locked -- robust_ futex_parity_ futex_pi_
 
-run_suite vfs 68 0 \
+run_suite vfs 72 0 \
     --manifest-path kernel/vfs/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
     --lib --locked
 
-run_suite kernel-core 126 0 \
+run_suite kernel-core 127 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -265,7 +265,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 126 \
+run_suite mitigation-mappings 5 127 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

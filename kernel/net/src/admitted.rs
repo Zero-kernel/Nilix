@@ -228,6 +228,10 @@ impl From<HeapAdmissionError> for AdmittedAllocError {
             | HeapAdmissionError::OwnerLimit
             | HeapAdmissionError::OwnerClassLimit
             | HeapAdmissionError::BlockingIoOwnerLimit
+            | HeapAdmissionError::UidLimit
+            | HeapAdmissionError::UidClassLimit
+            | HeapAdmissionError::BlockingIoUidLimit
+            | HeapAdmissionError::UidDomainLimit
             | HeapAdmissionError::AllocationFailed => Self::NoMemory,
             HeapAdmissionError::CorruptState => Self::CapacityInvariant,
         }

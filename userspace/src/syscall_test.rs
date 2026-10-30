@@ -6979,11 +6979,12 @@ fn test_proc_schedstat(results: &mut TestResult) {
 }
 
 /// Exercise real admission through pipe2/read/fork/open, including a holder
-/// that remains alive at its quota while an unrelated process makes progress.
+/// that remains alive at its local quota while another group makes progress.
+/// The second group must hit the shared host-UID ceiling before its own ceiling.
 fn test_heap_owner_isolation(results: &mut TestResult) {
     use core::sync::atomic::{AtomicU32, Ordering};
     const NAME: &str =
-        "heap owner isolation: oversized read refused, pipe holder cannot starve another process";
+        "heap quotas: oversized read refused, local isolation survives, fork shares the UID ceiling";
     unsafe {
         let buffer = mmap_anon(1024 * 1024, false);
         let shared = mmap_anon(PAGE, true);
@@ -7036,7 +7037,10 @@ fn test_heap_owner_isolation(results: &mut TestResult) {
                 }
                 count += 1;
             }
-            state.store(if denied && count > 8 { 1 } else { 2 }, Ordering::SeqCst);
+            state.store(
+                if denied && count > 8 { count as u32 } else { 1 },
+                Ordering::SeqCst,
+            );
             while release.load(Ordering::SeqCst) == 0 {
                 userspace::syscall::sys_yield();
             }
@@ -7052,7 +7056,8 @@ fn test_heap_owner_isolation(results: &mut TestResult) {
             }
             userspace::syscall::sys_yield();
         }
-        let held = state.load(Ordering::SeqCst) == 1;
+        let held_count = state.load(Ordering::SeqCst) as usize;
+        let held = held_count > 8;
         let fd = sys_open(b"/proc/schedstat\0".as_ptr(), 0, 0);
         let opened = !is_error(fd);
         if opened {
@@ -7060,7 +7065,32 @@ fn test_heap_owner_isolation(results: &mut TestResult) {
         }
         let another = sys_fork();
         if another == 0 {
-            raw_exit(SYS_EXIT, 0);
+            // The holder retains its pipes. A fresh thread-group owner must
+            // still inherit the same UID budget and run out substantially
+            // before the first child's local 512 KiB ceiling.
+            let mut pipes = [[-1i32; 2]; 124];
+            let mut count = 0;
+            let mut denied = false;
+            while count < pipes.len() {
+                let result = syscall2(SYS_PIPE2, pipes[count].as_mut_ptr() as u64, 0) as i64;
+                if result != 0 {
+                    denied = err_of(result) == ENOMEM;
+                    break;
+                }
+                count += 1;
+            }
+            for pair in &pipes[..count] {
+                sys_close(pair[0] as u64);
+                sys_close(pair[1] as u64);
+            }
+            raw_exit(
+                SYS_EXIT,
+                if denied && count > 0 && count + 8 < held_count {
+                    0
+                } else {
+                    1
+                },
+            );
         }
         let forked = !is_error(another) && reap_pid(another) == Some(0);
         release.store(1, Ordering::SeqCst);
