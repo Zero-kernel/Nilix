@@ -43,10 +43,11 @@ the toolchain installed work too.
 - **QEMU + OVMF** — `qemu-system-x86_64` and the OVMF UEFI firmware (for boot/run).
 - **GNU Make**.
 - **musl toolchain** — `musl-tools` (`musl-gcc`), only for the musl conformance gate.
+- **age** — only for the private fuzz evidence harness tests (`scripts/tests/private_fuzz_evidence_test.py`).
 
 On Debian/Ubuntu the non-Rust deps match what CI installs:
 ```bash
-sudo apt-get install -y qemu-system-x86 ovmf musl-tools make
+sudo apt-get install -y qemu-system-x86 ovmf musl-tools make age
 ```
 
 > Maintainer note: the project is also developed from a Windows mirror that has **no**

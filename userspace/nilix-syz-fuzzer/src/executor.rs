@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use crate::disk::{ensure_qemu_safe_path, Ext3Tools, Ext3Transport};
 use crate::program::SyscallProgram;
 use crate::protocol::{
-    constant_time_eq, decode_result, encode_program, ExecutionIdentity, ProgramBinding,
+    constant_time_eq, decode_result, encode_program, EncodedProgram, ExecutionIdentity,
+    ProgramBinding,
 };
 
 const MAX_SERIAL_LOG: u64 = 4 * 1024 * 1024;
@@ -46,6 +47,7 @@ pub struct QemuExecutor {
     timeout: Duration,
     transport: Ext3Transport,
     artifact_dir: Option<PathBuf>,
+    retain_successes: bool,
 }
 
 impl QemuExecutor {
@@ -87,6 +89,7 @@ impl QemuExecutor {
             timeout: Duration::from_secs(timeout_secs),
             transport: Ext3Transport::new(tools, disk_mib)?,
             artifact_dir: None,
+            retain_successes: true,
         })
     }
 
@@ -94,6 +97,15 @@ impl QemuExecutor {
     /// validation run. Normal campaigns keep the default temporary cleanup.
     pub fn with_artifact_dir(mut self, directory: PathBuf) -> Self {
         self.artifact_dir = Some(directory);
+        self.retain_successes = true;
+        self
+    }
+
+    /// Keep failed executions (including host/protocol errors) for private
+    /// triage, while reclaiming successful guest disks during long campaigns.
+    pub fn with_failure_artifact_dir(mut self, directory: PathBuf) -> Self {
+        self.artifact_dir = Some(directory);
+        self.retain_successes = false;
         self
     }
 
@@ -115,20 +127,33 @@ impl QemuExecutor {
         }
         .context("failed to create per-execution temporary directory")?;
         let work_dir = temp_dir.path().to_path_buf();
-        let _auto_cleanup = if self.artifact_dir.is_some() {
+        let result = self.execute_in(&encoded, &work_dir);
+        if self.artifact_dir.is_some()
+            && (self.retain_successes || !matches!(result, Ok(ExecutionResult::Success(_))))
+        {
+            // Keep the raw evidence even if writing the diagnostic receipt fails.
             let _ = temp_dir.keep();
+            std::fs::write(work_dir.join("program.json"), serde_json::to_vec(program)?)
+                .context("failed to retain the submitted syscall program")?;
+            let receipt = execution_receipt(&result, &encoded.binding, &work_dir);
+            std::fs::write(
+                work_dir.join("outcome.json"),
+                serde_json::to_vec_pretty(&receipt)?,
+            )
+            .context("failed to write private execution outcome")?;
             eprintln!("NILIX_SYZ_ARTIFACTS {}", work_dir.display());
-            None
-        } else {
-            Some(temp_dir)
-        };
+        }
+        result
+    }
+
+    fn execute_in(&self, encoded: &EncodedProgram, work_dir: &Path) -> Result<ExecutionResult> {
         let serial_path = work_dir.join("serial.log");
         let stderr_path = work_dir.join("qemu.stderr");
         File::create(&serial_path).context("failed to create serial log")?;
         let stderr_file = File::create(&stderr_path).context("failed to create QEMU stderr log")?;
         let disk_path = self
             .transport
-            .prepare(&work_dir, &encoded.bytes)
+            .prepare(work_dir, &encoded.bytes)
             .context("failed to prepare fresh syz Ext3 transport")?;
 
         let source_esp = self
@@ -180,7 +205,7 @@ impl QemuExecutor {
 
         match observation {
             Observation::Pass(marker) => {
-                let result_bytes = match self.transport.extract_result(&disk_path, &work_dir) {
+                let result_bytes = match self.transport.extract_result(&disk_path, work_dir) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         return Ok(ExecutionResult::Crash(CrashInfo {
@@ -225,6 +250,36 @@ impl QemuExecutor {
             Observation::Timeout { began: true } => Ok(ExecutionResult::Hang),
         }
     }
+}
+
+fn execution_receipt(
+    result: &Result<ExecutionResult>,
+    binding: &ProgramBinding,
+    work_dir: &Path,
+) -> serde_json::Value {
+    let (outcome, classification) = match result {
+        Ok(ExecutionResult::Success(_)) => ("success", String::new()),
+        Ok(ExecutionResult::Crash(info)) => ("crash", info.classification.clone()),
+        Ok(ExecutionResult::Timeout) => ("boot_timeout", String::new()),
+        Ok(ExecutionResult::Hang) => ("guest_hang", String::new()),
+        // An execution error is not, by itself, proof of a kernel defect.
+        Err(error) => ("execution_error", format!("{error:#}")),
+    };
+    let guest_began = SerialMonitor::open(&work_dir.join("serial.log"), binding)
+        .and_then(|mut serial| {
+            serial.poll()?;
+            Ok(serial.tracker.began)
+        })
+        .ok();
+    serde_json::json!({
+        "schema": "nilix-private-execution-v1",
+        "sequence": binding.sequence_hex(),
+        "run": binding.run_hex(),
+        "program": binding.program_hex(),
+        "outcome": outcome,
+        "classification": classification,
+        "guest_began": guest_began,
+    })
 }
 
 #[derive(Debug)]

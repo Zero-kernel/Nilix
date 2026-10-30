@@ -78,7 +78,12 @@ jobs:
       - name: Install QEMU and build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 musl-tools
+          sudo apt-get install -y qemu-system-x86 musl-tools age
+
+      - name: Verify private evidence encryption
+        env:
+          FUZZ_EVIDENCE_RECIPIENTS: ${{ vars.FUZZ_EVIDENCE_RECIPIENTS }}
+        run: python3 scripts/fuzz/private_evidence.py preflight
 
       # Build before any secret is present so dependency build scripts never
       # inherit the private fingerprinting key.
@@ -102,48 +107,23 @@ jobs:
       - name: Prepare fuzz directories
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          mkdir -p fuzz/artifacts/${{ matrix.target }}
 
       # Raw libFuzzer output can include Base64 reproducers and stack traces.
-      # Keep it only in RUNNER_TEMP; never tee, cat, summarize, or upload it.
+      # Keep plaintext in RUNNER_TEMP. Upload only the sealed age archive.
       - name: Run fuzzer privately
         id: run_fuzzer
         env:
           FUZZ_TIMEOUT: ${{ inputs.timeout || '900' }}
         run: |
-          timeout="$FUZZ_TIMEOUT"
-          if ! [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || [ "$timeout" -gt 1200 ]; then
-            echo "::error::Fuzz timeout must be an integer from 1 through 1200"
-            exit 1
-          fi
-
-          private_log="$RUNNER_TEMP/libfuzzer-output.log"
-          set +e
-
-          # QEMU fuzzer needs the qemu-executor feature flag
-          if [ "${{ matrix.target }}" = "fuzz_syscall_qemu" ]; then
-            cargo +nightly-2025-12-08 fuzz run ${{ matrix.target }} --features qemu-executor -- \
-              -max_total_time="$timeout" \
-              -rss_limit_mb=4096 \
-              -print_final_stats=1 \
-              > "$private_log" 2>&1
-          else
-            cargo +nightly-2025-12-08 fuzz run ${{ matrix.target }} -- \
-              -max_total_time="$timeout" \
-              -rss_limit_mb=4096 \
-              -print_final_stats=1 \
-              > "$private_log" 2>&1
-          fi
-
-          exit_code=$?
-          set -e
-          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+          python3 scripts/fuzz/private_evidence.py run \
+            --private-dir "$RUNNER_TEMP/nilix-fuzz-evidence" \
+            --target "${{ matrix.target }}" --timeout "$FUZZ_TIMEOUT"
 
       - name: Count private findings
         if: always()
         id: count_findings
         run: |
-          findings=$(find fuzz/artifacts/${{ matrix.target }} -maxdepth 1 -type f \
+          findings=$(find "$RUNNER_TEMP/nilix-fuzz-evidence/findings" -maxdepth 1 -type f \
             \( -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' -o -name 'leak-*' \) \
             2>/dev/null | wc -l)
           echo "findings=${findings}" >> "$GITHUB_OUTPUT"
@@ -178,12 +158,13 @@ jobs:
             exit 1
           fi
 
-          input_root="$RUNNER_TEMP/nilix-finding-input"
+          umask 077
+          input_root="$RUNNER_TEMP/nilix-fuzz-evidence/finding-input"
           input_dir="$input_root/cargo-fuzz-crashes-${{ matrix.target }}"
           candidate_dir="fuzz/candidates"
-          private_triage_log="$RUNNER_TEMP/candidate-triage.log"
+          private_triage_log="$RUNNER_TEMP/nilix-fuzz-evidence/triage.log"
           mkdir -p "$input_dir" "$candidate_dir"
-          if ! find fuzz/artifacts/${{ matrix.target }} -maxdepth 1 -type f \
+          if ! find "$RUNNER_TEMP/nilix-fuzz-evidence/findings" -maxdepth 1 -type f \
             \( -name 'crash-*' -o -name 'timeout-*' -o -name 'oom-*' -o -name 'leak-*' \) \
             -exec cp -- {} "$input_dir/" \; \
             > /dev/null 2> "$private_triage_log"; then
@@ -194,6 +175,7 @@ jobs:
           if ! userspace/fuzzer/target/x86_64-unknown-linux-gnu/release/crash-triage \
             --crash-dir "$input_root" \
             --output-dir "$candidate_dir" \
+            --private-index "$RUNNER_TEMP/nilix-fuzz-evidence/candidate-index.json" \
             --expected-findings "$FUZZ_FINDINGS" \
             --dedup \
             >> "$private_triage_log" 2>&1; then
@@ -217,8 +199,31 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+      # Preserve evidence even when the fuzzer/triage failed without a candidate.
+      # A missing recipient, seal failure or upload failure makes the campaign
+      # incomplete and prevents the reporting job from creating an empty pointer.
+      - name: Seal private campaign evidence
+        id: seal_evidence
+        if: always() && steps.run_fuzzer.outcome != 'skipped'
+        env:
+          FUZZ_EVIDENCE_RECIPIENTS: ${{ vars.FUZZ_EVIDENCE_RECIPIENTS }}
+        run: |
+          python3 scripts/fuzz/private_evidence.py seal \
+            --private-dir "$RUNNER_TEMP/nilix-fuzz-evidence" \
+            --output fuzz/evidence/campaign.tar.gz.age
+
+      - name: Upload encrypted campaign evidence
+        id: upload_evidence
+        if: always() && steps.seal_evidence.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-evidence-${{ strategy.job-index }}
+          path: fuzz/evidence/campaign.tar.gz.age
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Save clean corpus
-        if: steps.validate_fuzzer.outcome == 'success' && steps.count_findings.outputs.findings == '0'
+        if: steps.validate_fuzzer.outcome == 'success' && steps.count_findings.outputs.findings == '0' && steps.upload_evidence.outcome == 'success'
         uses: actions/cache/save@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}/
@@ -232,12 +237,14 @@ jobs:
           COUNT_OUTCOME: ${{ steps.count_findings.outcome }}
           VALIDATE_OUTCOME: ${{ steps.validate_fuzzer.outcome }}
           CANDIDATE_OUTCOME: ${{ steps.create_candidates.outcome }}
+          SEAL_OUTCOME: ${{ steps.seal_evidence.outcome }}
+          EVIDENCE_UPLOAD_OUTCOME: ${{ steps.upload_evidence.outcome }}
           FINDINGS: ${{ steps.count_findings.outputs.findings }}
           CANDIDATE_COUNT: ${{ steps.create_candidates.outputs.candidate_count }}
         run: |
           status=completed
           candidate_count=0
-          if [ "$RUN_OUTCOME" != "success" ] || [ "$COUNT_OUTCOME" != "success" ] || [ "$VALIDATE_OUTCOME" != "success" ]; then
+          if [ "$RUN_OUTCOME" != "success" ] || [ "$COUNT_OUTCOME" != "success" ] || [ "$VALIDATE_OUTCOME" != "success" ] || [ "$SEAL_OUTCOME" != "success" ] || [ "$EVIDENCE_UPLOAD_OUTCOME" != "success" ]; then
             status=incomplete
           elif ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then
             status=incomplete
@@ -326,11 +333,11 @@ jobs:
                 gh issue reopen "$issue_number"
               fi
               gh issue comment "$issue_number" \
-                --body "The opaque candidate was observed again in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) at head ${{ github.sha }}. Details remain private under SECURITY.md."
+                --body "The opaque candidate was observed again in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) at head ${{ github.sha }}. Encrypted evidence is retained in the run's fuzz-evidence artifacts; details remain private under SECURITY.md."
               continue
             fi
 
-            issue_body="Automated fuzzing observed a private candidate in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Potential security details and the reproducer were not written to public logs or artifacts. Maintainers should coordinate under SECURITY.md. Opaque candidate ID: ${candidate_id}."
+            issue_body="Automated fuzzing observed a private candidate in [workflow run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). Encrypted evidence is retained in the run's fuzz-evidence artifacts. Plaintext security details and the reproducer are not public. Maintainers should decrypt the archive and inspect candidate-index.json and guest outcome.json before classifying the finding under SECURITY.md. Opaque candidate ID: ${candidate_id}."
             issue_body+=$'\n\n'
             issue_body+="$marker"
             gh issue create \

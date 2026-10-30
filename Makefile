@@ -1151,7 +1151,7 @@ fuzz-qemu-campaign: build-fuzz-qemu-deps fuzz-qemu-seeds
 	cd fuzz && \
 	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
 		-max_total_time=3600 \
-		-timeout=120 \
+		-timeout=1200 \
 		-rss_limit_mb=4096 \
 		-print_final_stats=1
 
@@ -1161,7 +1161,7 @@ fuzz-qemu-overnight: build-fuzz-qemu-deps fuzz-qemu-seeds
 	cd fuzz && \
 	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor -- \
 		-max_total_time=28800 \
-		-timeout=120 \
+		-timeout=1200 \
 		-rss_limit_mb=8192 \
 		-print_final_stats=1
 
@@ -1171,7 +1171,7 @@ fuzz-qemu-parallel: build-fuzz-qemu-deps fuzz-qemu-seeds
 	cd fuzz && \
 	cargo +nightly fuzz run fuzz_syscall_qemu --features qemu-executor --jobs=4 -- \
 		-max_total_time=3600 \
-		-timeout=120 \
+		-timeout=1200 \
 		-rss_limit_mb=4096 \
 		-print_final_stats=1
 

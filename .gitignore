@@ -29,6 +29,7 @@ userspace/clippy-userspace-target
 # Fuzz testing
 /fuzz/target/
 /fuzz/corpus/
+/fuzz/evidence/
 /fuzz/artifacts/*.log
 /hosted-subcrate-review-target/
 

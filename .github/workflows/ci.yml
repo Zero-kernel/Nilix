@@ -72,6 +72,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m pip install -r requirements-ci.txt
+      - run: sudo apt-get update && sudo apt-get install -y age
       - run: bash scripts/ci/entrypoint.sh quality
       - name: Check Actions definitions
         if: always()

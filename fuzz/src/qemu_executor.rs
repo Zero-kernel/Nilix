@@ -43,10 +43,17 @@ pub fn configured_executor() -> Result<QemuExecutor> {
         Ext3Tools::default(),
     )
     .context("QEMU executor setup failed; build the guest with make build-syz-kcov")?;
-    Ok(match std::env::var_os("NILIX_FUZZ_ARTIFACTS") {
-        Some(root) => executor.with_artifact_dir(PathBuf::from(root)),
-        None => executor,
-    })
+    Ok(
+        match (
+            std::env::var_os("NILIX_FUZZ_ARTIFACTS"),
+            std::env::var_os("NILIX_FUZZ_FAILURE_ARTIFACTS"),
+        ) {
+            (Some(root), None) => executor.with_artifact_dir(PathBuf::from(root)),
+            (None, Some(root)) => executor.with_failure_artifact_dir(PathBuf::from(root)),
+            (None, None) => executor,
+            (Some(_), Some(_)) => anyhow::bail!("choose one artifact retention mode"),
+        },
+    )
 }
 
 /// count:u8, then (syscall-index:u8, argc:u8, arguments...). Argument tags:
@@ -199,11 +206,28 @@ mod tests {
             16,
             Ext3Tools::default(),
         )
-        .unwrap();
+        .unwrap()
+        .with_failure_artifact_dir(root.join("failures"));
         assert!(missing
             .execute(&program)
             .unwrap_err()
             .to_string()
             .contains("failed to spawn"));
+        let failures: Vec<_> = std::fs::read_dir(root.join("failures"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(failures.len(), 1);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(failures[0].join("outcome.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["outcome"], "execution_error");
+        assert_eq!(receipt["guest_began"], false);
+        assert!(receipt["classification"]
+            .as_str()
+            .unwrap()
+            .contains("failed to spawn"));
+        assert!(failures[0].join("program.json").is_file());
+        assert!(failures[0].join("syz-program.host.bin").is_file());
     }
 }

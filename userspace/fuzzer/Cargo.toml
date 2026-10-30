@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
+# Standalone host tool — not part of the kernel or userspace workspaces.
+[workspace]
+
 [[bin]]
 name = "fuzz-pipeline-smoke"
 path = "src/bin/continuous-fuzzer.rs"
@@ -16,8 +19,6 @@ path = "src/bin/crash-triage.rs"
 clap = { version = "4.5", features = ["derive"] }
 hmac = "0.13"
 sha2 = "0.11"
-
-[dev-dependencies]
 serde_json = "1"
 
 [profile.release]
