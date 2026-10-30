@@ -224,7 +224,11 @@ impl From<HeapAdmissionError> for AdmittedAllocError {
             HeapAdmissionError::ArithmeticOverflow => Self::Arithmetic,
             HeapAdmissionError::NotPublished
             | HeapAdmissionError::GlobalLimit
-            | HeapAdmissionError::ClassLimit => Self::NoMemory,
+            | HeapAdmissionError::ClassLimit
+            | HeapAdmissionError::OwnerLimit
+            | HeapAdmissionError::OwnerClassLimit
+            | HeapAdmissionError::BlockingIoOwnerLimit
+            | HeapAdmissionError::AllocationFailed => Self::NoMemory,
             HeapAdmissionError::CorruptState => Self::CapacityInvariant,
         }
     }

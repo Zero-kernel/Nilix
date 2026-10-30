@@ -591,6 +591,61 @@ pub(crate) fn discard_inert_pending(proc: &mut process::Process) {
 mod delivery_tests {
     use super::*;
 
+    #[cfg(feature = "host_harness")]
+    #[test]
+    fn namespace_init_uses_owning_namespace_not_root_visibility() {
+        use crate::pid_namespace::{
+            assign_pid_chain, detach_pid_chain, PidNamespace, ROOT_PID_NAMESPACE,
+        };
+        let root = ROOT_PID_NAMESPACE.clone();
+        let target = PidNamespace::new_child(root.clone()).unwrap();
+        let sibling = PidNamespace::new_child(root.clone()).unwrap();
+        let descendant = PidNamespace::new_child(target.clone()).unwrap();
+        let cases = [
+            (target.clone(), true, false),
+            (sibling, false, false),
+            (descendant, false, false),
+            (root.clone(), false, true),
+        ];
+        for (index, (owning, same, ancestor)) in cases.into_iter().enumerate() {
+            let pid = 24000 + index;
+            let chain = assign_pid_chain(owning, pid).unwrap();
+            assert!(Arc::ptr_eq(&chain[0].ns, &root));
+            let relationship = pid_namespace_signal_relationship(&chain, &target);
+            assert_eq!(relationship, (same, ancestor));
+            assert_eq!(
+                namespace_init_authorized(
+                    false,
+                    relationship.0,
+                    relationship.1,
+                    false,
+                    false,
+                    false
+                ),
+                ancestor
+            );
+            assert!(!pid_namespace_signal_relationship(&chain, &root).1);
+            detach_pid_chain(&chain, pid);
+        }
+        assert_eq!(
+            pid_namespace_signal_relationship(&[], &target),
+            (false, false)
+        );
+        assert!(!namespace_init_authorized(
+            false, false, false, false, false, false
+        ));
+        // Self and explicitly delegated ancestor-user supervision remain valid.
+        assert!(namespace_init_authorized(
+            true, true, false, false, false, false
+        ));
+        assert!(namespace_init_authorized(
+            false, true, false, true, true, false
+        ));
+        assert!(!namespace_init_authorized(
+            false, true, false, false, true, false
+        ));
+    }
+
     #[test]
     fn blocked_defaults_wait_until_unmask_without_any_handler() {
         let actions = default_sigactions();
@@ -934,12 +989,36 @@ pub(crate) fn user_namespace_is_strict_ancestor(
     false
 }
 
+/// Visibility in an ancestor namespace is not supervisor authority: every
+/// PID chain contains the root. Only the sender's owning (leaf) namespace may
+/// be compared with the target's strict ancestors. An absent identity denies.
+pub(crate) fn pid_namespace_signal_relationship(
+    sender_chain: &[crate::pid_namespace::PidNamespaceMembership],
+    target: &crate::pid_namespace::PidNamespaceArc,
+) -> (bool, bool) {
+    let Some(sender) = sender_chain.last() else {
+        return (false, false);
+    };
+    let same = Arc::ptr_eq(&sender.ns, target);
+    let mut cursor = target.parent();
+    for _ in 0..=crate::pid_namespace::MAX_PID_NS_LEVEL {
+        let Some(namespace) = cursor else {
+            break;
+        };
+        if Arc::ptr_eq(&sender.ns, &namespace) {
+            return (same, true);
+        }
+        cursor = namespace.parent();
+    }
+    (same, false)
+}
+
 /// Pure authorization decision for the namespace-init gate.  Keeping the
 /// policy separate from the process/namespace snapshots makes the dangerous
 /// cases executable in the hosted unit-test suite without manufacturing live
 /// scheduler tasks.
 #[inline]
-fn namespace_init_authorized(
+pub(crate) fn namespace_init_authorized(
     self_signal: bool,
     same_pid_namespace: bool,
     ancestor_pid_namespace: bool,
@@ -1023,26 +1102,8 @@ fn send_signal_inner(
             if let Some(init_ns) = target_init_ns {
                 let (sender_user_ns, same_pid_namespace, ancestor_pid_namespace) = {
                     let sender = sender_arc.lock();
-                    let same = sender
-                        .pid_ns_chain
-                        .iter()
-                        .any(|membership| Arc::ptr_eq(&membership.ns, &init_ns));
-                    let mut ancestor = false;
-                    let mut cursor = init_ns.parent();
-                    for _ in 0..=crate::pid_namespace::MAX_PID_NS_LEVEL {
-                        let Some(namespace) = cursor else {
-                            break;
-                        };
-                        if sender
-                            .pid_ns_chain
-                            .iter()
-                            .any(|membership| Arc::ptr_eq(&membership.ns, &namespace))
-                        {
-                            ancestor = true;
-                            break;
-                        }
-                        cursor = namespace.parent();
-                    }
+                    let (same, ancestor) =
+                        pid_namespace_signal_relationship(&sender.pid_ns_chain, &init_ns);
                     (Arc::clone(&sender.user_ns), same, ancestor)
                 };
                 let sender_has_admin = process::current_has_cap_rights(CapRights::ADMIN);

@@ -1469,6 +1469,9 @@ fn walk_robust_list(
     let mut hit_limit = false;
 
     while entry != 0 && entry != head_addr {
+        // This walk runs with IF=0. A sibling may hold PT_LOCK while waiting
+        // for this CPU's ACK; keep shootdowns progressing between nodes.
+        mm::tlb_shootdown::handle_shootdown_ipi();
         if visited_len >= limit {
             hit_limit = true;
             break;
@@ -1620,29 +1623,15 @@ fn walk_dying_robust_list(
     let owner_tids = [(owner_tid as u64 & FUTEX_TID_MASK as u64) as u32, 0];
     let mut releases = RobustReleases::new();
     let (outcome, processed) = unsafe {
-        use x86_64::registers::control::Cr3;
         use x86_64::structures::paging::PhysFrame;
         use x86_64::PhysAddr;
 
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            let current_cr3 = Cr3::read();
-            let Some(target_phys) = PhysAddr::try_new(memory_space as u64).ok() else {
-                // A corrupted PCB must not be truncated by `PhysAddr::new`
-                // into an unrelated page-table root.
-                return (RobustWalkOutcome::Fault, 0);
-            };
-            let target_frame = PhysFrame::containing_address(target_phys);
-            if current_cr3.0 != target_frame {
-                Cr3::write(target_frame, current_cr3.1);
-            }
-            let result = walk_robust_list(head_addr, owner_tids, &mut releases);
-            // Always restore the caller's address space before returning to the
-            // scheduler/exception path.  The closure has no early `return` edge
-            // after the switch, so this restore is unconditional.
-            if current_cr3.0 != target_frame {
-                Cr3::write(current_cr3.0, current_cr3.1);
-            }
-            result
+        let Some(target_phys) = PhysAddr::try_new(memory_space as u64).ok() else {
+            return;
+        };
+        let target_frame = PhysFrame::containing_address(target_phys);
+        mm::tlb_shootdown::with_temporary_address_space(target_frame, || {
+            walk_robust_list(head_addr, owner_tids, &mut releases)
         })
     };
 

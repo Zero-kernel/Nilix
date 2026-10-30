@@ -391,23 +391,53 @@ pub fn online_cpu_count() -> u64 {
 // CR3 Tracking for Optimized TLB Shootdown
 // ============================================================================
 
-/// Update CR3 -> CPU ownership tracking after a CR3 change on this CPU.
-///
-/// Called by `activate_memory_space()` whenever a context switch changes CR3.
-/// This allows TLB shootdown to target only CPUs that might have TLB entries
-/// for the affected address space, rather than broadcasting to all CPUs.
-///
-/// # Arguments
-///
-/// * `new_cr3` - The new CR3 value (physical address of PML4)
-///
-/// RF178-33: this context-switch hook is one Release store: no lock, allocation,
-/// lazy per-CPU initialization, or unbounded work is reachable from IRQ return.
+/// Publish the next CR3 BEFORE loading it, with interrupts disabled. The
+/// serializing CR3 write flushes translations after publication; until then no
+/// user address may be accessed. Paired with the target scan's fence, either
+/// the requester sees this CPU or the new root load sees its PTE changes.
+/// No lock, allocation, or lazy initialization is reachable here.
 pub fn track_cr3_switch(new_cr3: u64) {
     let cpu_id = current_cpu_id();
     if let Some(slot) = CPU_ACTIVE_CR3.get(cpu_id) {
-        slot.store(new_cr3, Ordering::Release);
+        slot.store(new_cr3, Ordering::SeqCst);
     }
+}
+
+/// Run bounded usercopy in a retained foreign address space, tracking both
+/// entry and restoration. Long callbacks must service the shootdown mailbox
+/// while interrupts are disabled, and must not take locks that require IRQs.
+///
+/// # Safety
+/// The target root must remain alive throughout the callback. Both roots must
+/// map the kernel and current stack identically. The callback must not schedule.
+pub unsafe fn with_temporary_address_space<R>(
+    target: x86_64::structures::paging::PhysFrame,
+    f: impl FnOnce() -> R,
+) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        struct RestoreRoot(x86_64::structures::paging::PhysFrame, Cr3Flags);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                track_cr3_switch(self.0.start_address().as_u64());
+                unsafe {
+                    Cr3::write(self.0, self.1);
+                }
+                // A request queued while IF=0 must be acknowledged before the
+                // caller resumes; this also handles foreign-root COW faults.
+                handle_shootdown_ipi();
+            }
+        }
+        let (saved, flags) = Cr3::read();
+        let _restore = RestoreRoot(saved, flags);
+        track_cr3_switch(target.start_address().as_u64());
+        // Flush even for an equal root: a previously untracked CPU must not
+        // carry translations from before its publication into the callback.
+        unsafe {
+            Cr3::write(target, flags);
+        }
+        handle_shootdown_ipi();
+        f()
+    })
 }
 
 /// Get the current CPU's tracked CR3 value.
@@ -510,13 +540,15 @@ pub fn force_init_tlb_shootdown_locals() {
 /// we fall back to broadcasting to all online CPUs (except self). This ensures
 /// correctness even if tracking becomes out of sync.
 fn collect_target_cpus(target_cr3: u64) -> CpuMask {
+    core::sync::atomic::fence(Ordering::SeqCst);
     let mut targets = CpuMask::empty();
     let self_id = current_cpu_id();
 
     // Try to use the per-CPU snapshots when CR3 is valid. A CPU switching
     // into this address space after our Acquire scan observes page-table
-    // mutations before it can execute in the newly loaded CR3; a CPU switching
-    // out flushes that CR3 before publishing its replacement snapshot.
+    // mutations in its serializing CR3 load. A CPU publishing a replacement
+    // root must not touch user memory until that CR3 load has flushed the old
+    // translations; publishing early therefore cannot expose a stale access.
     if target_cr3 != 0 {
         let online = cpu_local::online_cpu_mask();
         let max_tracked = core::cmp::min(max_cpus(), 64);
@@ -1245,7 +1277,8 @@ pub fn get_stats() -> TlbShootdownStats {
 ///
 /// # Safety
 ///
-/// Must be called from interrupt context with interrupts disabled.
+/// Must be called with interrupts disabled (including bounded foreign-root
+/// usercopy). This preserves the mailbox's single-consumer contract.
 pub fn handle_shootdown_ipi() {
     let mailbox = current_cpu().tlb_mailbox();
     let this_cr3 = current_cr3_value();

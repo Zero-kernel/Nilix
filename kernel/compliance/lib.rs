@@ -947,3 +947,58 @@ impl HardeningProfile {
         }
     }
 }
+
+/// Parse the explicitly supplied boot policy without silently weakening it.
+/// The last valid token wins; any malformed profile token rejects the command
+/// line, even if a later token is valid. Missing profile keeps the boot default.
+pub fn parse_boot_profile(
+    cmdline: &[u8],
+    declared_len: usize,
+) -> Result<Option<HardeningProfile>, &'static str> {
+    let bytes = cmdline
+        .get(..declared_len)
+        .ok_or("boot command line truncated")?;
+    let bytes = bytes.split(|byte| *byte == 0).next().unwrap_or(&[]);
+    let mut profile = None;
+    for token in bytes
+        .split(u8::is_ascii_whitespace)
+        .filter(|token| !token.is_empty())
+    {
+        if token
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"profile="))
+        {
+            let value =
+                core::str::from_utf8(&token[8..]).map_err(|_| "invalid boot profile encoding")?;
+            profile = Some(HardeningProfile::from_str(value).ok_or("unrecognized boot profile")?);
+        }
+    }
+    Ok(profile)
+}
+
+#[cfg(test)]
+mod boot_profile_tests {
+    use super::*;
+    #[test]
+    fn malformed_profiles_cannot_fall_back_to_balanced() {
+        for input in [
+            b"profile=".as_slice(),
+            b"profile=secur",
+            b"profile=\xff",
+            b"profile=invalid profile=secure",
+        ] {
+            assert!(parse_boot_profile(input, input.len()).is_err());
+        }
+        assert!(parse_boot_profile(b"profile=secure", 257).is_err());
+        assert_eq!(parse_boot_profile(b"quiet", 5), Ok(None));
+        assert_eq!(
+            parse_boot_profile(b"PROFILE=secure", 14),
+            Ok(Some(HardeningProfile::Secure))
+        );
+        let input = b"profile=balanced profile=secure";
+        assert_eq!(
+            parse_boot_profile(input, input.len()),
+            Ok(Some(HardeningProfile::Secure))
+        );
+    }
+}

@@ -1115,9 +1115,10 @@ fn validate_program_with_limit(prog: &[SeccompInsn], max_insns: usize) -> Result
         }
     }
 
-    // Check that program ends with a RET
-    let has_terminator = prog.iter().any(|insn| matches!(insn, SeccompInsn::Ret(_)));
-    if !has_terminator {
+    // All jumps are forward and in bounds. Requiring the last instruction to
+    // return therefore proves every path terminates, rather than accepting an
+    // early RET beside a reachable fall-through to the caller's default action.
+    if !matches!(prog.last(), Some(SeccompInsn::Ret(_))) {
         return Err(SeccompError::NoTerminator);
     }
 
@@ -1569,6 +1570,28 @@ mod invariant_tests {
     use alloc::vec;
 
     use super::*;
+
+    #[test]
+    fn rejects_a_reachable_fallthrough_even_with_an_earlier_return() {
+        let program = [
+            SeccompInsn::LdSyscallNr,
+            SeccompInsn::JmpEq(7, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Kill),
+            SeccompInsn::LdConst(0),
+        ];
+        assert_eq!(validate_program(&program), Err(SeccompError::NoTerminator));
+        assert_eq!(
+            validate_program_with_limit(&program, MAX_TRUSTED_INSNS),
+            Err(SeccompError::NoTerminator)
+        );
+        let valid = [
+            SeccompInsn::LdSyscallNr,
+            SeccompInsn::JmpEq(7, 0, 1),
+            SeccompInsn::Ret(SeccompAction::Kill),
+            SeccompInsn::Ret(SeccompAction::Allow),
+        ];
+        assert_eq!(validate_program(&valid), Ok(()));
+    }
 
     #[test]
     fn rf186_11_shift_range_is_central_and_interpreter_is_fail_closed() {

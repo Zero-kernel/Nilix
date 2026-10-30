@@ -2550,6 +2550,7 @@ impl Scheduler {
                         *current_guard = None;
                         CURRENT_GENERATION[local_cpu].store(0, Ordering::Release);
                         drop(current_guard);
+                        mm::heap_admission::set_current_owner(None);
                         process::set_current_pid(None);
                         process::note_context_switch(local_cpu);
                         if !selection.complete_cycle || candidate_deferred {
@@ -2712,6 +2713,7 @@ impl Scheduler {
         let next_wd_handle = next.watchdog_handle;
         let next_kcov_token = process::task_kcov_switch_token(&next);
         let next_generation = next.generation;
+        let next_heap_owner = next.thread_group.heap_owner.clone();
 
         if let Some(old) = old.as_mut() {
             if matches!(old.state, ProcessState::Running | ProcessState::Ready) {
@@ -2729,6 +2731,7 @@ impl Scheduler {
         *current_guard = Some(next_pid);
         CURRENT_GENERATION[local_cpu].store(next_generation, Ordering::Release);
         drop(current_guard);
+        mm::heap_admission::set_current_owner(Some(next_heap_owner));
         process::set_current_pid(Some(next_pid));
         process::note_context_switch(local_cpu);
         if let Some(mut stats) = SCHEDULER_STATS.try_lock() {

@@ -1866,9 +1866,9 @@ const MAX_ARG_STRLEN: usize = 4096;
 /// - 任意用户进程可 DoS 整个系统
 ///
 /// R180-10 FIX: preserve the historical 1 MiB per-call contract, while every
-/// live buffer is now aggregate-admitted below. The global ledger, not a
-/// functionality-reducing count cap, prevents concurrent blocked callers from
-/// starving unrelated kernel work.
+/// live buffer is aggregate-admitted below. Per-thread-group total and blocking
+/// I/O budgets additionally reject requests that would monopolize the shared
+/// pool; a syntactically valid size can therefore return ENOMEM.
 const MAX_RW_SIZE: usize = {
     let residual = mm::general_residual_bytes();
     if residual < 4096 {
@@ -9689,37 +9689,21 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
             let sender = get_process(self_global_pid).ok_or(SyscallError::ESRCH)?;
             let (same_namespace, ancestor_namespace, sender_user_ns) = {
                 let sender_proc = sender.lock();
-                let same = sender_proc
-                    .pid_ns_chain
-                    .iter()
-                    .any(|membership| alloc::sync::Arc::ptr_eq(&membership.ns, &init_ns));
-                let mut ancestor = false;
-                let mut cursor = init_ns.parent();
-                for _ in 0..=crate::pid_namespace::MAX_PID_NS_LEVEL {
-                    let Some(namespace) = cursor else {
-                        break;
-                    };
-                    if sender_proc
-                        .pid_ns_chain
-                        .iter()
-                        .any(|membership| alloc::sync::Arc::ptr_eq(&membership.ns, &namespace))
-                    {
-                        ancestor = true;
-                        break;
-                    }
-                    cursor = namespace.parent();
-                }
+                let (same, ancestor) = crate::signal::pid_namespace_signal_relationship(
+                    &sender_proc.pid_ns_chain,
+                    &init_ns,
+                );
                 (same, ancestor, sender_proc.user_ns.clone())
             };
-            let user_namespace_supervisor =
-                (crate::process::current_has_cap_rights(cap::CapRights::ADMIN)
-                    || crate::current_is_host_root())
-                    && crate::signal::user_namespace_is_strict_ancestor(
-                        &sender_user_ns,
-                        &target_user_ns,
-                    );
-            namespace_init_supervisor = ancestor_namespace || user_namespace_supervisor;
-            if same_namespace && !namespace_init_supervisor {
+            namespace_init_supervisor = crate::signal::namespace_init_authorized(
+                false,
+                same_namespace,
+                ancestor_namespace,
+                crate::signal::user_namespace_is_strict_ancestor(&sender_user_ns, &target_user_ns),
+                crate::process::current_has_cap_rights(cap::CapRights::ADMIN),
+                crate::current_is_host_root(),
+            );
+            if !namespace_init_supervisor {
                 return Err(SyscallError::EPERM);
             }
         }

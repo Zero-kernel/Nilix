@@ -491,7 +491,7 @@ fn find_rsdp_address(system_table: &SystemTable<Boot>) -> u64 {
 ///
 /// UEFI load options are UCS-2 (little-endian u16) encoded. This function
 /// down-converts ASCII-range code points to single bytes (non-ASCII → `?`)
-/// and truncates to 256 bytes. Returns `(len, buffer)`.
+/// and rejects input over 256 bytes. Returns `(len, buffer)`.
 ///
 /// Must be called **before** `exit_boot_services()` — the LoadedImage
 /// protocol becomes inaccessible after that point.
@@ -504,7 +504,7 @@ fn read_uefi_cmdline(handle: Handle, system_table: &SystemTable<Boot>) -> (usize
         if let Some(bytes) = loaded_image.load_options_as_bytes() {
             // UCS-2 little-endian: each character is 2 bytes (lo, hi).
             let mut i = 0;
-            while i + 1 < bytes.len() && cmdline_len < cmdline.len() {
+            while i + 1 < bytes.len() {
                 let lo = bytes[i];
                 let hi = bytes[i + 1];
                 i += 2;
@@ -512,6 +512,10 @@ fn read_uefi_cmdline(handle: Handle, system_table: &SystemTable<Boot>) -> (usize
                 if lo == 0 && hi == 0 {
                     break;
                 }
+                assert!(
+                    cmdline_len < cmdline.len(),
+                    "boot command line exceeds 256 bytes"
+                );
                 // ASCII range: hi == 0 && lo <= 0x7F
                 cmdline[cmdline_len] = if hi == 0 && lo <= 0x7F { lo } else { b'?' };
                 cmdline_len += 1;

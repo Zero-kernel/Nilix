@@ -52,6 +52,8 @@
 
 #define KCOV_BUFFER_SIZE 4096U
 #define MAX_PROGRAM_SIZE (256U * 1024U)
+/* Leave kernel allocation/accounting headroom below the per-owner I/O limit. */
+#define PROGRAM_READ_CHUNK (64U * 1024U)
 #define MAX_SYSCALLS 100U
 #define MAX_ARGS 6U
 #define MAX_ARG_CAPACITY 4096U
@@ -588,7 +590,9 @@ static int read_program_file(size_t *program_length, ExecutorError *error) {
             return set_error(error, "input_oversize", -(int64_t)E2BIG);
         }
 
-        const ssize_t count = read(fd, program_buffer + total, sizeof(program_buffer) - total);
+        const size_t remaining = sizeof(program_buffer) - total;
+        const size_t request = remaining < PROGRAM_READ_CHUNK ? remaining : PROGRAM_READ_CHUNK;
+        const ssize_t count = read(fd, program_buffer + total, request);
         if (count > 0) {
             total += (size_t)count;
             continue;
