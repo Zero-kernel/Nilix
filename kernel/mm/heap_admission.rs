@@ -600,14 +600,6 @@ fn current_owner() -> Option<Arc<HeapOwner>> {
     })
 }
 
-fn same_owner(left: &Option<Arc<HeapOwner>>, right: &Option<Arc<HeapOwner>>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-        _ => false,
-    }
-}
-
 fn reserve_owned_pair(
     class: HeapClass,
     bytes: usize,
@@ -714,10 +706,13 @@ impl HeapReservation {
     pub fn commit(mut self) -> Result<HeapCharge, HeapAdmissionError> {
         commit_pair(self.class, self.bytes)?;
         self.armed = false;
+        let owner = self.owner.take();
+        let owner_bytes = if owner.is_some() { self.bytes } else { 0 };
         Ok(HeapCharge {
-            owner: self.owner.take(),
+            owner,
             class: self.class,
             bytes: self.bytes,
+            owner_bytes,
             armed: true,
         })
     }
@@ -752,6 +747,10 @@ pub struct HeapCharge {
     owner: Option<Arc<HeapOwner>>,
     class: HeapClass,
     bytes: usize,
+    /// Portion of `bytes` attributed to `owner`. An ownerless boot/kernel
+    /// charge can adopt the first mutating thread group without retroactively
+    /// charging it for bytes that were already live.
+    owner_bytes: usize,
     armed: bool,
 }
 
@@ -767,7 +766,14 @@ impl HeapCharge {
     }
 
     pub fn try_reserve_more(&self, bytes: usize) -> Result<HeapReservation, HeapAdmissionError> {
-        try_reserve_owned(self.class, bytes, self.owner.clone())
+        try_reserve_owned(self.class, bytes, self.growth_owner())
+    }
+
+    /// Owner to charge when this object grows. Kernel/boot-created retained
+    /// objects have no owner; the first post-boot mutation binds them to the
+    /// calling thread group so user-driven growth cannot escape owner limits.
+    pub fn growth_owner(&self) -> Option<Arc<HeapOwner>> {
+        self.owner.clone().or_else(current_owner)
     }
 
     pub fn owner(&self) -> Option<Arc<HeapOwner>> {
@@ -777,22 +783,47 @@ impl HeapCharge {
     /// Merge a successfully allocated growth reservation into this object's
     /// lifetime charge immediately before the new capacity becomes reachable.
     pub fn absorb(&mut self, reservation: HeapReservation) -> Result<(), HeapAdmissionError> {
-        if !self.armed
-            || reservation.class != self.class
-            || !same_owner(&self.owner, &reservation.owner)
-        {
+        if !self.armed || reservation.class != self.class {
             return Err(HeapAdmissionError::CorruptState);
         }
+        // An existing owner is stable: only growth by that same owner may be
+        // merged. An ownerless kernel/boot charge may adopt the reservation's
+        // owner on its first mutating use so user-driven growth is accounted.
+        let adopting = match (&self.owner, &reservation.owner) {
+            (None, Some(_)) => true,
+            (None, None) => false,
+            (Some(left), Some(right)) => {
+                if !Arc::ptr_eq(left, right) {
+                    return Err(HeapAdmissionError::CorruptState);
+                }
+                false
+            }
+            (Some(_), None) => return Err(HeapAdmissionError::CorruptState),
+        };
         let new_total = self
             .bytes
             .checked_add(reservation.bytes)
             .ok_or(HeapAdmissionError::ArithmeticOverflow)?;
+        let new_owner_bytes = if adopting {
+            reservation.bytes
+        } else if self.owner.is_some() {
+            self.owner_bytes
+                .checked_add(reservation.bytes)
+                .ok_or(HeapAdmissionError::ArithmeticOverflow)?
+        } else {
+            0
+        };
         let _additional = reservation.commit()?;
         // `_additional` must not run Drop: its bytes are now owned by `self`.
         let mut additional = core::mem::ManuallyDrop::new(_additional);
         additional.armed = false;
-        drop(additional.owner.take());
+        if adopting {
+            self.owner = additional.owner.take();
+        } else {
+            drop(additional.owner.take());
+        }
         self.bytes = new_total;
+        self.owner_bytes = new_owner_bytes;
         Ok(())
     }
 
@@ -800,12 +831,16 @@ impl HeapCharge {
     /// been deallocated.  This ordering prevents another admission from racing
     /// memory that is still live.
     pub fn release_after_deallocation(&mut self, bytes: usize) -> Result<(), HeapAdmissionError> {
-        if !self.armed || bytes > self.bytes {
+        if !self.armed || bytes > self.bytes || self.owner_bytes > self.bytes {
             return Err(HeapAdmissionError::CorruptState);
         }
         release_committed_pair(self.class, bytes)?;
         if let Some(owner) = &self.owner {
-            owner.release(self.class, bytes);
+            // Ownerless bytes at the base of a boot-created object are not
+            // charged to the adopter; release at most the attributed portion.
+            let owner_release = core::cmp::min(bytes, self.owner_bytes);
+            owner.release(self.class, owner_release);
+            self.owner_bytes -= owner_release;
         }
         self.bytes -= bytes;
         Ok(())
@@ -818,8 +853,9 @@ impl Drop for HeapCharge {
             release_committed_pair(self.class, self.bytes)
                 .unwrap_or_else(|error| panic!("heap charge accounting corrupt: {error:?}"));
             if let Some(owner) = &self.owner {
-                owner.release(self.class, self.bytes);
+                owner.release(self.class, self.owner_bytes);
             }
+            self.owner_bytes = 0;
             self.armed = false;
         }
     }
@@ -1701,5 +1737,49 @@ mod tests {
         let _guard = super::TEST_LEDGER_LOCK.lock();
         super::publish();
         super::run_heap_admission_self_test();
+    }
+
+    #[test]
+    fn ownerless_charge_adopts_first_mutating_owner_and_releases_exactly() {
+        let _guard = TEST_LEDGER_LOCK.lock();
+        publish();
+        let before = snapshot();
+        set_current_owner(None);
+        let mut charge = try_reserve_owned(HeapClass::RamFs, 1000, None)
+            .unwrap()
+            .commit()
+            .unwrap();
+        // Remaining ownerless (kernel/boot) growth must not create phantom
+        // owner-attributed bytes or corrupt later releases.
+        let ownerless = charge.try_reserve_more(500).unwrap();
+        assert!(ownerless.owner.is_none());
+        charge.absorb(ownerless).unwrap();
+        assert_eq!(charge.bytes, 1500);
+        assert_eq!(charge.owner_bytes, 0);
+        let owner = HeapOwner::try_new().unwrap();
+        let other = HeapOwner::try_new().unwrap();
+
+        set_current_owner(Some(owner.clone()));
+        let growth = charge.try_reserve_more(2000).unwrap();
+        assert!(matches!(&growth.owner, Some(growth_owner) if Arc::ptr_eq(growth_owner, &owner)));
+        charge.absorb(growth).unwrap();
+        assert_eq!(owner.snapshot().used_bytes, 2000);
+        assert_eq!(other.snapshot().used_bytes, 0);
+
+        // A different current owner cannot steal an already-bound object.
+        set_current_owner(Some(other.clone()));
+        charge
+            .absorb(charge.try_reserve_more(500).unwrap())
+            .unwrap();
+        assert_eq!(owner.snapshot().used_bytes, 2500);
+        assert_eq!(other.snapshot().used_bytes, 0);
+
+        set_current_owner(None);
+        charge.release_after_deallocation(1500).unwrap();
+        assert_eq!(owner.snapshot().used_bytes, 1000);
+        drop(charge);
+        assert_eq!(owner.snapshot().used_bytes, 0);
+        drop((owner, other));
+        assert_eq!(snapshot(), before);
     }
 }

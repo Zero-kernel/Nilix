@@ -700,7 +700,7 @@ impl RamFsInode {
                         (
                             state.entries.len(),
                             state.entries.capacity(),
-                            state.heap_charge.owner(),
+                            state.heap_charge.growth_owner(),
                         )
                     };
                     let (prepared_key, prepared_backing) =
@@ -1588,7 +1588,7 @@ impl FileSystem for RamFs {
         let prepared_key = if is_move {
             Some(PreparedDirectoryKey::try_new(
                 new_name,
-                new_entries.read().heap_charge.owner(),
+                new_entries.read().heap_charge.growth_owner(),
             )?)
         } else {
             None
@@ -1599,7 +1599,7 @@ impl FileSystem for RamFs {
             if state.entries.capacity() < target {
                 Some(PreparedDirectoryCapacity::try_new(
                     target,
-                    state.heap_charge.owner(),
+                    state.heap_charge.growth_owner(),
                 )?)
             } else {
                 None
@@ -2085,5 +2085,81 @@ mod tests {
         drop(fs);
         assert_eq!(mm::heap_class_snapshot(HeapClass::RamFs), class_before);
         assert_eq!(ramfs_bytes_used(), quota_before);
+    }
+
+    #[test]
+    fn ownerless_file_growth_adopts_the_current_owner() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        mm::heap_admission::set_current_owner(None);
+        let file = RamFsInode::new_file(0x5151, 1, 0o600, 0, 0).unwrap();
+        let owner = mm::heap_admission::HeapOwner::try_new().unwrap();
+        mm::heap_admission::set_current_owner(Some(owner.clone()));
+
+        file.truncate(16 * 1024).unwrap();
+        assert!(owner.snapshot().used_bytes >= 16 * 1024);
+        let charged = owner.snapshot().used_bytes;
+
+        assert_eq!(
+            file.truncate(480 * 1024).unwrap_err(),
+            FsError::NoSpace,
+            "boot-created file must not bypass the caller's owner class limit"
+        );
+        assert_eq!(owner.snapshot().used_bytes, charged);
+        assert_eq!(file.stat().unwrap().size, (16 * 1024) as u64);
+
+        mm::heap_admission::set_current_owner(None);
+        drop(file);
+        assert_eq!(owner.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn ownerless_directory_growth_is_charged_to_the_mutating_owner() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        mm::heap_admission::set_current_owner(None);
+        let fs = RamFs::try_new().unwrap();
+        let root = fs.root_inode();
+        let owner = mm::heap_admission::HeapOwner::try_new().unwrap();
+        mm::heap_admission::set_current_owner(Some(owner.clone()));
+
+        let mut created = 0;
+        for index in 0..2000 {
+            let name = std::format!("{:0255}", index);
+            match fs.create(
+                &root,
+                &name,
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            ) {
+                Ok(_) => created += 1,
+                Err(FsError::NoSpace) => break,
+                Err(error) => panic!("unexpected directory admission error: {:?}", error),
+            }
+        }
+        assert!(created > 0);
+        assert!(
+            owner.snapshot().used_bytes > 0,
+            "entry key/backing growth must be charged to the mutating owner"
+        );
+        assert!(
+            owner.snapshot().used_bytes <= mm::HeapClass::RamFs.limit_bytes() / 4 * 3,
+            "owner class gate must bound boot-directory growth"
+        );
+
+        let victim = mm::heap_admission::HeapOwner::try_new().unwrap();
+        let victim_reservation = mm::heap_admission::try_reserve_owned(
+            HeapClass::RamFs,
+            16 * 1024,
+            Some(victim.clone()),
+        )
+        .unwrap();
+        drop(victim_reservation);
+        drop(victim);
+
+        mm::heap_admission::set_current_owner(None);
+        drop(root);
+        drop(fs);
+        assert_eq!(owner.snapshot().used_bytes, 0);
     }
 }
