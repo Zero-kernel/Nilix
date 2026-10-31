@@ -40,6 +40,12 @@ enum TcpLocalHandshake {
     Complete,
 }
 
+/// Exact conntrack incarnation whose graceful close a socket may confirm.
+/// The generation comes from its first successfully queued handshake packet;
+/// a delayed final ACK must never retire a reused tuple or another namespace.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TcpCloseToken(core::num::NonZeroU64);
+
 #[derive(Debug, Clone, Copy)]
 struct PendingEgress {
     token: u64,
@@ -390,6 +396,7 @@ pub struct ConntrackEntry {
     /// Established flow; the required SYN/SYN-ACK/final-ACK must have crossed
     /// the device acceptance boundary.
     tcp_local_handshake: TcpLocalHandshake,
+    tcp_generation: u64,
     /// Provisional egress transition. Ingress encountering this token fails
     /// closed until the lock-free device callback resolves it.
     pending_egress: Option<PendingEgress>,
@@ -425,6 +432,7 @@ impl ConntrackEntry {
             seen_reply: false,
             initiator_dir,
             tcp_local_handshake: TcpLocalHandshake::None,
+            tcp_generation: 0,
             pending_egress: None,
             local_origin: false,
         }
@@ -1518,6 +1526,9 @@ impl ConntrackTable {
         }
         entry.state = pending.new_state;
         entry.tcp_local_handshake = pending.tcp_handshake;
+        if entry.tcp_generation == 0 && pending.tcp_handshake != TcpLocalHandshake::None {
+            entry.tcp_generation = pending.token;
+        }
         entry.update_stats(pending.state_dir, pending.payload_len, pending.now_ms);
         entry.pending_egress = None;
         let result = CtUpdateResult {
@@ -2113,6 +2124,42 @@ impl ConntrackTable {
         }
         entry.state = CtProtoState::Tcp(TcpCtState::Established);
         entry.tcp_local_handshake = TcpLocalHandshake::Complete;
+        true
+    }
+
+    pub(crate) fn tcp_close_token(&self, key: &FlowKey) -> Option<TcpCloseToken> {
+        let entries = self.entries.read();
+        let entry = entries.get(key)?.lock();
+        if entry.tcp_generation == 0
+            || entry.tcp_local_handshake != TcpLocalHandshake::Complete
+            || !matches!(entry.state, CtProtoState::Tcp(_))
+        {
+            return None;
+        }
+        Some(TcpCloseToken(core::num::NonZeroU64::new(
+            entry.tcp_generation,
+        )?))
+    }
+
+    /// Only the socket can validate peer FIN sequence numbers and the ACK of
+    /// our FIN. A reply carrying this confirmation must first cross the device
+    /// acceptance boundary, so a rejected final ACK can still be retried.
+    pub(crate) fn commit_tcp_close(&self, key: &FlowKey, token: TcpCloseToken) -> bool {
+        let entries = self.entries.read();
+        let Some(entry_lock) = entries.get(key) else {
+            return false;
+        };
+        let mut entry = entry_lock.lock();
+        if entry.tcp_generation != token.0.get()
+            || entry.state == CtProtoState::Tcp(TcpCtState::Close)
+        {
+            return false;
+        }
+        let closed = CtProtoState::Tcp(TcpCtState::TimeWait);
+        if let Some(pending) = entry.pending_egress.as_mut() {
+            pending.new_state = closed;
+        }
+        entry.state = closed;
         true
     }
 
@@ -3045,6 +3092,160 @@ mod tests {
             table.drain_ns(ns);
             assert_eq!(table.len(), 0);
         }
+    }
+
+    fn establish_close_test_flow(table: &ConntrackTable, ns: u64, port: u16) -> FlowKey {
+        let (local, remote) = endpoints();
+        for (flags, now) in [(0x02, 1), (0x10, 3)] {
+            assert!(matches!(
+                table.update_on_egress_transaction(
+                    ns,
+                    IPPROTO_TCP,
+                    local,
+                    remote,
+                    port,
+                    443,
+                    &L4Meta::new(flags, 0),
+                    now,
+                    || Ok::<(), QueueFault>(()),
+                ),
+                CtEgressResult::Committed(_)
+            ));
+            if flags == 0x02 {
+                table.update_on_packet(
+                    ns,
+                    IPPROTO_TCP,
+                    remote,
+                    local,
+                    443,
+                    port,
+                    &L4Meta::new(0x12, 0),
+                    2,
+                );
+            }
+        }
+        let key = FlowKey::from_packet(ns, IPPROTO_TCP, local, remote, port, 443).0;
+        assert_eq!(
+            table.lookup(&key).unwrap().state,
+            CtProtoState::Tcp(TcpCtState::Established)
+        );
+        key
+    }
+
+    #[test]
+    fn graceful_close_releases_namespace_capacity_after_socket_confirmation() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        for index in 0..CT_MAX_ENTRIES_PER_NS {
+            let port = 20_000 + index as u16;
+            let key = establish_close_test_flow(&table, 5, port);
+            let token = table
+                .tcp_close_token(&key)
+                .expect("queued handshake identity");
+            table.update_on_packet(
+                5,
+                IPPROTO_TCP,
+                remote,
+                local,
+                443,
+                port,
+                &L4Meta::new(0x11, 0),
+                4,
+            );
+            assert!(
+                !table.lookup(&key).unwrap().replaceable(),
+                "peer FIN alone is untrusted"
+            );
+            for (flags, now) in [(0x10, 5), (0x11, 6)] {
+                assert!(matches!(
+                    table.update_on_egress_transaction(
+                        5,
+                        IPPROTO_TCP,
+                        local,
+                        remote,
+                        port,
+                        443,
+                        &L4Meta::new(flags, 0),
+                        now,
+                        || Ok::<(), QueueFault>(()),
+                    ),
+                    CtEgressResult::Committed(_)
+                ));
+            }
+            table.update_on_packet(
+                5,
+                IPPROTO_TCP,
+                remote,
+                local,
+                443,
+                port,
+                &L4Meta::new(0x10, 0),
+                7,
+            );
+            assert!(
+                !table.lookup(&key).unwrap().replaceable(),
+                "half-close stays protected"
+            );
+            assert!(table.commit_tcp_close(&key, token));
+            assert!(table.lookup(&key).unwrap().replaceable());
+        }
+        let next = table.update_on_packet(
+            5,
+            IPPROTO_TCP,
+            remote,
+            local,
+            45_000,
+            8080,
+            &L4Meta::new(0x02, 0),
+            8,
+        );
+        assert!(
+            !next.resource_exhausted,
+            "completed connections must release admission capacity"
+        );
+        assert_eq!(table.drain_ns(5), CT_MAX_ENTRIES_PER_NS);
+    }
+
+    #[test]
+    fn graceful_close_token_rejects_tuple_reuse_and_survives_pending_rollback() {
+        let table = ConntrackTable::new();
+        let (local, remote) = endpoints();
+        let key = establish_close_test_flow(&table, 5, 20_000);
+        let stale = table.tcp_close_token(&key).unwrap();
+        assert!(table.remove(&key));
+        establish_close_test_flow(&table, 5, 20_000);
+        let other = establish_close_test_flow(&table, 6, 20_000);
+        assert!(!table.commit_tcp_close(&key, stale));
+        assert!(!table.lookup(&key).unwrap().replaceable());
+        assert!(!table.commit_tcp_close(&other, table.tcp_close_token(&key).unwrap()));
+        let outcome = table.update_on_egress_transaction(
+            5,
+            IPPROTO_TCP,
+            local,
+            remote,
+            20_000,
+            443,
+            &L4Meta::new(0x10, 0),
+            4,
+            || {
+                // Egress can begin after ingress admission but before the
+                // socket captures its close token. Its generation stays valid.
+                let current = table.tcp_close_token(&key).unwrap();
+                assert!(table.commit_tcp_close(&key, current));
+                Err(QueueFault::Full)
+            },
+        );
+        assert!(matches!(
+            outcome,
+            CtEgressResult::QueueFailed(QueueFault::Full)
+        ));
+        assert_eq!(
+            table.lookup(&key).unwrap().state,
+            CtProtoState::Tcp(TcpCtState::TimeWait)
+        );
+        assert!(!table.lookup(&other).unwrap().replaceable());
+        assert_eq!(table.drain_ns(5), 1);
+        assert_eq!(table.drain_ns(6), 1);
     }
 
     #[test]

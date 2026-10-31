@@ -196,6 +196,7 @@ pub struct PreparedReply {
     frame: WirePacket,
     tx_context: Option<u64>,
     tcp_binding: Option<TcpReplyBinding>,
+    tcp_close: Option<crate::conntrack::TcpCloseToken>,
     stat: PreparedReplyStat,
     reject_count: u8,
     retry_not_before_ms: u64,
@@ -247,6 +248,7 @@ impl PreparedReply {
             frame,
             tx_context: None,
             tcp_binding: None,
+            tcp_close: None,
             stat: PreparedReplyStat::None,
             reject_count: 0,
             retry_not_before_ms: 0,
@@ -350,6 +352,7 @@ impl core::fmt::Debug for PreparedReply {
             .field("frame", &self.frame)
             .field("authorized", &self.tx_context.is_some())
             .field("tcp_binding", &self.tcp_binding)
+            .field("tcp_close", &self.tcp_close)
             .field("stat", &self.stat)
             .field("reject_count", &self.reject_count)
             .field("retry_not_before_ms", &self.retry_not_before_ms)
@@ -1370,6 +1373,7 @@ fn process_tcp(
     // R90-2 FIX: Use namespace ID from receiving device instead of hardcoded root
     let mut reply_binding = None;
     let mut ingress_handshake_committed = false;
+    let mut ingress_closed = None;
     let response = socket_table().process_tcp_segment(
         net_ns_id,
         ip_hdr.src,
@@ -1379,6 +1383,7 @@ fn process_tcp(
         &tcp_options,
         &mut reply_binding,
         &mut ingress_handshake_committed,
+        &mut ingress_closed,
     );
 
     #[cfg(feature = "conntrack")]
@@ -1416,9 +1421,22 @@ fn process_tcp(
 
         let mut reply = PreparedReply::new(frame);
         reply.bind_tcp(reply_binding);
+        reply.tcp_close = ingress_closed;
         return ProcessResult::Reply(reply);
     }
 
+    #[cfg(feature = "conntrack")]
+    if let Some(token) = ingress_closed {
+        let (key, _) = crate::conntrack::FlowKey::from_packet(
+            net_ns_id.0,
+            crate::conntrack::IPPROTO_TCP,
+            ip_hdr.src,
+            ip_hdr.dst,
+            tcp_hdr.src_port,
+            tcp_hdr.dst_port,
+        );
+        crate::conntrack::conntrack_table().commit_tcp_close(&key, token);
+    }
     ProcessResult::Handled
 }
 
@@ -2479,9 +2497,22 @@ pub fn drain_parked_ready(net_ns_id: u64, now_ms: u64) -> usize {
     if !snapshot.occupied() {
         return 0;
     }
+    drain_parked_snapshot(&cache, net_ns_id, now_ms, &snapshot)
+}
+
+// The bounded frame batches need several KiB of stack even when empty. Keep
+// them out of the routine empty-queue poll, which also runs on 16 KiB AP
+// stacks. LTO must preserve the small wrapper's early return.
+#[inline(never)]
+fn drain_parked_snapshot(
+    cache: &alloc::sync::Arc<Mutex<crate::arp::ArpCache>>,
+    net_ns_id: u64,
+    now_ms: u64,
+    snapshot: &crate::arp::PendingKeySnapshot,
+) -> usize {
     let authorized = snapshot.has_live_keys() && resolve_authorized_tx_device(net_ns_id).is_ok();
 
-    let drain = cache.lock().drain_pending(now_ms, authorized, &snapshot);
+    let drain = cache.lock().drain_pending(now_ms, authorized, snapshot);
 
     // Everything below runs with NO cache lock held.
     drop(drain.retired);
@@ -2788,6 +2819,9 @@ where
             drop(operation);
             return match outcome {
                 CtEgressResult::Committed(_) => {
+                    if let Some(token) = reply.tcp_close {
+                        conntrack_table().commit_tcp_close(&key, token);
+                    }
                     reply.commit_stat(stats);
                     Ok(())
                 }
@@ -4094,6 +4128,97 @@ mod tests {
         assert_eq!(committed.packets_reply, 1);
 
         assert_eq!(ct_drain_ns(NS), 1);
+    }
+
+    #[cfg(feature = "conntrack")]
+    #[test]
+    fn graceful_close_waits_for_final_ack_queue_acceptance() {
+        use crate::conntrack::{
+            conntrack_table, CtEgressResult, CtProtoState, FlowKey, L4Meta, TcpCtState, IPPROTO_TCP,
+        };
+        let _serial = crate::conntrack::GLOBAL_CONNTRACK_TEST_LOCK.lock();
+        const NS: u64 = 0x49_0001;
+        let table = conntrack_table();
+        table.drain_ns(NS);
+        let local = Ipv4Addr::new(192, 0, 2, 1);
+        let peer = Ipv4Addr::new(192, 0, 2, 2);
+        for (flags, now) in [
+            (TCP_FLAG_SYN, 1),
+            (TCP_FLAG_ACK, 3),
+            (TCP_FLAG_FIN | TCP_FLAG_ACK, 4),
+        ] {
+            assert!(matches!(
+                table.update_on_egress_transaction(
+                    NS,
+                    IPPROTO_TCP,
+                    local,
+                    peer,
+                    20_000,
+                    443,
+                    &L4Meta::new(flags, 0),
+                    now,
+                    || Ok::<(), TxError>(()),
+                ),
+                CtEgressResult::Committed(_)
+            ));
+            if flags == TCP_FLAG_SYN {
+                table.update_on_packet(
+                    NS,
+                    IPPROTO_TCP,
+                    peer,
+                    local,
+                    443,
+                    20_000,
+                    &L4Meta::new(TCP_FLAG_SYN | TCP_FLAG_ACK, 0),
+                    2,
+                );
+            }
+        }
+        let key = FlowKey::from_packet(NS, IPPROTO_TCP, local, peer, 20_000, 443).0;
+        let token = table.tcp_close_token(&key).unwrap();
+        table.update_on_packet(
+            NS,
+            IPPROTO_TCP,
+            peer,
+            local,
+            443,
+            20_000,
+            &L4Meta::new(TCP_FLAG_FIN | TCP_FLAG_ACK, 0),
+            5,
+        );
+        assert_eq!(
+            table.lookup(&key).unwrap().state,
+            CtProtoState::Tcp(TcpCtState::FinWait2)
+        );
+        let ack = build_tcp_segment(local, peer, 20_000, 443, 101, 201, TCP_FLAG_ACK, 4096, &[]);
+        let frame = try_prepare_tcp_reply_frame(
+            EthAddr::new(2, 0, 0, 0, 0, 1),
+            EthAddr::new(2, 0, 0, 0, 0, 2),
+            peer,
+            local,
+            ack,
+        )
+        .unwrap();
+        let mut reply = PreparedReply::new(frame);
+        reply.tcp_close = Some(token);
+        reply.authorize(NS, 5);
+        let stats = NetStats::new();
+        let retry = match complete_prepared_reply_transaction(reply, 6, NS, &stats, || {
+            Err(TxError::QueueFull)
+        }) {
+            Err(PreparedReplyTxError::Retryable(TxError::QueueFull, owner)) => owner,
+            other => panic!("final ACK must remain retryable: {other:?}"),
+        };
+        assert_eq!(
+            table.lookup(&key).unwrap().state,
+            CtProtoState::Tcp(TcpCtState::FinWait2)
+        );
+        assert!(complete_prepared_reply_transaction(retry, 7, NS, &stats, || Ok(())).is_ok());
+        assert_eq!(
+            table.lookup(&key).unwrap().state,
+            CtProtoState::Tcp(TcpCtState::TimeWait)
+        );
+        assert_eq!(table.drain_ns(NS), 1);
     }
 
     #[cfg(feature = "conntrack")]
