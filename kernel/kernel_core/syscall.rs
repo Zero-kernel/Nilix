@@ -9670,6 +9670,8 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
         .ok_or(SyscallError::ESRCH)?
         .lock()
         .tgid;
+    let signal_target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
+    let has_dac_permission = crate::signal::user_signal_dac_allowed(&signal_target)?;
     let mut namespace_init_supervisor = false;
     if self_tgid != target_tgid {
         let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
@@ -9702,6 +9704,7 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
                 crate::signal::user_namespace_is_strict_ancestor(&sender_user_ns, &target_user_ns),
                 crate::process::current_has_cap_rights(cap::CapRights::ADMIN),
                 crate::current_is_host_root(),
+                has_dac_permission,
             );
             if !namespace_init_supervisor {
                 return Err(SyscallError::EPERM);
@@ -9713,67 +9716,8 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
         return Err(SyscallError::EPERM);
     }
 
-    // 非自己的进程需要进行 POSIX 权限检查
-    if self_global_pid != target_global_pid {
-        // 获取发送者凭证
-        let sender_creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-
-        // 获取目标进程凭证
-        // R39-3 FIX: 使用共享凭证读取目标进程 uid
-        let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
-        let target_uid = target
-            .lock()
-            .try_credentials_read()
-            .ok_or(SyscallError::EAGAIN)?
-            .uid;
-
-        // R101-5/R101-13 FIX: User namespace-aware permission check.
-        //
-        // Previously, a process with euid=0 inside a user namespace could send
-        // signals to ANY process in the system, breaking container isolation.
-        // Now we translate UIDs through the user namespace hierarchy:
-        // - Both sender and target UIDs are mapped to their host-level equivalents
-        // - Root inside a user namespace maps to OVERFLOW_UID (65534) in the parent
-        // - Only processes whose UIDs match at the host level can signal each other
-        //
-        // For root namespace processes, map_uid_from_ns returns identity.
-        // R163-14 FIX: Single lookup — prevents TOCTOU on user_ns if setns
-        // runs between two separate lookups.
-        let sender_ns = {
-            let self_proc = get_process(self_global_pid).ok_or(SyscallError::ESRCH)?;
-            let guard = self_proc.lock();
-            guard.user_ns.clone()
-        };
-        let target_ns = {
-            let ns = target.lock().user_ns.clone();
-            ns
-        };
-
-        // Map sender's UIDs to host-level equivalents
-        const OVERFLOW_UID: u32 = 65534;
-        let sender_host_euid = sender_ns
-            .map_uid_from_ns(sender_creds.euid)
-            .unwrap_or(OVERFLOW_UID);
-        let sender_host_uid = sender_ns
-            .map_uid_from_ns(sender_creds.uid)
-            .unwrap_or(OVERFLOW_UID);
-        // Map target's UID to host-level equivalent
-        let target_host_uid = target_ns
-            .map_uid_from_ns(target_uid)
-            .unwrap_or(OVERFLOW_UID);
-
-        // POSIX 权限检查 (namespace-aware):
-        // 1. Root at HOST level (host_euid == 0) 可以发信号给任何进程
-        // 2. sender host_uid == target host_uid
-        // 3. sender host_euid == target host_uid
-        let has_permission = namespace_init_supervisor
-            || sender_host_euid == 0
-            || sender_host_uid == target_host_uid
-            || sender_host_euid == target_host_uid;
-
-        if !has_permission {
-            return Err(SyscallError::EPERM);
-        }
+    if self_global_pid != target_global_pid && !namespace_init_supervisor && !has_dac_permission {
+        return Err(SyscallError::EPERM);
     }
 
     // R161-2 FIX + R162-1-1 FIX: Invoke LSM hook_signal_send BEFORE sig==0
@@ -12787,6 +12731,9 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         if !console.readable {
             return Err(SyscallError::EBADF);
         }
+        if !crate::process::console_input_allowed() {
+            return Err(SyscallError::EPERM);
+        }
         #[cfg(feature = "kcov")]
         {
             coverage::trace_pc(1001); // sys_read stdin path
@@ -14880,6 +14827,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // per-AS ledger BEFORE they are published to the buddy (free-after-remove),
         // mirroring sys_munmap Phase-2/3. This pairs with SLICE-4b: a brk-grown ledgered
         // PT frame is now debited here on shrink instead of riding to teardown.
+        // SAFETY: the brk reservation pins this range in the current address
+        // space. with_current_manager holds PT_LOCK; removed leaves are flushed
+        // on all participating CPUs before any last-reference frame is freed.
         let table_frames: alloc::vec::Vec<x86_64::structures::paging::PhysFrame> = unsafe {
             use x86_64::structures::paging::PhysFrame;
             with_current_manager(VirtAddr::new(0), |manager| -> alloc::vec::Vec<PhysFrame> {
@@ -14888,6 +14838,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
                 let mut frames_to_free = Vec::new();
                 let _ = frames_to_free.try_reserve(shrink_size / PAGE_SIZE);
 
+                #[cfg(feature = "syscall_test")]
+                let flushes_before = mm::tlb_shootdown::get_stats();
+                let mut removed_leaf = false;
                 for offset in (0..shrink_size).step_by(PAGE_SIZE) {
                     let vaddr = VirtAddr::new((new_top + offset) as u64);
                     let page = Page::containing_address(vaddr);
@@ -14902,6 +14855,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     };
 
                     if let Some(frame) = frame_opt {
+                        removed_leaf = true;
                         let phys_addr = frame.start_address().as_u64() as usize;
 
                         let should_free = PAGE_REF_COUNT.release(phys_addr).should_free_unmapped();
@@ -14917,11 +14871,25 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     }
                 }
 
-                if !frames_to_free.is_empty() {
+                // Every removed translation must be invalidated, including COW
+                // leaves retained by another address space. PT_LOCK serializes
+                // release with peer COW/teardown until the shootdown completes.
+                if removed_leaf {
                     mm::flush_current_as_range(VirtAddr::new(new_top as u64), shrink_size);
                     for frame in frames_to_free {
                         frame_alloc.deallocate_frame(frame);
                     }
+                }
+
+                #[cfg(feature = "syscall_test")]
+                if removed_leaf {
+                    let after = mm::tlb_shootdown::get_stats();
+                    assert!(
+                        after.pages_flushed > flushes_before.pages_flushed
+                            || after.range_flushes > flushes_before.range_flushes
+                            || after.full_flushes > flushes_before.full_flushes,
+                        "brk removed a leaf without completing a cross-CPU flush"
+                    );
                 }
 
                 // M2-1 SLICE-4c: reclaim the now-empty intermediate PT/PD tables this
@@ -24596,6 +24564,10 @@ fn sys_kpatch_disable_all() -> Result<usize, SyscallError> {
 /// enumeration). Re-resolution per tick is therefore mandatory, not a staleness
 /// choice.
 enum FdKind {
+    ConsoleDevice {
+        readable: bool,
+        writable: bool,
+    },
     /// fd 0 — stdin (keyboard). Readiness = non-consuming keyboard byte count.
     Stdin,
     /// fd 1/2 — console. Always writable (matches sys_write routing).
@@ -24646,6 +24618,9 @@ fn poll_classify(p: &crate::process::Process, fd: i32) -> FdKind {
     match p.get_fd(fd) {
         None => FdKind::Nval,
         Some(ops) => match ops.poll_arm() {
+            crate::poll::PollArm::Console { readable, writable } => {
+                FdKind::ConsoleDevice { readable, writable }
+            }
             crate::poll::PollArm::AlwaysReady => FdKind::AlwaysReady,
             crate::poll::PollArm::Dyn { probe, write_end } => FdKind::Dyn { probe, write_end },
             crate::poll::PollArm::Socket { cap_id, socket_id } => {
@@ -24708,8 +24683,19 @@ fn sock_readiness_to_bits(r: net::SockPollReadiness) -> i16 {
 fn poll_probe(kind: &FdKind) -> i16 {
     use crate::poll::*;
     match kind {
+        FdKind::ConsoleDevice { readable, writable } => {
+            let output = if *writable { POLLOUT | POLLWRNORM } else { 0 };
+            output
+                | if *readable {
+                    poll_probe(&FdKind::Stdin)
+                } else {
+                    0
+                }
+        }
         FdKind::Stdin => {
-            if drivers::keyboard_available() > 0 {
+            if !crate::process::console_input_allowed() {
+                POLLERR
+            } else if drivers::keyboard_available() > 0 {
                 POLLIN | POLLRDNORM
             } else {
                 0

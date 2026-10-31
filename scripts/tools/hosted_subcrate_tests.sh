@@ -211,7 +211,7 @@ run_suite cap-cloexec 1 11 \
     --features mm/host_harness \
     --lib --locked -- ksa005_
 
-run_suite net 131 0 \
+run_suite net 135 0 \
     --manifest-path kernel/net/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -232,7 +232,7 @@ run_suite vfs 72 0 \
     --features host_harness \
     --lib --locked
 
-run_suite kernel-core 127 0 \
+run_suite kernel-core 132 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -265,7 +265,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 127 \
+run_suite mitigation-mappings 5 132 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

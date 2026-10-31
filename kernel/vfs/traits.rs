@@ -797,6 +797,18 @@ impl FileHandle {
 }
 
 impl FileOps for FileHandle {
+    fn poll_arm(&self) -> kernel_core::poll::PollArm {
+        if self.inode.as_any().is::<crate::devfs::ConsoleDevInode>() {
+            let flags = self.flags();
+            kernel_core::poll::PollArm::Console {
+                readable: flags.is_readable(),
+                writable: flags.is_writable(),
+            }
+        } else {
+            kernel_core::poll::PollArm::AlwaysReady
+        }
+    }
+
     fn status_flags(&self) -> Result<u32, SyscallError> {
         let flags = self.flags();
         let path_flags = OpenFlags::O_PATH | OpenFlags::O_DIRECTORY | OpenFlags::O_NOFOLLOW;

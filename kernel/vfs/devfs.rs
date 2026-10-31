@@ -397,7 +397,7 @@ impl Inode for ZeroDevInode {
 // ============================================================================
 
 /// /dev/console inode
-struct ConsoleDevInode {
+pub(crate) struct ConsoleDevInode {
     fs_id: u64,
     ino: u64,
 }
@@ -445,7 +445,9 @@ impl Inode for ConsoleDevInode {
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Console read: read from keyboard input buffer (non-blocking)
+        if !kernel_core::process::console_input_allowed() {
+            return Err(FsError::NotPermitted);
+        }
         Ok(drivers::keyboard_read(buf))
     }
 
@@ -455,6 +457,9 @@ impl Inode for ConsoleDevInode {
         buf: &mut [u8],
         commit: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
     ) -> Result<usize, FsError> {
+        if !kernel_core::process::console_input_allowed() {
+            return Err(FsError::NotPermitted);
+        }
         drivers::keyboard_read_with_commit(buf, commit)
     }
 

@@ -446,6 +446,31 @@ pub fn mutable_file_status_bits(flags: u32) -> Result<u32, SyscallError> {
     Ok(flags & FILE_STATUS_MUTABLE)
 }
 
+/// The single physical input queue has one boot-selected owner: the Ring-0
+/// shell when enabled, otherwise the global init thread group. Inherited or
+/// reopened descriptors do not transfer input ownership. A foreground/TTY
+/// handoff requires a separate explicit protocol; it is not implemented here.
+fn console_owner_allows(shell_enabled: bool, tgid: Option<ProcessId>) -> bool {
+    !shell_enabled && tgid == Some(1)
+}
+
+/// Called outside PCB and keyboard locks by both standard-fd and VFS paths.
+pub fn console_input_allowed() -> bool {
+    let tgid = current_pid()
+        .and_then(get_process)
+        .map(|proc| proc.lock().tgid);
+    console_owner_allows(compliance::policy().debug_interfaces_enabled, tgid)
+}
+
+#[cfg(test)]
+#[test]
+fn audit_20261031_console_has_exactly_one_input_owner() {
+    for tgid in [None, Some(1), Some(2), Some(65535)] {
+        assert!(!console_owner_allows(true, tgid));
+        assert_eq!(console_owner_allows(false, tgid), tgid == Some(1));
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ConsoleFile {
     pub(crate) readable: bool,
@@ -625,11 +650,8 @@ pub trait FileOps: Send + Sync {
     ///
     /// The default is `AlwaysReady` (Linux DEFAULT_POLLMASK: a fd kind with no
     /// blocking read/write always reports readable+writable). Regular files
-    /// (`FileHandle`/`Ext2File`) and namespace fds keep the default. NOTE: a
-    /// `/dev/console` `FileHandle` is a KNOWN-WRONG case under this default (its
-    /// `read_at` is a non-blocking `keyboard_read` that returns 0 when empty, so
-    /// poll would spuriously report POLLIN) — no in-tree consumer opens it today;
-    /// a char-device override rides this same mechanism as a tracked residual.
+    /// (`FileHandle`/`Ext2File`) and namespace fds keep the default. Console
+    /// devices override this with a non-consuming, owner-checked probe.
     fn poll_arm(&self) -> crate::poll::PollArm {
         crate::poll::PollArm::AlwaysReady
     }
@@ -14171,6 +14193,99 @@ impl ProcessStats {
 
 // ========== OOM Killer 回调实现 ==========
 
+/// Committed resident footprint used by the allocation-free OOM scan.
+fn oom_resident_pages(state: &MmState) -> u64 {
+    let rss_bytes = state
+        .mmap_regions
+        .iter()
+        .fold(0usize, |total, (&base, &entry)| {
+            // U05-1 FIX: PROT_NONE VMAs reserve address space but do
+            // not own resident frames. Counting them as RSS lets a
+            // process win OOM victim selection merely by reserving a
+            // large sparse range. Keep the snapshot aligned with the
+            // cgroup charge invariant and skip non-resident entries.
+            if entry.is_prot_none() {
+                total
+            } else if entry.is_shared() {
+                // Shared-anonymous regions are demand-paged; charge
+                // only materialized resident pages to OOM selection.
+                let resident = state
+                    .shared_regions
+                    .get(&base)
+                    .map(|region| region.resident_pages())
+                    .unwrap_or(0);
+                total.saturating_add(resident.saturating_mul(4096))
+            } else {
+                total.saturating_add(crate::syscall::mmap_region_len(entry))
+            }
+        });
+    // Match the committed charge model without counting in-flight reservations.
+    // brk_start may be unaligned; count the same page interval as sys_brk.
+    let ceil_pages = |bytes: usize| (bytes / 4096) as u64 + u64::from(bytes % 4096 != 0);
+    let heap_pages = ceil_pages(state.brk).saturating_sub(ceil_pages(state.brk_start));
+    (rss_bytes as u64)
+        .saturating_sub(state.mremap_uncharged_reserve_bytes)
+        .saturating_add(heap_pages.saturating_mul(4096))
+        .saturating_add(state.elf_charged_bytes)
+        .saturating_add(state.pt_charged_bytes)
+        / 4096
+}
+
+#[cfg(test)]
+#[test]
+fn audit_20261031_oom_counts_heap_image_and_page_tables() {
+    let mut state = MmState::new(0);
+    state.brk_start = 0x400001;
+    state.brk = 0x404001;
+    state.elf_charged_bytes = 8 * 4096;
+    state.pt_charged_bytes = 3 * 4096;
+    assert_eq!(oom_resident_pages(&state), 15);
+    // Reservations have not necessarily materialized into physical pages.
+    state.brk_pending_growth = 100 * 4096;
+    state.exec_pending_bytes = 100 * 4096;
+    state.stack_grow_pending_bytes = 100 * 4096;
+    assert_eq!(oom_resident_pages(&state), 15);
+}
+
+#[cfg(test)]
+#[test]
+fn audit_20261031_oom_excludes_sparse_and_mremap_reservations() {
+    let mut state = MmState::new(0);
+    state
+        .mmap_regions
+        .try_insert(0x400000, crate::syscall::MmapEntry::prot_none(1 << 30))
+        .unwrap();
+    state
+        .mmap_regions
+        .try_insert(
+            0x80000000,
+            crate::syscall::MmapEntry::from_len_flags(3 * 4096, 0),
+        )
+        .unwrap();
+    state.mremap_uncharged_reserve_bytes = 2 * 4096;
+    assert_eq!(oom_resident_pages(&state), 1);
+    state.brk_start = 0x1000;
+    state.brk = 0x11000;
+    let small = mm::OomProcessInfo {
+        pid: 100,
+        generation: 1,
+        tgid: 100,
+        uid: 1000,
+        gid: 1000,
+        rss_pages: 1,
+        nice: 0,
+        oom_score_adj: 0,
+        has_mm: true,
+        is_kernel_thread: false,
+    };
+    let large = mm::OomProcessInfo {
+        rss_pages: oom_resident_pages(&state),
+        ..small
+    };
+    assert_eq!(large.rss_pages, 17);
+    assert!(mm::score_oom_process(&large) > mm::score_oom_process(&small));
+}
+
 /// Return the highest-scoring currently observable OOM victim without allocating.
 /// Every lock in this recovery scan is nonblocking: a contended table, PCB, mm,
 /// or credential object is deferred to a later allocator-failure poll.
@@ -14193,31 +14308,7 @@ pub fn oom_snapshot() -> Option<mm::OomProcessInfo> {
                 Some(mm_state) => mm_state,
                 None => continue,
             };
-            let rss_bytes = mm_state
-                .mmap_regions
-                .iter()
-                .fold(0usize, |total, (&base, &entry)| {
-                    // U05-1 FIX: PROT_NONE VMAs reserve address space but do
-                    // not own resident frames. Counting them as RSS lets a
-                    // process win OOM victim selection merely by reserving a
-                    // large sparse range. Keep the snapshot aligned with the
-                    // cgroup charge invariant and skip non-resident entries.
-                    if entry.is_prot_none() {
-                        total
-                    } else if entry.is_shared() {
-                        // Shared-anonymous regions are demand-paged; charge
-                        // only materialized resident pages to OOM selection.
-                        let resident = mm_state
-                            .shared_regions
-                            .get(&base)
-                            .map(|region| region.resident_pages())
-                            .unwrap_or(0);
-                        total.saturating_add(resident.saturating_mul(4096))
-                    } else {
-                        total.saturating_add(crate::syscall::mmap_region_len(entry))
-                    }
-                });
-            (rss_bytes / 4096) as u64
+            oom_resident_pages(&mm_state)
         };
 
         let (uid, gid) = {
