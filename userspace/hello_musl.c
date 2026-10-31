@@ -84,6 +84,7 @@ static int standard_fd_smoke(void) {
         if (fcntl(0, F_GETFD) != -1 || errno != EBADF ||
             fcntl(2, F_GETFD) != FD_CLOEXEC) syscall(SYS_exit, 105);
         execl("/musl-test", "musl-test", "--fd-exec-check", (char *)NULL);
+        dprintf(2, "MUSL-EXEC-FAIL errno=%d\n", errno);
         syscall(SYS_exit, 106);
         __builtin_unreachable();
     }

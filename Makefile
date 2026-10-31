@@ -148,7 +148,9 @@ run-syscall-test: build-syscall-test
 # Build with musl test program
 build-musl-test:
 	@echo "=== 编译 musl 测试程序 ==="
-	cd userspace && musl-gcc -static -o hello_musl.elf hello_musl.c
+	@# Host musl archives may carry large debug/symbol sections. They are not
+	@# needed by this runtime fixture and must not consume its bounded exec budget.
+	cd userspace && musl-gcc -static -Wl,--strip-all -o hello_musl.elf hello_musl.c
 	cp userspace/hello_musl.elf kernel/src/musl_test.elf
 
 	@echo "=== 构建 Bootloader (UEFI) ==="
