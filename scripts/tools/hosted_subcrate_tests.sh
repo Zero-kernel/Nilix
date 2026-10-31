@@ -220,7 +220,7 @@ run_suite net 139 0 \
 # Robust-list and futex decision tests only: the remaining ipc tests reach
 # wakes or other privileged paths (one pipe admission test crashes a hosted
 # process at HEAD too). Futex parity/PI tests defer every wake.
-run_suite ipc-robust-futex 24 17 \
+run_suite ipc-robust-futex 25 17 \
     --manifest-path kernel/ipc/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
