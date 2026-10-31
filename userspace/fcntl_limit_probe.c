@@ -86,10 +86,17 @@ static int fdlimit_regular(const char *path) {
     FDL_CHECK(fdlimit_flags(independent, O_RDWR, 0));
     FDL_CHECK(fcntl(file, F_GETFD) == FD_CLOEXEC && fcntl(duplicate, F_GETFD) == 0);
     FDL_CHECK(write(file, "D", 1) == 1 && lseek(file, 0, SEEK_CUR) == 4);
-    FDL_CHECK(pwrite(duplicate, "E", 1, 0) == 1 && lseek(file, 0, SEEK_CUR) == 4);
+    /* This is the Linux pwrite64 append ABI oracle. musl 1.2.6 pwrite()
+     * instead requests POSIX no-append behavior through RWF_NOAPPEND.
+     * Call the intended syscall directly, retaining the data/offset checks. */
+    FDL_CHECK(syscall(SYS_pwrite64, duplicate, "E", (size_t)1, (off_t)0) == 1 &&
+              lseek(file, 0, SEEK_CUR) == 4);
     char bytes[5];
     FDL_CHECK(pread(file, bytes, sizeof(bytes), 0) == (ssize_t)sizeof(bytes) && !memcmp(bytes, "abcDE", 5));
     FDL_CHECK(write(independent, "Z", 1) == 1);
+    /* Also exercise libc pwrite on a non-append description. */
+    FDL_CHECK(pwrite(independent, "Z", 1, 0) == 1 &&
+              lseek(independent, 0, SEEK_CUR) == 1);
 
     fflush(NULL);
     pid_t child = (pid_t)syscall(SYS_fork);
