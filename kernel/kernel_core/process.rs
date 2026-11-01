@@ -11843,7 +11843,7 @@ fn notify_parent_of_group_exit(
 /// Count the report, and wake every member sleeping in a wait for any child or
 /// for `child_pid`. Returns whether one was woken (the caller kicks). Process
 /// context, no lock held; scans the table only while a member waits.
-fn wake_group_child_waiters(group: &Arc<ThreadGroup>, child_pid: ProcessId) -> bool {
+pub(crate) fn wake_group_child_waiters(group: &Arc<ThreadGroup>, child_pid: ProcessId) -> bool {
     // lint-fetch-add: allow (a change counter, compared only for inequality)
     group.child_events.fetch_add(1, Ordering::SeqCst);
     if group.child_waiters.load(Ordering::SeqCst) == 0 {

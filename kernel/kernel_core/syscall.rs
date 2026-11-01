@@ -8730,9 +8730,56 @@ fn prepare_child_wait(
 
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
 mod selective_wait_tests {
+    extern crate std;
+
     use super::*;
     use crate::pid_namespace::{PidNamespace, PidNamespaceArc, PidNamespaceMembership};
-    use crate::process::{Process, ProcessArc, ProcessNameSnapshot};
+    use crate::process::{Process, ProcessArc, ProcessNameSnapshot, ThreadGroup};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum GroupWaitPhase {
+        Scanned,
+        Checked,
+        Blocked,
+    }
+
+    std::thread_local! {
+        // Only the waiter under test sees these hooks. Parallel hosted tests
+        // and the production kernel never acquire a test callback or barrier.
+        static GROUP_WAIT_HOOK: std::cell::RefCell<Option<std::boxed::Box<dyn FnMut(GroupWaitPhase)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn group_wait_phase(phase: GroupWaitPhase) {
+        GROUP_WAIT_HOOK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(phase);
+            }
+        });
+    }
+
+    struct GroupWaitHook;
+
+    impl Drop for GroupWaitHook {
+        fn drop(&mut self) {
+            GROUP_WAIT_HOOK.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+
+    const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn pause_group_wait(
+        phase: GroupWaitPhase,
+        reached: &mpsc::Sender<GroupWaitPhase>,
+        resume: &mpsc::Receiver<()>,
+    ) {
+        reached.send(phase).unwrap();
+        resume
+            .recv_timeout(HANDOFF_TIMEOUT)
+            .expect("group wait interleaving did not finish");
+    }
 
     fn fixture(pid: usize, ppid: usize, view_pid: usize, ns: &PidNamespaceArc) -> ProcessArc {
         mm::publish_heap_budgets();
@@ -8759,6 +8806,257 @@ mod selective_wait_tests {
     fn namespace() -> PidNamespaceArc {
         mm::publish_heap_budgets();
         PidNamespace::new_child(crate::pid_namespace::ROOT_PID_NAMESPACE.clone()).unwrap()
+    }
+
+    static GROUP_FIXTURE_SERIAL: spin::Mutex<()> = spin::Mutex::new(());
+
+    /// Run the actual group scan/block loop and group notifier on published
+    /// PCBs, without installing a scheduler callback or physical stacks. The
+    /// caller is a non-leader waiting for another thread's children. WNOWAIT
+    /// keeps synthetic zombies out of physical-resource teardown.
+    struct GroupFixture {
+        owner: ProcessArc,
+        caller: ProcessArc,
+        sibling: ProcessArc,
+        target: ProcessArc,
+        outsider: ProcessArc,
+        group: Arc<ThreadGroup>,
+        base: ProcessId,
+        _serial: spin::MutexGuard<'static, ()>,
+    }
+
+    impl GroupFixture {
+        fn new() -> Self {
+            let serial = GROUP_FIXTURE_SERIAL.lock();
+            let ns = namespace();
+            let base = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                // Separate from the child-creation fixtures' 768..1024 slots.
+                (2048..4096)
+                    .step_by(5)
+                    .find(|base| {
+                        (*base..*base + 5).all(|pid| table.get(pid).is_none_or(Option::is_none))
+                    })
+                    .expect("unused group-wait fixture slots")
+            };
+            let owner = fixture(base, 0, 1, &ns);
+            let caller = fixture(base + 1, 0, 2, &ns);
+            let sibling = fixture(base + 2, base, 3, &ns);
+            let target = fixture(base + 3, base, 4, &ns);
+            let outsider = fixture(base + 4, 0, 5, &ns);
+            let group = owner.lock().thread_group.clone();
+            {
+                let mut proc = caller.lock();
+                proc.thread_group = group.clone();
+                proc.tgid = base;
+                proc.ns_tgid = 1;
+            }
+            {
+                let mut proc = owner.lock();
+                proc.children.try_reserve_exact(2).unwrap();
+                proc.children.push_reserved(base + 2).unwrap();
+                proc.children.push_reserved(base + 3).unwrap();
+            }
+            // Matching PID alone must not wake a task outside the parent group.
+            {
+                let mut proc = outsider.lock();
+                proc.enter_blocked_at(0);
+                proc.waiting_child = Some(base + 3);
+            }
+            {
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if table.len() < base + 5 {
+                    let missing = base + 5 - table.len();
+                    table.try_reserve_exact(missing).unwrap();
+                    while table.len() < base + 5 {
+                        table.push_reserved(None).unwrap();
+                    }
+                }
+                for (offset, proc) in [&owner, &caller, &sibling, &target, &outsider]
+                    .into_iter()
+                    .enumerate()
+                {
+                    assert!(table[base + offset].is_none());
+                    table[base + offset] = Some(proc.clone());
+                }
+                group.join_locked();
+            }
+            Self {
+                owner,
+                caller,
+                sibling,
+                target,
+                outsider,
+                group,
+                base,
+                _serial: serial,
+            }
+        }
+
+        fn wait(
+            &self,
+            hook: impl FnMut(GroupWaitPhase) + 'static,
+        ) -> Result<Option<WaitOutcome>, SyscallError> {
+            GROUP_WAIT_HOOK.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(std::boxed::Box::new(hook));
+            });
+            let _hook = GroupWaitHook;
+            assert_eq!(self.group.members(), 2);
+            wait_reap_group(
+                WaitTarget::Pid(4),
+                false,
+                true,
+                |_| Ok(()),
+                self.base + 1,
+                &self.caller,
+                &self.group,
+            )
+        }
+
+        fn exit(&self, child: &ProcessArc, code: i32) -> bool {
+            let pid = {
+                let mut proc = child.lock();
+                proc.state = ProcessState::Zombie;
+                proc.exit_code = Some(code);
+                proc.teardown_done
+                    .store(true, core::sync::atomic::Ordering::Release);
+                proc.pid
+            };
+            crate::process::wake_group_child_waiters(&self.group, pid)
+        }
+
+        fn assert_target(&self, result: Result<Option<WaitOutcome>, SyscallError>) {
+            let outcome = result.unwrap().expect("target must be reported");
+            assert_eq!(
+                (outcome.global_pid, outcome.view_pid, outcome.exit_code),
+                (self.base + 3, 4, 22)
+            );
+            let caller = self.caller.lock();
+            assert_eq!(caller.state, ProcessState::Ready);
+            assert_eq!(caller.waiting_child, None);
+            assert_eq!(self.target.lock().state, ProcessState::Zombie);
+            assert_eq!(self.outsider.lock().state, ProcessState::Blocked);
+        }
+    }
+
+    impl Drop for GroupFixture {
+        fn drop(&mut self) {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            for (offset, proc) in [
+                &self.owner,
+                &self.caller,
+                &self.sibling,
+                &self.target,
+                &self.outsider,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let slot = &mut table[self.base + offset];
+                if slot.as_ref().is_some_and(|entry| Arc::ptr_eq(entry, proc)) {
+                    *slot = None;
+                }
+            }
+            // Fixture fields retain the PCBs until after the table is unlocked.
+        }
+    }
+
+    #[test]
+    fn group_pid_wait_sibling_exit_does_not_wake_another_threads_waiter() {
+        let fixture = GroupFixture::new();
+        let (reached, phases) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let waiter = threads.spawn(|| {
+                fixture.wait(move |phase| {
+                    if phase == GroupWaitPhase::Blocked {
+                        pause_group_wait(phase, &reached, &proceed);
+                    }
+                })
+            });
+            assert_eq!(
+                phases.recv_timeout(HANDOFF_TIMEOUT).unwrap(),
+                GroupWaitPhase::Blocked
+            );
+            assert_eq!(fixture.caller.lock().state, ProcessState::Blocked);
+            assert!(!fixture.exit(&fixture.sibling, 11));
+            assert_eq!(fixture.caller.lock().state, ProcessState::Blocked);
+            assert_eq!(fixture.caller.lock().waiting_child, Some(fixture.base + 3));
+            assert!(fixture.exit(&fixture.target, 22));
+            assert_eq!(fixture.caller.lock().state, ProcessState::Ready);
+            resume.send(()).unwrap();
+            fixture.assert_target(waiter.join().unwrap());
+            assert_eq!(fixture.sibling.lock().state, ProcessState::Zombie);
+        });
+    }
+
+    #[test]
+    fn group_pid_wait_exit_after_scan_prevents_stale_block_publication() {
+        let fixture = GroupFixture::new();
+        let (reached, phases) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let waiter = threads.spawn(|| {
+                let mut first_scan = true;
+                fixture.wait(move |phase| {
+                    assert_ne!(phase, GroupWaitPhase::Blocked, "lost child event");
+                    if phase == GroupWaitPhase::Scanned && first_scan {
+                        first_scan = false;
+                        pause_group_wait(phase, &reached, &proceed);
+                    }
+                })
+            });
+            assert_eq!(
+                phases.recv_timeout(HANDOFF_TIMEOUT).unwrap(),
+                GroupWaitPhase::Scanned
+            );
+            assert_eq!(fixture.group.child_events(), 0);
+            assert!(!fixture.exit(&fixture.target, 22));
+            assert_eq!(fixture.group.child_events(), 1);
+            resume.send(()).unwrap();
+            fixture.assert_target(waiter.join().unwrap());
+        });
+    }
+
+    #[test]
+    fn group_pid_wait_exit_after_event_check_wakes_the_published_wait() {
+        let fixture = GroupFixture::new();
+        let (reached, phases) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let waiter = threads.spawn(|| {
+                fixture.wait(move |phase| {
+                    if phase != GroupWaitPhase::Scanned {
+                        pause_group_wait(phase, &reached, &proceed);
+                    }
+                })
+            });
+            assert_eq!(
+                phases.recv_timeout(HANDOFF_TIMEOUT).unwrap(),
+                GroupWaitPhase::Checked
+            );
+            // The waiter still holds its PCB lock after reading child_events.
+            // The notifier publishes the event, then must wait for that lock.
+            assert!(fixture.caller.try_lock().is_none());
+            let notifier = threads.spawn(|| fixture.exit(&fixture.target, 22));
+            let deadline = Instant::now() + HANDOFF_TIMEOUT;
+            while fixture.group.child_events() == 0 {
+                assert!(Instant::now() < deadline, "child event was not published");
+                std::thread::yield_now();
+            }
+            assert!(!notifier.is_finished());
+            resume.send(()).unwrap();
+            assert_eq!(
+                phases.recv_timeout(HANDOFF_TIMEOUT).unwrap(),
+                GroupWaitPhase::Blocked
+            );
+            assert!(notifier.join().unwrap(), "target exit must wake the waiter");
+            assert_eq!(fixture.caller.lock().state, ProcessState::Ready);
+            assert_eq!(fixture.caller.lock().waiting_child, None);
+            resume.send(()).unwrap();
+            fixture.assert_target(waiter.join().unwrap());
+        });
     }
 
     #[test]
@@ -9360,6 +9658,9 @@ where
             continue;
         }
 
+        #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+        selective_wait_tests::group_wait_phase(selective_wait_tests::GroupWaitPhase::Scanned);
+
         if let Some((child_pid, exit_code, view_pid)) = found {
             let outcome = WaitOutcome {
                 global_pid: child_pid,
@@ -9410,9 +9711,16 @@ where
             if group.child_events() != events {
                 continue;
             }
+            // The hosted interleaving pauses here with the caller PCB locked.
+            #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+            selective_wait_tests::group_wait_phase(selective_wait_tests::GroupWaitPhase::Checked);
+
             proc.enter_blocked_at(crate::get_ticks());
             proc.waiting_child = Some(wake_pid);
         }
+        #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+        selective_wait_tests::group_wait_phase(selective_wait_tests::GroupWaitPhase::Blocked);
+
         crate::force_reschedule();
         // Ready again, whether woken or not switched out at all.
         let mut proc = caller.lock();
