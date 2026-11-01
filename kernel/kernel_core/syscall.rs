@@ -8684,6 +8684,198 @@ struct WaitOutcome {
     exit_code: i32,
 }
 
+/// Resolve the wake filter before publishing Blocked. A PID selector must
+/// never temporarily admit sibling exits. Use the child's retained identity:
+/// live namespace maps may already have been detached by exit.
+///
+/// No parent PCB guard is held while looking up or locking a child. The caller
+/// MUST scan for reapable children after this returns: an exit during identity
+/// resolution either precedes that scan or sees the published wait and wakes it.
+/// False leaves the caller runnable so stale/incomplete child-list recovery can
+/// run without ever falling back to an any-child wait for an unresolved PID.
+fn prepare_child_wait(
+    parent: &crate::process::ProcessArc,
+    pid: ProcessId,
+    target: WaitTarget,
+    children: &[ProcessId],
+    namespace: &crate::pid_namespace::PidNamespaceArc,
+    mut lookup: impl FnMut(ProcessId) -> Option<crate::process::ProcessArc>,
+) -> Result<bool, SyscallError> {
+    let wake_pid = match target {
+        WaitTarget::Any => Some(0),
+        WaitTarget::Pid(want) => children.iter().find_map(|&global| {
+            let child = lookup(global)?;
+            let child = child.lock();
+            (child.ppid == pid && child.wait_pid_in_namespace(namespace) == Some(want))
+                .then_some(global)
+        }),
+    };
+    let mut proc = parent.lock();
+    // Signal/kill publishers take this same lock. Recheck immediately before
+    // committing Blocked so an interrupt racing with identity resolution wins.
+    if crate::signal::should_abort_pending_block(&proc) {
+        proc.enter_ready_at(crate::get_ticks());
+        proc.waiting_child = None;
+        return Err(SyscallError::EINTR);
+    }
+    if let Some(global) = wake_pid {
+        proc.enter_blocked_at(crate::get_ticks());
+        proc.waiting_child = Some(global);
+    } else {
+        proc.enter_ready_at(crate::get_ticks());
+        proc.waiting_child = None;
+    }
+    Ok(wake_pid.is_some())
+}
+
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod selective_wait_tests {
+    use super::*;
+    use crate::pid_namespace::{PidNamespace, PidNamespaceArc, PidNamespaceMembership};
+    use crate::process::{Process, ProcessArc, ProcessNameSnapshot};
+
+    fn fixture(pid: usize, ppid: usize, view_pid: usize, ns: &PidNamespaceArc) -> ProcessArc {
+        mm::publish_heap_budgets();
+        let process = Process::try_new_pcb(
+            pid,
+            ppid,
+            ProcessNameSnapshot::from_parts("selective-wait", ""),
+            120,
+        )
+        .unwrap();
+        {
+            let mut proc = process.lock();
+            proc.pid_ns_chain.try_reserve(1).unwrap();
+            proc.pid_ns_chain
+                .push_reserved(PidNamespaceMembership {
+                    ns: ns.clone(),
+                    pid: view_pid,
+                })
+                .unwrap();
+        }
+        process
+    }
+
+    fn namespace() -> PidNamespaceArc {
+        mm::publish_heap_budgets();
+        PidNamespace::new_child(crate::pid_namespace::ROOT_PID_NAMESPACE.clone()).unwrap()
+    }
+
+    #[test]
+    fn selective_wait_sibling_exit_cannot_wake_between_publication_and_scan() {
+        let ns = namespace();
+        let parent = fixture(100, 1, 1, &ns);
+        let fast = fixture(200, 100, 2, &ns);
+        let slow = fixture(300, 100, 3, &ns);
+        assert!(
+            prepare_child_wait(&parent, 100, WaitTarget::Pid(3), &[200, 300], &ns, |pid| {
+                assert!(
+                    parent.try_lock().is_some(),
+                    "parent/child locks must not nest"
+                );
+                Some(if pid == 200 {
+                    fast.clone()
+                } else {
+                    slow.clone()
+                })
+            })
+            .unwrap()
+        );
+        // Force the exact old race: a sibling exit arrives after publication,
+        // before the first reapability scan. Exercise the production waker
+        // shared by notification and the final switch-out handoff.
+        let mut proc = parent.lock();
+        assert!(!proc.wake_for_child_exit(200, 1));
+        assert_eq!(proc.state, ProcessState::Blocked);
+        assert_eq!(proc.waiting_child, Some(300));
+        assert!(proc.wake_for_child_exit(300, 2));
+        assert_eq!(proc.state, ProcessState::Ready);
+        assert_eq!(proc.waiting_child, None);
+        assert!(!proc.wake_for_child_exit(300, 3));
+    }
+
+    #[test]
+    fn selective_wait_target_exit_during_resolution_is_visible_to_the_rescan() {
+        let ns = namespace();
+        let parent = fixture(100, 1, 1, &ns);
+        let child = fixture(200, 100, 2, &ns);
+        assert!(
+            prepare_child_wait(&parent, 100, WaitTarget::Pid(2), &[200], &ns, |_| {
+                // Exit before publication cannot wake a runnable parent. Its
+                // zombie remains visible to the required post-publication scan.
+                child.lock().state = ProcessState::Zombie;
+                assert!(!parent.lock().wake_for_child_exit(200, 1));
+                Some(child.clone())
+            })
+            .unwrap()
+        );
+        assert_eq!(child.lock().state, ProcessState::Zombie);
+        assert_eq!(child.lock().wait_pid_in_namespace(&ns), Some(2));
+        assert_eq!(parent.lock().waiting_child, Some(200));
+        // Teardown/switch-out completing after publication still wakes it.
+        assert!(parent.lock().wake_for_child_exit(200, 2));
+    }
+
+    #[test]
+    fn selective_wait_missing_or_reparented_target_never_arms_any_child() {
+        let ns = namespace();
+        let parent = fixture(100, 1, 1, &ns);
+        let stranger = fixture(200, 999, 2, &ns);
+        // A scheduler may have declined the preceding switch; clear that old
+        // wait when the identity is no longer a child of this parent.
+        {
+            let mut proc = parent.lock();
+            proc.enter_blocked_at(0);
+            proc.waiting_child = Some(200);
+        }
+        assert!(
+            !prepare_child_wait(&parent, 100, WaitTarget::Pid(2), &[200, 300], &ns, |pid| {
+                (pid == 200).then(|| stranger.clone())
+            })
+            .unwrap()
+        );
+        let mut proc = parent.lock();
+        assert_eq!(proc.state, ProcessState::Ready);
+        assert_eq!(proc.waiting_child, None);
+        assert!(!proc.wake_for_child_exit(300, 1));
+    }
+
+    #[test]
+    fn selective_wait_kill_during_resolution_prevents_blocking() {
+        let ns = namespace();
+        let parent = fixture(100, 1, 1, &ns);
+        let child = fixture(200, 100, 2, &ns);
+        assert_eq!(
+            prepare_child_wait(&parent, 100, WaitTarget::Pid(2), &[200], &ns, |_| {
+                parent
+                    .lock()
+                    .pending_kill
+                    .store(true, core::sync::atomic::Ordering::Release);
+                Some(child.clone())
+            }),
+            Err(SyscallError::EINTR)
+        );
+        assert_eq!(parent.lock().state, ProcessState::Ready);
+        assert_eq!(parent.lock().waiting_child, None);
+    }
+
+    #[test]
+    fn selective_wait_any_child_keeps_its_broad_wake_contract() {
+        let ns = namespace();
+        let parent = fixture(100, 1, 1, &ns);
+        assert!(
+            prepare_child_wait(&parent, 100, WaitTarget::Any, &[200], &ns, |_| {
+                panic!("any-child wait needs no PID translation")
+            })
+            .unwrap()
+        );
+        let mut proc = parent.lock();
+        assert_eq!(proc.waiting_child, Some(0));
+        assert!(proc.wake_for_child_exit(200, 1));
+        assert_eq!(proc.waiting_child, None);
+    }
+}
+
 /// Shared blocking reap loop behind `wait4(2)` and `waitid(2)`.
 ///
 /// This is the lost-wakeup-critical path: `Blocked` + `waiting_child` are
@@ -8750,9 +8942,8 @@ where
         // handler that this drain posts ends the wait with EINTR (pre-existing;
         // Linux scans first and reports the child).
         crate::process::run_blocked_wait_drains();
-        // 【关键修复】先标记为等待状态，再扫描子进程，避免 lost wake-up
-        // 如果子进程在我们标记之后、扫描之前退出，terminate_process 会看到我们的等待状态
-        // 如果子进程在我们扫描时/之后退出，我们会在扫描中发现它的 Zombie 状态
+        // Snapshot the children before resolving the wake filter. Publication
+        // follows identity resolution and still precedes the reapability scan.
         let child_list = {
             let mut proc = parent.lock();
             if proc.children.is_empty() {
@@ -8833,27 +9024,10 @@ where
                     return Err(SyscallError::ENOMEM);
                 }
                 drop(table);
-                // Re-acquire and set wait state.
-                let mut proc = parent.lock();
-                // R172-11 FIX: re-check kill/signal UNDER the held parent lock (the lock the
-                // wakers take) immediately before publishing Blocked. The loop-top gates
-                // (5670/5679) read-and-dropped the lock; a kill/handler-signal racing into
-                // the gate->commit window would set its pending bit while state != Blocked,
-                // so the bare state-flip wake no-ops and wait4 (no IRQ/data backstop) strands
-                // permanently (+ deferred SIGKILL). Mirror sync.rs:585 — bail to EINTR.
-                if crate::signal::should_abort_pending_block(&proc) {
-                    proc.enter_ready_at(crate::get_ticks());
-                    proc.waiting_child = None;
-                    return Err(SyscallError::EINTR);
-                }
-                proc.enter_blocked_at(crate::get_ticks());
-                proc.waiting_child = Some(0);
                 found
             } else {
-                // Normal fast path: use children list.
-                // R172-11 FIX: same under-lock recheck before publishing Blocked. Reserve the
-                // snapshot FIRST (ENOMEM rollback needs no Blocked-undo since nothing is
-                // committed yet), then recheck, then commit Blocked + waiting_child.
+                // Normal fast path: snapshot first; prepare_child_wait will
+                // recheck signals under the PCB lock before publishing Blocked.
                 let mut snapshot = Vec::new();
                 if snapshot.try_reserve_exact(proc.children.len()).is_err() {
                     // ST-K3 FIX (W-1): the "nothing is committed yet" rationale
@@ -8863,13 +9037,6 @@ where
                     proc.waiting_child = None;
                     return Err(SyscallError::ENOMEM);
                 }
-                if crate::signal::should_abort_pending_block(&proc) {
-                    proc.enter_ready_at(crate::get_ticks());
-                    proc.waiting_child = None;
-                    return Err(SyscallError::EINTR);
-                }
-                proc.enter_blocked_at(crate::get_ticks());
-                proc.waiting_child = Some(0);
                 snapshot.extend_from_slice(&proc.children);
                 snapshot
             }
@@ -8882,8 +9049,15 @@ where
             crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
                 .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone())
         };
+        let prepared = prepare_child_wait(
+            &parent,
+            pid,
+            target,
+            &child_list,
+            &parent_namespace,
+            get_process,
+        )?;
         let mut selected_exists = false;
-        let mut selected_global: Option<ProcessId> = None;
         // A selected zombie whose teardown/switch-out is still in flight: the
         // wake was genuine, only early (wake_reaper_after_switch follows).
         let mut selected_zombie_pending = false;
@@ -8909,7 +9083,6 @@ where
                         if view_pid != want {
                             continue;
                         }
-                        selected_global = Some(*child_pid);
                     }
 
                     selected_exists = true;
@@ -9037,22 +9210,15 @@ where
             return Ok(None);
         }
 
-        // GAP-6 W-3: a pid-targeted wait narrows its published wake filter from
-        // "any child" to the selected child's global pid, so sibling exits no
-        // longer over-wake it. Only narrow while the Some(0) published above is
-        // still in place: a child that exited during the scan already cleared it
-        // (and made us Ready), and the loop below rescans without sleeping.
-        // A resume that rescans into another block found nothing reapable: it
-        // was an over-wake (sibling exit under the old Some(0) filter, or a
-        // zombie still mid-switch). Counted so the rubric can bound it.
+        if !prepared {
+            // A child may have been adopted between identity resolution and
+            // this scan. Resolve it again before sleeping; no broad filter.
+            continue;
+        }
+        // A real resume with no reportable target is an over-wake. Preserve
+        // this oracle; an in-flight target zombie is only an early valid wake.
         if resumed_from_block && !selected_zombie_pending {
             crate::process::note_wait_over_wake();
-        }
-        if let Some(global) = selected_global {
-            let mut proc = parent.lock();
-            if proc.state == ProcessState::Blocked && proc.waiting_child == Some(0) {
-                proc.waiting_child = Some(global);
-            }
         }
 
         // 没有找到僵尸子进程，让出 CPU 等待被唤醒
@@ -9120,6 +9286,7 @@ where
             .try_reserve_exact(group.members().saturating_add(1))
             .map_err(|_| SyscallError::ENOMEM)?;
         let mut selected_exists = false;
+        let mut wake_pid = 0;
         let mut grew = false;
         // A candidate that becomes reapable without a report: poll for it.
         let mut transient = false;
@@ -9151,6 +9318,7 @@ where
                     if view_pid != want {
                         continue;
                     }
+                    wake_pid = child_pid;
                 }
                 selected_exists = true;
                 // A zombie leader whose group is empty is reported once its
@@ -9243,7 +9411,7 @@ where
                 continue;
             }
             proc.enter_blocked_at(crate::get_ticks());
-            proc.waiting_child = Some(0);
+            proc.waiting_child = Some(wake_pid);
         }
         crate::force_reschedule();
         // Ready again, whether woken or not switched out at all.

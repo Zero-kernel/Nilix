@@ -2505,21 +2505,25 @@ fn test_selective_wait_nested_zombie(results: &mut TestResult) {
         results.fail("selective wait: /proc/waitstat unreadable");
         return;
     };
-    if !selective_pair(SW_FAST, SW_SLOW) {
-        results.fail("selective wait: pid-targeted reap took the wrong sibling");
-        return;
-    }
-    let Some(wakes_after) = read_wait_over_wakes() else {
-        results.fail("selective wait: /proc/waitstat unreadable");
-        return;
-    };
-    if wakes_after != wakes_before {
-        println("");
-        print("  over-wakes during targeted wait: ");
-        print_int(wakes_after.wrapping_sub(wakes_before) as i64);
-        println("");
-        results.fail("selective wait: sibling exit over-woke a pid-targeted wait");
-        return;
+    for round in 1..=16 {
+        if !selective_pair(SW_FAST, SW_SLOW) {
+            results.fail("selective wait: pid-targeted reap took the wrong sibling");
+            return;
+        }
+        let Some(wakes_after) = read_wait_over_wakes() else {
+            results.fail("selective wait: /proc/waitstat unreadable");
+            return;
+        };
+        if wakes_after != wakes_before {
+            println("");
+            print("  targeted wait round ");
+            print_int(round);
+            print(", over-wakes: ");
+            print_int(wakes_after.wrapping_sub(wakes_before) as i64);
+            println("");
+            results.fail("selective wait: sibling exit over-woke a pid-targeted wait");
+            return;
+        }
     }
 
     let mid = unsafe { sys_fork() };
@@ -2551,6 +2555,10 @@ fn test_selective_wait_nested_zombie(results: &mut TestResult) {
         }
     }
 
+    if read_wait_over_wakes() != Some(wakes_before) {
+        results.fail("selective wait: nested wait introduced an extra wake");
+        return;
+    }
     results.pass("selective wait reaps only its target across sibling and nested zombies");
 }
 

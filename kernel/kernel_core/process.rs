@@ -3439,6 +3439,20 @@ impl Process {
         self.children.is_empty() && self.children_incomplete
     }
 
+    /// Wake a child waiter under its PCB lock. Both exit notification and the
+    /// scheduler's final switch-out handoff must obey the same global-PID filter.
+    /// A caller kicks the scheduler only after releasing its locks.
+    pub fn wake_for_child_exit(&mut self, child_pid: ProcessId, now_tick: u64) -> bool {
+        if self.state != ProcessState::Blocked
+            || (self.waiting_child != Some(0) && self.waiting_child != Some(child_pid))
+        {
+            return false;
+        }
+        self.enter_ready_at(now_tick);
+        self.waiting_child = None;
+        true
+    }
+
     /// Wait identity is independent of mutable namespace maps and survives exit.
     pub(crate) fn wait_pid_in_namespace(
         &self,
@@ -11814,15 +11828,7 @@ fn notify_parent_of_group_exit(
     let mut wake_parent = false;
     if let Some(parent) = get_process(parent_pid) {
         let mut parent_proc = parent.lock();
-        let waiting = parent_proc.waiting_child;
-        // 父进程正在等待，且等待的是任意子进程(0)或此特定子进程
-        if parent_proc.state == ProcessState::Blocked
-            && (waiting == Some(0) || waiting == Some(leader_pid))
-        {
-            parent_proc.enter_ready_at(crate::get_ticks());
-            parent_proc.waiting_child = None;
-            wake_parent = true;
-        }
+        wake_parent = parent_proc.wake_for_child_exit(leader_pid, crate::get_ticks());
     }
     // GAP-5 G8 (review D3): any member of the parent's group may wait for it.
     if let Some(group) = parent_group {
@@ -11854,13 +11860,7 @@ fn wake_group_child_waiters(group: &Arc<ThreadGroup>, child_pid: ProcessId) -> b
         if !Arc::ptr_eq(&proc.thread_group, group) {
             continue;
         }
-        let waiting = proc.waiting_child;
-        if proc.state == ProcessState::Blocked && (waiting == Some(0) || waiting == Some(child_pid))
-        {
-            proc.enter_ready_at(now_tick);
-            proc.waiting_child = None;
-            woke = true;
-        }
+        woke |= proc.wake_for_child_exit(child_pid, now_tick);
     }
     woke
 }

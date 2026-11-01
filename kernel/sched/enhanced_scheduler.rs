@@ -688,13 +688,7 @@ fn wake_reaper_after_switch(
     // running. A parent made Ready below can therefore never observe the old
     // on_cpu/reap-pending state and re-block without a matching wake.
     child.switch_reap_pending.store(false, Ordering::Release);
-    let waiting = parent.waiting_child;
-    let woke =
-        parent.state == ProcessState::Blocked && (waiting == Some(0) || waiting == Some(child_pid));
-    if woke {
-        parent.enter_ready_at(kernel_core::get_ticks());
-        parent.waiting_child = None;
-    }
+    let woke = parent.wake_for_child_exit(child_pid, kernel_core::get_ticks());
     drop(child);
     drop(parent);
     if woke {
