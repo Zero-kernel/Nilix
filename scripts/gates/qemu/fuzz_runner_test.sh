@@ -163,7 +163,7 @@ echo "OVMF:    $OVMF"
 echo "Timeout: ${TEST_TIMEOUT}s"
 
 "$QEMU" -bios "$OVMF" \
-    -drive format=raw,file=fat:rw:"$ESP" \
+    -drive format=raw,file=fat:"$ESP",snapshot=on \
     -accel tcg -smp 1 -m 512M \
     -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
