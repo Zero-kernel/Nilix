@@ -1,7 +1,7 @@
 # Contributing to Nilix
 
-Thanks for your interest in Nilix — a security-first hybrid microkernel written in
-Rust for x86_64. This guide gets you from a fresh clone to a green local check run
+Thanks for your interest in Nilix — a security-first kernel written in Rust for
+x86_64. This guide gets you from a fresh clone to a green local check run
 and a pull request. For an architectural tour, see the [README](README.md).
 
 **Design principle:** Security > Correctness > Efficiency > Performance. When a
