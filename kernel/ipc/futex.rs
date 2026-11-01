@@ -2057,35 +2057,35 @@ pub fn futex_requeue(
                 None => Step::NoSource,
                 // The target created above was reaped before the table lock
                 // was taken: create it again instead of waking the waiters.
-                Some(_)
-                    if created.is_some()
-                        && target.is_none()
-                        && attempt < FUTEX_REVALIDATE_RETRIES =>
-                {
-                    Step::Retry
-                }
-                Some(source) => Step::Done(requeue_pass(
+                Some(_) if created.is_some() && target.is_none() => Step::Retry,
+                Some(source) => match requeue_pass(
                     key1,
                     key2,
                     source,
                     target.as_ref(),
                     nr_wake,
                     nr_requeue,
+                    wanted,
                     compare,
                     &mut prepared,
                     &mut retired,
                     &mut deferred,
-                )),
+                ) {
+                    Ok(None) => Step::Retry,
+                    Ok(Some(count)) => Step::Done(Ok(count)),
+                    Err(error) => Step::Done(Err(error)),
+                },
             }
         };
         drop(retired);
         drop(prepared);
         drop(created);
         let result = match step {
-            Step::Retry => {
+            Step::Retry if attempt < FUTEX_REVALIDATE_RETRIES => {
                 attempt += 1;
                 continue;
             }
+            Step::Retry => Err(FutexError::TooManyBuckets),
             Step::NoSource => check_requeue_compare_unlocked(uaddr1, compare).map(|()| 0),
             // GAP-5 PI review D2-1: the compare faulted under the locks
             // (nothing moved). Fault the word in and start over.
@@ -2146,6 +2146,7 @@ fn prepare_requeue_target(
 
 /// The locked part of a requeue between two distinct keys. The caller holds
 /// `FUTEX_TABLE`; the two bucket locks are taken in ascending key order.
+/// `Ok(None)` requests fresh preparation without changing any waiter.
 #[allow(clippy::too_many_arguments)]
 fn requeue_pass(
     key1: FutexKey,
@@ -2154,11 +2155,12 @@ fn requeue_pass(
     target: Option<&FutexBucketRef>,
     nr_wake: usize,
     nr_requeue: usize,
+    prepared_movers: usize,
     compare: Option<u32>,
     prepared: &mut Option<PreparedWaiterList>,
     retired: &mut Option<RetiredWaiterList>,
     deferred: &mut FutexDeferredWakes,
-) -> Result<usize, FutexError> {
+) -> Result<Option<usize>, FutexError> {
     let (mut src, mut tgt) = match target {
         Some(target) if key2 < key1 => {
             let tgt = target.lock();
@@ -2174,6 +2176,14 @@ fn requeue_pass(
     if plain_op_refused(&src) {
         return Err(FutexError::InvalidOperation);
     }
+    // A waiter may publish after phase 1 observed an empty/short source.
+    // Retry before waking or moving anyone: lack of preparation for these
+    // new arrivals is not allocation pressure and must not spuriously wake
+    // a waiter that the caller asked to move to the target.
+    let movers = nr_requeue.min(src.waiters.len().saturating_sub(nr_wake));
+    if movers > prepared_movers {
+        return Ok(None);
+    }
     if let Some(tgt) = tgt.as_mut() {
         install_waiter_list_backing(&mut tgt.waiters, prepared, retired);
     }
@@ -2185,7 +2195,7 @@ fn requeue_pass(
         nr_requeue,
         deferred,
     );
-    Ok(woken + requeued)
+    Ok(Some(woken + requeued))
 }
 
 /// Requeue onto the same futex: Linux counts the waiters it would move, and
@@ -5326,6 +5336,78 @@ mod tests {
             assert_eq!(t.waiters.len(), 1);
             assert_eq!(t.waiters[0], queued[2]);
         }
+        drain_test_bucket(&source);
+        drain_test_bucket(&target);
+        drop(source);
+        drop(target);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Futex), before);
+    }
+
+    #[test]
+    fn futex_parity_requeue_revalidates_arrivals_after_preparation() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::Futex);
+        const SOURCE: FutexKey = (0x7249, 0x6000);
+        const TARGET: FutexKey = (0x7249, 0x7000);
+        const PID: u32 = 0x7249;
+        let source = new_test_bucket();
+        let target = new_test_bucket();
+        let mut deferred = FutexDeferredWakes::new();
+        let mut retired = None;
+        let mut prepared = None;
+        // Phase 1 saw no waiters. One arrives before the table/bucket locks
+        // for phase 2. There is consequently no prepared target yet.
+        queue_records(
+            &mut source.lock(),
+            &[record(0x5800, PID, FUTEX_BITSET_MATCH_ANY)],
+        );
+        assert_eq!(
+            requeue_pass(
+                SOURCE,
+                TARGET,
+                &source,
+                None,
+                0,
+                1,
+                0,
+                None,
+                &mut prepared,
+                &mut retired,
+                &mut deferred
+            ),
+            Ok(None)
+        );
+        assert_eq!(source.lock().waiters.len(), 1);
+        assert_eq!(deferred.len, 0);
+        assert!(!wake_mark_is_set(PID as ProcessId));
+
+        // A second preparation sees the waiter and the next locked pass
+        // moves it, leaving it asleep and discoverable on the target.
+        prepared = prepare_waiter_list_growth(0, 0, 1).expect("target backing");
+        assert_eq!(
+            requeue_pass(
+                SOURCE,
+                TARGET,
+                &source,
+                Some(&target),
+                0,
+                1,
+                1,
+                None,
+                &mut prepared,
+                &mut retired,
+                &mut deferred
+            ),
+            Ok(Some(1))
+        );
+        assert!(source.lock().waiters.is_empty());
+        assert_eq!(target.lock().waiters.len(), 1);
+        assert_eq!(target.lock().waiters[0].pid, PID);
+        assert_eq!(deferred.len, 0);
+        assert!(!wake_mark_is_set(PID as ProcessId));
+        drop(retired);
+        drop(prepared);
         drain_test_bucket(&source);
         drain_test_bucket(&target);
         drop(source);

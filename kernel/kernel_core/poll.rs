@@ -145,6 +145,8 @@ impl Drop for OwnedPollProbe {
 /// and would defeat the re-resolution-per-tick lifetime rule (see the
 /// TEARDOWN/LIFETIME lens + lock_ordering.rs strong-owner enumeration).
 pub enum PollArm {
+    /// Physical console; ownership is checked outside the process lock.
+    Console { readable: bool, writable: bool },
     /// Always ready per Linux DEFAULT_POLLMASK (regular files, ns fds, unknown).
     AlwaysReady,
     /// A cross-crate probe (pipe). `write_end` selects which end's status to read.

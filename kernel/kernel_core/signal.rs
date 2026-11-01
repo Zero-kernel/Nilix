@@ -591,6 +591,22 @@ pub(crate) fn discard_inert_pending(proc: &mut process::Process) {
 mod delivery_tests {
     use super::*;
 
+    #[test]
+    fn audit_20261031_pid_ancestry_alone_is_not_signal_authority() {
+        assert!(!namespace_init_authorized(
+            false, false, true, false, false, false, false
+        ));
+        assert!(!namespace_init_authorized(
+            false, false, true, true, false, false, false
+        ));
+        assert!(namespace_init_authorized(
+            false, false, true, true, true, false, false
+        ));
+        assert!(namespace_init_authorized(
+            false, false, true, false, false, true, false
+        ));
+    }
+
     #[cfg(feature = "host_harness")]
     #[test]
     fn namespace_init_uses_owning_namespace_not_root_visibility() {
@@ -620,7 +636,8 @@ mod delivery_tests {
                     relationship.1,
                     false,
                     false,
-                    false
+                    false,
+                    ancestor
                 ),
                 ancestor
             );
@@ -632,17 +649,17 @@ mod delivery_tests {
             (false, false)
         );
         assert!(!namespace_init_authorized(
-            false, false, false, false, false, false
+            false, false, false, false, false, false, false
         ));
         // Self and explicitly delegated ancestor-user supervision remain valid.
         assert!(namespace_init_authorized(
-            true, true, false, false, false, false
+            true, true, false, false, false, false, false
         ));
         assert!(namespace_init_authorized(
-            false, true, false, true, true, false
+            false, true, false, true, true, false, false
         ));
         assert!(!namespace_init_authorized(
-            false, true, false, false, true, false
+            false, true, false, false, true, false, false
         ));
     }
 
@@ -1025,11 +1042,13 @@ pub(crate) fn namespace_init_authorized(
     ancestor_user_namespace: bool,
     has_admin: bool,
     is_host_root: bool,
+    has_dac_permission: bool,
 ) -> bool {
-    if self_signal || ancestor_pid_namespace {
+    if self_signal || (ancestor_pid_namespace && (has_dac_permission || is_host_root)) {
         return true;
     }
-    // Callers that are not in an ancestor PID namespace need an explicit ADMIN
+    // PID ancestry permits supervision only after normal host-mapped DAC.
+    // Other callers need an explicit ADMIN
     // capability in a strict ancestor user namespace; equal user namespaces
     // never satisfy this path.
     let user_supervisor = (has_admin || is_host_root) && ancestor_user_namespace;
@@ -1037,6 +1056,60 @@ pub(crate) fn namespace_init_authorized(
         return false;
     }
     user_supervisor
+}
+
+/// Compare mapped identities without turning two unmapped UIDs into a match.
+fn mapped_signal_dac(
+    sender_uid: Option<u32>,
+    sender_euid: Option<u32>,
+    target_uid: Option<u32>,
+) -> bool {
+    sender_euid == Some(0)
+        || target_uid
+            .is_some_and(|target| sender_uid == Some(target) || sender_euid == Some(target))
+}
+
+/// Shared by syscall preflight and delivery. Snapshot each PCB separately so
+/// self-signals cannot recursively acquire the same lock. The delivery caller
+/// retains the exact target Arc through authorization and queueing.
+pub(crate) fn user_signal_dac_allowed(target: &ProcessArc) -> Result<bool, SignalError> {
+    let sender_pid = require_signal_sender_pid(process::current_pid())?;
+    let sender = process::get_process(sender_pid).ok_or(SignalError::NoSuchProcess)?;
+    let (sender_ns, sender_tgid, uid, euid) = {
+        let proc = sender.lock();
+        let creds = proc
+            .try_credentials_read()
+            .ok_or(SignalError::CredentialBusy)?;
+        (Arc::clone(&proc.user_ns), proc.tgid, creds.uid, creds.euid)
+    };
+    let (target_ns, target_tgid, target_uid) = {
+        let proc = target.lock();
+        let creds = proc
+            .try_credentials_read()
+            .ok_or(SignalError::CredentialBusy)?;
+        (Arc::clone(&proc.user_ns), proc.tgid, creds.uid)
+    };
+    // Threads in one group share identity and may signal themselves even
+    // before their user namespace has a UID mapping. This is self authority,
+    // never a match between two unknown principals in different groups.
+    if sender_tgid == target_tgid {
+        return Ok(true);
+    }
+    Ok(mapped_signal_dac(
+        sender_ns.map_uid_from_ns(uid),
+        sender_ns.map_uid_from_ns(euid),
+        target_ns.map_uid_from_ns(target_uid),
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn audit_20261031_signal_dac_requires_mapped_identity() {
+    assert!(!mapped_signal_dac(None, None, None));
+    assert!(!mapped_signal_dac(Some(1000), Some(1000), Some(2000)));
+    assert!(mapped_signal_dac(Some(1000), Some(1000), Some(1000)));
+    assert!(mapped_signal_dac(Some(1000), Some(2000), Some(2000)));
+    assert!(mapped_signal_dac(Some(0), Some(0), None));
 }
 
 /// Inner implementation shared by user-facing and kernel-internal signal paths.
@@ -1071,6 +1144,7 @@ fn send_signal_inner(
         // signal authority.  Kernel-internal callers use `send_signal_kernel`
         // and intentionally bypass this branch.
         let sender_pid = require_signal_sender_pid(process::current_pid())?;
+        let has_dac_permission = user_signal_dac_allowed(&process_arc)?;
         let mut namespace_init_supervisor = false;
         // GAP-5 (review D1): init is a process; name the target's and the
         // sender's thread groups, not the selected task.
@@ -1083,8 +1157,8 @@ fn send_signal_inner(
         // R188-U02-2: namespace init is a namespace-wide failure boundary.
         // Re-check this relationship at the single delivery choke point so a
         // same-namespace task cannot turn matching DAC credentials into a
-        // SIGKILL/SIGSTOP cascade.  Ancestor PID namespaces retain supervisor
-        // authority; an ADMIN-capable ancestor user namespace is accepted as a
+        // SIGKILL/SIGSTOP cascade. Ancestor PID namespaces still require DAC;
+        // an ADMIN-capable ancestor user namespace is accepted as a
         // defense-in-depth escape for a task that stayed in the same PID ns.
         if sender_tgid != target_tgid {
             let sender_arc = process::get_process(sender_pid).ok_or(SignalError::NoSuchProcess)?;
@@ -1115,6 +1189,7 @@ fn send_signal_inner(
                     user_namespace_is_strict_ancestor(&sender_user_ns, &target_user_ns),
                     sender_has_admin,
                     sender_is_host_root,
+                    has_dac_permission,
                 );
                 if !allowed {
                     return Err(SignalError::PermissionDenied);
@@ -1128,34 +1203,8 @@ fn send_signal_inner(
             return Err(SignalError::PermissionDenied);
         }
 
-        // 非自己的进程需要进行 POSIX 权限检查
-        if sender_pid != pid {
-            // 获取发送者凭证
-            let sender_creds = process::current_credentials().ok_or(SignalError::NoSuchProcess)?;
-
-            // R65-26 FIX: Read target UID from the same Arc we'll use for signal delivery
-            // This closes the TOCTOU window where PID could be reused between check and delivery
-            let target_uid = process_arc
-                .lock()
-                .try_credentials_read()
-                .ok_or(SignalError::CredentialBusy)?
-                .uid;
-
-            // POSIX 权限检查：
-            // 1. Host root (host-mapped euid == 0) 可以发信号给任何进程
-            // 2. sender.uid == target.uid
-            // 3. sender.euid == target.uid
-            // R134-7 FIX: Use host-mapped root check for defense-in-depth.
-            // sys_kill already performs namespace-aware check, but this
-            // hardens the inner function against future callers.
-            let has_permission = namespace_init_supervisor
-                || crate::current_is_host_root()
-                || sender_creds.uid == target_uid
-                || sender_creds.euid == target_uid;
-
-            if !has_permission {
-                return Err(SignalError::PermissionDenied);
-            }
+        if sender_pid != pid && !namespace_init_supervisor && !has_dac_permission {
+            return Err(SignalError::PermissionDenied);
         }
     }
 
@@ -1411,25 +1460,25 @@ pub fn run_signal_self_test() {
     // same-namespace peer, while self, ancestor-PID, and explicitly delegated
     // ancestor-user authority retain the intended supervisor paths.
     assert!(!namespace_init_authorized(
-        false, true, false, false, false, false
+        false, true, false, false, false, false, false
     ));
     assert!(namespace_init_authorized(
-        true, true, false, false, false, false
+        true, true, false, false, false, false, false
     ));
     assert!(namespace_init_authorized(
-        false, false, true, false, false, false
+        false, false, true, false, false, false, true
     ));
     assert!(!namespace_init_authorized(
-        false, false, false, false, false, false
+        false, false, false, false, false, false, false
     ));
     assert!(namespace_init_authorized(
-        false, true, false, true, true, false
+        false, true, false, true, true, false, false
     ));
     assert!(namespace_init_authorized(
-        false, true, false, true, false, true
+        false, true, false, true, false, true, false
     ));
     assert!(!namespace_init_authorized(
-        false, true, false, false, true, false
+        false, true, false, false, true, false, false
     ));
 
     let kill_stop = uncatchable_mask();

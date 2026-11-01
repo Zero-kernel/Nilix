@@ -1591,6 +1591,41 @@ impl core::fmt::Debug for TcpReplyBinding {
     }
 }
 
+/// Validated terminal state and any FIN acknowledgement still owed.
+struct TcpIngressClose {
+    token: crate::conntrack::TcpCloseToken,
+    final_ack: Option<(u32, u32, u16)>,
+}
+
+/// Observe the same socket that processed the segment, including early
+/// returns and out-of-order FIN delivery. Declared before the TCB guard so
+/// its drop runs after that guard unlocks. It borrows the existing owner.
+#[cfg(feature = "conntrack")]
+struct TcpIngressCloseGuard<'a> {
+    sock: &'a SocketArc,
+    token: Option<crate::conntrack::TcpCloseToken>,
+    closed: &'a mut Option<TcpIngressClose>,
+}
+
+#[cfg(feature = "conntrack")]
+impl Drop for TcpIngressCloseGuard<'_> {
+    fn drop(&mut self) {
+        let Some(token) = self.token else { return };
+        let guard = self.sock.tcp.lock();
+        let final_ack = match guard.as_ref().map(|tcp| &tcp.control) {
+            Some(tcb) if tcb.state == TcpState::TimeWait => Some((
+                tcb.snd_nxt,
+                tcb.rcv_nxt,
+                SocketTable::current_adv_window(tcb),
+            )),
+            None => None,
+            Some(tcb) if tcb.state == TcpState::Closed => None,
+            _ => return,
+        };
+        *self.closed = Some(TcpIngressClose { token, final_ack });
+    }
+}
+
 /// A serialized TCP control packet whose heap admission remains owned until
 /// the caller finishes transmission and drops the packet.
 pub struct SerializedTcpPacket {
@@ -8245,9 +8280,67 @@ impl SocketTable {
         options: &TcpOptions,
         reply_binding: &mut Option<TcpReplyBinding>,
         ingress_handshake_committed: &mut bool,
+        ingress_closed: &mut Option<crate::conntrack::TcpCloseToken>,
+    ) -> Option<WirePacket> {
+        let mut closed = None;
+        let mut response = self.process_tcp_segment_inner(
+            net_ns_id,
+            src_ip,
+            dst_ip,
+            header,
+            payload,
+            options,
+            reply_binding,
+            ingress_handshake_committed,
+            &mut closed,
+        );
+        *ingress_closed = closed.map(|closed| {
+            if let Some((seq, ack, window)) = closed.final_ack {
+                // Another RX may have completed the close after this handler
+                // released its TCB lock. Also, CLOSING -> TIME-WAIT can have
+                // no reply even though an earlier FIN ACK failed to queue.
+                // Couple retirement to an ACK of the actual terminal rcv_nxt,
+                // never to an older response or an unrelated silent packet.
+                let acknowledges_fin = response.as_ref().is_some_and(|segment| {
+                    crate::tcp::parse_tcp_header(segment).is_ok_and(|reply| {
+                        reply.flags == TCP_FLAG_ACK && reply.seq_num == seq && reply.ack_num == ack
+                    })
+                });
+                if !acknowledges_fin {
+                    response = Some(build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        seq,
+                        ack,
+                        TCP_FLAG_ACK,
+                        window,
+                        &[],
+                    ));
+                }
+            }
+            closed.token
+        });
+        response
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_tcp_segment_inner(
+        &self,
+        net_ns_id: NamespaceId,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        header: &TcpHeader,
+        payload: &[u8],
+        options: &TcpOptions,
+        reply_binding: &mut Option<TcpReplyBinding>,
+        ingress_handshake_committed: &mut bool,
+        ingress_closed: &mut Option<TcpIngressClose>,
     ) -> Option<WirePacket> {
         *reply_binding = None;
         *ingress_handshake_committed = false;
+        *ingress_closed = None;
         // R160-9 FIX: Reject invalid TCP flag combinations per RFC 793 §3.4.
         // SYN+RST is always invalid (connection-setup contradicts abort).
         // SYN+FIN is suspicious and rejected by modern stacks. These malformed
@@ -8408,6 +8501,20 @@ impl SocketTable {
             }
             return None;
         }
+
+        // Capture the conntrack incarnation before looking up the socket.
+        #[cfg(feature = "conntrack")]
+        let close_token = {
+            let (key, _) = crate::conntrack::FlowKey::from_packet(
+                net_ns_id.0,
+                crate::conntrack::IPPROTO_TCP,
+                src_ip,
+                dst_ip,
+                header.src_port,
+                header.dst_port,
+            );
+            crate::conntrack::conntrack_table().tcp_close_token(&key)
+        };
 
         // Look up existing connection by namespace + 4-tuple
         let sock =
@@ -8933,6 +9040,13 @@ impl SocketTable {
                     return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                 }
             };
+
+        #[cfg(feature = "conntrack")]
+        let _close_guard = TcpIngressCloseGuard {
+            sock: &sock,
+            token: close_token,
+            closed: ingress_closed,
+        };
 
         // Process based on current TCP state
         let mut guard = sock.tcp.lock();
@@ -13627,6 +13741,7 @@ mod tests {
                 &options,
                 &mut None,
                 &mut false,
+                &mut None,
             )
             .is_none());
 
@@ -13722,6 +13837,7 @@ mod tests {
                 &options,
                 &mut None,
                 &mut false,
+                &mut None,
             )
             .is_none());
         {
@@ -13759,6 +13875,7 @@ mod tests {
                 &options,
                 &mut reply_binding,
                 &mut false,
+                &mut None,
             )
             .expect("retransmitted peer SYN must retry SYN-ACK preparation");
         assert!(!syn_ack.is_empty());
@@ -13864,6 +13981,7 @@ mod tests {
                 &options,
                 &mut None,
                 &mut false,
+                &mut None,
             )
             .is_none());
         {
@@ -13910,6 +14028,7 @@ mod tests {
                 &options,
                 &mut reply_binding,
                 &mut false,
+                &mut None,
             )
             .expect("retransmitted SYN-ACK must retry final-ACK preparation");
         let ack_header = crate::tcp::parse_tcp_header(&ack).expect("prepared final ACK parses");
@@ -14006,6 +14125,7 @@ mod tests {
                     &options,
                     &mut None,
                     &mut false,
+                    &mut None,
                 )
                 .expect("an unacceptable ACK is answered with a RST");
             let rst_header = crate::tcp::parse_tcp_header(&rst).expect("RST parses");
@@ -14032,6 +14152,7 @@ mod tests {
                 &options,
                 &mut None,
                 &mut false,
+                &mut None,
             )
             .is_none());
         assert_eq!(state(&sock), TcpState::SynSent);
@@ -14055,6 +14176,7 @@ mod tests {
                 &options,
                 &mut reply_binding,
                 &mut false,
+                &mut None,
             )
             .expect("the valid SYN-ACK is answered");
         let ack_header = crate::tcp::parse_tcp_header(&ack).expect("final ACK parses");
@@ -15344,6 +15466,126 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "conntrack")]
+    #[test]
+    fn graceful_close_confirmation_requires_validated_terminal_socket_state() {
+        use crate::conntrack::{conntrack_table, CtEgressResult, FlowKey, L4Meta, IPPROTO_TCP};
+        let _serial = crate::conntrack::GLOBAL_CONNTRACK_TEST_LOCK.lock();
+        let ns = NamespaceId(0x49_0002);
+        let ct = conntrack_table();
+        ct.drain_ns(ns.0);
+        let local = Ipv4Addr::new(192, 0, 2, 1);
+        let peer = Ipv4Addr::new(192, 0, 2, 2);
+        for state in [
+            TcpState::Established,
+            TcpState::FinWait1,
+            TcpState::FinWait2,
+            TcpState::Closing,
+            TcpState::LastAck,
+        ] {
+            let table = SocketTable::new();
+            let sock = test_socket_in_ns(0x4902, SocketType::Stream, SocketProtocol::Tcp, ns);
+            sock.bind_local(local, 20_000);
+            sock.set_remote(peer, 443);
+            let mut tcb = TcpControlBlock::new_client(local, 20_000, peer, 443, 100);
+            tcb.state = state;
+            tcb.snd_una = 100;
+            tcb.snd_nxt = 101;
+            tcb.rcv_nxt = 200;
+            tcb.rcv_wnd = 128;
+            tcb.fin_sent = state != TcpState::Established;
+            tcb.fin_received = matches!(state, TcpState::LastAck | TcpState::Closing);
+            sock.attach_tcp(tcb).unwrap();
+            let socket_key = tcp_map_key_from_parts(ns, local, 20_000, peer, 443);
+            table
+                .tcp_conns
+                .lock()
+                .try_insert(socket_key, Arc::downgrade(&sock))
+                .unwrap();
+            for (flags, now) in [(TCP_FLAG_SYN, 1), (TCP_FLAG_ACK, 3)] {
+                assert!(matches!(
+                    ct.update_on_egress_transaction(
+                        ns.0,
+                        IPPROTO_TCP,
+                        local,
+                        peer,
+                        20_000,
+                        443,
+                        &L4Meta::new(flags, 0),
+                        now,
+                        || Ok::<(), ()>(()),
+                    ),
+                    CtEgressResult::Committed(_)
+                ));
+                if flags == TCP_FLAG_SYN {
+                    ct.update_on_packet(
+                        ns.0,
+                        IPPROTO_TCP,
+                        peer,
+                        local,
+                        443,
+                        20_000,
+                        &L4Meta::new(TCP_FLAG_SYN | TCP_FLAG_ACK, 0),
+                        2,
+                    );
+                }
+            }
+            let mut closed = None;
+            // A FIN outside the receive window cannot make the flow replaceable.
+            let mut header = TcpHeader::new(
+                443,
+                20_000,
+                10_000,
+                101,
+                TCP_FLAG_ACK | TCP_FLAG_FIN,
+                TCP_DEFAULT_WINDOW,
+            );
+            let _ = table.process_tcp_segment(
+                ns,
+                peer,
+                local,
+                &header,
+                &[],
+                &TcpOptions::default(),
+                &mut None,
+                &mut false,
+                &mut closed,
+            );
+            assert!(closed.is_none(), "unvalidated FIN in {state:?}");
+            header.seq_num = 200;
+            if matches!(state, TcpState::Closing | TcpState::LastAck) {
+                header.flags = TCP_FLAG_ACK;
+            }
+            let response = table.process_tcp_segment(
+                ns,
+                peer,
+                local,
+                &header,
+                &[],
+                &TcpOptions::default(),
+                &mut None,
+                &mut false,
+                &mut closed,
+            );
+            if state != TcpState::LastAck {
+                let response = response.expect("terminal FIN acknowledgement");
+                let ack = crate::tcp::parse_tcp_header(&response).unwrap();
+                let guard = sock.tcp.lock();
+                assert_eq!(ack.ack_num, guard.as_ref().unwrap().control.rcv_nxt);
+                assert_eq!(ack.seq_num, guard.as_ref().unwrap().control.snd_nxt);
+                assert_eq!(ack.flags, TCP_FLAG_ACK);
+            }
+            assert_eq!(
+                closed.is_some(),
+                state != TcpState::Established,
+                "only a fully closed socket may retire conntrack: {state:?}"
+            );
+            let key = FlowKey::from_packet(ns.0, IPPROTO_TCP, local, peer, 20_000, 443).0;
+            assert!(ct.tcp_close_token(&key).is_some());
+            assert_eq!(ct.drain_ns(ns.0), 1);
+        }
+    }
+
     fn assert_duplicate_payload_fin_transition(
         initial_state: TcpState,
         expected_state: TcpState,
@@ -15394,6 +15636,7 @@ mod tests {
             &TcpOptions::default(),
             &mut None,
             &mut false,
+            &mut None,
         );
         assert!(response.is_some(), "an in-order FIN must be acknowledged");
 

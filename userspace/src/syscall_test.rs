@@ -198,6 +198,16 @@ pub extern "C" fn _start() -> ! {
     println("");
 
     let mut results = TestResult::new();
+    // Optional focused guest for the audit's before/after oracle; normal gates
+    // still run both legs as part of the complete suite below.
+    if option_env!("NILIX_AUDIT_FOCUSED") == Some("1") {
+        test_console_input_ownership(&mut results);
+        test_brk_cow_shrink(&mut results);
+        // SAFETY: the exit wrapper consumes only a scalar exit code.
+        unsafe {
+            userspace::syscall::sys_exit(if results.failed == 0 { 0 } else { 1 });
+        }
+    }
 
     // Test 1: gettid
     test_gettid(&mut results);
@@ -326,6 +336,8 @@ pub extern "C" fn _start() -> ! {
     test_kpti_fresh_pml4_slots(&mut results);
 
     test_heap_owner_isolation(&mut results);
+    test_brk_cow_shrink(&mut results);
+    test_console_input_ownership(&mut results);
 
     // Print summary
     println("");
@@ -7101,5 +7113,108 @@ fn test_heap_owner_isolation(results: &mut TestResult) {
         } else {
             results.fail(NAME);
         }
+    }
+}
+
+/// Keep the peer's COW reference alive while brk removes a leaf. The syscall
+/// fixture checks the real shootdown counters under PT_LOCK before pruning.
+fn test_brk_cow_shrink(results: &mut TestResult) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const NAME: &str = "brk COW shrink flushes retained leaves before returning";
+    // SAFETY: accesses stay within successful brk/shared mappings. Only the
+    // child reads the retained top page after the parent unmaps its own leaf.
+    unsafe {
+        let shared = mmap_anon(PAGE, true);
+        if shared < 0 {
+            results.fail("brk COW: shared state");
+            return;
+        }
+        let done = &*(shared as *const AtomicU32);
+        done.store(0, Ordering::SeqCst);
+        let old = syscall1(SYS_BRK, 0) as usize;
+        let base = (old + PAGE - 1) & !(PAGE - 1);
+        let mut top = base + 3 * PAGE;
+        if top % 0x200000 <= PAGE {
+            top += 2 * PAGE;
+        }
+        if syscall1(SYS_BRK, top as u64) as usize != top {
+            munmap(shared as usize, PAGE);
+            results.fail("brk COW: grow");
+            return;
+        }
+        let word = (top - PAGE) as *mut u64;
+        core::ptr::write_volatile(word, 0xC031);
+        let child = sys_fork();
+        if is_error(child) {
+            syscall1(SYS_BRK, old as u64);
+            munmap(shared as usize, PAGE);
+            results.fail("brk COW: fork");
+            return;
+        }
+        if child == 0 {
+            while done.load(Ordering::SeqCst) == 0 {
+                userspace::syscall::sys_yield();
+            }
+            let valid = core::ptr::read_volatile(word) == 0xC031;
+            raw_exit(SYS_EXIT, if valid { 0 } else { 1 });
+        }
+        let shrunk = syscall1(SYS_BRK, (top - PAGE) as u64) as usize == top - PAGE;
+        done.store(1, Ordering::SeqCst);
+        let mut info = SigInfo::poisoned();
+        let waited = waitid(P_PID, child, &mut info, WEXITED);
+        let restored = syscall1(SYS_BRK, old as u64) as usize == old;
+        munmap(shared as usize, PAGE);
+        if shrunk && restored && !is_error(waited) && info.status() == 0 {
+            results.pass(NAME);
+        } else {
+            results.fail("brk COW: shrink or peer contents");
+        }
+    }
+}
+
+/// Balanced's Ring-0 shell owns input; even init's inherited console handle
+/// and an independently opened device must fail before touching the queue.
+fn test_console_input_ownership(results: &mut TestResult) {
+    const NAME: &str = "console input belongs exclusively to the configured owner";
+    // SAFETY: read and poll buffers live for each syscall, lengths match their
+    // allocations, and every opened or duplicated descriptor is closed.
+    unsafe {
+        let fd = sys_open(b"/dev/console\0".as_ptr(), 0, 0);
+        if is_error(fd) {
+            results.fail("console owner: open");
+            return;
+        }
+        let mut byte = 0u8;
+        let device = syscall3(SYS_READ, fd, &mut byte as *mut u8 as u64, 1) as i64;
+        if device != -1 {
+            sys_close(fd);
+            results.fail("console owner: device read was not EPERM");
+            return;
+        }
+        // Linux pollfd encoded as fd:i32/events:i16/revents:i16.
+        let mut poll = [(fd as u32 as u64) | (1 << 32), 1u64 << 32];
+        let ready = syscall3(7, poll.as_mut_ptr() as u64, 2, 0);
+        sys_close(fd);
+        if ready != 2 || poll.iter().any(|entry| entry >> 48 != 8) {
+            results.fail("console owner: poll did not report POLLERR");
+            return;
+        }
+        let duplicate = syscall1(32, 0);
+        if is_error(duplicate) {
+            results.fail("console owner: dup");
+            return;
+        }
+        let copied = syscall3(SYS_READ, duplicate, &mut byte as *mut u8 as u64, 1) as i64;
+        sys_close(duplicate);
+        if copied != -1 {
+            results.fail("console owner: dup bypassed ownership");
+            return;
+        }
+        let stdin = syscall3(SYS_READ, 0, &mut byte as *mut u8 as u64, 1) as i64;
+        if stdin != -1 {
+            results.fail("console owner: inherited stdin was not EPERM");
+            return;
+        }
+        results.pass(NAME);
     }
 }

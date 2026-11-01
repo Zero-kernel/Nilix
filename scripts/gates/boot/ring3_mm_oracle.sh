@@ -109,6 +109,8 @@ mremap relocation keeps the moved frames: relocated data survives a 32 MiB alloc
 mremap relocation of the largest mapping that fits moves every page in one hold, its page tables staged before it
 KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them
 heap quotas: oversized read refused, local isolation survives, fork shares the UID ceiling
+brk COW shrink flushes retained leaves before returning
+console input belongs exclusively to the configured owner
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.
