@@ -1,0 +1,117 @@
+name: Plan milestones
+
+# Sets an issue's or pull request's milestone from one explicit body line:
+#
+#     Plan item: EXT2-MUT
+#
+# A mention elsewhere in the text never counts, and an item with no such line is
+# left alone, so a milestone set by hand stays until a plan line says otherwise.
+# Add new plan items to the table below.
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  pull_request_target:
+    # Metadata-only: never check out or execute untrusted pull request code.
+    types: [opened, edited, reopened]
+  push:
+    # Backfill existing issues when the plan table changes.
+    branches: [main]
+    paths:
+      - .github/workflows/plan-milestones.yml
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: plan-milestones-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  assign:
+    name: Assign plan milestones
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Assign from the plan item line
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const MILESTONES = {
+              N1: ["N1 Preview chain", "Clear the 1.0-Preview blockers: durability, Ext2 mutation, race probes, stress acceptance, strict qualification and audits."],
+              N2: ["N2 Static POSIX baseline", "Unmodified static BusyBox runs from the journaled disk, measured by external conformance suites."],
+              N3: ["N3 Memory and dynamic userspace", "Dynamically linked musl and glibc programs run; kernel capacity limits scale with RAM."],
+              N4: ["N4 Event-driven servers", "An unmodified nginx or redis serves curl, checked by an independent packet capture."],
+              N5: ["N5 Containers", "runc or crun starts a BusyBox OCI image under QEMU with network connectivity."],
+              N6: ["N6 Platform and hardening", "Full KPTI, retpoline, physical hardware support, and re-evaluated native IPC and personality."],
+            };
+            const PREVIEW_ITEMS = new Set([
+              "ST-K4", "EXT2-MUT", "ST-K2-P2", "THREAD-HB", "EXT-CI", "STRESS-7", "STRICT-Q", "AUDIT-ROUNDS",
+            ]);
+
+            const planItem = (body) => {
+              const match = /^[ \t]*(?:\*\*)?Plan item:(?:\*\*)?[ \t]*`?([A-Z0-9][A-Z0-9.-]*)`?[ \t]*\r?$/m.exec(body || "");
+              return match ? match[1] : null;
+            };
+            const milestoneKey = (item) => {
+              if (PREVIEW_ITEMS.has(item)) return "N1";
+              const later = /^(N[1-6])(?:\.[0-9]+)?$/.exec(item);
+              return later ? later[1] : null;
+            };
+
+            const existing = await github.paginate(github.rest.issues.listMilestones, {
+              ...context.repo,
+              state: "all",
+              per_page: 100,
+            });
+            const numbers = new Map(existing.map((milestone) => [milestone.title, milestone.number]));
+            const milestoneNumber = async (key) => {
+              const [title, description] = MILESTONES[key];
+              if (!numbers.has(title)) {
+                const created = await github.rest.issues.createMilestone({
+                  ...context.repo,
+                  title,
+                  description,
+                });
+                numbers.set(title, created.data.number);
+              }
+              return numbers.get(title);
+            };
+
+            const assign = async (item) => {
+              const plan = planItem(item.body);
+              if (plan === null) return;
+              const key = milestoneKey(plan);
+              if (key === null) {
+                core.warning(`#${item.number}: unknown plan item ${plan}`);
+                return;
+              }
+              const number = await milestoneNumber(key);
+              if (item.milestone?.number === number) return;
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: item.number,
+                milestone: number,
+              });
+              core.info(`#${item.number}: ${plan} -> ${MILESTONES[key][0]}`);
+            };
+
+            const single = context.payload.issue ?? context.payload.pull_request;
+            if (single) {
+              await assign(single);
+              return;
+            }
+            const items = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo,
+              state: "all",
+              per_page: 100,
+            });
+            for (const item of items) {
+              await assign(item);
+            }
