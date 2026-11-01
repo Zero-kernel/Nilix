@@ -530,6 +530,20 @@ pub fn test_ext2_write() {
                                 );
                                 assert_eq!(committed, *b"J");
                                 klog_always!("    R180-6 production JBD2 write path passed");
+
+                                // EXT2-MUT: on the real page cache, a truncated tail
+                                // must not come back when the file grows again.
+                                assert_eq!(alloc_file.inode.write_at(0, b"JKL"), Ok(3));
+                                let mut cached = [0u8; 3];
+                                assert_eq!(alloc_file.inode.read_at(0, &mut cached), Ok(3));
+                                assert_eq!(cached, *b"JKL");
+                                alloc_file.inode.truncate(1).expect("EXT2-MUT truncate");
+                                assert_eq!(alloc_file.inode.read_at(1, &mut cached), Ok(0));
+                                alloc_file.inode.truncate(3).expect("EXT2-MUT grow");
+                                assert_eq!(alloc_file.inode.read_at(0, &mut cached), Ok(3));
+                                assert_eq!(cached, *b"J\0\0");
+                                alloc_file.inode.truncate(1).expect("EXT2-MUT restore");
+                                klog_always!("    EXT2-MUT production truncate path passed");
                             }
                             Err(e) => {
                                 klog_always!(
