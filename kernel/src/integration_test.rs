@@ -504,14 +504,18 @@ pub fn test_ext2_write() {
                                     .as_any()
                                     .downcast_ref::<vfs::FileHandle>()
                                     .expect("ext3 allocation probe FileHandle");
-                                assert_eq!(
-                                    alloc_file
-                                        .inode
-                                        .stat()
-                                        .expect("stat production ext3 allocation probe")
-                                        .size,
-                                    0,
-                                    "production allocation probe must be reset to an empty inode"
+                                // ST-K4: a recovery boot runs on the exact crashed
+                                // disk, so this probe's own byte from the earlier boot
+                                // may already be there. The write below then takes the
+                                // mapped commit path instead of allocation.
+                                let probe_size = alloc_file
+                                    .inode
+                                    .stat()
+                                    .expect("stat production ext3 allocation probe")
+                                    .size;
+                                assert!(
+                                    probe_size <= 1,
+                                    "production allocation probe must be empty or hold its own byte"
                                 );
                                 assert_eq!(
                                     alloc_file.write(b"J"),

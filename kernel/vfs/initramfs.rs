@@ -291,6 +291,11 @@ impl Initramfs {
 }
 
 impl FileSystem for Initramfs {
+    /// ST-K4: RAM-backed and volatile; success says nothing about persistent media.
+    fn sync(&self) -> Result<(), FsError> {
+        Ok(())
+    }
+
     fn directory_parent(
         &self,
         inode: &Arc<dyn Inode>,

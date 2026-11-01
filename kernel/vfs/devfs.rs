@@ -138,6 +138,11 @@ impl DevFs {
 }
 
 impl FileSystem for DevFs {
+    /// ST-K4: synthetic and volatile; success says nothing about persistent media.
+    fn sync(&self) -> Result<(), FsError> {
+        Ok(())
+    }
+
     fn fs_id(&self) -> u64 {
         self.fs_id
     }

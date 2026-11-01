@@ -798,6 +798,11 @@ pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_rename_callback(vfs_rename_callback);
     kernel_core::register_vfs_readdir_callback(vfs_readdir_callback);
     kernel_core::register_vfs_truncate_callback(vfs_truncate_callback);
+    kernel_core::syscall::register_vfs_durability_callbacks(
+        vfs_fsync_callback,
+        vfs_sync_callback,
+        vfs_sync_file_range_callback,
+    );
     kernel_core::register_vfs_pread_callback(vfs_pread_callback); // R173-07 proper fix
     kernel_core::register_vfs_pwrite_callback(vfs_pwrite_callback); // R173-07 proper fix
     kernel_core::syscall::register_vfs_symlink_callback(vfs_symlink_callback); // M0-6 SLICE 3
@@ -1324,6 +1329,95 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
     file.inode.truncate(length).map_err(fs_error_to_syscall)
 }
 
+/// ST-K4: clone the descriptor's file handle so its filesystem owner stays
+/// pinned, then release the PCB lock before any device work. `not_a_file` is the
+/// errno for a descriptor that is not a VFS file.
+fn durability_handle(fd: i32, not_a_file: SyscallError) -> Result<FileHandle, SyscallError> {
+    let context = crate::context::OperationContext::current().map_err(fs_error_to_syscall)?;
+    let process = context.process.as_ref().ok_or(SyscallError::ESRCH)?;
+    let proc = process.lock();
+    let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+    let file = handle
+        .as_any()
+        .downcast_ref::<FileHandle>()
+        .ok_or(not_a_file)?
+        .clone();
+    Ok(file)
+}
+
+/// A failed or unsupported barrier is an I/O failure to the caller, never ENOSYS.
+fn durability_error(error: FsError) -> SyscallError {
+    match error {
+        FsError::NotSupported => SyscallError::EIO,
+        other => fs_error_to_syscall(other),
+    }
+}
+
+/// ST-K4: fsync(2) and fdatasync(2), which are identical under write-through.
+fn vfs_fsync_callback(fd: i32) -> Result<(), SyscallError> {
+    durability_handle(fd, SyscallError::EINVAL)?
+        .fsync()
+        .map_err(durability_error)
+}
+
+/// ST-K4: sync(2) over the caller's mount namespace. Every filesystem is
+/// attempted; unlike Linux, a failure is reported rather than discarded.
+fn vfs_sync_callback() -> Result<(), SyscallError> {
+    let context = crate::context::OperationContext::current().map_err(fs_error_to_syscall)?;
+    let filesystems = VFS
+        .visible_filesystems(&context.namespace)
+        .map_err(durability_error)?;
+    let mut failed = false;
+    for filesystem in filesystems.iter() {
+        if let Err(error) = filesystem.sync() {
+            klog!(
+                Warn,
+                "sync: {} fs {} failed: {:?}",
+                filesystem.fs_type(),
+                filesystem.fs_id(),
+                error
+            );
+            failed = true;
+        }
+    }
+    if failed {
+        return Err(SyscallError::EIO);
+    }
+    Ok(())
+}
+
+const SYNC_FILE_RANGE_VALID_FLAGS: u32 = 1 | 2 | 4; // WAIT_BEFORE | WRITE | WAIT_AFTER
+
+/// Linux's sync_file_range checks: known flags, then a non-negative range that
+/// does not overflow. `nbytes == 0` means "to end of file" and is valid.
+fn sync_file_range_args_valid(offset: i64, nbytes: i64, flags: u32) -> bool {
+    flags & !SYNC_FILE_RANGE_VALID_FLAGS == 0
+        && offset >= 0
+        && nbytes >= 0
+        && offset.checked_add(nbytes).is_some()
+}
+
+/// ST-K4: sync_file_range(2). Under write-through the range is already on the
+/// device, so this validates and reports health without a barrier.
+fn vfs_sync_file_range_callback(
+    fd: i32,
+    offset: i64,
+    nbytes: i64,
+    flags: u32,
+) -> Result<(), SyscallError> {
+    let file = durability_handle(fd, SyscallError::ESPIPE)?;
+    if file.flags().is_path() {
+        return Err(SyscallError::EBADF);
+    }
+    if !sync_file_range_args_valid(offset, nbytes, flags) {
+        return Err(SyscallError::EINVAL);
+    }
+    match file.sync_file_range().map_err(durability_error)? {
+        true => Ok(()),
+        false => Err(SyscallError::ESPIPE),
+    }
+}
+
 /// Shared access/seekability gate for pread64 and pwrite64.
 #[inline]
 fn positioned_io_gate(access_allowed: bool, seekable: bool) -> Result<(), SyscallError> {
@@ -1435,4 +1529,73 @@ fn vfs_symlink_callback(linkpath: &str, target: &str) -> Result<(), SyscallError
 /// to a file — or a dangling link — reads correctly.
 fn vfs_readlink_callback(path: &str) -> Result<alloc::string::String, SyscallError> {
     VFS.readlink(path).map_err(fs_error_to_syscall)
+}
+
+#[cfg(test)]
+mod st_k4_manager_tests {
+    use super::*;
+    use kernel_core::ROOT_MNT_NAMESPACE;
+
+    #[test]
+    fn sync_file_range_arguments_match_the_linux_checks() {
+        for (offset, nbytes, flags) in [(0, 0, 0), (0, 4096, 7), (4096, 0, 1), (i64::MAX - 1, 1, 2)]
+        {
+            assert!(sync_file_range_args_valid(offset, nbytes, flags));
+        }
+        for (offset, nbytes, flags) in [
+            (-1, 0, 0),
+            (0, -1, 0),
+            (i64::MAX, 1, 0),
+            (0, 0, 8),
+            (0, 0, u32::MAX),
+        ] {
+            assert!(!sync_file_range_args_valid(offset, nbytes, flags));
+        }
+    }
+
+    #[test]
+    fn a_failed_or_missing_barrier_is_eio_rather_than_enosys() {
+        assert_eq!(durability_error(FsError::NotSupported), SyscallError::EIO);
+        assert_eq!(durability_error(FsError::Io), SyscallError::EIO);
+        assert_eq!(durability_error(FsError::BadFd), SyscallError::EBADF);
+        assert_eq!(durability_error(FsError::Invalid), SyscallError::EINVAL);
+    }
+
+    #[test]
+    fn the_sync_snapshot_lists_each_visible_filesystem_once() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let vfs = Vfs::new();
+        let root = RamFs::try_new().expect("root fixture");
+        let other = RamFs::try_new().expect("second fixture");
+        {
+            let topology = crate::topology::write();
+            let setup = topology.setup(0, 0);
+            for name in ["a", "b"] {
+                root.create(
+                    &root.root_inode(),
+                    name,
+                    FileMode::new(FileType::Directory, 0o755),
+                    &setup,
+                )
+                .expect("mount directory");
+            }
+        }
+        vfs.mount_in_namespace(&ROOT_MNT_NAMESPACE, "/", root.clone())
+            .expect("root mount");
+        vfs.mount_in_namespace(&ROOT_MNT_NAMESPACE, "/a", other.clone())
+            .expect("first mount");
+        vfs.mount_in_namespace(&ROOT_MNT_NAMESPACE, "/b", other.clone())
+            .expect("duplicate mount");
+
+        let visible = vfs
+            .visible_filesystems(&ROOT_MNT_NAMESPACE)
+            .expect("snapshot");
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().any(|fs| fs.fs_id() == root.fs_id()));
+        assert!(visible.iter().any(|fs| fs.fs_id() == other.fs_id()));
+        for filesystem in visible.iter() {
+            assert_eq!(filesystem.sync(), Ok(()));
+        }
+    }
 }

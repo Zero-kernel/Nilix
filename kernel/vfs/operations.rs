@@ -1301,6 +1301,34 @@ impl Vfs {
         ))
     }
 
+    /// ST-K4: an admitted snapshot of the filesystems visible in `ns`, each once.
+    ///
+    /// The owners keep every filesystem alive after the view lock is released,
+    /// so a concurrent namespace retirement cannot invalidate the flush targets.
+    pub(crate) fn visible_filesystems(
+        &self,
+        ns: &Arc<MountNamespace>,
+    ) -> Result<mm::AdmittedVec<Arc<dyn FileSystem>>, FsError> {
+        let table = self.ensure_namespace_table(ns)?;
+        let mut filesystems = mm::AdmittedVec::new(mm::HeapClass::Vfs);
+        let view = table.view.read();
+        filesystems
+            .try_reserve_exact(view.mounts.len())
+            .map_err(|_| FsError::NoMem)?;
+        for mount in view.mounts.values() {
+            let seen = filesystems
+                .iter()
+                .any(|fs: &Arc<dyn FileSystem>| fs.fs_id() == mount.fs.fs_id());
+            if !seen {
+                filesystems
+                    .push_reserved(mount.fs.clone())
+                    .map_err(|_| FsError::NoMem)?;
+            }
+        }
+        drop(view);
+        Ok(filesystems)
+    }
+
     pub fn register_block_device(
         &self,
         name: &str,

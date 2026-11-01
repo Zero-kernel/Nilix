@@ -261,6 +261,12 @@ pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
             SYS_SELECT,
             SYS_PSELECT6,
             SYS_PPOLL,
+            // ST-K4: durability over already-held descriptors. In lockstep with
+            // promise_allows_syscall (types.rs) per R150-3.
+            SYS_FSYNC,
+            SYS_FDATASYNC,
+            SYS_SYNC,
+            SYS_SYNC_FILE_RANGE,
         ]);
     }
 
@@ -581,6 +587,22 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    #[test]
+    fn stdio_admits_the_durability_family_in_every_list() {
+        let list = pledge_syscall_list(PledgePromises::STDIO);
+        for nr in [74u64, 75, 162, 277] {
+            assert!(list.contains(&nr), "pledge list omits {nr}");
+            assert!(
+                types::promise_allows_syscall_probe(PledgePromises::STDIO, nr),
+                "promise check omits {nr}"
+            );
+            assert!(!types::promise_allows_syscall_probe(
+                PledgePromises::RPATH,
+                nr
+            ));
+        }
+    }
 
     #[test]
     fn test_strict_filter() {

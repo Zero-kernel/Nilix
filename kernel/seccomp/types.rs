@@ -203,6 +203,10 @@ pub(crate) const SYS_STAT: u64 = 4;
 pub(crate) const SYS_FSTAT: u64 = 5;
 pub(crate) const SYS_LSTAT: u64 = 6;
 pub(crate) const SYS_LSEEK: u64 = 8;
+pub(crate) const SYS_FSYNC: u64 = 74;
+pub(crate) const SYS_FDATASYNC: u64 = 75;
+pub(crate) const SYS_SYNC: u64 = 162;
+pub(crate) const SYS_SYNC_FILE_RANGE: u64 = 277;
 
 // Memory management
 pub(crate) const SYS_MMAP: u64 = 9;
@@ -1387,6 +1391,10 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
                 | SYS_SELECT      // M0-6 poll/select
                 | SYS_PSELECT6    // M0-6 poll/select (sigmask leg only masks the CALLER's own signals)
                 | SYS_PPOLL // M0-6 poll/select
+                | SYS_FSYNC // ST-K4: lockstep with pledge_syscall_list
+                | SYS_FDATASYNC
+                | SYS_SYNC
+                | SYS_SYNC_FILE_RANGE
         ) {
             return true;
         }

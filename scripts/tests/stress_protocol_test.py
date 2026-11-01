@@ -196,6 +196,61 @@ class ConfigTests(unittest.TestCase):
             protocol.StressConfig.from_bytes(bytes(encoded) + b"\0")
 
 
+class BlockDurabilityTests(unittest.TestCase):
+    RUN = "0123456789abcdef"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.writer = self.root / "writer.log"
+        self.recovery = self.root / "recovery.log"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def line(self, kind: str, generation: int, checksum: str = CHECKSUM_A) -> str:
+        slot = generation % 12
+        if kind == "BASELINE":
+            return (
+                f"NILIX_STRESS_V2_BLOCK_BASELINE run={self.RUN} "
+                f"generation={generation} checksum={checksum}"
+            )
+        return (
+            f"NILIX_STRESS_V2_BLOCK_COMMIT run={self.RUN} generation={generation} "
+            f"slot={slot} checksum={checksum}"
+        )
+
+    def check(self, writer: str, recovered: int, checksum: str = CHECKSUM_A) -> dict:
+        self.writer.write_text(writer)
+        self.recovery.write_text(
+            f"NILIX_STRESS_V2_BLOCK_RECOVERED run={self.RUN} generation={recovered} "
+            f"valid_slots=12 invalid_slots=0 checksum={checksum}\n"
+        )
+        return protocol.validate_block_durability(self.writer, self.recovery)
+
+    def test_recovery_equal_to_the_last_commit_passes(self) -> None:
+        log = self.line("BASELINE", 12) + "\n" + self.line("COMMIT", 13) + "\n"
+        self.assertEqual(self.check(log, 13)["committed_generation"], 13)
+
+    def test_a_later_generation_is_allowed(self) -> None:
+        log = self.line("BASELINE", 12) + "\n" + self.line("COMMIT", 13) + "\n"
+        self.assertEqual(self.check(log, 14, CHECKSUM_B)["recovered_generation"], 14)
+
+    def test_a_lost_commit_is_rejected(self) -> None:
+        log = self.line("BASELINE", 12) + "\n" + self.line("COMMIT", 13) + "\n"
+        with self.assertRaisesRegex(protocol.StressProtocolError, "lost an acknowledged commit"):
+            self.check(log, 12)
+
+    def test_a_different_record_at_the_same_generation_is_rejected(self) -> None:
+        log = self.line("BASELINE", 12) + "\n"
+        with self.assertRaisesRegex(protocol.StressProtocolError, "differs"):
+            self.check(log, 12, CHECKSUM_B)
+
+    def test_a_marker_cut_by_the_kill_is_not_an_acknowledgement(self) -> None:
+        log = self.line("BASELINE", 12) + "\n" + self.line("COMMIT", 13)[:40]
+        self.assertEqual(self.check(log, 12)["committed_generation"], 12)
+
+
 class MarkerStateMachineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -467,6 +522,20 @@ class BlockRecoveryTests(unittest.TestCase):
         markers.append(protocol.parse_marker(common_pass(self.config, 1, CHECKSUM_A)))
         with self.assertRaises(protocol.StressProtocolError):
             protocol.validate_writer_markers(markers, self.config)
+
+    def test_replayed_image_is_stripped_only_with_an_empty_log(self) -> None:
+        replayed = self.root / "replayed.img"
+        make_ext3_image(replayed, recover=True, zero_intent=True, start=0)
+        protocol.strip_private_journal_bits(replayed)
+        probe = protocol.probe_journal(replayed)
+        self.assertFalse(probe["recover"])
+        self.assertFalse(probe["zero_intent"])
+
+        pending = self.root / "pending.img"
+        make_ext3_image(pending, recover=True, zero_intent=True, start=1)
+        with self.assertRaisesRegex(protocol.StressProtocolError, "pending journal"):
+            protocol.strip_private_journal_bits(pending)
+        self.assertTrue(protocol.probe_journal(pending)["recover"])
 
     def test_raw_probe_requires_all_three_active_journal_signals(self) -> None:
         active = self.root / "active.img"

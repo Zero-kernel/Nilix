@@ -48,7 +48,7 @@ already run.
   QEMU.
 - **Storage and networking**: a VFS with ramfs/ext2/JBD2 subsets and procfs/devfs/cgroupfs,
   virtio-blk, and virtio-net with IPv4/TCP/UDP and a default-DROP firewall.
-- **Evidence over claims**: 616 hosted unit tests per profile, QEMU boot/SMP/musl/Ring-3
+- **Evidence over claims**: 632 hosted unit tests per profile, QEMU boot/SMP/musl/Ring-3
   gates, KCOV fuzzing, 900-second stress soaks and independent security audits.
   A *qualified* result is never reported as a pass.
 
@@ -92,7 +92,7 @@ just because its API or source files exist.
 | IPC and signals | Capability-backed pipes, Linux futex ops (WAIT/WAKE, true REQUEUE/CMP_REQUEUE, WAKE_OP, partial bitsets, PI lock/trylock/unlock with priority inheritance, requeue-PI) keyed by address space, robust cleanup, masks/handlers/return, blocked-signal tests, poll/select | Native synchronous IPC/shared-memory completion, sigaltstack/queued-RT/restart semantics, PI ABBA `EDEADLK` detection |
 | File descriptors | Ordinary fd 0/1/2, dup/close/fork/exec/CLOEXEC, shared status flags, O_NONBLOCK consumers and NOFILE enforcement | Broader fcntl/rlimit semantics |
 | VFS and paths | ramfs/ext2/JBD2 subset, procfs/devfs/CPIO/cgroupfs; cwd/root/pivot, symlink/jail resolution, DAC/UID/GID, mount retirement | General dirfd, chown/statx/hard links, terminal fidelity and full POSIX/filesystem compatibility |
-| Storage | Owned BIO/completion, virtio-blk, checked 512B/4096B geometry and guest I/O evidence | fsync/fdatasync/sync/sync_file_range not wired; power-loss/recovery/cache qualification |
+| Storage | Owned BIO/completion, virtio-blk, checked 512B/4096B geometry and guest I/O evidence | Verification pending: fsync/fdatasync/sync/sync_file_range with a real device barrier and a fail-closed unsupported path. Still missing: power-loss, cache and Ext2 mutation qualification |
 | Networking | virtio-net, Ethernet/ARP/IPv4/ICMP/UDP/TCP, conntrack/default-DROP firewall machinery, per-netns state and process-context RX | veth/child RX/routes/admin/loopback breadth, IPv6 and wire interoperability; device transfer remains disabled |
 
 ### Isolation and security
@@ -186,7 +186,7 @@ bash scripts/ci/entrypoint.sh musl      # musl guest on 1 and 4 CPUs
 
 | Measure | Count |
 | --- | --- |
-| Hosted unit tests | **616** per debug/release profile, plus CpuLocal doctests and 3 test-code compile checks |
+| Hosted unit tests | **632** per debug/release profile, plus CpuLocal doctests and 3 test-code compile checks |
 | Runtime tests discovered | **74** `RuntimeTest` implementations (a source count, not 74 guest passes) |
 | Stress-v2 profiles | **7**, 900 seconds each |
 | Fuzz campaigns | **11** scheduled campaigns, plus deterministic KCOV smoke |
@@ -213,7 +213,7 @@ workload gaps, and fuzz sampling is not proof of completeness.
 2. **Strict qualification**: reconcile the R188 review lineage and complete strict guest
    qualification.
 3. **Release conditions**: all seven stress profiles (thread needs its heartbeat gaps explained,
-   block needs `fsync`, combined needs Ext2 truncate, indirect allocation and unlink), strict network/SMP/security matrices
+   block needs its accepted 900-second run, combined needs Ext2 truncate, indirect allocation and unlink), strict network/SMP/security matrices
    and fresh full-audit conditions.
 4. **After qualification**: native capability/IPC, static ABI residuals,
    personality/dynamic linking, container networking and measured operations/performance.

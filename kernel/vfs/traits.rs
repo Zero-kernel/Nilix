@@ -3,7 +3,7 @@
 //! Core traits for filesystem and inode operations.
 
 use crate::topology::MutationContext;
-use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
+use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat};
 use alloc::alloc::{dealloc, Layout};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -174,8 +174,17 @@ pub trait FileSystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
-    /// Sync filesystem to storage (flush caches)
+    /// ST-K4: make every write completed before this call persistent.
+    ///
+    /// Fails closed by default so a new persistent filesystem cannot claim
+    /// durability by omission. A volatile filesystem overrides this with an
+    /// explicit `Ok(())`, which says nothing about persistent media.
     fn sync(&self) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
+
+    /// ST-K4: report a latched I/O failure without touching the device.
+    fn check_io_health(&self) -> Result<(), FsError> {
         Ok(())
     }
 }
@@ -545,6 +554,13 @@ impl FileLifetime {
             Self::Mount(mount) => mount.fs.fs_id(),
         }
     }
+
+    fn filesystem(&self) -> &Arc<dyn FileSystem> {
+        match self {
+            Self::Filesystem(fs) => fs,
+            Self::Mount(mount) => &mount.fs,
+        }
+    }
 }
 
 impl PreparedFileHandle {
@@ -673,6 +689,43 @@ impl FileHandle {
     /// U.S2 SLICE-3B: Get the underlying inode for cap allocation.
     ///
     /// Returns a reference to the Arc<dyn Inode> backing this handle.
+    /// ST-K4: fsync/fdatasync for this open description.
+    ///
+    /// Reaches the filesystem through the descriptor's own lifetime owner, so a
+    /// pivot or namespace change cannot retarget the barrier. The caller must
+    /// not hold the PCB lock.
+    pub(crate) fn fsync(&self) -> Result<(), FsError> {
+        if self.flags.is_path() {
+            return Err(FsError::BadFd);
+        }
+        match self.inode.stat()?.mode.file_type {
+            FileType::Regular | FileType::Directory | FileType::Symlink => {
+                self.owner.filesystem().sync()
+            }
+            // Linux has no fsync for these. Raw block nodes refuse because
+            // devfs has no route to the driver barrier.
+            _ => Err(FsError::Invalid),
+        }
+    }
+
+    /// ST-K4: sync_file_range admission after argument validation.
+    ///
+    /// Ext2 is write-through, so an admitted range is already on the device and
+    /// nothing is flushed. Returns `Ok(false)` for a kind Linux answers with
+    /// ESPIPE.
+    pub(crate) fn sync_file_range(&self) -> Result<bool, FsError> {
+        if self.flags.is_path() {
+            return Err(FsError::BadFd);
+        }
+        match self.inode.stat()?.mode.file_type {
+            FileType::Regular | FileType::Directory | FileType::Symlink | FileType::BlockDevice => {
+                self.owner.filesystem().check_io_health()?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn inode(&self) -> &Arc<dyn Inode> {
         &self.inode
     }
@@ -1160,5 +1213,191 @@ mod rf180_37_tests {
             before,
             "the last Weak must deallocate backing before releasing its charge"
         );
+    }
+}
+
+#[cfg(test)]
+mod st_k4_durability_tests {
+    extern crate std;
+
+    use super::*;
+    use crate::types::TimeSpec;
+    use crate::HEAP_TEST_LOCK;
+    use core::sync::atomic::AtomicBool;
+
+    struct KindInode(FileType);
+
+    impl Inode for KindInode {
+        fn ino(&self) -> u64 {
+            1
+        }
+        fn fs_id(&self) -> u64 {
+            7
+        }
+        fn stat(&self) -> Result<Stat, FsError> {
+            Ok(Stat {
+                dev: 1,
+                ino: 1,
+                mode: FileMode::new(self.0, 0o600),
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                size: 0,
+                blksize: 4096,
+                blocks: 0,
+                atime: TimeSpec::new(0, 0),
+                mtime: TimeSpec::new(0, 0),
+                ctime: TimeSpec::new(0, 0),
+            })
+        }
+        fn open(
+            self: Arc<Self>,
+            flags: OpenFlags,
+            prepared: PreparedFileHandle,
+        ) -> Result<FileDescriptor, FsError> {
+            let inode: Arc<dyn Inode> = self;
+            Ok(prepared.finalize(inode, flags, false))
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    struct CountingFs {
+        inode: Arc<dyn Inode>,
+        syncs: AtomicUsize,
+        unhealthy: AtomicBool,
+    }
+
+    impl FileSystem for CountingFs {
+        fn fs_id(&self) -> u64 {
+            7
+        }
+        fn fs_type(&self) -> &'static str {
+            "st-k4-test"
+        }
+        fn root_inode(&self) -> Arc<dyn Inode> {
+            self.inode.clone()
+        }
+        fn lookup(&self, _parent: &Arc<dyn Inode>, _name: &str) -> Result<Arc<dyn Inode>, FsError> {
+            Err(FsError::NotFound)
+        }
+        fn sync(&self) -> Result<(), FsError> {
+            // lint-fetch-add: allow (test-only call counter)
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn check_io_health(&self) -> Result<(), FsError> {
+            if self.unhealthy.load(Ordering::SeqCst) {
+                Err(FsError::Io)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn open(kind: FileType, flags: u32) -> (Arc<CountingFs>, FileDescriptor) {
+        // lint-fallible: BOUNDED(test-only fixture)
+        let inode: Arc<dyn Inode> = Arc::new(KindInode(kind));
+        // lint-fallible: BOUNDED(test-only fixture)
+        let fs = Arc::new(CountingFs {
+            inode: inode.clone(),
+            syncs: AtomicUsize::new(0),
+            unhealthy: AtomicBool::new(false),
+        });
+        let descriptor = PreparedFileHandle::try_new()
+            .unwrap()
+            .bind_filesystem(fs.clone())
+            .finalize(inode, OpenFlags::new(flags), false);
+        (fs, descriptor)
+    }
+
+    fn handle(descriptor: &FileDescriptor) -> &FileHandle {
+        descriptor.as_any().downcast_ref::<FileHandle>().unwrap()
+    }
+
+    #[test]
+    fn fsync_is_decided_by_object_kind_and_reaches_the_owner() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        for kind in [FileType::Regular, FileType::Directory, FileType::Symlink] {
+            let (fs, descriptor) = open(kind, OpenFlags::O_RDONLY);
+            assert_eq!(handle(&descriptor).fsync(), Ok(()));
+            assert_eq!(fs.syncs.load(Ordering::SeqCst), 1);
+        }
+        for kind in [FileType::CharDevice, FileType::BlockDevice, FileType::Fifo] {
+            let (fs, descriptor) = open(kind, OpenFlags::O_RDWR);
+            assert_eq!(handle(&descriptor).fsync(), Err(FsError::Invalid));
+            assert_eq!(fs.syncs.load(Ordering::SeqCst), 0);
+        }
+        let (fs, descriptor) = open(FileType::Regular, OpenFlags::O_PATH);
+        assert_eq!(handle(&descriptor).fsync(), Err(FsError::BadFd));
+        assert_eq!(fs.syncs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn descriptor_pins_its_filesystem_through_clones() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let (fs, descriptor) = open(FileType::Regular, OpenFlags::O_RDWR);
+        let duplicate = handle(&descriptor).clone();
+        let observed = Arc::downgrade(&fs);
+        drop(fs);
+        drop(descriptor);
+        // The namespace and every other owner are gone; the duplicate still
+        // reaches the same filesystem instead of a lookup target.
+        assert_eq!(duplicate.fsync(), Ok(()));
+        assert_eq!(observed.upgrade().unwrap().syncs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sync_file_range_never_flushes_and_reports_health() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        for kind in [
+            FileType::Regular,
+            FileType::Directory,
+            FileType::Symlink,
+            FileType::BlockDevice,
+        ] {
+            let (fs, descriptor) = open(kind, OpenFlags::O_RDONLY);
+            assert_eq!(handle(&descriptor).sync_file_range(), Ok(true));
+            assert_eq!(fs.syncs.load(Ordering::SeqCst), 0);
+        }
+        let (_fs, descriptor) = open(FileType::Fifo, OpenFlags::O_RDONLY);
+        assert_eq!(handle(&descriptor).sync_file_range(), Ok(false));
+        let (fs, descriptor) = open(FileType::Regular, OpenFlags::O_RDONLY);
+        fs.unhealthy.store(true, Ordering::SeqCst);
+        assert_eq!(handle(&descriptor).sync_file_range(), Err(FsError::Io));
+    }
+
+    #[test]
+    fn an_unimplemented_filesystem_sync_fails_closed() {
+        struct SilentFs(Arc<dyn Inode>);
+        impl FileSystem for SilentFs {
+            fn fs_id(&self) -> u64 {
+                7
+            }
+            fn fs_type(&self) -> &'static str {
+                "st-k4-silent"
+            }
+            fn root_inode(&self) -> Arc<dyn Inode> {
+                self.0.clone()
+            }
+            fn lookup(
+                &self,
+                _parent: &Arc<dyn Inode>,
+                _name: &str,
+            ) -> Result<Arc<dyn Inode>, FsError> {
+                Err(FsError::NotFound)
+            }
+        }
+        // lint-fallible: BOUNDED(test-only fixture)
+        let fs = SilentFs(Arc::new(KindInode(FileType::Regular)));
+        assert_eq!(fs.sync(), Err(FsError::NotSupported));
     }
 }

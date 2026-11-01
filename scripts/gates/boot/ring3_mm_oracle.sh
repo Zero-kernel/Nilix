@@ -79,6 +79,7 @@ lazy shared buffers pass the getrandom, pipe2, fstat, rt_sigprocmask and futex p
 the syscall preflight maps frames a fork child filled and keeps the words in front of the buffers
 shared-anon adjacent private PT lifetime
 waitid argument contract, WNOWAIT survival, EFAULT-before-reap, P_ALL
+durability syscalls decide by descriptor kind and validate ranges
 root-init adopts an orphaned grandchild and can reap it
 selective wait reaps only its target across sibling and nested zombies
 fork refused by pids.max leaves no child, task charge or reapable zombie
