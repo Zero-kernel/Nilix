@@ -122,6 +122,10 @@ if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Fq 'EXT2-MUT production truncate 
     echo "KERNEL-TEST FAIL: missing production truncate probe"
     rc=1
 fi
+if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Fq 'EXT2-MUT production indirect path passed' "$ser"; then
+    echo "KERNEL-TEST FAIL: missing production indirect probe"
+    rc=1
+fi
 if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Eq "^KSA-019-BLOCK PASS sector_bytes=$logical_block_size sector=[0-9]+ capacity_sectors=[0-9]+ restored=exact$" "$ser"; then
     echo "KERNEL-TEST FAIL: missing actual logical-sector round-trip/restoration evidence"
     rc=1

@@ -224,6 +224,7 @@ class OtherCallerOutcomeTests(unittest.TestCase):
                 if has_probe:
                     serial += "R180-6 production JBD2 write path passed\n"
                     serial += "EXT2-MUT production truncate path passed\n"
+                    serial += "EXT2-MUT production indirect path passed\n"
                     serial += "KSA-019-BLOCK PASS sector_bytes=512 sector=126 capacity_sectors=128 restored=exact\n"
                 result = self.fixture.run_gate("kernel_test.sh", serial)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)

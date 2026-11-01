@@ -184,6 +184,17 @@ const ZERO_INTENT_KIND_FILE_RENAME: u8 = 4;
 const ZERO_INTENT_KIND_DIRECT_FREE: u8 = 5;
 /// EXT2-MUT: lower an inode's size without freeing a block.
 const ZERO_INTENT_KIND_INODE_SHRINK: u8 = 6;
+/// EXT2-MUT: attach an all-zero single-indirect mapping block. Four homes.
+const ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION: u8 = 7;
+/// EXT2-MUT: detach and free an all-zero single-indirect mapping block.
+const ZERO_INTENT_KIND_INDIRECT_ROOT_FREE: u8 = 8;
+/// EXT2-MUT: allocate a data block through the mapping block. Five homes.
+const ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION: u8 = 9;
+/// EXT2-MUT: free a data block through the mapping block. Five homes.
+const ZERO_INTENT_KIND_INDIRECT_DATA_FREE: u8 = 10;
+/// Metadata homes of an indirect data transaction: bitmap, group descriptor,
+/// superblock, mapping block, inode.
+const INDIRECT_DATA_METADATA_BLOCKS: usize = 5;
 const ZERO_INTENT_MAGIC_OFFSET: usize = JBD2_HEADER_BYTES;
 const ZERO_INTENT_VERSION_OFFSET: usize = 16;
 const ZERO_INTENT_KIND_OFFSET: usize = 18;
@@ -2032,22 +2043,27 @@ pub fn run_ext2_journal_transaction_self_test() {
     drop(_fs);
     drop(device);
 
-    // A journal makes direct holes allocatable, but an indirect hole anywhere
-    // in the range still rejects the whole request before its first write.
+    // A journal makes direct and single-indirect holes allocatable, but a
+    // double-indirect hole anywhere in the range still rejects the whole request
+    // before its first write.
     let mut indirect_hole = base.clone();
     let file_offset = 5 * BLOCK_SIZE + (FILE_INO as usize - 1) * size_of::<Ext2InodeRaw>();
     let mut sparse_file: Ext2InodeRaw = read_struct(&indirect_hole, file_offset);
-    sparse_file.size_lo = (13 * BLOCK_SIZE) as u32;
+    let single_indirect_end = (EXT2_NDIR_BLOCKS + BLOCK_SIZE / 4) * BLOCK_SIZE;
+    sparse_file.size_lo = (single_indirect_end + BLOCK_SIZE) as u32;
     copy_struct(&mut indirect_hole, file_offset, &sparse_file);
     let (device, _fs, file) = mount_image(indirect_hole);
     device.arm(0, 0);
     let mut cross_direct_limit = Vec::new();
     cross_direct_limit
         .try_reserve_exact(BLOCK_SIZE + 1)
-        .expect("direct/indirect boundary payload");
+        .expect("indirect/double-indirect boundary payload");
     cross_direct_limit.resize(BLOCK_SIZE + 1, 0xCC);
     assert_eq!(
-        file.write_at(11 * BLOCK_SIZE as u64, &cross_direct_limit),
+        file.write_at(
+            (single_indirect_end - BLOCK_SIZE) as u64,
+            &cross_direct_limit
+        ),
         Err(FsError::NotSupported)
     );
     assert_eq!(device.operation.load(Ordering::Acquire), 0);
@@ -3072,6 +3088,368 @@ pub fn run_ext2_journal_transaction_self_test() {
     assert!(matches!(Ext2Fs::mount(dev), Err(FsError::NotSupported)));
 
     run_truncate_scenarios(&synthetic_image());
+    run_indirect_scenarios(&synthetic_image());
+
+    /// Every block the file owns: direct pointers, the mapping block, and its
+    /// pointers. It must match the bitmap, the counts and `blocks_lo` exactly.
+    fn assert_indirect_consistent(
+        fs: &Arc<Ext2Fs>,
+        file: &Arc<Ext2Inode>,
+        payload: &[u8],
+        image: &[u8],
+    ) {
+        assert_indirect_consistent_except(fs, file, payload, image, 0..0);
+    }
+
+    /// `may_be_zero` is the kept block's tail, which a truncate clears before its
+    /// first commit. Bytes there may read as zero; every other byte must match.
+    fn assert_indirect_consistent_except(
+        fs: &Arc<Ext2Fs>,
+        file: &Arc<Ext2Inode>,
+        payload: &[u8],
+        image: &[u8],
+        may_be_zero: core::ops::Range<usize>,
+    ) {
+        let raw = *file.raw.read();
+        let size = file.size.load(Ordering::Acquire) as usize;
+        assert_eq!(raw.size_lo as usize, size);
+        assert_eq!(raw.block[EXT2_DIND_BLOCK], 0);
+        assert_eq!(raw.block[EXT2_TIND_BLOCK], 0);
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(16).expect("owned blocks");
+        owned.extend(
+            raw.block[..EXT2_NDIR_BLOCKS]
+                .iter()
+                .copied()
+                .filter(|b| *b != 0),
+        );
+        if raw.block[EXT2_IND_BLOCK] != 0 {
+            owned.push(raw.block[EXT2_IND_BLOCK]);
+            let mut mapping =
+                Ext2MutationScratch::try_new(BLOCK_SIZE as u32).expect("mapping scratch");
+            fs.read_block(raw.block[EXT2_IND_BLOCK], mapping.block_mut())
+                .expect("read mapping block");
+            for pointer in 0..BLOCK_SIZE / 4 {
+                let physical = read_u32_le(mapping.block(), pointer).expect("read pointer");
+                if physical != 0 {
+                    owned.push(physical);
+                }
+            }
+        }
+        assert_eq!(raw.blocks_lo as usize, owned.len() * (BLOCK_SIZE / 512));
+        for block in FIRST_FREE_BLOCK..FIRST_FREE_BLOCK + 16 {
+            assert_eq!(
+                bitmap_allocated(image, block),
+                owned.contains(&block),
+                "bitmap and owners disagree on block {block}"
+            );
+        }
+        assert_eq!(
+            fs.superblock.read().free_blocks_count,
+            16 - owned.len() as u32
+        );
+        assert_eq!(
+            fs.group_descs.read()[0].free_blocks_count,
+            16 - owned.len() as u16
+        );
+        assert!(size <= payload.len());
+        for (position, byte) in disk_bytes(fs, file, 0, size).iter().enumerate() {
+            assert!(
+                *byte == payload[position] || (*byte == 0 && may_be_zero.contains(&position)),
+                "byte {position} of {size} changed"
+            );
+        }
+    }
+
+    /// EXT2-MUT slice 2. The synthetic image has 16 free 1 KiB blocks, enough for 12
+    /// direct blocks, the mapping block and three more.
+    // lint-fallible-fn: INFALLIBLE-OK(boot self-test; OOM here is boot-fatal by policy)
+    fn run_indirect_scenarios(pristine: &[u8]) {
+        const LEN: usize = 14 * BLOCK_SIZE - 100;
+        // Free blocks hold stale bytes on real disks. Without this, a mapping block
+        // published without being zeroed would pass by accident.
+        let mut stale = pristine.to_vec();
+        stale[FIRST_FREE_BLOCK as usize * BLOCK_SIZE..].fill(0xEE);
+        let empty = &stale[..];
+        // The hosted build walks every boundary. The boot oracle samples them, since
+        // it repeats on every boot of every kernel.
+        let stride: u64 = if cfg!(test) { 1 } else { 7 };
+        let mut payload = Vec::new();
+        payload.try_reserve_exact(LEN).expect("indirect payload");
+        payload.extend((0..LEN).map(|index| (index % 239) as u8 + 1));
+
+        // Past the direct range: the mapping block appears and owns the new blocks.
+        let (device, fs, file) = mount_image(empty.to_vec());
+        assert_eq!(file.write_at(0, &payload), Ok(LEN));
+        let written = device.durable_snapshot();
+        assert_ne!(file.raw.read().block[EXT2_IND_BLOCK], 0);
+        assert_eq!(fs.superblock.read().free_blocks_count, 1);
+        assert_indirect_consistent(&fs, &file, &payload, &written);
+        let direct_only = {
+            let (device, fs, file) = mount_image(empty.to_vec());
+            assert_eq!(
+                file.write_at(0, &payload[..EXT2_NDIR_BLOCKS * BLOCK_SIZE]),
+                Ok(EXT2_NDIR_BLOCKS * BLOCK_SIZE)
+            );
+            assert_eq!(file.raw.read().block[EXT2_IND_BLOCK], 0);
+            let image = device.durable_snapshot();
+            drop(file);
+            drop(fs);
+            drop(device);
+            image
+        };
+        drop(file);
+        drop(fs);
+        drop(device);
+        let (clean, fs, file) = mount_image(written.clone());
+        assert_eq!(clean.operation.load(Ordering::Acquire), 0);
+        assert_indirect_consistent(&fs, &file, &payload, &written);
+        drop(file);
+        drop(fs);
+        drop(clean);
+
+        // Out of space: the write stops short with everything it reported durable.
+        let (device, fs, file) = mount_image(written.clone());
+        let extra = [0x5Au8; 3 * BLOCK_SIZE];
+        let short = file.write_at(LEN as u64, &extra).expect("short write");
+        assert!(
+            short < extra.len(),
+            "the image cannot hold three more blocks"
+        );
+        assert_eq!(fs.superblock.read().free_blocks_count, 0);
+        assert_eq!(disk_bytes(&fs, &file, LEN, short), &extra[..short]);
+        drop(file);
+        drop(fs);
+        drop(device);
+
+        // Past the single-indirect range nothing happens at all.
+        let past_limit = ((EXT2_NDIR_BLOCKS + BLOCK_SIZE / 4) * BLOCK_SIZE) as u64;
+        let (device, _fs, file) = mount_image(written.clone());
+        device.arm(0, 0);
+        assert_eq!(file.write_at(past_limit, b"x"), Err(FsError::NotSupported));
+        assert_eq!(device.operation.load(Ordering::Acquire), 0);
+        drop(file);
+        drop(_fs);
+        drop(device);
+
+        // A hole inside the mapping block reads as zeros and owns no block.
+        let (device, fs, file) = mount_image(empty.to_vec());
+        let far = (EXT2_NDIR_BLOCKS + 2) * BLOCK_SIZE;
+        assert_eq!(file.write_at(far as u64, b"far"), Ok(3));
+        assert_eq!(fs.superblock.read().free_blocks_count, 14);
+        assert_eq!(disk_bytes(&fs, &file, far - 8, 8), [0u8; 8]);
+        assert_eq!(disk_bytes(&fs, &file, far, 3), b"far");
+        file.truncate(0).expect("truncate a sparse indirect file");
+        assert_eq!(fs.superblock.read().free_blocks_count, 16);
+        assert_eq!(file.raw.read().block[EXT2_IND_BLOCK], 0);
+        drop(file);
+        drop(fs);
+        drop(device);
+
+        // Shrinks that keep the root, drop it, and clear the whole file.
+        for (new_size, root_kept, free) in [
+            (13 * BLOCK_SIZE - 10, true, 2u32),
+            (12 * BLOCK_SIZE + 1, true, 2),
+            (12 * BLOCK_SIZE, false, 4),
+            (10 * BLOCK_SIZE + 3, false, 5),
+            (0, false, 16),
+        ] {
+            let (device, fs, file) = mount_image(written.clone());
+            file.truncate(new_size as u64).expect("indirect truncate");
+            assert_eq!(file.size.load(Ordering::Acquire), new_size as u64);
+            assert_eq!(file.raw.read().block[EXT2_IND_BLOCK] != 0, root_kept);
+            assert_eq!(fs.superblock.read().free_blocks_count, free);
+            let image = device.durable_snapshot();
+            assert_eq!(journal_start(&image), 0);
+            assert_indirect_consistent(&fs, &file, &payload, &image);
+            drop(file);
+            drop(fs);
+            drop(device);
+            let (clean, fs, file) = mount_image(image.clone());
+            assert_eq!(clean.operation.load(Ordering::Acquire), 0);
+            assert_indirect_consistent(&fs, &file, &payload, &image);
+            drop(file);
+            drop(fs);
+            drop(clean);
+        }
+
+        // Crashing while growing past the direct range: every crash image mounts,
+        // holds a prefix of the payload, and a retry finishes the write.
+        const TAIL: usize = EXT2_NDIR_BLOCKS * BLOCK_SIZE;
+        for persist_previous in [false, true] {
+            let mut fail_at = 1;
+            loop {
+                let (device, _fs, file) = mount_image(direct_only.clone());
+                device.arm(fail_at, if persist_previous { fail_at - 1 } else { 0 });
+                let _ = file.write_at(TAIL as u64, &payload[TAIL..]);
+                let reached = device.failed.load(Ordering::Acquire);
+                let crashed = device.durable_snapshot();
+                drop(file);
+                drop(_fs);
+                drop(device);
+
+                let (retry_device, retry_fs, retry_file) = mount_image(crashed);
+                let replayed = retry_device.durable_snapshot();
+                assert_eq!(journal_start(&replayed), 0);
+                assert_indirect_consistent(&retry_fs, &retry_file, &payload, &replayed);
+                assert_eq!(
+                    retry_file.write_at(TAIL as u64, &payload[TAIL..]),
+                    Ok(LEN - TAIL)
+                );
+                let finished = retry_device.durable_snapshot();
+                assert_indirect_consistent(&retry_fs, &retry_file, &payload, &finished);
+                assert_eq!(retry_file.size.load(Ordering::Acquire), LEN as u64);
+                drop(retry_file);
+                drop(retry_fs);
+                drop(retry_device);
+                if !reached {
+                    break;
+                }
+                fail_at += stride;
+                assert!(fail_at < 400, "the growing write never finished");
+            }
+            assert!(fail_at > 20, "the matrix must cross several transactions");
+        }
+
+        // Crashing while shrinking through the mapping block, past the root and into
+        // the direct blocks. Replay of every new kind happens here.
+        let target = 11 * BLOCK_SIZE + 5;
+        let cleared_tail = target..12 * BLOCK_SIZE;
+        let mut replayed_logs = 0;
+        for persist_previous in [false, true] {
+            let mut fail_at = 1;
+            loop {
+                let (device, _fs, file) = mount_image(written.clone());
+                device.arm(fail_at, if persist_previous { fail_at - 1 } else { 0 });
+                let _ = file.truncate(target as u64);
+                let reached = device.failed.load(Ordering::Acquire);
+                let crashed = device.durable_snapshot();
+                drop(file);
+                drop(_fs);
+                drop(device);
+                if journal_start(&crashed) != 0 {
+                    replayed_logs += 1;
+                }
+
+                let (retry_device, retry_fs, retry_file) = mount_image(crashed);
+                let replayed = retry_device.durable_snapshot();
+                assert_eq!(journal_start(&replayed), 0);
+                assert_indirect_consistent_except(
+                    &retry_fs,
+                    &retry_file,
+                    &payload,
+                    &replayed,
+                    cleared_tail.clone(),
+                );
+                retry_file.truncate(target as u64).expect("truncate retry");
+                let finished = retry_device.durable_snapshot();
+                assert_indirect_consistent_except(
+                    &retry_fs,
+                    &retry_file,
+                    &payload,
+                    &finished,
+                    cleared_tail.clone(),
+                );
+                assert_eq!(retry_file.size.load(Ordering::Acquire), target as u64);
+                assert_eq!(retry_file.raw.read().block[EXT2_IND_BLOCK], 0);
+                drop(retry_file);
+                drop(retry_fs);
+                drop(retry_device);
+                if !reached {
+                    break;
+                }
+                fail_at += stride;
+                assert!(fail_at < 400, "the truncate never finished");
+            }
+            assert!(fail_at > 20, "the matrix must cross several transactions");
+        }
+        assert!(replayed_logs > 0, "no boundary left an active indirect log");
+
+        // Recovery refuses transitions no writer produces.
+        let (_device, fs, _file) = mount_image(empty.to_vec());
+        let mut old = Ext2InodeRaw::default();
+        old.mode = EXT2_S_IFREG | 0o644;
+        old.links_count = 1;
+        old.block[EXT2_IND_BLOCK] = 20;
+        old.blocks_lo = 4;
+        old.size_lo = (13 * BLOCK_SIZE) as u32;
+        let intent = |kind: u8, file_block: u32, physical: u32| JournalCommitIntent {
+            kind,
+            metadata_count: 5,
+            inode_number: FILE_INO,
+            file_block,
+            physical,
+            preimage_hashes: [[0; 32]; JOURNAL_MAX_METADATA_BLOCKS],
+            old_inode: old,
+            new_ino: 0,
+            parent_ino: 0,
+            rename_dir_off: 0,
+            rename_rec_len: 0,
+            rename_old_name_len: 0,
+            rename_old_name: [0; 255],
+        };
+        let mut valid = old;
+        valid.blocks_lo = 2;
+        valid.size_lo = (12 * BLOCK_SIZE) as u32;
+        let free = ZERO_INTENT_KIND_INDIRECT_DATA_FREE;
+        let allocate = ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION;
+        assert_eq!(
+            fs.validate_intent_inode_transition(&intent(free, 12, 21), &valid),
+            Ok(())
+        );
+        let mut wrong_count = valid;
+        wrong_count.blocks_lo = 4;
+        let mut size_above_block = valid;
+        size_above_block.size_lo = (12 * BLOCK_SIZE + 1) as u32;
+        let mut moved_root = valid;
+        moved_root.block[EXT2_IND_BLOCK] = 22;
+        let mut touched_direct = valid;
+        touched_direct.block[0] = 23;
+        for forged in [wrong_count, size_above_block, moved_root, touched_direct] {
+            assert_eq!(
+                fs.validate_intent_inode_transition(&intent(free, 12, 21), &forged),
+                Err(FsError::NotSupported)
+            );
+        }
+        let past_mapping = (EXT2_NDIR_BLOCKS + BLOCK_SIZE / 4) as u32;
+        assert_eq!(
+            fs.validate_intent_inode_transition(&intent(free, past_mapping, 21), &valid),
+            Err(FsError::NotSupported)
+        );
+        let mut grew = old;
+        grew.blocks_lo = 6;
+        grew.size_lo = (13 * BLOCK_SIZE) as u32;
+        assert_eq!(
+            fs.validate_intent_inode_transition(&intent(allocate, 12, 21), &grew),
+            Ok(())
+        );
+        let mut shrank = grew;
+        shrank.size_lo = (12 * BLOCK_SIZE) as u32;
+        assert_eq!(
+            fs.validate_intent_inode_transition(&intent(allocate, 12, 21), &shrank),
+            Err(FsError::NotSupported)
+        );
+        let mut no_root = old;
+        no_root.block[EXT2_IND_BLOCK] = 0;
+        let mut root_free_result = no_root;
+        root_free_result.blocks_lo = 2;
+        root_free_result.size_lo = (13 * BLOCK_SIZE) as u32;
+        assert_eq!(
+            fs.validate_intent_inode_transition(
+                &intent(
+                    ZERO_INTENT_KIND_INDIRECT_ROOT_FREE,
+                    EXT2_IND_BLOCK as u32,
+                    20
+                ),
+                &root_free_result
+            ),
+            Err(FsError::NotSupported),
+            "a size past the direct range cannot survive losing the root"
+        );
+        drop(_file);
+        drop(fs);
+        drop(_device);
+    }
 
     /// EXT2-MUT slice 1. `written` holds a three-block file.
     fn run_truncate_scenarios(empty: &[u8]) {
@@ -3140,11 +3518,13 @@ pub fn run_ext2_journal_transaction_self_test() {
         out.try_reserve_exact(len).expect("truncate readback");
         let mut block = Ext2MutationScratch::try_new(BLOCK_SIZE as u32).expect("readback block");
         for position in offset..offset + len {
-            let physical = raw.block[position / BLOCK_SIZE];
-            if physical == 0 {
+            let mapped = fs
+                .map_file_block(&raw, (position / BLOCK_SIZE) as u32)
+                .expect("map file block");
+            let Some(physical) = mapped else {
                 out.push(0);
                 continue;
-            }
+            };
             fs.read_block(physical, block.block_mut())
                 .expect("read file block");
             out.push(block.block()[position % BLOCK_SIZE]);
@@ -3225,7 +3605,7 @@ pub fn run_ext2_journal_transaction_self_test() {
         file.truncate(payload.len() as u64)
             .expect("same-size truncate");
         assert_eq!(
-            file.truncate((EXT2_NDIR_BLOCKS * BLOCK_SIZE + 1) as u64),
+            file.truncate(((EXT2_NDIR_BLOCKS + BLOCK_SIZE / 4) * BLOCK_SIZE + 1) as u64),
             Err(FsError::NotSupported)
         );
         device.arm(0, 0);
@@ -3235,9 +3615,9 @@ pub fn run_ext2_journal_transaction_self_test() {
         file.raw.write().flags |= EXT2_IMMUTABLE_FL;
         assert_eq!(file.truncate(0), Err(FsError::PermDenied));
         file.raw.write().flags &= !EXT2_IMMUTABLE_FL;
-        file.raw.write().block[EXT2_IND_BLOCK] = FIRST_FREE_BLOCK + 7;
+        file.raw.write().block[EXT2_DIND_BLOCK] = FIRST_FREE_BLOCK + 7;
         assert_eq!(file.truncate(0), Err(FsError::NotSupported));
-        file.raw.write().block[EXT2_IND_BLOCK] = 0;
+        file.raw.write().block[EXT2_DIND_BLOCK] = 0;
         assert_eq!(device.operation.load(Ordering::Acquire), 0);
         drop(file);
         drop(_fs);
@@ -4440,6 +4820,15 @@ struct RenamePlan {
     new_name: [u8; 255],
 }
 
+/// EXT2-MUT: one data block entering or leaving the single-indirect mapping block.
+/// `block` carries the same bitmap, count and inode edits as a direct allocation.
+#[derive(Clone, Copy)]
+struct IndirectDataPlan {
+    block: DirectAllocationPlan,
+    mapping_block: u32,
+    pointer_offset: usize,
+}
+
 #[derive(Clone, Copy)]
 enum JournalMetadataPlan {
     DirectAllocation(DirectAllocationPlan),
@@ -4461,13 +4850,25 @@ enum JournalMetadataPlan {
         old_inode: Ext2InodeRaw,
         new_inode: Ext2InodeRaw,
     },
+    /// EXT2-MUT: same homes and edits as `DirectAllocation`, on pointer 12.
+    IndirectRootAllocation(DirectAllocationPlan),
+    /// EXT2-MUT: same homes and edits as `DirectFree`, on pointer 12.
+    IndirectRootFree(DirectAllocationPlan),
+    IndirectData {
+        plan: IndirectDataPlan,
+        freeing: bool,
+    },
 }
 
 impl JournalMetadataPlan {
     #[inline]
     fn metadata_blocks(self) -> usize {
         match self {
-            Self::DirectAllocation(_) | Self::DirectFree(_) => DIRECT_ALLOCATION_METADATA_BLOCKS,
+            Self::DirectAllocation(_)
+            | Self::DirectFree(_)
+            | Self::IndirectRootAllocation(_)
+            | Self::IndirectRootFree(_) => DIRECT_ALLOCATION_METADATA_BLOCKS,
+            Self::IndirectData { .. } => INDIRECT_DATA_METADATA_BLOCKS,
             Self::InodeUpdate { .. } | Self::InodeShrink { .. } => 1,
             Self::FileCreate(plan) => plan.home_count(),
             Self::Rename(_) => 2,
@@ -6916,7 +7317,11 @@ impl Ext2Fs {
         inode_blocks: &mut u64,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), FsError> {
-        if !(1..=3).contains(&level) || logical_base >= logical_blocks {
+        // EXT2-MUT: growth attaches an empty single-indirect block before the size
+        // reaches it, and a shrink empties it before freeing it, so a crash can leave
+        // one past the end of the file. It owns nothing else: the child check below
+        // still refuses any pointer past the end.
+        if !(1..=3).contains(&level) || (logical_base >= logical_blocks && level != 1) {
             return Err(FsError::Invalid);
         }
         let root = self.push_ordinary_owner(journal, work, root)?;
@@ -7456,12 +7861,74 @@ impl Ext2Fs {
         let new_size = ((new.size_high_or_dir_acl as u64) << 32) | new.size_lo as u64;
         let shrinking = matches!(
             intent.kind,
-            ZERO_INTENT_KIND_DIRECT_FREE | ZERO_INTENT_KIND_INODE_SHRINK
+            ZERO_INTENT_KIND_DIRECT_FREE
+                | ZERO_INTENT_KIND_INODE_SHRINK
+                | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
+                | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
         );
         if new_size < old_size && !shrinking {
             return Err(FsError::NotSupported);
         }
+        let sectors = self.block_size / 512;
+        let others_unchanged = |skip: Option<usize>| {
+            (0..old.block.len())
+                .all(|pointer| Some(pointer) == skip || old.block[pointer] == new.block[pointer])
+        };
         match intent.kind {
+            ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION => {
+                // The root holds no data yet, so the size must not move.
+                if intent.physical == 0
+                    || old.block[EXT2_IND_BLOCK] != 0
+                    || new.block[EXT2_IND_BLOCK] != intent.physical
+                    || new.blocks_lo
+                        != old.blocks_lo.checked_add(sectors).ok_or(FsError::Invalid)?
+                    || new_size != old_size
+                    || !others_unchanged(Some(EXT2_IND_BLOCK))
+                {
+                    return Err(FsError::NotSupported);
+                }
+            }
+            ZERO_INTENT_KIND_INDIRECT_ROOT_FREE => {
+                let direct_limit = (EXT2_NDIR_BLOCKS as u64)
+                    .checked_mul(self.block_size as u64)
+                    .ok_or(FsError::Invalid)?;
+                if intent.physical == 0
+                    || old.block[EXT2_IND_BLOCK] != intent.physical
+                    || new.block[EXT2_IND_BLOCK] != 0
+                    || old.blocks_lo
+                        != new.blocks_lo.checked_add(sectors).ok_or(FsError::Invalid)?
+                    || new_size > old_size
+                    || new_size > direct_limit
+                    || !others_unchanged(Some(EXT2_IND_BLOCK))
+                {
+                    return Err(FsError::NotSupported);
+                }
+            }
+            ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_DATA_FREE => {
+                let start = (intent.file_block as u64)
+                    .checked_mul(self.block_size as u64)
+                    .ok_or(FsError::Invalid)?;
+                let pointer = intent
+                    .file_block
+                    .checked_sub(EXT2_NDIR_BLOCKS as u32)
+                    .ok_or(FsError::Invalid)?;
+                let transition_valid = if intent.kind == ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION {
+                    new.blocks_lo == old.blocks_lo.checked_add(sectors).ok_or(FsError::Invalid)?
+                        && new_size > start
+                } else {
+                    old.blocks_lo == new.blocks_lo.checked_add(sectors).ok_or(FsError::Invalid)?
+                        && new_size <= old_size
+                        && new_size <= start
+                };
+                if pointer >= self.block_size / 4
+                    || intent.physical == 0
+                    || old.block[EXT2_IND_BLOCK] == 0
+                    || !others_unchanged(None)
+                    || !transition_valid
+                {
+                    return Err(FsError::NotSupported);
+                }
+            }
             ZERO_INTENT_KIND_INODE_SHRINK => {
                 if old.block != new.block || old.blocks_lo != new.blocks_lo || new_size >= old_size
                 {
@@ -7606,7 +8073,16 @@ impl Ext2Fs {
             .map_err(|_| FsError::NoMem)?;
         pre_images.extend_from_slice(post_images);
 
-        let freeing = intent.kind == ZERO_INTENT_KIND_DIRECT_FREE;
+        let freeing = matches!(
+            intent.kind,
+            ZERO_INTENT_KIND_DIRECT_FREE
+                | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
+                | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
+        );
+        let with_mapping = matches!(
+            intent.kind,
+            ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
+        );
         match intent.kind {
             ZERO_INTENT_KIND_INODE_UPDATE | ZERO_INTENT_KIND_INODE_SHRINK => {
                 if overlay.len() != 1 || inode_entry.order != 0 {
@@ -7623,8 +8099,18 @@ impl Ext2Fs {
                     .ok_or(FsError::Invalid)?;
                 Self::replace_inode_in_block(pre, inode_target, &intent.old_inode)?;
             }
-            ZERO_INTENT_KIND_DIRECT_ALLOCATION | ZERO_INTENT_KIND_DIRECT_FREE => {
-                if overlay.len() != DIRECT_ALLOCATION_METADATA_BLOCKS {
+            ZERO_INTENT_KIND_DIRECT_ALLOCATION
+            | ZERO_INTENT_KIND_DIRECT_FREE
+            | ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION
+            | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
+            | ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION
+            | ZERO_INTENT_KIND_INDIRECT_DATA_FREE => {
+                let home_count = if with_mapping {
+                    INDIRECT_DATA_METADATA_BLOCKS
+                } else {
+                    DIRECT_ALLOCATION_METADATA_BLOCKS
+                };
+                if overlay.len() != home_count {
                     return Err(FsError::NotSupported);
                 }
                 let sb = *self.superblock.read();
@@ -7642,13 +8128,18 @@ impl Ext2Fs {
                     .copied()
                     .ok_or(FsError::Invalid)?;
                 let desc_target = self.group_desc_write_target(group)?;
-                let expected_homes = [
+                let mut expected_homes = [
                     desc.block_bitmap,
                     desc_target.block,
                     self.superblock_home_target().0,
                     inode_target.block,
+                    0,
                 ];
-                for order in 0..DIRECT_ALLOCATION_METADATA_BLOCKS {
+                if with_mapping {
+                    expected_homes[3] = intent.old_inode.block[EXT2_IND_BLOCK];
+                    expected_homes[4] = inode_target.block;
+                }
+                for order in 0..home_count {
                     let entry = overlay
                         .iter()
                         .find(|entry| entry.order as usize == order)
@@ -7656,6 +8147,43 @@ impl Ext2Fs {
                     if entry.home != expected_homes[order] {
                         return Err(FsError::NotSupported);
                     }
+                }
+                if with_mapping {
+                    // The pointer must hold exactly this intent's block after the
+                    // edit, and exactly nothing (or this block) before it.
+                    let pointer = usize::try_from(
+                        intent
+                            .file_block
+                            .checked_sub(EXT2_NDIR_BLOCKS as u32)
+                            .ok_or(FsError::Invalid)?,
+                    )
+                    .map_err(|_| FsError::Invalid)?;
+                    let mapping_entry = overlay
+                        .iter()
+                        .find(|entry| entry.order == 3)
+                        .ok_or(FsError::Invalid)?;
+                    let mapping = pre_images
+                        .get_mut(
+                            mapping_entry.image_offset
+                                ..mapping_entry
+                                    .image_offset
+                                    .checked_add(self.block_size as usize)
+                                    .ok_or(FsError::Invalid)?,
+                        )
+                        .ok_or(FsError::Invalid)?;
+                    let (after, before) = if freeing {
+                        (0, intent.physical)
+                    } else {
+                        (intent.physical, 0)
+                    };
+                    if read_u32_le(mapping, pointer)? != after {
+                        return Err(FsError::NotSupported);
+                    }
+                    let start = pointer.checked_mul(4).ok_or(FsError::Invalid)?;
+                    mapping
+                        .get_mut(start..start.checked_add(4).ok_or(FsError::Invalid)?)
+                        .ok_or(FsError::Invalid)?
+                        .copy_from_slice(&before.to_le_bytes());
                 }
 
                 let bitmap_entry = overlay
@@ -8372,7 +8900,8 @@ impl Ext2Fs {
                 ) => {}
                 None => {
                     // RF180-13 FIX: this implementation never journals file
-                    // data, directory data, or indirect mapping blocks.  Such
+                    // data or directory data, and journals a mapping block only
+                    // for the EXT2-MUT indirect data kinds below.  Other such
                     // homes have no bounded ownership proof at mount, so they
                     // are not replayed speculatively.  Newly published mapping
                     // trees are instead validated from their inode roots below.
@@ -8387,6 +8916,18 @@ impl Ext2Fs {
                     // (block array unchanged by Case-A create / in-place rename,
                     // so intent.old_inode agrees).
                     if let Some(intent) = intent {
+                        // EXT2-MUT: the single-indirect block named by the inode is
+                        // the one mapping block these kinds journal. Its ownership
+                        // follows from the inode, and the grammar pins the edit.
+                        if matches!(
+                            intent.kind,
+                            ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION
+                                | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
+                        ) && entry.home != 0
+                            && entry.home == intent.old_inode.block[EXT2_IND_BLOCK]
+                        {
+                            continue;
+                        }
                         if intent.kind == ZERO_INTENT_KIND_FILE_CREATE
                             || intent.kind == ZERO_INTENT_KIND_FILE_RENAME
                         {
@@ -8407,6 +8948,23 @@ impl Ext2Fs {
         }
         changed_bitmap_groups.sort_unstable();
         changed_bitmap_groups.dedup();
+
+        // EXT2-MUT: a root enters and leaves a file empty. Otherwise a commit could
+        // publish stale pointers, or a free could orphan the blocks they name.
+        if let Some(intent) = intent {
+            if matches!(
+                intent.kind,
+                ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
+            ) {
+                let root = self
+                    .validate_block(intent.physical)?
+                    .ok_or(FsError::Invalid)?;
+                self.read_virtual_block(journal, overlay, post_images, root, &mut scratch.control)?;
+                if scratch.control.block().iter().any(|byte| *byte != 0) {
+                    return Err(FsError::NotSupported);
+                }
+            }
+        }
 
         let original = *self.superblock.read();
         let (super_home, super_offset) = self.superblock_home_target();
@@ -8770,7 +9328,16 @@ impl Ext2Fs {
                     {
                         return Err(FsError::Invalid);
                     }
-                    if changed && old_physical != physical && (old_physical != 0 || physical == 0) {
+                    let root_freed = physical == 0
+                        && index == EXT2_IND_BLOCK
+                        && intent.is_some_and(|intent| {
+                            intent.kind == ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
+                        });
+                    if changed
+                        && !root_freed
+                        && old_physical != physical
+                        && (old_physical != 0 || physical == 0)
+                    {
                         return Err(FsError::NotSupported);
                     }
                     if physical == 0 {
@@ -8963,6 +9530,18 @@ impl Ext2Fs {
             && metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS as u8
             && file_block < EXT2_NDIR_BLOCKS as u32
             && physical != 0;
+        let valid_root = matches!(
+            kind,
+            ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
+        ) && metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS as u8
+            && file_block == EXT2_IND_BLOCK as u32
+            && physical != 0;
+        let valid_indirect = matches!(
+            kind,
+            ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
+        ) && metadata_count == INDIRECT_DATA_METADATA_BLOCKS as u8
+            && file_block >= EXT2_NDIR_BLOCKS as u32
+            && physical != 0;
         let valid_file_create = kind == ZERO_INTENT_KIND_FILE_CREATE
             && (metadata_count == 5 || metadata_count == 6)
             && file_block == u32::MAX
@@ -8979,7 +9558,12 @@ impl Ext2Fs {
             && rename_rec_len >= size_of::<Ext2DirEntryHead>() as u16
             && rename_old_name_len > 0;
         if inode_number == 0
-            || (!valid_update && !valid_direct && !valid_file_create && !valid_file_rename)
+            || (!valid_update
+                && !valid_direct
+                && !valid_root
+                && !valid_indirect
+                && !valid_file_create
+                && !valid_file_rename)
         {
             return Err(FsError::Invalid);
         }
@@ -10024,8 +10608,39 @@ impl Ext2Fs {
         self.write_physical_block(home, scratch.block())
     }
 
-    fn metadata_home_block(&self, plan: JournalMetadataPlan, index: usize) -> Result<u32, FsError> {
+    /// EXT2-MUT: the indirect kinds share the direct kinds' bitmap, count and inode
+    /// edits. Only the mapping-block home (`None` here) has its own image.
+    fn delegated_block_plan(
+        plan: JournalMetadataPlan,
+        index: usize,
+    ) -> Option<(JournalMetadataPlan, usize)> {
         match plan {
+            JournalMetadataPlan::IndirectRootAllocation(plan) => {
+                Some((JournalMetadataPlan::DirectAllocation(plan), index))
+            }
+            JournalMetadataPlan::IndirectRootFree(plan) => {
+                Some((JournalMetadataPlan::DirectFree(plan), index))
+            }
+            JournalMetadataPlan::IndirectData { plan, freeing } if index != 3 => {
+                let direct = if freeing {
+                    JournalMetadataPlan::DirectFree(plan.block)
+                } else {
+                    JournalMetadataPlan::DirectAllocation(plan.block)
+                };
+                Some((direct, if index == 4 { 3 } else { index }))
+            }
+            _ => None,
+        }
+    }
+
+    fn metadata_home_block(&self, plan: JournalMetadataPlan, index: usize) -> Result<u32, FsError> {
+        if let Some((plan, index)) = Self::delegated_block_plan(plan, index) {
+            return self.metadata_home_block(plan, index);
+        }
+        match plan {
+            JournalMetadataPlan::IndirectData { plan, .. } => Ok(plan.mapping_block),
+            JournalMetadataPlan::IndirectRootAllocation(_)
+            | JournalMetadataPlan::IndirectRootFree(_) => Err(FsError::Invalid),
             JournalMetadataPlan::DirectAllocation(plan) | JournalMetadataPlan::DirectFree(plan) => {
                 match index {
                     0 => Ok(plan.bitmap_block),
@@ -10070,11 +10685,24 @@ impl Ext2Fs {
         index: usize,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<u32, FsError> {
+        if let Some((plan, index)) = Self::delegated_block_plan(plan, index) {
+            return self.build_metadata_image(plan, index, scratch);
+        }
         let home = self.metadata_home_block(plan, index)?;
         self.read_physical_block(home, scratch.block_mut())?;
         let block = scratch.block_mut();
         let freeing = matches!(plan, JournalMetadataPlan::DirectFree(_));
         match plan {
+            JournalMetadataPlan::IndirectData { plan, freeing } => {
+                let after = if freeing { 0 } else { plan.block.phys_block };
+                let end = plan.pointer_offset.checked_add(4).ok_or(FsError::Invalid)?;
+                block
+                    .get_mut(plan.pointer_offset..end)
+                    .ok_or(FsError::Invalid)?
+                    .copy_from_slice(&after.to_le_bytes());
+            }
+            JournalMetadataPlan::IndirectRootAllocation(_)
+            | JournalMetadataPlan::IndirectRootFree(_) => return Err(FsError::Invalid),
             JournalMetadataPlan::DirectAllocation(plan) | JournalMetadataPlan::DirectFree(plan) => {
                 match index {
                     0 => {
@@ -10315,8 +10943,17 @@ impl Ext2Fs {
         if post_image.len() != self.block_size as usize {
             return Err(FsError::Invalid);
         }
+        if let Some((plan, index)) = Self::delegated_block_plan(plan, index) {
+            return self.metadata_preimage_hash(plan, index, post_image);
+        }
         let freeing = matches!(plan, JournalMetadataPlan::DirectFree(_));
         match plan {
+            JournalMetadataPlan::IndirectData { plan, freeing } => {
+                let before = if freeing { plan.block.phys_block } else { 0 };
+                Self::hash_block_replacement(post_image, plan.pointer_offset, &before.to_le_bytes())
+            }
+            JournalMetadataPlan::IndirectRootAllocation(_)
+            | JournalMetadataPlan::IndirectRootFree(_) => Err(FsError::Invalid),
             JournalMetadataPlan::DirectAllocation(plan) | JournalMetadataPlan::DirectFree(plan) => {
                 match index {
                     0 => {
@@ -10517,10 +11154,40 @@ impl Ext2Fs {
         plan: JournalMetadataPlan,
         preimage_hashes: [[u8; 32]; JOURNAL_MAX_METADATA_BLOCKS],
     ) -> JournalCommitIntent {
-        let block_kind = if matches!(plan, JournalMetadataPlan::DirectFree(_)) {
-            ZERO_INTENT_KIND_DIRECT_FREE
-        } else {
-            ZERO_INTENT_KIND_DIRECT_ALLOCATION
+        let block_kind = match plan {
+            JournalMetadataPlan::DirectFree(_) => ZERO_INTENT_KIND_DIRECT_FREE,
+            JournalMetadataPlan::IndirectRootAllocation(_) => {
+                ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION
+            }
+            JournalMetadataPlan::IndirectRootFree(_) => ZERO_INTENT_KIND_INDIRECT_ROOT_FREE,
+            JournalMetadataPlan::IndirectData { freeing: true, .. } => {
+                ZERO_INTENT_KIND_INDIRECT_DATA_FREE
+            }
+            JournalMetadataPlan::IndirectData { freeing: false, .. } => {
+                ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION
+            }
+            _ => ZERO_INTENT_KIND_DIRECT_ALLOCATION,
+        };
+        let plan = match plan {
+            JournalMetadataPlan::IndirectData { plan, .. } => {
+                let mut intent = Self::intent_for_plan(
+                    JournalMetadataPlan::DirectAllocation(plan.block),
+                    preimage_hashes,
+                );
+                intent.kind = block_kind;
+                intent.metadata_count = INDIRECT_DATA_METADATA_BLOCKS as u8;
+                return intent;
+            }
+            JournalMetadataPlan::IndirectRootAllocation(plan)
+            | JournalMetadataPlan::IndirectRootFree(plan) => {
+                let mut intent = Self::intent_for_plan(
+                    JournalMetadataPlan::DirectAllocation(plan),
+                    preimage_hashes,
+                );
+                intent.kind = block_kind;
+                return intent;
+            }
+            plan => plan,
         };
         let inode_kind = if matches!(plan, JournalMetadataPlan::InodeShrink { .. }) {
             ZERO_INTENT_KIND_INODE_SHRINK
@@ -10587,6 +11254,11 @@ impl Ext2Fs {
                 rename_old_name_len: 0,
                 rename_old_name: [0; 255],
             },
+            JournalMetadataPlan::IndirectRootAllocation(_)
+            | JournalMetadataPlan::IndirectRootFree(_)
+            | JournalMetadataPlan::IndirectData { .. } => {
+                unreachable!("indirect intents return above")
+            }
             JournalMetadataPlan::Rename(plan) => JournalCommitIntent {
                 kind: ZERO_INTENT_KIND_FILE_RENAME,
                 metadata_count: 2,
@@ -10689,31 +11361,34 @@ impl Ext2Fs {
         Ok(())
     }
 
-    /// EXT2-MUT: plan freeing direct block `file_block`, the inverse of
-    /// `plan_direct_allocation`. Every value is proved before the plan exists,
-    /// so a corrupt pointer or bitmap cannot reach the journal.
+    /// EXT2-MUT: plan freeing `phys_block`, the inverse of `plan_direct_allocation`.
+    /// `inode_pointer` names the inode slot to clear, if the block hangs off the
+    /// inode. Every value is proved before the plan exists, so a corrupt pointer or
+    /// bitmap cannot reach the journal.
     fn plan_direct_free(
         &self,
         inode_number: u32,
         committed_raw: &Ext2InodeRaw,
         mut next_raw: Ext2InodeRaw,
         file_block: u32,
+        inode_pointer: Option<usize>,
+        phys_block: u32,
         inode_target: InodeWriteTarget,
         journal: &Ext2Journal,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<DirectAllocationPlan, FsError> {
-        let index = usize::try_from(file_block).map_err(|_| FsError::Invalid)?;
-        if index >= EXT2_NDIR_BLOCKS {
-            return Err(FsError::NotSupported);
-        }
-        let phys_block = committed_raw.block[index];
         if self.validate_block(phys_block)?.is_none()
             || journal.contains_physical(phys_block)
             || self.is_structural_metadata_block(phys_block)?
         {
             return Err(FsError::Invalid);
         }
-        next_raw.block[index] = 0;
+        if let Some(pointer) = inode_pointer {
+            if pointer >= next_raw.block.len() || committed_raw.block[pointer] != phys_block {
+                return Err(FsError::Invalid);
+            }
+            next_raw.block[pointer] = 0;
+        }
         next_raw.blocks_lo = committed_raw
             .blocks_lo
             .checked_sub(self.block_size / 512)
@@ -10806,18 +11481,62 @@ impl Ext2Fs {
         Ok(plan)
     }
 
+    /// EXT2-MUT: file blocks reachable through direct and single-indirect pointers.
+    /// Allocation and truncate stop here; double-indirect stays read-only.
+    fn single_indirect_block_limit(&self) -> u64 {
+        EXT2_NDIR_BLOCKS as u64 + (self.block_size / 4) as u64
+    }
+
+    /// EXT2-MUT: wrap a block plan with the mapping-block edit. An indirect data
+    /// transaction is one home larger than the smallest journal must hold, so a
+    /// journal too small for it refuses before anything is written.
+    fn indirect_data_plan(
+        &self,
+        block: DirectAllocationPlan,
+        mapping_block: u32,
+        journal: &Ext2Journal,
+    ) -> Result<IndirectDataPlan, FsError> {
+        let blocks = INDIRECT_DATA_METADATA_BLOCKS as u32 + 2;
+        if journal
+            .first
+            .checked_add(blocks)
+            .is_none_or(|end| end > journal.max_len)
+        {
+            return Err(FsError::NotSupported);
+        }
+        if journal.contains_physical(mapping_block)
+            || self.is_structural_metadata_block(mapping_block)?
+            || mapping_block == block.phys_block
+        {
+            return Err(FsError::Invalid);
+        }
+        let pointer = block
+            .file_block
+            .checked_sub(EXT2_NDIR_BLOCKS as u32)
+            .filter(|pointer| *pointer < self.block_size / 4)
+            .ok_or(FsError::NotSupported)?;
+        Ok(IndirectDataPlan {
+            block,
+            mapping_block,
+            pointer_offset: usize::try_from(pointer).map_err(|_| FsError::Invalid)? * 4,
+        })
+    }
+
     fn plan_direct_allocation(
         &self,
         inode_number: u32,
         committed_raw: &Ext2InodeRaw,
         mut next_raw: Ext2InodeRaw,
         file_block: u32,
+        inode_pointer: Option<usize>,
         inode_target: InodeWriteTarget,
         journal: &Ext2Journal,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<DirectAllocationPlan, FsError> {
-        if file_block >= EXT2_NDIR_BLOCKS as u32 || committed_raw.block[file_block as usize] != 0 {
-            return Err(FsError::NotSupported);
+        if let Some(pointer) = inode_pointer {
+            if pointer >= committed_raw.block.len() || committed_raw.block[pointer] != 0 {
+                return Err(FsError::NotSupported);
+            }
         }
         next_raw.blocks_lo = committed_raw
             .blocks_lo
@@ -10917,7 +11636,9 @@ impl Ext2Fs {
                         .free_blocks_count
                         .checked_sub(1)
                         .ok_or(FsError::Invalid)?;
-                    next_raw.block[file_block as usize] = phys_block;
+                    if let Some(pointer) = inode_pointer {
+                        next_raw.block[pointer] = phys_block;
+                    }
 
                     let plan = DirectAllocationPlan {
                         inode_number,
@@ -13018,9 +13739,9 @@ impl Ext2Inode {
         }
     }
 
-    /// EXT2-MUT slice 1: set the file size, for files held entirely in direct
-    /// blocks. Files with mapping blocks, or a size past the direct range, return
-    /// `NotSupported` until the indirect slice.
+    /// EXT2-MUT: set the file size, for files held in direct and single-indirect
+    /// blocks. A double- or triple-indirect root, or a size past that range, returns
+    /// `NotSupported`.
     ///
     /// Shrinking frees one block per transaction, highest first, lowering the size
     /// past each block before it leaves the bitmap. A crash therefore leaves a
@@ -13056,13 +13777,16 @@ impl Ext2Inode {
         }
 
         let block_size = fs.block_size as u64;
-        let direct_limit = EXT2_NDIR_BLOCKS as u64 * block_size;
+        let size_limit = fs
+            .single_indirect_block_limit()
+            .checked_mul(block_size)
+            .ok_or(FsError::Invalid)?;
         let old_size = self.size.load(Ordering::Acquire);
-        if raw_guard.block[EXT2_NDIR_BLOCKS..]
+        if raw_guard.block[EXT2_DIND_BLOCK..]
             .iter()
             .any(|block| *block != 0)
-            || old_size > direct_limit
-            || new_size > direct_limit
+            || old_size > size_limit
+            || new_size > size_limit
         {
             return Err(FsError::NotSupported);
         }
@@ -13131,6 +13855,108 @@ impl Ext2Inode {
 
         let first_freed =
             usize::try_from(new_size.div_ceil(block_size)).map_err(|_| FsError::Invalid)?;
+
+        // Empty the mapping block from the top, then free it once nothing below the
+        // new size needs it. Each step stays a consistent, shorter file.
+        let mapping_block = raw_guard.block[EXT2_IND_BLOCK];
+        if mapping_block != 0 {
+            let pointers = (fs.block_size / 4) as usize;
+            loop {
+                fs.read_block(mapping_block, scratch.block_mut())?;
+                let mut highest = None;
+                for pointer in (0..pointers).rev() {
+                    let physical = read_u32_le(scratch.block(), pointer)?;
+                    if physical != 0 {
+                        highest = Some((pointer, physical));
+                        break;
+                    }
+                }
+                let Some((pointer, physical)) =
+                    highest.filter(|(pointer, _)| EXT2_NDIR_BLOCKS + *pointer >= first_freed)
+                else {
+                    let mapping_empty = highest.is_none();
+                    if mapping_empty && first_freed <= EXT2_NDIR_BLOCKS {
+                        let committed_raw = *raw_guard;
+                        let current_size = self.size.load(Ordering::Acquire);
+                        let step_size = current_size
+                            .min(EXT2_NDIR_BLOCKS as u64 * block_size)
+                            .max(new_size);
+                        let journal = journal_guard.as_ref().ok_or(FsError::ReadOnly)?;
+                        let plan = fs.plan_direct_free(
+                            self.ino,
+                            &committed_raw,
+                            stamped(&committed_raw, step_size),
+                            EXT2_IND_BLOCK as u32,
+                            Some(EXT2_IND_BLOCK),
+                            mapping_block,
+                            inode_target,
+                            journal,
+                            &mut scratch,
+                        )?;
+                        let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+                        let result = fs.commit_metadata_transaction(
+                            journal,
+                            JournalMetadataPlan::IndirectRootFree(plan),
+                            &mut scratch,
+                        );
+                        if !result.as_ref().is_err_and(|failure| !failure.committed) {
+                            *fs.superblock.write() = plan.new_superblock;
+                            fs.group_descs.write()[plan.group] = plan.new_group_desc;
+                        }
+                        self.finish_truncate_step(
+                            &fs,
+                            &mut raw_guard,
+                            plan.new_inode,
+                            current_size,
+                            step_size,
+                            result,
+                        )?;
+                    }
+                    break;
+                };
+                let file_block = EXT2_NDIR_BLOCKS + pointer;
+                let committed_raw = *raw_guard;
+                let current_size = self.size.load(Ordering::Acquire);
+                let step_size = current_size
+                    .min(file_block as u64 * block_size)
+                    .max(new_size);
+                let journal = journal_guard.as_ref().ok_or(FsError::ReadOnly)?;
+                let block = fs.plan_direct_free(
+                    self.ino,
+                    &committed_raw,
+                    stamped(&committed_raw, step_size),
+                    file_block as u32,
+                    None,
+                    physical,
+                    inode_target,
+                    journal,
+                    &mut scratch,
+                )?;
+                let plan = fs.indirect_data_plan(block, mapping_block, journal)?;
+                let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+                let result = fs.commit_metadata_transaction(
+                    journal,
+                    JournalMetadataPlan::IndirectData {
+                        plan,
+                        freeing: true,
+                    },
+                    &mut scratch,
+                );
+                if !result.as_ref().is_err_and(|failure| !failure.committed) {
+                    *fs.superblock.write() = block.new_superblock;
+                    fs.group_descs.write()[block.group] = block.new_group_desc;
+                }
+                self.finish_truncate_step(
+                    &fs,
+                    &mut raw_guard,
+                    block.new_inode,
+                    current_size,
+                    step_size,
+                    result,
+                )?;
+            }
+        }
+
         for index in (first_freed..EXT2_NDIR_BLOCKS).rev() {
             let committed_raw = *raw_guard;
             if committed_raw.block[index] == 0 {
@@ -13144,6 +13970,8 @@ impl Ext2Inode {
                 &committed_raw,
                 stamped(&committed_raw, step_size),
                 index as u32,
+                Some(index),
+                committed_raw.block[index],
                 inode_target,
                 journal,
                 &mut scratch,
@@ -13305,7 +14133,7 @@ impl Ext2Inode {
                     }
                     Ok(true)
                 }
-                None => Ok(journaled && file_block < EXT2_NDIR_BLOCKS as u32),
+                None => Ok(journaled && (file_block as u64) < fs.single_indirect_block_limit()),
             },
         )?;
         let sparse_gap = fs.preflight_sparse_gap(
@@ -13407,20 +14235,75 @@ impl Ext2Inode {
                 continue;
             }
 
-            // Preflight permits a hole only when it is direct and an internal
-            // journal is present. Both conditions remain stable under the
-            // inode, metadata, and journal locks held for this mutation.
+            // Preflight permits a hole only when it is direct or single-indirect
+            // and an internal journal is present. Both conditions remain stable
+            // under the inode, metadata, and journal locks held for this mutation.
             let Some(journal) = journal_guard.as_mut() else {
                 return fail(FsError::NotSupported, written);
             };
-            if file_block >= EXT2_NDIR_BLOCKS as u32 {
+            if (file_block as u64) >= fs.single_indirect_block_limit() {
                 return fail(FsError::NotSupported, written);
             }
+            let indirect = file_block >= EXT2_NDIR_BLOCKS as u32;
+            if indirect && committed_raw.block[EXT2_IND_BLOCK] == 0 {
+                // Attach an empty mapping block in its own transaction. A crash
+                // here leaves a file that owns one empty block, which is consistent
+                // and which the next attempt simply reuses.
+                let mut root_raw = next_raw;
+                root_raw.size_lo = committed_raw.size_lo;
+                root_raw.size_high_or_dir_acl = committed_raw.size_high_or_dir_acl;
+                let plan = match fs.plan_direct_allocation(
+                    self.ino,
+                    &committed_raw,
+                    root_raw,
+                    EXT2_IND_BLOCK as u32,
+                    Some(EXT2_IND_BLOCK),
+                    inode_target,
+                    journal,
+                    &mut scratch,
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => return fail(error, written),
+                };
+                scratch.block_mut().fill(0);
+                if let Err(error) = fs
+                    .write_block(plan.phys_block, scratch.block())
+                    .and_then(|()| fs.flush_device())
+                {
+                    return fail(error, written);
+                }
+                let transaction_failure = match fs.commit_metadata_transaction(
+                    journal,
+                    JournalMetadataPlan::IndirectRootAllocation(plan),
+                    &mut scratch,
+                ) {
+                    Ok(()) => None,
+                    Err(failure) if failure.committed => Some(failure),
+                    Err(failure) => {
+                        if failure.poison {
+                            fs.io_faulted.store(true, Ordering::Release);
+                        }
+                        return fail(failure.error, written);
+                    }
+                };
+                *fs.superblock.write() = plan.new_superblock;
+                fs.group_descs.write()[plan.group] = plan.new_group_desc;
+                *raw_guard = plan.new_inode;
+                if let Some(failure) = transaction_failure {
+                    if failure.poison {
+                        fs.io_faulted.store(true, Ordering::Release);
+                    }
+                    return fail(failure.error, written);
+                }
+                continue;
+            }
+            let inode_pointer = (!indirect).then_some(file_block as usize);
             let plan = match fs.plan_direct_allocation(
                 self.ino,
                 &committed_raw,
                 next_raw,
                 file_block,
+                inode_pointer,
                 inode_target,
                 journal,
                 &mut scratch,
@@ -13429,7 +14312,17 @@ impl Ext2Inode {
                 Err(error) => return fail(error, written),
             };
             debug_assert_eq!(plan.file_block, file_block);
-            debug_assert_eq!(plan.new_inode.block[file_block as usize], plan.phys_block);
+            let metadata_plan = if indirect {
+                match fs.indirect_data_plan(plan, committed_raw.block[EXT2_IND_BLOCK], journal) {
+                    Ok(plan) => JournalMetadataPlan::IndirectData {
+                        plan,
+                        freeing: false,
+                    },
+                    Err(error) => return fail(error, written),
+                }
+            } else {
+                JournalMetadataPlan::DirectAllocation(plan)
+            };
 
             // Ordered-data rule: initialize and durably flush the complete new
             // block before any metadata transaction can make it reachable.
@@ -13444,20 +14337,17 @@ impl Ext2Inode {
                 return fail(error, written);
             }
 
-            let transaction_failure = match fs.commit_metadata_transaction(
-                journal,
-                JournalMetadataPlan::DirectAllocation(plan),
-                &mut scratch,
-            ) {
-                Ok(()) => None,
-                Err(failure) if failure.committed => Some(failure),
-                Err(failure) => {
-                    if failure.poison {
-                        fs.io_faulted.store(true, Ordering::Release);
+            let transaction_failure =
+                match fs.commit_metadata_transaction(journal, metadata_plan, &mut scratch) {
+                    Ok(()) => None,
+                    Err(failure) if failure.committed => Some(failure),
+                    Err(failure) => {
+                        if failure.poison {
+                            fs.io_faulted.store(true, Ordering::Release);
+                        }
+                        return fail(failure.error, written);
                     }
-                    return fail(failure.error, written);
-                }
-            };
+                };
 
             // The commit is durable at this point even when checkpoint or log
             // clearing subsequently failed. Publish exactly the state recovery

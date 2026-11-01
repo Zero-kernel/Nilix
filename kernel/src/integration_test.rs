@@ -544,6 +544,30 @@ pub fn test_ext2_write() {
                                 assert_eq!(cached, *b"J\0\0");
                                 alloc_file.inode.truncate(1).expect("EXT2-MUT restore");
                                 klog_always!("    EXT2-MUT production truncate path passed");
+
+                                // EXT2-MUT: past the direct range on the real image,
+                                // through a mapping block and back. Sixteen 1-page
+                                // writes are what the combined stress profile needs.
+                                let page = [0x4Du8; 4096];
+                                for index in 0..16u64 {
+                                    assert_eq!(
+                                        alloc_file.inode.write_at(index * 4096, &page),
+                                        Ok(4096),
+                                        "EXT2-MUT indirect write"
+                                    );
+                                }
+                                let mut tail = [0u8; 4096];
+                                assert_eq!(
+                                    alloc_file.inode.read_at(15 * 4096, &mut tail),
+                                    Ok(4096)
+                                );
+                                assert_eq!(tail, page);
+                                alloc_file
+                                    .inode
+                                    .truncate(1)
+                                    .expect("EXT2-MUT indirect shrink");
+                                assert_eq!(alloc_file.inode.write_at(0, b"J"), Ok(1));
+                                klog_always!("    EXT2-MUT production indirect path passed");
                             }
                             Err(e) => {
                                 klog_always!(
