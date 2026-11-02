@@ -517,6 +517,14 @@ pub fn test_ext2_write() {
                                     probe_size <= 1,
                                     "production allocation probe must be empty or hold its own byte"
                                 );
+                                if probe_size == 1 {
+                                    let mut previous = [0u8; 1];
+                                    assert_eq!(alloc_file.inode.read_at(0, &mut previous), Ok(1));
+                                    assert_eq!(
+                                        previous, *b"J",
+                                        "production allocation probe lost its committed byte"
+                                    );
+                                }
                                 assert_eq!(
                                     alloc_file.write(b"J"),
                                     Ok(1),
