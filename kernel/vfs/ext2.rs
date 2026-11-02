@@ -5815,12 +5815,12 @@ pub fn run_ext2_create_self_test() {
 
     let mut sealed_namespace_kinds = [false; 4];
 
-    // A dangling name must not become an alias when its free inode is reused.
-    {
+    // A dangling/out-of-range name must not alias a reused inode or panic.
+    for dangling in [11u32, 17, u32::MAX] {
         let mut image = build_image();
         let directory = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
         directory[16..18].copy_from_slice(&12u16.to_le_bytes());
-        directory[24..28].copy_from_slice(&11u32.to_le_bytes());
+        directory[24..28].copy_from_slice(&dangling.to_le_bytes());
         directory[28..30].copy_from_slice(&((BLOCK_SIZE - 24) as u16).to_le_bytes());
         directory[30] = 5;
         directory[31] = EXT2_FT_REG_FILE;

@@ -1165,6 +1165,9 @@ impl Ext2Fs {
             return Ok(());
         }
         let is_orphan = orphans.binary_search(&ino).is_ok();
+        let inode_count = self
+            .read_virtual_superblock(journal, overlay, images, scratch)?
+            .inodes_count;
         let mut bitmap = Ext2MutationScratch::try_new_admitted(self.block_size)?;
         let mut bitmap_home = None;
         if is_orphan && raw.size_lo == 0 {
@@ -1202,13 +1205,28 @@ impl Ext2Fs {
                         return Err(FsError::Invalid);
                     }
                     if !is_orphan {
+                        if child > inode_count {
+                            return Err(FsError::Invalid);
+                        }
                         let (group, bit) = self.inode_group_index(child).ok_or(FsError::Invalid)?;
-                        let home = self.group_descs.read()[group].inode_bitmap;
+                        let home = self
+                            .group_descs
+                            .read()
+                            .get(group)
+                            .ok_or(FsError::Invalid)?
+                            .inode_bitmap;
                         if bitmap_home != Some(home) {
                             self.read_virtual_block(journal, overlay, images, home, &mut bitmap)?;
                             bitmap_home = Some(home);
                         }
-                        if bitmap.block()[bit / 8] & (1 << (bit % 8)) == 0 {
+                        if bitmap
+                            .block()
+                            .get(bit / 8)
+                            .copied()
+                            .ok_or(FsError::Invalid)?
+                            & (1 << (bit % 8))
+                            == 0
+                        {
                             return Err(FsError::Invalid);
                         }
                     }
