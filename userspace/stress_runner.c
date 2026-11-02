@@ -1575,8 +1575,8 @@ static ThreadRoundReport run_thread_round(uint64_t seq) {
 
 /*
  * Each record fills one page: magic, run id, generation and slot, a payload
- * derived from the seed, then a SHA-256 over everything before it. A torn or
- * stale page cannot verify. Generation g lives in slot g % io_slots, which is
+ * derived from the seed, then a SHA-256 over everything before it. A torn page
+ * cannot verify. Generation g lives in slot g % io_slots, which is
  * the rotation the host validator requires. BLOCK_COMMIT is printed only after
  * fsync returned, so the host can hold the recovery boot to every commit it saw.
  */
@@ -1588,6 +1588,8 @@ static ThreadRoundReport run_thread_round(uint64_t seq) {
 typedef struct {
     uint32_t valid_slots;
     uint32_t invalid_slots;
+    uint32_t invalid_slot;
+    uint64_t min_generation;
     uint64_t max_generation;
     uint64_t max_checksum;
 } BlockScan;
@@ -1681,6 +1683,7 @@ static uint64_t block_commit(uint64_t generation) {
 static void block_scan(BlockScan *scan) {
     static uint8_t record[PAGE_BYTES];
     memset(scan, 0, sizeof(*scan));
+    scan->min_generation = UINT64_MAX;
     for (uint32_t slot = 0; slot < config.io_slots; ++slot) {
         const off_t offset = (off_t)((size_t)slot * PAGE_BYTES);
         size_t got = 0;
@@ -1702,13 +1705,30 @@ static void block_scan(BlockScan *scan) {
         uint64_t checksum = 0;
         if (got == PAGE_BYTES && block_verify_record(record, slot, &generation, &checksum)) {
             scan->valid_slots += 1u;
+            if (generation < scan->min_generation) {
+                scan->min_generation = generation;
+            }
             if (generation > scan->max_generation) {
                 scan->max_generation = generation;
                 scan->max_checksum = checksum;
             }
         } else {
             scan->invalid_slots += 1u;
+            scan->invalid_slot = slot;
         }
+    }
+    /* A valid digest alone also admits a page from an older rotation. Every
+     * surviving slot must belong to the latest io_slots generations. Slot
+     * identity was checked above, so this range uniquely fixes each generation.
+     * Only the next slot may be torn by the single in-flight write at crash. */
+    if (scan->max_generation < config.io_slots ||
+        scan->min_generation <= scan->max_generation - config.io_slots) {
+        fail("block_stale_record", 0, scan->min_generation);
+    }
+    if (scan->invalid_slots > 1u ||
+        (scan->invalid_slots == 1u &&
+         scan->invalid_slot != (scan->max_generation + 1u) % config.io_slots)) {
+        fail("block_lost_record", 0, scan->invalid_slot);
     }
 }
 
