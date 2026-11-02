@@ -178,6 +178,71 @@ impl TreeCursor {
 }
 
 impl Ext2Fs {
+    pub(super) fn mapping_usage_after(&self, delta: i8) -> Result<usize, FsError> {
+        let current = self.mapping_bytes.load(Ordering::Acquire);
+        let bytes = self.block_size as usize;
+        match delta {
+            1 => current
+                .checked_add(bytes)
+                .filter(|next| *next <= MAX_OWNERSHIP_MAPPING_BYTES)
+                .ok_or(FsError::NoSpace),
+            -1 => current.checked_sub(bytes).ok_or(FsError::Invalid),
+            0 => Ok(current),
+            _ => Err(FsError::Invalid),
+        }
+    }
+
+    /// Full ownership admission accounts for every allocated bitmap bit.
+    /// Preserve its reference limit as runtime allocation consumes free space.
+    pub(super) fn check_allocation_budget(&self, blocks: u32) -> Result<(), FsError> {
+        let sb = self.superblock.read();
+        let free_floor = sb
+            .blocks_count
+            .checked_sub(sb.first_data_block)
+            .ok_or(FsError::Invalid)?
+            .saturating_sub(MAX_OWNERSHIP_REFERENCES as u32);
+        sb.free_blocks_count
+            .checked_sub(blocks)
+            .filter(|remaining| *remaining >= free_floor)
+            .ok_or(FsError::NoSpace)?;
+        Ok(())
+    }
+
+    /// Check the complete missing path, including its data leaf, before any
+    /// sparse-gap zeroing or mapping initialization. The metadata lock keeps
+    /// these budgets stable through allocation and publication.
+    pub(super) fn check_tree_allocation_budget(
+        &self,
+        raw: &Ext2InodeRaw,
+        logical: u32,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<(), FsError> {
+        let path = self.block_path(logical)?;
+        let mut physical = raw.block[path.root];
+        let mut missing = 0;
+        for hop in 0..path.depth {
+            if physical == 0 {
+                missing = usize::from(path.depth - hop);
+                break;
+            }
+            self.read_block(physical, scratch.block_mut())?;
+            physical = read_u32_le(scratch.block(), path.indices[usize::from(hop)])?;
+        }
+        if physical == 0 {
+            self.mapping_bytes
+                .load(Ordering::Acquire)
+                .checked_add(missing * self.block_size as usize)
+                .filter(|next| *next <= MAX_OWNERSHIP_MAPPING_BYTES)
+                .ok_or(FsError::NoSpace)?;
+            let blocks = missing as u32 + 1;
+            self.check_allocation_budget(blocks)?;
+            raw.blocks_lo
+                .checked_add(blocks * (self.block_size / 512))
+                .ok_or(FsError::Invalid)?;
+        }
+        Ok(())
+    }
+
     /// Writers and recovery must admit the same live parent shape. Reject
     /// malformed directories before publishing an intent recovery would refuse.
     pub(super) fn check_directory_shape(&self, raw: &Ext2InodeRaw) -> Result<(), FsError> {
@@ -545,6 +610,7 @@ impl Ext2Fs {
         journal: &mut Ext2Journal,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), FsError> {
+        self.check_tree_allocation_budget(raw, logical, scratch)?;
         let path = self.block_path(logical)?;
         let target = self.inode_write_target(inode.ino)?;
         let p = u64::from(self.block_size / 4);
@@ -556,6 +622,9 @@ impl Ext2Fs {
             if edge.physical != 0 {
                 continue;
             }
+            // Reject before even initializing the still-unallocated block.
+            // The commit path rechecks and publishes the same budget delta.
+            self.mapping_usage_after(1)?;
             let mut next = *raw;
             next.mtime = TimeSpec::now().sec as u32;
             next.ctime = next.mtime;

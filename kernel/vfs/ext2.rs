@@ -18,7 +18,7 @@ use block::BlockDevice;
 use core::any::Any;
 use core::cmp;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use kernel_core::FileDescriptor;
 use kernel_crypto::sha256::Sha256;
 use mm::{
@@ -591,6 +591,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
             journal: Mutex::new(None),
             resize_reserved_blocks: RwLock::new(Vec::new()),
             io_faulted: AtomicBool::new(false),
+            mapping_bytes: AtomicUsize::new(0),
             self_ref: Mutex::new(None),
         })
         .expect("trace ext2 filesystem");
@@ -3146,6 +3147,10 @@ pub fn run_ext2_journal_transaction_self_test() {
         assert_eq!(raw.size_lo as usize, size);
         assert_eq!(raw.block[EXT2_DIND_BLOCK], 0);
         assert_eq!(raw.block[EXT2_TIND_BLOCK], 0);
+        assert_eq!(
+            fs.mapping_bytes.load(Ordering::Acquire),
+            usize::from(raw.block[EXT2_IND_BLOCK] != 0) * BLOCK_SIZE
+        );
         let mut owned = Vec::new();
         owned.try_reserve_exact(16).expect("owned blocks");
         owned.extend(
@@ -3257,7 +3262,82 @@ pub fn run_ext2_journal_transaction_self_test() {
             assert_eq!(file.stat().unwrap().size, offset + 1);
             drop((file, fs, device));
         }
-        for logical in [12 + p, 12 + p + p * p, 12 + p + p * p + p + 1] {
+        // Simulate headroom already used by other admitted inodes. At the
+        // limit, an overwrite still works; a new branch must fail before even
+        // zeroing the old partial EOF block. Freeing restores the headroom.
+        for (logical, depth) in [(12, 1), (12 + p, 2), (12 + p + p * p, 3)] {
+            let (device, fs, file) = mount_image(empty.to_vec());
+            let baseline = MAX_OWNERSHIP_MAPPING_BYTES - depth * BLOCK_SIZE;
+            let offset = logical * BLOCK_SIZE as u64 + 17;
+            // One remaining mapping block cannot fund a complete triple path.
+            // Do not commit even an empty ancestor before reporting exhaustion.
+            if depth == 3 {
+                fs.mapping_bytes
+                    .store(MAX_OWNERSHIP_MAPPING_BYTES - BLOCK_SIZE, Ordering::Release);
+                let before = device.durable_snapshot();
+                device.arm(0, 0);
+                assert_eq!(file.write_at(offset, b"deep"), Err(FsError::NoSpace));
+                assert_eq!(device.operation.load(Ordering::Acquire), 0);
+                assert_eq!(device.durable_snapshot(), before);
+                assert_eq!(
+                    fs.mapping_bytes.load(Ordering::Acquire),
+                    MAX_OWNERSHIP_MAPPING_BYTES - BLOCK_SIZE
+                );
+                assert!(!fs.io_faulted.load(Ordering::Acquire));
+            }
+            fs.mapping_bytes.store(baseline, Ordering::Release);
+            assert_eq!(file.write_at(offset, b"deep"), Ok(4));
+            assert_eq!(
+                fs.mapping_bytes.load(Ordering::Acquire),
+                MAX_OWNERSHIP_MAPPING_BYTES
+            );
+            assert_eq!(file.write_at(offset, b"D"), Ok(1));
+            let before = device.durable_snapshot();
+            device.arm(0, 0);
+            assert_eq!(
+                file.write_at((logical + p) * BLOCK_SIZE as u64 + 17, b"x"),
+                Err(FsError::NoSpace)
+            );
+            assert_eq!(device.operation.load(Ordering::Acquire), 0);
+            assert_eq!(device.durable_snapshot(), before);
+            assert!(!fs.io_faulted.load(Ordering::Acquire));
+            file.truncate(0).expect("budget reclaim");
+            assert_eq!(fs.mapping_bytes.load(Ordering::Acquire), baseline);
+            assert_eq!(file.write_at(offset, b"deep"), Ok(4));
+            let image = device.durable_snapshot();
+            drop((file, fs, device));
+            let (device, fs, file) = mount_image(image);
+            assert_eq!(fs.mapping_bytes.load(Ordering::Acquire), depth * BLOCK_SIZE);
+            file.truncate(0).expect("remounted budget reclaim");
+            assert_eq!(fs.mapping_bytes.load(Ordering::Acquire), 0);
+            drop((file, fs, device));
+        }
+        // Reference admission has the same allocation gate, without needing a
+        // multi-million-block fixture: adjust only the reported total here.
+        {
+            let (device, fs, file) = mount_image(empty.to_vec());
+            let old_count = fs.superblock.read().blocks_count;
+            {
+                let mut sb = fs.superblock.write();
+                sb.blocks_count =
+                    MAX_OWNERSHIP_REFERENCES as u32 + sb.first_data_block + sb.free_blocks_count;
+            }
+            device.arm(0, 0);
+            assert_eq!(file.write_at(17, b"x"), Err(FsError::NoSpace));
+            assert_eq!(device.operation.load(Ordering::Acquire), 0);
+            assert!(!fs.io_faulted.load(Ordering::Acquire));
+            fs.superblock.write().blocks_count = old_count;
+            assert_eq!(file.write_at(17, b"x"), Ok(1));
+            drop((file, fs, device));
+        }
+        for logical in [12, 12 + p, 12 + p + p * p, 12 + p + p * p + p + 1] {
+            let depth = if logical < 12 + p {
+                1
+            } else if logical < 12 + p + p * p {
+                2
+            } else {
+                3
+            };
             let offset = logical * BLOCK_SIZE as u64 + 17;
             let (device, fs, file) = mount_image(empty.to_vec());
             assert_eq!(file.write_at(offset, b"deep"), Ok(4));
@@ -3288,6 +3368,11 @@ pub fn run_ext2_journal_transaction_self_test() {
                         } else {
                             let _ = file.write_at(offset, b"deep");
                         }
+                        assert_eq!(
+                            fs.mapping_bytes.load(Ordering::Acquire),
+                            (file.raw.read().blocks_lo as usize / (BLOCK_SIZE / 512)).min(depth)
+                                * BLOCK_SIZE
+                        );
                         let reached = device.failed.load(Ordering::Acquire);
                         let image = device.durable_snapshot();
                         drop((file, fs, device));
@@ -3344,6 +3429,11 @@ pub fn run_ext2_journal_transaction_self_test() {
                             }
                         }
                         let (device, fs, file) = mount_image(image);
+                        assert_eq!(
+                            fs.mapping_bytes.load(Ordering::Acquire),
+                            (file.raw.read().blocks_lo as usize / (BLOCK_SIZE / 512)).min(depth)
+                                * BLOCK_SIZE
+                        );
                         if !freeing && file.stat().unwrap().size != 0 {
                             assert_eq!(disk_bytes(&fs, &file, offset as usize, 4), b"deep");
                         }
@@ -3351,6 +3441,7 @@ pub fn run_ext2_journal_transaction_self_test() {
                             .expect("deep crash retry, including empty mapping chains");
                         assert_eq!(fs.superblock.read().free_blocks_count, 16);
                         assert_eq!(file.raw.read().blocks_lo, 0);
+                        assert_eq!(fs.mapping_bytes.load(Ordering::Acquire), 0);
                         drop((file, fs, device));
                         if !reached {
                             break;
@@ -5443,6 +5534,7 @@ pub fn run_ext2_inode_cache_self_test() {
         journal: Mutex::new(None),
         resize_reserved_blocks: RwLock::new(Vec::new()),
         io_faulted: AtomicBool::new(false),
+        mapping_bytes: AtomicUsize::new(0),
         self_ref: Mutex::new(None),
     })
     .expect("synthetic ext2 filesystem");
@@ -7294,6 +7386,10 @@ pub struct Ext2Fs {
     /// Fallible metadata and data operations are rejected until remount instead
     /// of trusting stale inode/page-cache state.
     io_faulted: AtomicBool,
+    /// Ordinary inode mapping bytes admitted by the complete ownership proof.
+    /// meta_lock serializes checks and committed updates; replay initializes it
+    /// from the proved post-image rather than applying a second delta.
+    mapping_bytes: AtomicUsize,
     self_ref: Mutex<Option<Weak<Ext2Fs>>>,
 }
 
@@ -7374,6 +7470,7 @@ impl Ext2Fs {
             journal: Mutex::new(None),
             resize_reserved_blocks: RwLock::new(Vec::new()),
             io_faulted: AtomicBool::new(false),
+            mapping_bytes: AtomicUsize::new(0),
             self_ref: Mutex::new(None),
         })
         .map_err(|_| FsError::NoMem)?;
@@ -7569,7 +7666,9 @@ impl Ext2Fs {
             // same complete ownership proof. Otherwise two allocated inodes may
             // alias data/metadata blocks and disclose another object's contents.
             let plain = Ext2Journal::plain_image();
-            return self.validate_block_ownership(&plain, &[], &[]);
+            let mapping_bytes = self.validate_block_ownership(&plain, &[], &[])?;
+            self.mapping_bytes.store(mapping_bytes, Ordering::Release);
+            return Ok(());
         }
 
         let journal_inode = self.read_inode_raw(sb.journal_inum)?;
@@ -7626,7 +7725,7 @@ impl Ext2Fs {
         if !pre_images.is_empty() {
             self.validate_block_ownership(&journal, overlay, &pre_images)?;
         }
-        self.validate_block_ownership(&journal, overlay, post_images)?;
+        let mapping_bytes = self.validate_block_ownership(&journal, overlay, post_images)?;
         if let Some(intent) = intent.filter(|intent| namespace::is_kind(intent.kind)) {
             self.validate_namespace_contents(
                 &journal,
@@ -7671,6 +7770,7 @@ impl Ext2Fs {
             self.clear_recovered_journal(&mut recovered_journal, &plan)?;
             journal = recovered_journal;
         }
+        self.mapping_bytes.store(mapping_bytes, Ordering::Release);
         *self.journal.lock() = Some(journal);
         Ok(())
     }
@@ -8624,7 +8724,7 @@ impl Ext2Fs {
         journal: &Ext2Journal,
         overlay: &[JournalOverlayEntry],
         post_images: &[u8],
-    ) -> Result<(), FsError> {
+    ) -> Result<usize, FsError> {
         let mut scratch = JournalRecoveryScratch::try_new(self.block_size)?;
         let proposed =
             self.read_virtual_superblock(journal, overlay, post_images, &mut scratch.control)?;
@@ -8965,7 +9065,7 @@ impl Ext2Fs {
         {
             return Err(FsError::Invalid);
         }
-        Ok(())
+        Ok(work.mapping_bytes)
     }
 
     fn validate_intent_inode_transition(
@@ -10506,7 +10606,11 @@ impl Ext2Fs {
                 } else {
                     new_raw
                 };
-                if changed || new_raw.mode != 0 {
+                // The typed grammar and complete pre/post ownership proofs
+                // already cover unchanged neighbors. Deep-scanning them here
+                // would apply the smaller per-transaction budget to an unrelated
+                // inode that was validly admitted by the full-filesystem proof.
+                if changed {
                     changes.push((inode_number, old_raw, new_raw, changed));
                 }
             }
@@ -12962,9 +13066,7 @@ impl Ext2Fs {
                 sb.free_blocks_count,
             )
         };
-        if old_super_free_blocks == 0 {
-            return Err(FsError::NoSpace);
-        }
+        self.check_allocation_budget(1)?;
         let group_descs = self.group_descs.read();
         let groups_count = blocks_count
             .checked_sub(first_data_block)
@@ -13118,6 +13220,39 @@ impl Ext2Fs {
     }
 
     fn commit_metadata_transaction(
+        &self,
+        journal: &mut Ext2Journal,
+        plan: JournalMetadataPlan<'_>,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<(), JournalTxFailure> {
+        // All callers hold meta_lock through planning, commit and publication.
+        // Compute the counter transition before persistence, then publish it
+        // exactly once even when a durable commit's checkpoint subsequently fails.
+        let delta = match plan {
+            JournalMetadataPlan::IndirectRootAllocation(_) => 1,
+            JournalMetadataPlan::IndirectRootFree(_) => -1,
+            JournalMetadataPlan::Tree(tree) if tree.edge.level > 0 => match tree.kind {
+                tree::ATTACH => 1,
+                tree::DETACH => -1,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let next = self
+            .mapping_usage_after(delta)
+            .map_err(|error| JournalTxFailure {
+                error,
+                committed: false,
+                poison: error != FsError::NoSpace,
+            })?;
+        let result = self.commit_metadata_transaction_inner(journal, plan, scratch);
+        if result.is_ok() || result.as_ref().is_err_and(|failure| failure.committed) {
+            self.mapping_bytes.store(next, Ordering::Release);
+        }
+        result
+    }
+
+    fn commit_metadata_transaction_inner(
         &self,
         journal: &mut Ext2Journal,
         plan: JournalMetadataPlan<'_>,
@@ -15188,9 +15323,8 @@ impl Ext2Inode {
     }
 
     /// R180-6 FIX: mapped blocks retain the ordered in-place update path, while
-    /// direct holes on a validated Ext3/JBD2 image use one ordered-data
-    /// transaction per allocated block. Unsupported indirect holes are found
-    /// before the first write. Earlier durable chunks are returned as a POSIX
+    /// holes on a validated Ext3/JBD2 image use one ordered-data transaction
+    /// per allocated block. Unsupported geometry is found before the first write. Earlier durable chunks are returned as a POSIX
     /// short-write prefix if a later chunk fails.
     fn write_mutation(&self, mode: Ext2WriteMode, data: &[u8]) -> Result<(usize, u64), FsError> {
         self.write_mutation_inner(mode, data, false)
@@ -15292,6 +15426,13 @@ impl Ext2Inode {
                 None => Ok(journaled && (file_block as u64) < fs.tree_block_limit()),
             },
         )?;
+        if offset > current_size {
+            fs.check_tree_allocation_budget(
+                &preflight_raw,
+                u32::try_from(offset / u64::from(fs.block_size)).map_err(|_| FsError::Invalid)?,
+                &mut scratch,
+            )?;
+        }
         let sparse_gap = fs.preflight_sparse_gap(
             &preflight_raw,
             current_size,
@@ -15880,6 +16021,7 @@ mod st_k4_barrier_tests {
             journal: Mutex::new(None),
             resize_reserved_blocks: RwLock::new(Vec::new()),
             io_faulted: AtomicBool::new(false),
+            mapping_bytes: AtomicUsize::new(0),
             self_ref: Mutex::new(None),
         })
         .expect("synthetic ext2 filesystem");
