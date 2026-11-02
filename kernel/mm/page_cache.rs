@@ -803,6 +803,38 @@ impl GlobalPageCache {
         true
     }
 
+    /// Retire a write-through inode after its final reference disappears.
+    /// The caller guarantees no new I/O can use this identity. Walk only cache
+    /// entries, including sparse files with huge offsets, without allocating.
+    pub fn retire_inode(&self, inode_id: InodeId) {
+        let mut first = 0;
+        loop {
+            let next = {
+                let index = self.index.read();
+                let entry = index
+                    .range((inode_id, first)..=(inode_id, u64::MAX))
+                    .next()
+                    .map(|(key, page)| (key.1, page.clone()));
+                entry
+            };
+            let Some((index, page)) = next else {
+                break;
+            };
+            {
+                let _io = page.lock_io();
+                self.clear_dirty(&page);
+            }
+            drop(page);
+            // A shrinker can retain a transient Arc; the clean page will then
+            // be reclaimed by it, and the retired identity is never reused.
+            self.remove_from_cache(inode_id, index);
+            let Some(next) = index.checked_add(1) else {
+                break;
+            };
+            first = next;
+        }
+    }
+
     /// Mark a page as dirty
     pub fn mark_dirty(&self, page: &PageCacheEntry) {
         // Swap, rather than a load followed by a store, so two writers cannot

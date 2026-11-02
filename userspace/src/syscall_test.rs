@@ -249,6 +249,7 @@ pub extern "C" fn _start() -> ! {
 
     // ST-K4: the durability family, decided by descriptor kind.
     test_durability_syscalls(&mut results);
+    test_ext2_mut_syscalls(&mut results);
 
     // ROOT-INIT: this binary runs as root-namespace PID 1, so an orphaned
     // grandchild must be reparented to *us*. Last, because it forks twice.
@@ -2114,6 +2115,157 @@ const SYS_FDATASYNC: u64 = 75;
 const SYS_SYNC: u64 = 162;
 const SYS_SYNC_FILE_RANGE: u64 = 277;
 const ESPIPE: i32 = 29;
+
+/// Exercise real Ext2 namespace syscalls and a fork reader racing truncate.
+/// The ordinary Ring3 lane has no disk; the Ext3 Ring3 lane requires this PASS.
+fn test_ext2_mut_syscalls(results: &mut TestResult) {
+    const NAME: &str = "EXT2-MUT namespace, open unlink and concurrent truncate";
+    const DIR: &[u8] = b"/mnt/test/.ext2-mut-sys\0";
+    const FILE: &[u8] = b"/mnt/test/.ext2-mut-sys/target\0";
+    const SHORT: &[u8] = b"/mnt/test/.ext2-mut-sys/short\0";
+    const LONG: &[u8] = b"/mnt/test/.ext2-mut-sys/long\0";
+    unsafe {
+        let mounted = sys_open(b"/mnt/test\0".as_ptr(), 0o200000, 0);
+        if is_error(mounted) {
+            results.skip(NAME);
+            return;
+        }
+        sys_close(mounted);
+        for name in [SHORT, LONG, FILE] {
+            let _ = syscall1(87, name.as_ptr() as u64);
+        }
+        let _ = syscall1(84, DIR.as_ptr() as u64);
+        let ok = (|| -> bool {
+            if syscall2(83, DIR.as_ptr() as u64, 0o750) != 0 {
+                return false;
+            }
+            let fd = sys_open(FILE.as_ptr(), 2 | 0o100 | 0o200, 0o600);
+            if is_error(fd) {
+                return false;
+            }
+            let page = [0x4Du8; PAGE];
+            for index in 0..16 {
+                if syscall4(
+                    18,
+                    fd,
+                    page.as_ptr() as u64,
+                    PAGE as u64,
+                    index * PAGE as u64,
+                ) != PAGE as u64
+                {
+                    return false;
+                }
+            }
+            let pid = sys_fork();
+            if is_error(pid) {
+                return false;
+            }
+            if pid == 0 {
+                let mut bytes = [0u8; PAGE];
+                let mut valid = true;
+                for _ in 0..256 {
+                    let count = syscall4(
+                        17,
+                        fd,
+                        bytes.as_mut_ptr() as u64,
+                        PAGE as u64,
+                        15 * PAGE as u64,
+                    );
+                    if count != 0
+                        && (count != PAGE as u64
+                            || !bytes.iter().all(|byte| *byte == bytes[0])
+                            || (bytes[0] != 0 && bytes[0] != 0x4D))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    syscall0(24);
+                }
+                syscall1(60, if valid { 0 } else { 41 });
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+            for _ in 0..16 {
+                if syscall2(77, fd, 4097) != 0
+                    || syscall2(77, fd, 65536) != 0
+                    || syscall4(18, fd, page.as_ptr() as u64, PAGE as u64, 15 * PAGE as u64)
+                        != PAGE as u64
+                {
+                    return false;
+                }
+            }
+            let mut status = -1;
+            if sys_wait(&mut status) != pid || status != 0 {
+                return false;
+            }
+            if syscall2(88, b"target\0".as_ptr() as u64, SHORT.as_ptr() as u64) != 0 {
+                return false;
+            }
+            const LONG_TARGET: &[u8] =
+                b"././././././././././././././././././././././././././././././././target\0";
+            if syscall2(88, LONG_TARGET.as_ptr() as u64, LONG.as_ptr() as u64) != 0 {
+                return false;
+            }
+            let mut bytes = [0; 128];
+            if syscall3(
+                89,
+                LONG.as_ptr() as u64,
+                bytes.as_mut_ptr() as u64,
+                bytes.len() as u64,
+            ) != (LONG_TARGET.len() - 1) as u64
+                || bytes[..LONG_TARGET.len() - 1] != LONG_TARGET[..LONG_TARGET.len() - 1]
+            {
+                return false;
+            }
+            for link in [SHORT, LONG] {
+                let opened = sys_open(link.as_ptr(), 0, 0);
+                if is_error(opened)
+                    || sys_read(opened, bytes.as_mut_ptr(), 4) != 4
+                    || bytes[..4] != [0x4D; 4]
+                {
+                    return false;
+                }
+                sys_close(opened);
+            }
+            if err_of(syscall1(84, DIR.as_ptr() as u64) as i64) != 39 {
+                return false;
+            }
+            if syscall1(87, FILE.as_ptr() as u64) != 0
+                || syscall4(18, fd, b"old".as_ptr() as u64, 3, 0) != 3
+            {
+                return false;
+            }
+            let replacement = sys_open(FILE.as_ptr(), 2 | 0o100 | 0o200, 0o600);
+            if is_error(replacement) || syscall4(18, replacement, b"new".as_ptr() as u64, 3, 0) != 3
+            {
+                return false;
+            }
+            if syscall4(17, fd, bytes.as_mut_ptr() as u64, 3, 0) != 3 || &bytes[..3] != b"old" {
+                return false;
+            }
+            if syscall4(17, replacement, bytes.as_mut_ptr() as u64, 3, 0) != 3
+                || &bytes[..3] != b"new"
+            {
+                return false;
+            }
+            if sys_close(fd) != 0 || sys_close(replacement) != 0 {
+                return false;
+            }
+            for name in [SHORT, LONG, FILE] {
+                if syscall1(87, name.as_ptr() as u64) != 0 {
+                    return false;
+                }
+            }
+            syscall1(84, DIR.as_ptr() as u64) == 0
+        })();
+        if ok {
+            results.pass(NAME);
+        } else {
+            results.fail(NAME);
+        }
+    }
+}
 
 /// ST-K4: durability syscalls answer by object kind, never by fd number. This
 /// runs on ramfs, whose explicit volatile sync is not a persistence claim; the

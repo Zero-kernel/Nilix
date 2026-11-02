@@ -58,6 +58,10 @@ if grep -Eq "$FATAL" "$serial"; then
     report_fail "terminal fault marker in serial"
 fi
 
+if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Fq '[PASS] EXT2-MUT namespace, open unlink and concurrent truncate' "$serial"; then
+    report_fail "missing Ext2 namespace/concurrent-truncate syscall leg"
+fi
+
 # 2. Every leg printed its PASS line. The list is the contract: a leg that stops
 #    running (or is renamed) must fail the gate rather than silently disappear.
 while IFS= read -r leg; do

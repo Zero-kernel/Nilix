@@ -5,8 +5,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::types::FsError;
 
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(1);
-// Ext2 page-cache keys pack fs_id and its 32-bit inode number into one u64.
-// Reserve 2^32 as a permanent exhaustion sentinel rather than losing high bits.
+// Keep filesystem identities within their established 32-bit namespace.
+// Reserve 2^32 as a permanent exhaustion sentinel; never recycle an identity.
 const MAX_FS_ID: u64 = u32::MAX as u64;
 
 /// Never reuse an ID, even when a constructor subsequently fails. Delayed inode

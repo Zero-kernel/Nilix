@@ -30,3 +30,8 @@ mm = { path = "../mm" }
 cap = { path = "../cap" }
 klog = { path = "../klog" }
 kernel_crypto = { package = "crypto", path = "../crypto" }
+
+[[example]]
+name = "ext2_mut_image"
+path = "../../scripts/tests/ext2_mut_image.rs"
+required-features = ["host_harness"]
