@@ -3762,6 +3762,20 @@ pub fn run_ext2_journal_transaction_self_test() {
                 drop((file, fs, device));
             }
             let mut image = active.expect("committed truncate intent before checkpoint");
+            // Even a payload that fails decoding must not be cleared if the
+            // complete transaction is sealed; some homes may be checkpointed.
+            let mut malformed = image.clone();
+            write_be_u16(
+                &mut malformed,
+                commit + ZERO_INTENT_VERSION_OFFSET,
+                u16::MAX,
+            )
+            .unwrap();
+            resign_private_transaction(&mut malformed, count);
+            let device = Arc::try_new(CrashBlockDevice::new(malformed.clone())).unwrap();
+            assert!(Ext2Fs::mount(device.clone()).is_err());
+            assert_eq!(device.operation.load(Ordering::Acquire), 0);
+            assert_eq!(device.durable_snapshot(), malformed);
             let inode_offset = (FILE_INO as usize - 1) * size_of::<Ext2InodeRaw>();
             let inode_home = 5 * BLOCK_SIZE + inode_offset;
             let within_block = inode_offset % BLOCK_SIZE;
