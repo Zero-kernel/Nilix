@@ -539,18 +539,38 @@ pub fn test_ext2_write() {
                                 assert_eq!(committed, *b"J");
                                 klog_always!("    R180-6 production JBD2 write path passed");
 
+                                // Keep the durability witness alloc.bin at its
+                                // committed single byte across arbitrary reboot.
+                                // The mutation probe owns a separate scratch name.
+                                const MUT_PATH: &str = "/mnt/test/.ext2-mut-probe";
+                                let mutation_ops = vfs::VFS
+                                    .open_trusted(
+                                        MUT_PATH,
+                                        vfs::OpenFlags::new(
+                                            vfs::OpenFlags::O_RDWR
+                                                | vfs::OpenFlags::O_CREAT
+                                                | vfs::OpenFlags::O_TRUNC
+                                                | vfs::OpenFlags::O_NOFOLLOW,
+                                        ),
+                                        0o600,
+                                    )
+                                    .expect("open EXT2-MUT scratch");
+                                let mutation = mutation_ops
+                                    .as_any()
+                                    .downcast_ref::<vfs::FileHandle>()
+                                    .expect("mutation FileHandle");
                                 // EXT2-MUT: on the real page cache, a truncated tail
                                 // must not come back when the file grows again.
-                                assert_eq!(alloc_file.inode.write_at(0, b"JKL"), Ok(3));
+                                assert_eq!(mutation.inode.write_at(0, b"JKL"), Ok(3));
                                 let mut cached = [0u8; 3];
-                                assert_eq!(alloc_file.inode.read_at(0, &mut cached), Ok(3));
+                                assert_eq!(mutation.inode.read_at(0, &mut cached), Ok(3));
                                 assert_eq!(cached, *b"JKL");
-                                alloc_file.inode.truncate(1).expect("EXT2-MUT truncate");
-                                assert_eq!(alloc_file.inode.read_at(1, &mut cached), Ok(0));
-                                alloc_file.inode.truncate(3).expect("EXT2-MUT grow");
-                                assert_eq!(alloc_file.inode.read_at(0, &mut cached), Ok(3));
+                                mutation.inode.truncate(1).expect("EXT2-MUT truncate");
+                                assert_eq!(mutation.inode.read_at(1, &mut cached), Ok(0));
+                                mutation.inode.truncate(3).expect("EXT2-MUT grow");
+                                assert_eq!(mutation.inode.read_at(0, &mut cached), Ok(3));
                                 assert_eq!(cached, *b"J\0\0");
-                                alloc_file.inode.truncate(1).expect("EXT2-MUT restore");
+                                mutation.inode.truncate(1).expect("EXT2-MUT restore");
                                 klog_always!("    EXT2-MUT production truncate path passed");
 
                                 // EXT2-MUT: past the direct range on the real image,
@@ -559,23 +579,103 @@ pub fn test_ext2_write() {
                                 let page = [0x4Du8; 4096];
                                 for index in 0..16u64 {
                                     assert_eq!(
-                                        alloc_file.inode.write_at(index * 4096, &page),
+                                        mutation.inode.write_at(index * 4096, &page),
                                         Ok(4096),
                                         "EXT2-MUT indirect write"
                                     );
                                 }
                                 let mut tail = [0u8; 4096];
-                                assert_eq!(
-                                    alloc_file.inode.read_at(15 * 4096, &mut tail),
-                                    Ok(4096)
-                                );
+                                assert_eq!(mutation.inode.read_at(15 * 4096, &mut tail), Ok(4096));
                                 assert_eq!(tail, page);
-                                alloc_file
+                                mutation
                                     .inode
                                     .truncate(1)
                                     .expect("EXT2-MUT indirect shrink");
-                                assert_eq!(alloc_file.inode.write_at(0, b"J"), Ok(1));
+                                assert_eq!(mutation.inode.write_at(0, b"J"), Ok(1));
                                 klog_always!("    EXT2-MUT production indirect path passed");
+                                // Cached bytes and storage remain attached to the
+                                // unlinked open description until its final close.
+                                let old_ino = mutation.inode.ino();
+                                vfs::VFS
+                                    .unlink_trusted(MUT_PATH, Some(false))
+                                    .expect("unlink open probe");
+                                assert_eq!(mutation.inode.stat().unwrap().nlink, 0);
+                                assert_eq!(mutation.inode.write_at(0, b"old"), Ok(3));
+                                let replacement_ops = vfs::VFS
+                                    .open_trusted(
+                                        MUT_PATH,
+                                        vfs::OpenFlags::new(
+                                            vfs::OpenFlags::O_RDWR
+                                                | vfs::OpenFlags::O_CREAT
+                                                | vfs::OpenFlags::O_EXCL,
+                                        ),
+                                        0o600,
+                                    )
+                                    .expect("replacement probe");
+                                let replacement = replacement_ops
+                                    .as_any()
+                                    .downcast_ref::<vfs::FileHandle>()
+                                    .unwrap();
+                                assert_ne!(old_ino, replacement.inode.ino());
+                                assert_eq!(replacement.inode.write_at(0, b"new"), Ok(3));
+                                assert_eq!(replacement.inode.read_at(0, &mut cached), Ok(3));
+                                assert_eq!(cached, *b"new");
+                                assert_eq!(mutation.inode.read_at(0, &mut cached), Ok(3));
+                                assert_eq!(cached, *b"old");
+                                drop(mutation_ops);
+                                vfs::VFS.unlink_trusted(MUT_PATH, Some(false)).unwrap();
+                                drop(replacement_ops);
+                                // Recover interrupted prior probe runs before
+                                // creating a fresh directory and both link forms.
+                                for name in [
+                                    "/mnt/test/.ext2-mut-dir/short",
+                                    "/mnt/test/.ext2-mut-dir/long",
+                                    "/mnt/test/.ext2-mut-dir/target",
+                                ] {
+                                    match vfs::VFS.unlink_trusted(name, Some(false)) {
+                                        Ok(()) | Err(vfs::FsError::NotFound) => {}
+                                        Err(e) => panic!("namespace cleanup: {e:?}"),
+                                    }
+                                }
+                                match vfs::VFS.unlink_trusted("/mnt/test/.ext2-mut-dir", Some(true))
+                                {
+                                    Ok(()) | Err(vfs::FsError::NotFound) => {}
+                                    Err(e) => panic!("directory cleanup: {e:?}"),
+                                }
+                                let directory = vfs::VFS
+                                    .create_trusted(
+                                        "/mnt/test/.ext2-mut-dir",
+                                        vfs::FileMode::directory(0o750),
+                                    )
+                                    .expect("mkdir probe");
+                                assert_eq!(directory.stat().unwrap().nlink, 2);
+                                let target = vfs::VFS
+                                    .create_trusted(
+                                        "/mnt/test/.ext2-mut-dir/target",
+                                        vfs::FileMode::regular(0o600),
+                                    )
+                                    .unwrap();
+                                assert_eq!(target.write_at(0, b"link"), Ok(4));
+                                assert_eq!(
+                                    vfs::VFS.unlink_trusted("/mnt/test/.ext2-mut-dir", Some(true)),
+                                    Err(vfs::FsError::NotEmpty)
+                                );
+                                for (name, value) in [("/mnt/test/.ext2-mut-dir/short", "target"), ("/mnt/test/.ext2-mut-dir/long", "././././././././././././././././././././././././././././././././target")] {
+                                    vfs::VFS.symlink_trusted(name, value).expect("symlink probe");
+                                    let opened = vfs::VFS.open_trusted(name, vfs::OpenFlags::new(vfs::OpenFlags::O_RDONLY), 0).expect("follow symlink");
+                                    let mut bytes = [0; 4]; assert_eq!(opened.as_any().downcast_ref::<vfs::FileHandle>().unwrap().read(&mut bytes), Ok(4)); assert_eq!(&bytes, b"link");
+                                    drop(opened);
+                                    vfs::VFS.unlink_trusted(name, Some(false)).unwrap();
+                                }
+                                vfs::VFS
+                                    .unlink_trusted("/mnt/test/.ext2-mut-dir/target", Some(false))
+                                    .unwrap();
+                                drop(target);
+                                vfs::VFS
+                                    .unlink_trusted("/mnt/test/.ext2-mut-dir", Some(true))
+                                    .unwrap();
+                                drop(directory);
+                                klog_always!("    EXT2-MUT production namespace path passed");
                             }
                             Err(e) => {
                                 klog_always!(

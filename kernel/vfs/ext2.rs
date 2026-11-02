@@ -174,6 +174,12 @@ const JBD2_SUPER_FEATURE_RO_COMPAT_OFFSET: usize = 44;
 const JBD2_SUPER_UUID_OFFSET: usize = 48;
 const JBD2_SUPER_NR_USERS_OFFSET: usize = 64;
 
+mod namespace;
+use namespace::{NamespaceExtra, NamespacePlan};
+
+// Page-cache identities belong to object lifetimes, never reusable inode numbers.
+static NEXT_EXT2_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+
 const ZERO_INTENT_MAGIC: [u8; 4] = *b"ZJ01";
 const ZERO_INTENT_VERSION: u16 = 1;
 const ZERO_INTENT_KIND_INODE_UPDATE: u8 = 1;
@@ -578,6 +584,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
             inode_size: 256,
             root: RwLock::new(None),
             inode_cache: WeakArcCache::new(),
+            orphan_lock: Mutex::new(()),
             meta_lock: Mutex::new(()),
             journal: Mutex::new(None),
             resize_reserved_blocks: RwLock::new(Vec::new()),
@@ -680,6 +687,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
             rename_rec_len: 0,
             rename_old_name_len: 0,
             rename_old_name: [0; 255],
+            namespace: NamespaceExtra::default(),
         };
         let writes_before_recovery_validation = device.writes.load(Ordering::Relaxed);
         assert!(fs
@@ -1134,7 +1142,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     }
 
     fn resign_private_transaction(image: &mut [u8], metadata_count: usize) {
-        assert!(metadata_count == 1 || metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS);
+        assert!((1..=JOURNAL_MAX_METADATA_BLOCKS).contains(&metadata_count));
         let sequence = journal_sequence(image);
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(
@@ -1165,7 +1173,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     }
 
     fn resequence_private_transaction(image: &mut [u8], metadata_count: usize, sequence: u32) {
-        assert!(metadata_count == 1 || metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS);
+        assert!((1..=JOURNAL_MAX_METADATA_BLOCKS).contains(&metadata_count));
         write_be_u32(
             image,
             journal_logical_offset(0) + JBD2_SUPER_SEQUENCE_OFFSET,
@@ -1187,7 +1195,7 @@ pub fn run_ext2_journal_transaction_self_test() {
         start: u32,
         wrap: bool,
     ) {
-        assert!(metadata_count == 1 || metadata_count == DIRECT_ALLOCATION_METADATA_BLOCKS);
+        assert!((1..=JOURNAL_MAX_METADATA_BLOCKS).contains(&metadata_count));
         assert!((1..8).contains(&start));
         let transaction_blocks = metadata_count + 2;
         let source_start = journal_logical_offset(1);
@@ -1334,6 +1342,27 @@ pub fn run_ext2_journal_transaction_self_test() {
             5 * BLOCK_SIZE + (JOURNAL_INO as usize - 1) * size_of::<Ext2InodeRaw>(),
             &journal_inode,
         );
+
+        // The ownership oracle also validates directory references. Keep this
+        // synthetic root a real directory instead of an all-zero placeholder.
+        let directory = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
+        for (off, ino, name, kind, len) in [
+            (0, 2, &b"."[..], EXT2_FT_DIR, 12u16),
+            (12, 2, &b".."[..], EXT2_FT_DIR, 12),
+            (
+                24,
+                FILE_INO,
+                &b"file"[..],
+                EXT2_FT_REG_FILE,
+                (BLOCK_SIZE - 24) as u16,
+            ),
+        ] {
+            directory[off..off + 4].copy_from_slice(&ino.to_le_bytes());
+            directory[off + 4..off + 6].copy_from_slice(&len.to_le_bytes());
+            directory[off + 6] = name.len() as u8;
+            directory[off + 7] = kind;
+            directory[off + 8..off + 8 + name.len()].copy_from_slice(name);
+        }
 
         let journal_super = &mut image[JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE
             ..(JOURNAL_FIRST_PHYS as usize + 1) * BLOCK_SIZE];
@@ -3161,10 +3190,60 @@ pub fn run_ext2_journal_transaction_self_test() {
         }
     }
 
+    // A valid checksum is not authority to redirect a metadata operation.
+    // Start with each real committed kind and re-sign the complete forged log.
+    // lint-fallible-fn: INFALLIBLE-OK(boot self-test; OOM here is boot-fatal by policy)
+    fn reject_resigned_indirect_logs(image: &[u8], seen: &mut [bool; 4]) {
+        if journal_start(image) == 0 {
+            return;
+        }
+        for count in [4usize, 5] {
+            let commit = journal_logical_offset((count + 2) as u32);
+            let kind = image[commit + ZERO_INTENT_KIND_OFFSET];
+            if !(7..=10).contains(&kind)
+                || seen[(kind - 7) as usize]
+                || read_be_u32(image, commit).ok() != Some(JBD2_MAGIC)
+                || read_be_u32(image, commit + 4).ok() != Some(JBD2_COMMIT_BLOCK)
+                || read_be_u32(image, commit + 8).ok() != Some(journal_sequence(image))
+                || image[commit + ZERO_INTENT_COUNT_OFFSET] as usize != count
+            {
+                continue;
+            }
+            let mut verified = image.to_vec();
+            resign_private_transaction(&mut verified, count);
+            if verified[commit..commit + BLOCK_SIZE] != image[commit..commit + BLOCK_SIZE] {
+                continue;
+            }
+            seen[(kind - 7) as usize] = true;
+            for field in [ZERO_INTENT_PHYSICAL_OFFSET, ZERO_INTENT_FILE_BLOCK_OFFSET] {
+                let mut forged = image.to_vec();
+                write_be_u32(
+                    &mut forged,
+                    commit + field,
+                    if field == ZERO_INTENT_PHYSICAL_OFFSET {
+                        JOURNAL_FIRST_PHYS
+                    } else {
+                        u32::MAX
+                    },
+                )
+                .unwrap();
+                resign_private_transaction(&mut forged, count);
+                let device = Arc::try_new(CrashBlockDevice::new(forged.clone())).unwrap();
+                assert!(
+                    Ext2Fs::mount(device.clone()).is_err(),
+                    "resigned indirect kind {kind} field {field} accepted"
+                );
+                assert_eq!(device.operation.load(Ordering::Acquire), 0);
+                assert_eq!(device.durable_snapshot(), forged);
+            }
+        }
+    }
+
     /// EXT2-MUT slice 2. The synthetic image has 16 free 1 KiB blocks, enough for 12
     /// direct blocks, the mapping block and three more.
     // lint-fallible-fn: INFALLIBLE-OK(boot self-test; OOM here is boot-fatal by policy)
     fn run_indirect_scenarios(pristine: &[u8]) {
+        let mut sealed_kinds = [false; 4];
         const LEN: usize = 14 * BLOCK_SIZE - 100;
         // Free blocks hold stale bytes on real disks. Without this, a mapping block
         // published without being zeroed would pass by accident.
@@ -3310,6 +3389,7 @@ pub fn run_ext2_journal_transaction_self_test() {
                 let _ = file.write_at(TAIL as u64, &payload[TAIL..]);
                 let reached = device.failed.load(Ordering::Acquire);
                 let crashed = device.durable_snapshot();
+                reject_resigned_indirect_logs(&crashed, &mut sealed_kinds);
                 drop(file);
                 drop(_fs);
                 drop(device);
@@ -3350,6 +3430,7 @@ pub fn run_ext2_journal_transaction_self_test() {
                 let _ = file.truncate(target as u64);
                 let reached = device.failed.load(Ordering::Acquire);
                 let crashed = device.durable_snapshot();
+                reject_resigned_indirect_logs(&crashed, &mut sealed_kinds);
                 drop(file);
                 drop(_fs);
                 drop(device);
@@ -3413,6 +3494,7 @@ pub fn run_ext2_journal_transaction_self_test() {
             rename_rec_len: 0,
             rename_old_name_len: 0,
             rename_old_name: [0; 255],
+            namespace: NamespaceExtra::default(),
         };
         let mut valid = old;
         valid.blocks_lo = 2;
@@ -3475,6 +3557,12 @@ pub fn run_ext2_journal_transaction_self_test() {
         drop(_file);
         drop(fs);
         drop(_device);
+        if cfg!(test) {
+            assert!(
+                sealed_kinds.iter().all(|seen| *seen),
+                "missing committed indirect-kind forgery coverage"
+            );
+        }
     }
 
     /// EXT2-MUT slice 1. `written` holds a three-block file.
@@ -4386,6 +4474,7 @@ struct JournalCommitIntent {
     rename_rec_len: u16,
     rename_old_name_len: u8,
     rename_old_name: [u8; 255],
+    namespace: NamespaceExtra,
 }
 
 struct OwnershipWork {
@@ -4928,19 +5017,20 @@ struct IndirectDataPlan {
 }
 
 #[derive(Clone, Copy)]
-enum JournalMetadataPlan {
-    DirectAllocation(DirectAllocationPlan),
+enum JournalMetadataPlan<'a> {
+    Namespace(&'a NamespacePlan),
+    DirectAllocation(&'a DirectAllocationPlan),
     InodeUpdate {
         inode_number: u32,
         inode_target: InodeWriteTarget,
         old_inode: Ext2InodeRaw,
         new_inode: Ext2InodeRaw,
     },
-    FileCreate(FileCreatePlan),
-    Rename(RenamePlan),
+    FileCreate(&'a FileCreatePlan),
+    Rename(&'a RenamePlan),
     /// EXT2-MUT: the exact inverse of `DirectAllocation`. `phys_block` is the
     /// block being freed and `new_inode` no longer references it.
-    DirectFree(DirectAllocationPlan),
+    DirectFree(&'a DirectAllocationPlan),
     /// EXT2-MUT: one inode home, lowering the size with no block change.
     InodeShrink {
         inode_number: u32,
@@ -4949,19 +5039,20 @@ enum JournalMetadataPlan {
         new_inode: Ext2InodeRaw,
     },
     /// EXT2-MUT: same homes and edits as `DirectAllocation`, on pointer 12.
-    IndirectRootAllocation(DirectAllocationPlan),
+    IndirectRootAllocation(&'a DirectAllocationPlan),
     /// EXT2-MUT: same homes and edits as `DirectFree`, on pointer 12.
-    IndirectRootFree(DirectAllocationPlan),
+    IndirectRootFree(&'a DirectAllocationPlan),
     IndirectData {
-        plan: IndirectDataPlan,
+        plan: &'a IndirectDataPlan,
         freeing: bool,
     },
 }
 
-impl JournalMetadataPlan {
+impl JournalMetadataPlan<'_> {
     #[inline]
     fn metadata_blocks(self) -> usize {
         match self {
+            Self::Namespace(plan) => usize::from(plan.intent.metadata_count),
             Self::DirectAllocation(_)
             | Self::DirectFree(_)
             | Self::IndirectRootAllocation(_)
@@ -5196,6 +5287,7 @@ pub fn run_ext2_inode_cache_self_test() {
         inode_size: size_of::<Ext2InodeRaw>() as u16,
         root: RwLock::new(None),
         inode_cache: WeakArcCache::new(),
+        orphan_lock: Mutex::new(()),
         meta_lock: Mutex::new(()),
         journal: Mutex::new(None),
         resize_reserved_blocks: RwLock::new(Vec::new()),
@@ -5419,6 +5511,7 @@ pub fn run_ext2_create_self_test() {
         operation: AtomicU64,
         fail_at: AtomicU64,
         failed: AtomicBool,
+        persist_before: AtomicBool,
         read_only: bool,
     }
 
@@ -5433,6 +5526,7 @@ pub fn run_ext2_create_self_test() {
                 operation: AtomicU64::new(0),
                 fail_at: AtomicU64::new(fail_at),
                 failed: AtomicBool::new(false),
+                persist_before: AtomicBool::new(false),
                 read_only,
             }
         }
@@ -5449,6 +5543,9 @@ pub fn run_ext2_create_self_test() {
                 .map_err(|_| block::BlockError::Io)?
                 + 1;
             if self.fail_at.load(Ordering::Acquire) == op {
+                if self.persist_before.load(Ordering::Acquire) {
+                    self.durable.lock().copy_from_slice(&self.live.lock());
+                }
                 self.failed.store(true, Ordering::Release);
                 return Err(block::BlockError::Io);
             }
@@ -5606,6 +5703,612 @@ pub fn run_ext2_create_self_test() {
         ));
         assert_state(&fs, true);
         klog_always!("    Ext2Fs::create happy-path + 6-block commit passed");
+    }
+
+    fn resign_namespace_log(image: &mut [u8], count: usize) {
+        let journal = JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE;
+        let sequence = read_be_u32(image, journal + JBD2_SUPER_SEQUENCE_OFFSET).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(ZERO_INTENT_HASH_DOMAIN);
+        hasher.update(
+            &image[journal + JBD2_SUPER_UUID_OFFSET..journal + JBD2_SUPER_UUID_OFFSET + 16],
+        );
+        hasher.update(&sequence.to_be_bytes());
+        for logical in 1..=count + 1 {
+            let start = journal + logical * BLOCK_SIZE;
+            hasher.update(&image[start..start + BLOCK_SIZE]);
+        }
+        let commit = journal + (count + 2) * BLOCK_SIZE;
+        let digest =
+            Ext2Fs::finish_transaction_digest(hasher, &image[commit..commit + BLOCK_SIZE]).unwrap();
+        image[commit + ZERO_INTENT_DIGEST_OFFSET..commit + ZERO_INTENT_END]
+            .copy_from_slice(&digest);
+    }
+
+    // lint-fallible-fn: INFALLIBLE-OK(boot self-test; OOM here is boot-fatal by policy)
+    fn check_namespace_log(image: &[u8], seen: &mut [bool; 4]) {
+        let journal = JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE;
+        if read_be_u32(image, journal + JBD2_SUPER_START_OFFSET).unwrap() == 0 {
+            return;
+        }
+        let sequence = read_be_u32(image, journal + JBD2_SUPER_SEQUENCE_OFFSET).unwrap();
+        for count in 3..=6 {
+            let commit = journal + (count + 2) * BLOCK_SIZE;
+            let kind = image[commit + ZERO_INTENT_KIND_OFFSET];
+            if !(11..=14).contains(&kind)
+                || seen[(kind - 11) as usize]
+                || read_be_u32(image, commit).ok() != Some(JBD2_MAGIC)
+                || read_be_u32(image, commit + 4).ok() != Some(JBD2_COMMIT_BLOCK)
+                || read_be_u32(image, commit + 8).ok() != Some(sequence)
+                || image[commit + ZERO_INTENT_COUNT_OFFSET] as usize != count
+            {
+                continue;
+            }
+            let mut verified = image.to_vec();
+            resign_namespace_log(&mut verified, count);
+            if verified != image {
+                continue;
+            }
+            seen[(kind - 11) as usize] = true;
+            for field in [ZERO_INTENT_INODE_OFFSET, ZERO_INTENT_PHYSICAL_OFFSET] {
+                let mut forged = image.to_vec();
+                write_be_u32(&mut forged, commit + field, JOURNAL_FIRST_PHYS).unwrap();
+                resign_namespace_log(&mut forged, count);
+                let device = Arc::try_new(CreateCrashDevice::new(forged.clone(), 0)).unwrap();
+                assert!(
+                    Ext2Fs::mount(device.clone()).is_err(),
+                    "resigned namespace kind {kind} accepted"
+                );
+                assert_eq!(device.operation.load(Ordering::Acquire), 0);
+                assert_eq!(device.durable_image(), forged);
+            }
+            let intent = Ext2Fs::decode_commit_intent(&image[commit..commit + BLOCK_SIZE]).unwrap();
+            if kind == namespace::PUBLISH
+                && intent.namespace.old_child.mode & EXT2_S_IFMT == EXT2_S_IFDIR
+            {
+                let mut forged = image.to_vec();
+                let block = intent.namespace.old_child.block[0] as usize * BLOCK_SIZE;
+                forged[block..block + 4].copy_from_slice(&EXT2_ROOT_INO.to_le_bytes());
+                let device = Arc::try_new(CreateCrashDevice::new(forged.clone(), 0)).unwrap();
+                assert!(
+                    Ext2Fs::mount(device.clone()).is_err(),
+                    "published directory with invalid dot entry"
+                );
+                assert_eq!(device.operation.load(Ordering::Acquire), 0);
+                assert_eq!(device.durable_image(), forged);
+            }
+            // Interrupt recovery itself, including orphan completion; a second
+            // mount must finish without leaking allocations or a dangling chain.
+            for persist in [false, true] {
+                for boundary in (1..=100).step_by(if cfg!(test) { 1 } else { 7 }) {
+                    let device =
+                        Arc::try_new(CreateCrashDevice::new(image.to_vec(), boundary)).unwrap();
+                    device.persist_before.store(persist, Ordering::Release);
+                    let result = Ext2Fs::mount(device.clone());
+                    let failed = device.failed.load(Ordering::Acquire);
+                    drop(result);
+                    let retry =
+                        Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0)).unwrap();
+                    let fs = Ext2Fs::mount(retry).unwrap_or_else(|err| panic!("recovery restart kind={kind} boundary={boundary} persist={persist}: {err:?}"));
+                    assert_eq!(fs.superblock.read().last_orphan, 0);
+                    if !failed {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sealed_namespace_kinds = [false; 4];
+
+    // A dangling name must not become an alias when its free inode is reused.
+    {
+        let mut image = build_image();
+        let directory = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
+        directory[16..18].copy_from_slice(&12u16.to_le_bytes());
+        directory[24..28].copy_from_slice(&11u32.to_le_bytes());
+        directory[28..30].copy_from_slice(&((BLOCK_SIZE - 24) as u16).to_le_bytes());
+        directory[30] = 5;
+        directory[31] = EXT2_FT_REG_FILE;
+        directory[32..37].copy_from_slice(b"stale");
+        let device = Arc::try_new(CreateCrashDevice::new(image.clone(), 0)).unwrap();
+        assert!(matches!(
+            Ext2Fs::mount(device.clone()),
+            Err(FsError::Invalid)
+        ));
+        assert_eq!(device.operation.load(Ordering::Acquire), 0);
+        assert_eq!(device.durable_image(), image);
+    }
+
+    // A falsely low nlink must not release storage still reachable by another
+    // name. A correctly counted hard link remains usable until its last unlink.
+    for links in [1u16, 2] {
+        let device = Arc::try_new(CreateCrashDevice::new(build_image(), 0)).unwrap();
+        let fs = Ext2Fs::mount(device.clone()).unwrap();
+        let root = fs.root_inode();
+        let file = fs
+            .create(
+                &root,
+                "first",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+        file.write_at(0, b"hard link payload").unwrap();
+        let ino = file.ino() as u32;
+        let target = fs.inode_write_target(ino).unwrap();
+        drop(file);
+        drop(root);
+        drop(fs);
+        let mut image = device.durable_image();
+        let directory = &mut image[7 * BLOCK_SIZE..8 * BLOCK_SIZE];
+        let offset = 24; // dot and dotdot occupy the first two 12-byte records.
+        assert_eq!(
+            u32::from_le_bytes(directory[offset..offset + 4].try_into().unwrap()),
+            ino
+        );
+        let length = u16::from_le_bytes(directory[offset + 4..offset + 6].try_into().unwrap());
+        directory[offset + 4..offset + 6].copy_from_slice(&16u16.to_le_bytes());
+        let alias = offset + 16;
+        directory[alias..alias + 4].copy_from_slice(&ino.to_le_bytes());
+        directory[alias + 4..alias + 6].copy_from_slice(&(length - 16).to_le_bytes());
+        directory[alias + 6] = 5;
+        directory[alias + 7] = EXT2_FT_REG_FILE;
+        directory[alias + 8..alias + 13].copy_from_slice(b"alias");
+        let count = target.block as usize * BLOCK_SIZE
+            + target.start
+            + core::mem::offset_of!(Ext2InodeRaw, links_count);
+        image[count..count + 2].copy_from_slice(&links.to_le_bytes());
+        let device = Arc::try_new(CreateCrashDevice::new(image, 0)).unwrap();
+        let fs = Ext2Fs::mount(device.clone()).unwrap();
+        let root = fs.root_inode();
+        let before = device.operation.load(Ordering::Acquire);
+        let result = fs.unlink(
+            &root,
+            "first",
+            ino as u64,
+            Some(false),
+            &crate::topology::write().setup(0, 0),
+        );
+        if links == 1 {
+            assert_eq!(result, Err(FsError::Invalid));
+            assert_eq!(device.operation.load(Ordering::Acquire), before);
+            assert!(fs.lookup(&root, "first").is_ok());
+        } else {
+            result.unwrap();
+            let alias = fs.lookup(&root, "alias").unwrap();
+            assert_eq!(alias.stat().unwrap().nlink, 1);
+            let mut bytes = [0; BLOCK_SIZE];
+            let raw = fs.read_inode_raw(ino).unwrap();
+            fs.read_block(raw.block[0], &mut bytes).unwrap();
+            assert_eq!(&bytes[..17], b"hard link payload");
+            alias.write_at(0, b"still usable").unwrap();
+            fs.read_block(raw.block[0], &mut bytes).unwrap();
+            assert_eq!(&bytes[..12], b"still usable");
+            fs.unlink(
+                &root,
+                "alias",
+                ino as u64,
+                Some(false),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+            assert!(fs.inode_is_allocated(ino).unwrap());
+            drop(alias);
+            assert!(!fs.inode_is_allocated(ino).unwrap());
+        }
+    }
+
+    // The legacy directory layout has a 16-bit name length instead of a type.
+    {
+        let mut image = build_image();
+        let flags = 1024 + core::mem::offset_of!(Ext2Superblock, feature_incompat);
+        image[flags..flags + 4].fill(0);
+        image[7 * BLOCK_SIZE + 7] = 0;
+        image[7 * BLOCK_SIZE + 19] = 0;
+        let device = Arc::try_new(CreateCrashDevice::new(image, 0)).unwrap();
+        let fs = Ext2Fs::mount(device.clone()).unwrap();
+        let root = fs.root_inode();
+        let dir = fs
+            .create(
+                &root,
+                "legacy",
+                FileMode::directory(0o700),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+        let file = fs
+            .create(
+                &dir,
+                "file",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+        let link = fs
+            .symlink(&dir, "link", "file", &crate::topology::write().setup(0, 0))
+            .unwrap();
+        let raw = fs.read_inode_raw(dir.ino() as u32).unwrap();
+        let image = device.durable_image();
+        let bytes =
+            &image[raw.block[0] as usize * BLOCK_SIZE..(raw.block[0] as usize + 1) * BLOCK_SIZE];
+        let mut off = 0;
+        while off < bytes.len() {
+            assert_eq!(bytes[off + 7], 0);
+            off += usize::from(u16::from_le_bytes(
+                bytes[off + 4..off + 6].try_into().unwrap(),
+            ));
+        }
+        assert!(fs.lookup(&dir, "file").is_ok());
+        for (name, inode) in [("link", link), ("file", file)] {
+            fs.unlink(
+                &dir,
+                name,
+                inode.ino(),
+                Some(false),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+            drop(inode);
+        }
+        fs.unlink(
+            &root,
+            "legacy",
+            dir.ino(),
+            Some(true),
+            &crate::topology::write().setup(0, 0),
+        )
+        .unwrap();
+        drop(dir);
+        drop(root);
+        drop(fs);
+        Ext2Fs::mount(Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0)).unwrap())
+            .unwrap();
+    }
+
+    // EXT2-MUT namespace lifetime: an unlinked open file retains its allocation;
+    // the final reference reclaims it, including non-head orphan removal.
+    {
+        let device = Arc::try_new(CreateCrashDevice::new(build_image(), 0)).unwrap();
+        let fs = Ext2Fs::mount(device.clone()).unwrap();
+        let root = fs.root_inode();
+        let free = fs.superblock.read().free_inodes_count;
+        let blocks = fs.superblock.read().free_blocks_count;
+        for _ in 0..16 {
+            let a = fs
+                .create(
+                    &root,
+                    "first",
+                    FileMode::regular(0o600),
+                    &crate::topology::write().setup(0, 0),
+                )
+                .unwrap();
+            let b = fs
+                .create(
+                    &root,
+                    "second",
+                    FileMode::regular(0o600),
+                    &crate::topology::write().setup(0, 0),
+                )
+                .unwrap();
+            let ino = a.ino() as u32;
+            a.write_at(0, b"still open").unwrap();
+            fs.unlink(
+                &root,
+                "first",
+                a.ino(),
+                Some(false),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+            fs.unlink(
+                &root,
+                "second",
+                b.ino(),
+                Some(false),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+            assert!(matches!(fs.lookup(&root, "first"), Err(FsError::NotFound)));
+            assert!(fs.inode_is_allocated(ino).unwrap());
+            assert_eq!(a.stat().unwrap().nlink, 0);
+            a.write_at(0, b"after unlink").unwrap();
+            let raw = fs.read_inode_raw(ino).unwrap();
+            let mut bytes = [0u8; BLOCK_SIZE];
+            fs.read_block(raw.block[0], &mut bytes).unwrap();
+            assert_eq!(&bytes[..12], b"after unlink");
+            drop(a);
+            assert!(
+                !fs.inode_is_allocated(ino).unwrap(),
+                "non-head orphan not reaped"
+            );
+            assert_eq!(b.stat().unwrap().nlink, 0);
+            drop(b);
+            assert_eq!(fs.superblock.read().last_orphan, 0);
+            assert_eq!(fs.superblock.read().free_inodes_count, free);
+            assert_eq!(fs.superblock.read().free_blocks_count, blocks);
+        }
+        let directory = fs
+            .create(
+                &root,
+                "folder",
+                FileMode::directory(0o750),
+                &crate::topology::write().setup(123, 456),
+            )
+            .unwrap();
+        assert_eq!(root.stat().unwrap().nlink, 3);
+        assert_eq!(directory.stat().unwrap().nlink, 2);
+        assert_eq!(fs.lookup(&directory, ".").unwrap().ino(), directory.ino());
+        assert_eq!(fs.lookup(&directory, "..").unwrap().ino(), root.ino());
+        let link = fs
+            .symlink(
+                &directory,
+                "short",
+                "../target",
+                &crate::topology::write().setup(123, 456),
+            )
+            .unwrap();
+        let mut buf = [0; 64];
+        assert_eq!(link.read_at(2, &mut buf).unwrap(), 7);
+        assert_eq!(&buf[..7], b"/target");
+        assert_eq!(
+            fs.unlink(
+                &root,
+                "folder",
+                directory.ino(),
+                Some(true),
+                &crate::topology::write().setup(0, 0)
+            ),
+            Err(FsError::NotEmpty)
+        );
+        assert_eq!(
+            fs.unlink(
+                &root,
+                "folder",
+                directory.ino(),
+                Some(false),
+                &crate::topology::write().setup(0, 0)
+            ),
+            Err(FsError::IsDir)
+        );
+        fs.unlink(
+            &directory,
+            "short",
+            link.ino(),
+            Some(false),
+            &crate::topology::write().setup(0, 0),
+        )
+        .unwrap();
+        drop(link);
+        for length in [59, 60, 61, BLOCK_SIZE - 1] {
+            let target = "z".repeat(length);
+            let link = fs
+                .symlink(
+                    &directory,
+                    "bound",
+                    &target,
+                    &crate::topology::write().setup(0, 0),
+                )
+                .unwrap();
+            assert_eq!(link.stat().unwrap().blocks, if length < 60 { 0 } else { 2 });
+            fs.unlink(
+                &directory,
+                "bound",
+                link.ino(),
+                Some(false),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+            drop(link);
+        }
+        let before = device.operation.load(Ordering::Acquire);
+        assert!(matches!(
+            fs.symlink(
+                &directory,
+                "too-long",
+                &"x".repeat(BLOCK_SIZE),
+                &crate::topology::write().setup(0, 0)
+            ),
+            Err(FsError::NameTooLong)
+        ));
+        assert_eq!(device.operation.load(Ordering::Acquire), before);
+        let target = "a".repeat(700);
+        let link = fs
+            .symlink(
+                &directory,
+                "long",
+                &target,
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+        assert_eq!(link.stat().unwrap().size, 700);
+        assert_eq!(link.stat().unwrap().blocks, 2);
+        fs.unlink(
+            &directory,
+            "long",
+            link.ino(),
+            Some(false),
+            &crate::topology::write().setup(0, 0),
+        )
+        .unwrap();
+        drop(link);
+        fs.unlink(
+            &root,
+            "folder",
+            directory.ino(),
+            Some(true),
+            &crate::topology::write().setup(0, 0),
+        )
+        .unwrap();
+        assert_eq!(root.stat().unwrap().nlink, 2);
+        drop(directory);
+        assert_eq!(fs.superblock.read().free_inodes_count, free);
+        assert_eq!(fs.superblock.read().free_blocks_count, blocks);
+        assert_eq!(fs.group_descs.read()[0].used_dirs_count, 1);
+        let image = device.durable_image();
+        drop(root);
+        drop(fs);
+        Ext2Fs::mount(Arc::try_new(CreateCrashDevice::new(image, 0)).unwrap())
+            .expect("clean namespace remount");
+    }
+    klog_always!("    EXT2-MUT unlink/orphan reuse, mkdir/rmdir and fast/long symlink passed");
+
+    // Fail every persistent step, retaining or losing previously unflushed
+    // writes. Recovery must expose the complete name or reclaim its private
+    // inode, and may itself restart at every persistence boundary.
+    for operation in 0..6 {
+        for persist in [false, true] {
+            let mut reached_success = false;
+            for boundary in (1..=160).step_by(if cfg!(test) { 1 } else { 7 }) {
+                let device = Arc::try_new(CreateCrashDevice::new(build_image(), 0)).unwrap();
+                let fs = Ext2Fs::mount(device.clone()).unwrap();
+                let root = fs.root_inode();
+                let nested = if operation >= 4 {
+                    Some(
+                        fs.create(
+                            &root,
+                            "sub",
+                            FileMode::directory(0o750),
+                            &crate::topology::write().setup(0, 0),
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let parent = nested.as_ref().unwrap_or(&root);
+                let file = if operation == 3 || operation == 5 {
+                    let file = fs
+                        .create(
+                            parent,
+                            "entry",
+                            FileMode::regular(0o600),
+                            &crate::topology::write().setup(0, 0),
+                        )
+                        .unwrap();
+                    file.write_at(0, &[0x65; 1300]).unwrap();
+                    Some(file)
+                } else {
+                    None
+                };
+                device.persist_before.store(persist, Ordering::Release);
+                device.fail_at.store(
+                    device.operation.load(Ordering::Acquire) + boundary,
+                    Ordering::Release,
+                );
+                match operation {
+                    0 | 4 => {
+                        let _ = fs.create(
+                            parent,
+                            "entry",
+                            FileMode::directory(0o750),
+                            &crate::topology::write().setup(0, 0),
+                        );
+                    }
+                    1 => {
+                        let _ = fs.symlink(
+                            parent,
+                            "entry",
+                            "target",
+                            &crate::topology::write().setup(0, 0),
+                        );
+                    }
+                    2 => {
+                        let _ = fs.symlink(
+                            parent,
+                            "entry",
+                            &"x".repeat(700),
+                            &crate::topology::write().setup(0, 0),
+                        );
+                    }
+                    _ => {
+                        let file = file.unwrap();
+                        let _ = fs.unlink(
+                            parent,
+                            "entry",
+                            file.ino(),
+                            Some(false),
+                            &crate::topology::write().setup(0, 0),
+                        );
+                        drop(file);
+                    }
+                }
+                let failed = device.failed.load(Ordering::Acquire);
+                let image = device.durable_image();
+                check_namespace_log(&image, &mut sealed_namespace_kinds);
+                drop(nested);
+                drop(root);
+                drop(fs);
+                let recovered_device = Arc::try_new(CreateCrashDevice::new(image, 0)).unwrap();
+                let recovered = Ext2Fs::mount(recovered_device.clone()).unwrap_or_else(|err| panic!("namespace recovery op={operation} boundary={boundary} persist={persist}: {err:?}"));
+                assert_eq!(recovered.superblock.read().last_orphan, 0);
+                let parent = if operation >= 4 {
+                    recovered.lookup(&recovered.root_inode(), "sub").unwrap()
+                } else {
+                    recovered.root_inode()
+                };
+                let visible = recovered.lookup(&parent, "entry");
+                let (used_inodes, used_blocks, used_dirs) = match visible {
+                    Ok(inode) => {
+                        let stat = inode.stat().unwrap();
+                        match operation {
+                            0 | 4 => {
+                                assert!(stat.mode.is_dir());
+                                assert_eq!(stat.nlink, 2);
+                                (1, 1, 1)
+                            }
+                            1 => {
+                                assert!(stat.mode.is_symlink());
+                                assert_eq!(stat.size, 6);
+                                (1, 0, 0)
+                            }
+                            2 => {
+                                assert!(stat.mode.is_symlink());
+                                assert_eq!(stat.size, 700);
+                                (1, 1, 0)
+                            }
+                            _ => {
+                                assert!(stat.mode.is_file());
+                                assert_eq!(stat.size, 1300);
+                                (1, 2, 0)
+                            }
+                        }
+                    }
+                    Err(FsError::NotFound) => (0, 0, 0),
+                    Err(err) => panic!("namespace lookup: {err:?}"),
+                };
+                assert_eq!(
+                    recovered.superblock.read().free_inodes_count,
+                    6 - used_inodes - u32::from(operation >= 4)
+                );
+                assert_eq!(
+                    recovered.superblock.read().free_blocks_count,
+                    12 - used_blocks - u32::from(operation >= 4)
+                );
+                assert_eq!(
+                    recovered.group_descs.read()[0].used_dirs_count,
+                    1 + used_dirs + u16::from(operation >= 4)
+                );
+                assert_eq!(parent.stat().unwrap().nlink, 2 + u32::from(used_dirs));
+                let image = recovered_device.durable_image();
+                drop(recovered);
+                Ext2Fs::mount(Arc::try_new(CreateCrashDevice::new(image, 0)).unwrap())
+                    .expect("idempotent namespace recovery");
+                if !failed {
+                    reached_success = true;
+                    break;
+                }
+            }
+            assert!(reached_success, "namespace crash range missed completion");
+        }
+    }
+    klog_always!("    EXT2-MUT namespace persistence-boundary recovery passed");
+
+    if cfg!(test) {
+        assert!(
+            sealed_namespace_kinds.iter().all(|seen| *seen),
+            "missing sealed namespace intent coverage"
+        );
     }
 
     // Scenario B: crash before the commit block is durable → all-or-nothing.
@@ -6291,6 +6994,7 @@ pub struct Ext2Fs {
     root: RwLock<Option<Arc<Ext2Inode>>>,
     /// Canonical `(filesystem, inode-number) -> Arc<Ext2Inode>` identity.
     inode_cache: WeakArcCache<Ext2Inode>,
+    orphan_lock: Mutex<()>,
     /// Serialize metadata updates requiring read-modify-write
     meta_lock: Mutex<()>,
     /// Validated internal JBD2 journal. `None` is rigorously read-only: no
@@ -6379,6 +7083,7 @@ impl Ext2Fs {
             inode_size,
             root: RwLock::new(None),
             inode_cache: WeakArcCache::new(),
+            orphan_lock: Mutex::new(()),
             meta_lock: Mutex::new(()),
             journal: Mutex::new(None),
             resize_reserved_blocks: RwLock::new(Vec::new()),
@@ -6395,6 +7100,7 @@ impl Ext2Fs {
         // R180-6 FIX: recover an active internal journal before the root inode
         // or filesystem object can be published to VFS callers.
         fs.initialize_journal()?;
+        fs.reap_orphans()?;
 
         // Load root inode
         let root = fs.load_inode(EXT2_ROOT_INO)?;
@@ -6477,10 +7183,9 @@ impl Ext2Fs {
             // This applies equally to plain Ext2 and journaled Ext3 images.
             return Err(FsError::NotSupported);
         }
-        if sb.last_orphan != 0 {
-            // An outstanding orphan chain represents an interrupted truncate
-            // or unlink.  This implementation does not yet own that recovery
-            // protocol, so even a journaled image must fail closed.
+        if sb.last_orphan != 0
+            && (!has_journal || sb.last_orphan > sb.inodes_count || dev.is_read_only())
+        {
             return Err(FsError::NotSupported);
         }
         if has_journal && (sb.rev_level < 1 || sb.journal_inum == 0 || sb.journal_dev != 0) {
@@ -6636,6 +7341,16 @@ impl Ext2Fs {
             self.validate_block_ownership(&journal, overlay, &pre_images)?;
         }
         self.validate_block_ownership(&journal, overlay, post_images)?;
+        if let Some(intent) = intent.filter(|intent| namespace::is_kind(intent.kind)) {
+            self.validate_namespace_contents(
+                &journal,
+                overlay,
+                &pre_images,
+                post_images,
+                intent,
+                &mut verification.control,
+            )?;
+        }
         if !active_recovery {
             self.ensure_recovery_feature()?;
         }
@@ -7495,10 +8210,15 @@ impl Ext2Fs {
         overlay: &[JournalOverlayEntry],
         post_images: &[u8],
         raw: &Ext2InodeRaw,
+        orphan: bool,
         work: &mut OwnershipWork,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), FsError> {
-        if raw.mode == 0 || raw.dtime != 0 || raw.links_count == 0 || raw.faddr != 0 {
+        if raw.mode == 0
+            || raw.faddr != 0
+            || (orphan && raw.links_count != 0)
+            || (!orphan && (raw.dtime != 0 || raw.links_count == 0))
+        {
             return Err(FsError::Invalid);
         }
         if raw.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
@@ -7506,8 +8226,14 @@ impl Ext2Fs {
         }
 
         let inode_type = raw.mode & EXT2_S_IFMT;
+        if inode_type == EXT2_S_IFLNK
+            && (raw.size_lo >= self.block_size || (!orphan && raw.size_lo == 0))
+        {
+            return Err(FsError::Invalid);
+        }
         let inline_symlink = inode_type == EXT2_S_IFLNK
-            && raw.size_lo as usize <= core::mem::size_of_val(&raw.block);
+            && raw.blocks_lo == 0
+            && (raw.size_lo as usize) < core::mem::size_of_val(&raw.block);
         let mapped =
             matches!(inode_type, EXT2_S_IFREG | EXT2_S_IFDIR | EXT2_S_IFLNK) && !inline_symlink;
         let size = if inode_type == EXT2_S_IFREG {
@@ -7622,6 +8348,8 @@ impl Ext2Fs {
         if proposed.inodes_count > MAX_OWNERSHIP_INODES {
             return Err(FsError::NotSupported);
         }
+        let orphans =
+            self.read_orphan_chain(journal, overlay, post_images, &mut scratch.control)?;
         let groups = self.group_descs.read().len();
         let inode_table_blocks = (self.inodes_per_group as u64)
             .checked_mul(self.inode_size as u64)
@@ -7843,11 +8571,21 @@ impl Ext2Fs {
                     if raw.mode & EXT2_S_IFMT == EXT2_S_IFDIR {
                         used_dirs = used_dirs.checked_add(1).ok_or(FsError::Invalid)?;
                     }
+                    self.validate_orphan_directory_references(
+                        journal,
+                        overlay,
+                        post_images,
+                        ino,
+                        &raw,
+                        orphans.as_slice(),
+                        &mut scratch.control,
+                    )?;
                     self.collect_inode_owners(
                         journal,
                         overlay,
                         post_images,
                         &raw,
+                        orphans.as_slice().binary_search(&ino).is_ok(),
                         &mut work,
                         &mut scratch.data,
                     )?;
@@ -7950,15 +8688,17 @@ impl Ext2Fs {
         new: &Ext2InodeRaw,
     ) -> Result<(), FsError> {
         let old = &intent.old_inode;
-        if old.mode & EXT2_S_IFMT != EXT2_S_IFREG
-            || new.mode & EXT2_S_IFMT != EXT2_S_IFREG
+        let orphan = old.links_count == 0 && new.links_count == 0;
+        let kind = old.mode & EXT2_S_IFMT;
+        if (!orphan && kind != EXT2_S_IFREG)
+            || (orphan && !matches!(kind, EXT2_S_IFREG | EXT2_S_IFDIR | EXT2_S_IFLNK))
+            || new.mode & EXT2_S_IFMT != kind
             || old.mode != new.mode
             || old.uid != new.uid
             || old.atime != new.atime
-            || old.dtime != 0
-            || new.dtime != 0
+            || (!orphan && old.dtime != 0)
+            || old.dtime != new.dtime
             || old.gid != new.gid
-            || old.links_count == 0
             || old.links_count != new.links_count
             || old.flags != new.flags
             || old.flags & (EXT2_IMMUTABLE_FL | EXT2_UNSUPPORTED_WRITE_LAYOUT_FL) != 0
@@ -8124,7 +8864,7 @@ impl Ext2Fs {
         if overlay.len() != usize::from(intent.metadata_count)
             || !matches!(
                 overlay.len(),
-                1 | DIRECT_ALLOCATION_METADATA_BLOCKS | 2 | 5 | 6
+                1 | DIRECT_ALLOCATION_METADATA_BLOCKS | 2 | 3 | 5 | 6
             )
             || post_images.len()
                 != overlay
@@ -8150,6 +8890,9 @@ impl Ext2Fs {
             }
         }
 
+        if namespace::is_kind(intent.kind) {
+            return self.validate_namespace_grammar(intent, overlay, post_images);
+        }
         if intent.kind == ZERO_INTENT_KIND_FILE_CREATE {
             return self.validate_recovery_file_create(intent, overlay, post_images);
         }
@@ -9030,6 +9773,13 @@ impl Ext2Fs {
                     // (block array unchanged by Case-A create / in-place rename,
                     // so intent.old_inode agrees).
                     if let Some(intent) = intent {
+                        if namespace::is_kind(intent.kind)
+                            && intent.physical != 0
+                            && entry.home == intent.physical
+                            && intent.old_inode.block[..EXT2_NDIR_BLOCKS].contains(&entry.home)
+                        {
+                            continue;
+                        }
                         // EXT2-MUT: the single-indirect block named by the inode is
                         // the one mapping block these kinds journal. Its ownership
                         // follows from the inode, and the grammar pins the edit.
@@ -9119,7 +9869,7 @@ impl Ext2Fs {
             || proposed.journal_uuid != original.journal_uuid
             || proposed.journal_inum != original.journal_inum
             || proposed.journal_dev != original.journal_dev
-            || proposed.last_orphan != 0
+            || proposed.last_orphan > proposed.inodes_count
             || proposed.free_blocks_count > proposed.blocks_count;
         if immutable_super_changed
             || (journal.start != 0
@@ -9211,8 +9961,11 @@ impl Ext2Fs {
             // unchanged by regular-file creation.  Other kinds never touch inode
             // allocation, so any change remains unsupported.
             let file_create = intent.is_some_and(|i| i.kind == ZERO_INTENT_KIND_FILE_CREATE);
-            if (desc.free_inodes_count != current_desc.free_inodes_count && !file_create)
-                || desc.used_dirs_count != current_desc.used_dirs_count
+            let namespace = intent.is_some_and(|i| namespace::is_kind(i.kind));
+            if (desc.free_inodes_count != current_desc.free_inodes_count
+                && !file_create
+                && !namespace)
+                || (desc.used_dirs_count != current_desc.used_dirs_count && !namespace)
             {
                 return Err(FsError::NotSupported);
             }
@@ -9303,6 +10056,10 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
+        if intent.is_some_and(|i| namespace::is_kind(i.kind)) {
+            return Ok(());
+        }
+
         // Validate every changed inode-table block before it can reach home.
         // In addition to the root words, every newly published indirect tree
         // is walked under an explicit work/memory budget and every non-zero
@@ -9382,7 +10139,8 @@ impl Ext2Fs {
                 }
                 let inode_type = raw.mode & EXT2_S_IFMT;
                 let inline_symlink = inode_type == EXT2_S_IFLNK
-                    && raw.size_lo as usize <= core::mem::size_of_val(&raw.block);
+                    && raw.blocks_lo == 0
+                    && (raw.size_lo as usize) < core::mem::size_of_val(&raw.block);
                 if inline_symlink
                     || !matches!(inode_type, EXT2_S_IFREG | EXT2_S_IFDIR | EXT2_S_IFLNK)
                 {
@@ -9584,7 +10342,10 @@ impl Ext2Fs {
         // in [ZERO_INTENT_END..ZERO_INTENT_FILE_CREATE_END); every other kind
         // keeps the whole [ZERO_INTENT_END..] region zero, so its on-disk format
         // is unchanged.
-        let trailing_ok = if kind == ZERO_INTENT_KIND_FILE_CREATE {
+        let trailing_ok = if namespace::is_kind(kind) {
+            block.len() >= namespace::INTENT_END
+                && block[namespace::INTENT_END..].iter().all(|b| *b == 0)
+        } else if kind == ZERO_INTENT_KIND_FILE_CREATE {
             block.len() >= ZERO_INTENT_FILE_CREATE_END
                 && block[ZERO_INTENT_FILE_CREATE_END..].iter().all(|b| *b == 0)
         } else if kind == ZERO_INTENT_KIND_FILE_RENAME {
@@ -9599,22 +10360,22 @@ impl Ext2Fs {
         let inode_number = read_be_u32(block, ZERO_INTENT_INODE_OFFSET)?;
         let file_block = read_be_u32(block, ZERO_INTENT_FILE_BLOCK_OFFSET)?;
         let physical = read_be_u32(block, ZERO_INTENT_PHYSICAL_OFFSET)?;
-        let new_ino = if kind == ZERO_INTENT_KIND_FILE_CREATE {
+        let new_ino = if kind == ZERO_INTENT_KIND_FILE_CREATE || namespace::is_kind(kind) {
             read_be_u32(block, ZERO_INTENT_NEW_INO_OFFSET)?
         } else {
             0
         };
-        let parent_ino = if kind == ZERO_INTENT_KIND_FILE_CREATE {
+        let parent_ino = if kind == ZERO_INTENT_KIND_FILE_CREATE || namespace::is_kind(kind) {
             read_be_u32(block, ZERO_INTENT_PARENT_INO_OFFSET)?
         } else {
             0
         };
-        let rename_dir_off = if kind == ZERO_INTENT_KIND_FILE_RENAME {
+        let rename_dir_off = if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
             read_be_u32(block, ZERO_INTENT_RENAME_DIR_OFF_OFFSET)?
         } else {
             0
         };
-        let rename_rec_len = if kind == ZERO_INTENT_KIND_FILE_RENAME {
+        let rename_rec_len = if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
             u16::from_be_bytes([
                 block[ZERO_INTENT_RENAME_REC_LEN_OFFSET],
                 block[ZERO_INTENT_RENAME_REC_LEN_OFFSET + 1],
@@ -9622,13 +10383,14 @@ impl Ext2Fs {
         } else {
             0
         };
-        let rename_old_name_len = if kind == ZERO_INTENT_KIND_FILE_RENAME {
-            block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET]
-        } else {
-            0
-        };
+        let rename_old_name_len =
+            if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
+                block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET]
+            } else {
+                0
+            };
         let mut rename_old_name = [0u8; 255];
-        if kind == ZERO_INTENT_KIND_FILE_RENAME {
+        if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
             rename_old_name.copy_from_slice(
                 &block
                     [ZERO_INTENT_RENAME_OLD_NAME_OFFSET..ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255],
@@ -9671,13 +10433,23 @@ impl Ext2Fs {
             && rename_dir_off != u32::MAX
             && rename_rec_len >= size_of::<Ext2DirEntryHead>() as u16
             && rename_old_name_len > 0;
+        let valid_namespace = namespace::is_kind(kind)
+            && (3..=6).contains(&metadata_count)
+            && file_block == u32::MAX
+            && new_ino != 0;
+        let namespace = if namespace::is_kind(kind) {
+            namespace::decode_extra(block)?
+        } else {
+            NamespaceExtra::default()
+        };
         if inode_number == 0
             || (!valid_update
                 && !valid_direct
                 && !valid_root
                 && !valid_indirect
                 && !valid_file_create
-                && !valid_file_rename)
+                && !valid_file_rename
+                && !valid_namespace)
         {
             return Err(FsError::Invalid);
         }
@@ -9715,23 +10487,8 @@ impl Ext2Fs {
             rename_rec_len,
             rename_old_name_len,
             rename_old_name,
+            namespace,
         })
-    }
-
-    fn commit_candidate(
-        block: &[u8],
-        sequence: u32,
-        expected_count: u8,
-    ) -> Option<JournalCommitIntent> {
-        if read_be_u32(block, 0).ok() != Some(JBD2_MAGIC)
-            || read_be_u32(block, 4).ok() != Some(JBD2_COMMIT_BLOCK)
-            || read_be_u32(block, 8).ok() != Some(sequence)
-        {
-            return None;
-        }
-        Self::decode_commit_intent(block)
-            .ok()
-            .filter(|intent| intent.metadata_count == expected_count)
     }
 
     fn plan_recovery_candidate(
@@ -9742,18 +10499,15 @@ impl Ext2Fs {
         commit: &[u8],
         expected_count: u8,
     ) -> Result<Option<JournalRecoveryPlan>, FsError> {
-        if expected_count != 1
-            && expected_count != 2
-            && expected_count != DIRECT_ALLOCATION_METADATA_BLOCKS as u8
-            && expected_count != 5
-            && expected_count != 6
-        {
+        if !(1..=JOURNAL_MAX_METADATA_BLOCKS as u8).contains(&expected_count) {
             return Err(FsError::Invalid);
         }
-        let Some(intent) = Self::commit_candidate(commit, journal.next_sequence, expected_count)
-        else {
+        if read_be_u32(commit, 0).ok() != Some(JBD2_MAGIC)
+            || read_be_u32(commit, 4).ok() != Some(JBD2_COMMIT_BLOCK)
+            || read_be_u32(commit, 8).ok() != Some(journal.next_sequence)
+        {
             return Ok(None);
-        };
+        }
         let expected_bytes = usize::from(expected_count)
             .checked_mul(self.block_size as usize)
             .ok_or(FsError::Invalid)?;
@@ -9772,6 +10526,14 @@ impl Ext2Fs {
             // block.  It is not authoritative until the complete transaction
             // digest matches the current descriptor and post-images.
             return Ok(None);
+        }
+
+        // A sealed transaction is authoritative even when its typed payload is
+        // invalid. Do not discard it as a torn/uncommitted tail: checkpoints may
+        // already have changed homes. Reject before any replay or journal clear.
+        let intent = Self::decode_commit_intent(commit)?;
+        if intent.metadata_count != expected_count {
+            return Err(FsError::Invalid);
         }
 
         // The descriptor grammar is part of candidate selection, not a check
@@ -10020,6 +10782,19 @@ impl Ext2Fs {
                 .get_mut(img3_start..img3_end)
                 .ok_or(FsError::Invalid)?,
         )?;
+        // Coalesced namespace edits have three homes: superblock, the shared
+        // parent/child inode-table block, and directory data. first+4 was just
+        // captured as image[3] of the possible four-home form; reuse it here.
+        match self.plan_recovery_candidate(
+            journal,
+            descriptor.block(),
+            &raw_images[..img3_start],
+            &raw_images[img3_start..img3_end],
+            3,
+        )? {
+            Some(plan) => return Ok(Some(plan)),
+            None => {}
+        }
         let mut four_commit = Ext2MutationScratch::try_new(self.block_size)?;
         self.read_journal_block(journal, four_commit_logical, four_commit.block_mut())?;
         match self.plan_recovery_candidate(
@@ -10724,10 +11499,10 @@ impl Ext2Fs {
 
     /// EXT2-MUT: the indirect kinds share the direct kinds' bitmap, count and inode
     /// edits. Only the mapping-block home (`None` here) has its own image.
-    fn delegated_block_plan(
-        plan: JournalMetadataPlan,
+    fn delegated_block_plan<'a>(
+        plan: JournalMetadataPlan<'a>,
         index: usize,
-    ) -> Option<(JournalMetadataPlan, usize)> {
+    ) -> Option<(JournalMetadataPlan<'a>, usize)> {
         match plan {
             JournalMetadataPlan::IndirectRootAllocation(plan) => {
                 Some((JournalMetadataPlan::DirectAllocation(plan), index))
@@ -10737,9 +11512,9 @@ impl Ext2Fs {
             }
             JournalMetadataPlan::IndirectData { plan, freeing } if index != 3 => {
                 let direct = if freeing {
-                    JournalMetadataPlan::DirectFree(plan.block)
+                    JournalMetadataPlan::DirectFree(&plan.block)
                 } else {
-                    JournalMetadataPlan::DirectAllocation(plan.block)
+                    JournalMetadataPlan::DirectAllocation(&plan.block)
                 };
                 Some((direct, if index == 4 { 3 } else { index }))
             }
@@ -10747,11 +11522,16 @@ impl Ext2Fs {
         }
     }
 
-    fn metadata_home_block(&self, plan: JournalMetadataPlan, index: usize) -> Result<u32, FsError> {
+    fn metadata_home_block(
+        &self,
+        plan: JournalMetadataPlan<'_>,
+        index: usize,
+    ) -> Result<u32, FsError> {
         if let Some((plan, index)) = Self::delegated_block_plan(plan, index) {
             return self.metadata_home_block(plan, index);
         }
         match plan {
+            JournalMetadataPlan::Namespace(plan) => plan.home(index),
             JournalMetadataPlan::IndirectData { plan, .. } => Ok(plan.mapping_block),
             JournalMetadataPlan::IndirectRootAllocation(_)
             | JournalMetadataPlan::IndirectRootFree(_) => Err(FsError::Invalid),
@@ -10795,18 +11575,22 @@ impl Ext2Fs {
 
     fn build_metadata_image(
         &self,
-        plan: JournalMetadataPlan,
+        plan: JournalMetadataPlan<'_>,
         index: usize,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<u32, FsError> {
         if let Some((plan, index)) = Self::delegated_block_plan(plan, index) {
             return self.build_metadata_image(plan, index, scratch);
         }
+        if let JournalMetadataPlan::Namespace(plan) = plan {
+            return plan.build(self, index, scratch);
+        }
         let home = self.metadata_home_block(plan, index)?;
         self.read_physical_block(home, scratch.block_mut())?;
         let block = scratch.block_mut();
         let freeing = matches!(plan, JournalMetadataPlan::DirectFree(_));
         match plan {
+            JournalMetadataPlan::Namespace(_) => return Err(FsError::Invalid),
             JournalMetadataPlan::IndirectData { plan, freeing } => {
                 let after = if freeing { 0 } else { plan.block.phys_block };
                 let end = plan.pointer_offset.checked_add(4).ok_or(FsError::Invalid)?;
@@ -10948,7 +11732,7 @@ impl Ext2Fs {
                         )?;
                     }
                     FileCreateHomeRole::DirData => {
-                        Self::write_file_create_dirent(&plan, block)?;
+                        self.write_file_create_dirent(plan, block)?;
                     }
                 }
             }
@@ -10993,7 +11777,11 @@ impl Ext2Fs {
     /// minimal size and place the new entry in the freed tail.  The pre-image
     /// tail is all zero (gated at plan-build), so the new entry's padding stays
     /// zero and the preimage reversal is exact.
-    fn write_file_create_dirent(plan: &FileCreatePlan, block: &mut [u8]) -> Result<(), FsError> {
+    fn write_file_create_dirent(
+        &self,
+        plan: &FileCreatePlan,
+        block: &mut [u8],
+    ) -> Result<(), FsError> {
         let rec_len_off = plan
             .dir_last_off
             .checked_add(core::mem::offset_of!(Ext2DirEntryHead, rec_len))
@@ -11014,7 +11802,7 @@ impl Ext2Fs {
         slot[0..4].copy_from_slice(&plan.new_ino.to_le_bytes());
         slot[4..6].copy_from_slice(&plan.dir_new_rec_len.to_le_bytes());
         slot[6] = plan.dir_name_len;
-        slot[7] = EXT2_FT_REG_FILE;
+        slot[7] = self.disk_dirent_type(EXT2_FT_REG_FILE);
         let name_len = usize::from(plan.dir_name_len);
         let name_end = 8usize.checked_add(name_len).ok_or(FsError::Invalid)?;
         slot.get_mut(8..name_end)
@@ -11050,7 +11838,7 @@ impl Ext2Fs {
 
     fn metadata_preimage_hash(
         &self,
-        plan: JournalMetadataPlan,
+        plan: JournalMetadataPlan<'_>,
         index: usize,
         post_image: &[u8],
     ) -> Result<[u8; 32], FsError> {
@@ -11062,6 +11850,10 @@ impl Ext2Fs {
         }
         let freeing = matches!(plan, JournalMetadataPlan::DirectFree(_));
         match plan {
+            JournalMetadataPlan::Namespace(plan) => {
+                plan.home(index)?;
+                Ok(plan.intent.preimage_hashes[index])
+            }
             JournalMetadataPlan::IndirectData { plan, freeing } => {
                 let before = if freeing { plan.block.phys_block } else { 0 };
                 Self::hash_block_replacement(post_image, plan.pointer_offset, &before.to_le_bytes())
@@ -11265,7 +12057,7 @@ impl Ext2Fs {
     }
 
     fn intent_for_plan(
-        plan: JournalMetadataPlan,
+        plan: JournalMetadataPlan<'_>,
         preimage_hashes: [[u8; 32]; JOURNAL_MAX_METADATA_BLOCKS],
     ) -> JournalCommitIntent {
         let block_kind = match plan {
@@ -11285,7 +12077,7 @@ impl Ext2Fs {
         let plan = match plan {
             JournalMetadataPlan::IndirectData { plan, .. } => {
                 let mut intent = Self::intent_for_plan(
-                    JournalMetadataPlan::DirectAllocation(plan.block),
+                    JournalMetadataPlan::DirectAllocation(&plan.block),
                     preimage_hashes,
                 );
                 intent.kind = block_kind;
@@ -11295,7 +12087,7 @@ impl Ext2Fs {
             JournalMetadataPlan::IndirectRootAllocation(plan)
             | JournalMetadataPlan::IndirectRootFree(plan) => {
                 let mut intent = Self::intent_for_plan(
-                    JournalMetadataPlan::DirectAllocation(plan),
+                    JournalMetadataPlan::DirectAllocation(&plan),
                     preimage_hashes,
                 );
                 intent.kind = block_kind;
@@ -11309,6 +12101,11 @@ impl Ext2Fs {
             ZERO_INTENT_KIND_INODE_UPDATE
         };
         match plan {
+            JournalMetadataPlan::Namespace(plan) => {
+                let mut intent = plan.intent;
+                intent.preimage_hashes = preimage_hashes;
+                intent
+            }
             JournalMetadataPlan::DirectAllocation(plan) | JournalMetadataPlan::DirectFree(plan) => {
                 JournalCommitIntent {
                     kind: block_kind,
@@ -11324,6 +12121,7 @@ impl Ext2Fs {
                     rename_rec_len: 0,
                     rename_old_name_len: 0,
                     rename_old_name: [0; 255],
+                    namespace: NamespaceExtra::default(),
                 }
             }
             JournalMetadataPlan::InodeUpdate {
@@ -11349,6 +12147,7 @@ impl Ext2Fs {
                 rename_rec_len: 0,
                 rename_old_name_len: 0,
                 rename_old_name: [0; 255],
+                namespace: NamespaceExtra::default(),
             },
             JournalMetadataPlan::FileCreate(plan) => JournalCommitIntent {
                 kind: ZERO_INTENT_KIND_FILE_CREATE,
@@ -11367,6 +12166,7 @@ impl Ext2Fs {
                 rename_rec_len: 0,
                 rename_old_name_len: 0,
                 rename_old_name: [0; 255],
+                namespace: NamespaceExtra::default(),
             },
             JournalMetadataPlan::IndirectRootAllocation(_)
             | JournalMetadataPlan::IndirectRootFree(_)
@@ -11387,6 +12187,7 @@ impl Ext2Fs {
                 rename_rec_len: plan.rec_len,
                 rename_old_name_len: plan.old_name_len,
                 rename_old_name: plan.old_name,
+                namespace: NamespaceExtra::default(),
             },
         }
     }
@@ -11410,6 +12211,24 @@ impl Ext2Fs {
         block[ZERO_INTENT_OLD_INODE_OFFSET..ZERO_INTENT_DIGEST_OFFSET]
             .copy_from_slice(Self::inode_bytes(&intent.old_inode));
         block[ZERO_INTENT_DIGEST_OFFSET..ZERO_INTENT_END].fill(0);
+        if namespace::is_kind(intent.kind) {
+            write_be_u32(block, ZERO_INTENT_NEW_INO_OFFSET, intent.new_ino)?;
+            write_be_u32(block, ZERO_INTENT_PARENT_INO_OFFSET, intent.parent_ino)?;
+            write_be_u32(
+                block,
+                ZERO_INTENT_RENAME_DIR_OFF_OFFSET,
+                intent.rename_dir_off,
+            )?;
+            write_be_u16(
+                block,
+                ZERO_INTENT_RENAME_REC_LEN_OFFSET,
+                intent.rename_rec_len,
+            )?;
+            block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET] = intent.rename_old_name_len;
+            block[ZERO_INTENT_RENAME_OLD_NAME_OFFSET..ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255]
+                .copy_from_slice(&intent.rename_old_name);
+            return namespace::encode_extra(block, intent);
+        }
         if intent.kind == ZERO_INTENT_KIND_FILE_CREATE {
             if block.len() < ZERO_INTENT_FILE_CREATE_END {
                 return Err(FsError::Invalid);
@@ -11585,7 +12404,7 @@ impl Ext2Fs {
             new_inode: next_raw,
         };
         let mut homes = [0u32; DIRECT_ALLOCATION_METADATA_BLOCKS];
-        let metadata_plan = JournalMetadataPlan::DirectFree(plan);
+        let metadata_plan = JournalMetadataPlan::DirectFree(&plan);
         for index in 0..DIRECT_ALLOCATION_METADATA_BLOCKS {
             homes[index] = self.metadata_home_block(metadata_plan, index)?;
             if journal.contains_physical(homes[index]) || homes[..index].contains(&homes[index]) {
@@ -11772,7 +12591,7 @@ impl Ext2Fs {
                         new_inode: next_raw,
                     };
                     let mut homes = [0u32; DIRECT_ALLOCATION_METADATA_BLOCKS];
-                    let metadata_plan = JournalMetadataPlan::DirectAllocation(plan);
+                    let metadata_plan = JournalMetadataPlan::DirectAllocation(&plan);
                     for index in 0..DIRECT_ALLOCATION_METADATA_BLOCKS {
                         homes[index] = self.metadata_home_block(metadata_plan, index)?;
                         if journal.contains_physical(homes[index]) {
@@ -11820,7 +12639,7 @@ impl Ext2Fs {
     fn commit_metadata_transaction(
         &self,
         journal: &mut Ext2Journal,
-        plan: JournalMetadataPlan,
+        plan: JournalMetadataPlan<'_>,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), JournalTxFailure> {
         let metadata_blocks = plan.metadata_blocks();
@@ -12086,6 +12905,10 @@ impl Ext2Fs {
             fs: Arc::downgrade(self),
             fs_id: self.fs_id,
             ino,
+            cache_id: NEXT_EXT2_CACHE_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| FsError::NoSpace)?,
+            unlinked: AtomicBool::new(raw.links_count == 0),
             raw: RwLock::new(raw),
             size: AtomicU64::new(size),
             write_lock: Mutex::new(()),
@@ -12093,65 +12916,23 @@ impl Ext2Fs {
         .map_err(|_| FsError::NoMem)
     }
 
-    /// RF178-37 FIX: load or return the canonical in-memory inode wrapper.
-    ///
-    /// R186-7: the bitmap-allocation gate lives in `read_inode_raw`, which only
-    /// runs on a cache MISS. A cache hit therefore bypasses it. That is safe today
-    /// and the reasoning is recorded here because it is a load-bearing precondition
-    /// rather than an accident:
-    ///
-    ///   - The cache starts empty at mount, so the FIRST load of any inode goes
-    ///     through `read_inode_raw` and is bitmap-checked. A crafted directory
-    ///     entry pointing at a bitmap-free inode is rejected there.
-    ///   - Nothing in this driver ever frees an inode: the `FileSystem` impl
-    ///     exposes only `fs_id`/`fs_type`/`root_inode`/`lookup`, and `Inode`
-    ///     exposes no unlink/rmdir/create. No code path clears an inode bitmap
-    ///     bit, so a cached entry cannot outlive its allocation.
-    ///
-    /// If an inode-free path is ever added it MUST invalidate this cache entry
-    /// atomically with clearing the bitmap bit, otherwise a subsequent lookup
-    /// through a stale or aliasing directory entry would resolve to a freed inode
-    /// and write through it into blocks that have been reallocated to another
-    /// file. `debug_assert_inode_allocated` below exists to catch exactly that
-    /// regression in checked builds.
+    /// Serialize cache publication with bitmap allocation/free. Orphans remain
+    /// reachable through existing handles, but cannot be loaded through a stale
+    /// directory entry. The atomic flag avoids taking raw after meta_lock.
     fn load_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<Ext2Inode>, FsError> {
+        let _meta = self.meta_lock.lock();
+        self.ensure_io_healthy()?;
         let cached = self.inode_cache.get_or_try_insert_with(ino, || {
             let raw = self.read_inode_raw(ino)?;
+            if raw.links_count == 0 {
+                return Err(FsError::NotFound);
+            }
             self.new_inode_from_raw(ino, raw)
         })?;
-        self.debug_assert_inode_allocated(ino);
+        if cached.unlinked.load(Ordering::Acquire) {
+            return Err(FsError::NotFound);
+        }
         Ok(cached)
-    }
-
-    /// R186-7: re-verify the bitmap bit for an inode served from the cache.
-    ///
-    /// Compiled out of release builds — the release-path guarantee is the
-    /// no-free-path argument documented on `load_inode`, not a per-lookup block
-    /// read (which would cost one device read per path component). In checked
-    /// builds this turns "someone added an inode-free path and forgot to
-    /// invalidate the cache" from a silent cross-file corruption primitive into an
-    /// immediate, located failure.
-    #[inline]
-    fn debug_assert_inode_allocated(&self, ino: u32) {
-        #[cfg(debug_assertions)]
-        {
-            match self.inode_is_allocated(ino) {
-                Ok(true) => {}
-                Ok(false) => panic!(
-                    "R186-7: ext2 inode {} served from cache but its bitmap bit is \
-                     CLEAR — an inode-free path must invalidate the inode cache \
-                     atomically with clearing the bitmap",
-                    ino
-                ),
-                // An I/O or bounds failure here is not evidence of the violation
-                // this assertion targets; the ordinary error paths cover it.
-                Err(_) => {}
-            }
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            let _ = ino;
-        }
     }
 
     /// Calculate group and index for an inode number
@@ -12854,6 +13635,10 @@ impl FileSystem for Ext2Fs {
         if self.dev.durability() == block::DurabilityGuarantee::Unsupported {
             return Err(FsError::Io);
         }
+        let owner = self.self_ref.lock().as_ref().and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            owner.reap_orphans()?;
+        }
         self.flush_with_retry()?;
         // A concurrent writer may have poisoned the mount during the barrier.
         self.ensure_io_healthy()
@@ -12891,6 +13676,33 @@ impl FileSystem for Ext2Fs {
         parent.dir_lookup(name)
     }
 
+    fn unlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        expected_ino: u64,
+        must_be_dir: Option<bool>,
+        _context: &crate::topology::MutationContext<'_>,
+    ) -> Result<(), FsError> {
+        self.unlink_namespace(parent, name, expected_ino, must_be_dir)
+    }
+
+    fn symlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        target: &str,
+        context: &crate::topology::MutationContext<'_>,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        self.create_namespace(
+            parent,
+            name,
+            FileMode::symlink(0o777),
+            Some(target),
+            context,
+        )
+    }
+
     /// Transactional ext3 file creation.  All metadata homes — inode bitmap,
     /// group descriptor, superblock, the new inode's table block, the parent
     /// inode's table block (or one coalesced block), and the parent directory
@@ -12908,6 +13720,9 @@ impl FileSystem for Ext2Fs {
         mode: FileMode,
         context: &crate::topology::MutationContext<'_>,
     ) -> Result<Arc<dyn Inode>, FsError> {
+        if mode.is_dir() {
+            return self.create_namespace(parent, name, mode, None, context);
+        }
         self.ensure_io_healthy()?;
         if !mode.is_file() {
             // mkdir is out of scope: it needs a directory data block and the
@@ -12947,6 +13762,9 @@ impl FileSystem for Ext2Fs {
         let _meta = fs.meta_lock.lock();
         fs.ensure_io_healthy()?;
         let committed_parent = *raw_guard;
+        if committed_parent.links_count == 0 {
+            return Err(FsError::NotFound);
+        }
         if committed_parent.flags & EXT2_IMMUTABLE_FL != 0 {
             return Err(FsError::PermDenied);
         }
@@ -13230,7 +14048,7 @@ impl FileSystem for Ext2Fs {
         };
         let transaction_failure = match fs.commit_metadata_transaction(
             journal,
-            JournalMetadataPlan::FileCreate(plan),
+            JournalMetadataPlan::FileCreate(&plan),
             &mut scratch,
         ) {
             Ok(()) => None,
@@ -13319,6 +14137,11 @@ impl FileSystem for Ext2Fs {
         if fs.dev.is_read_only() {
             return Err(FsError::ReadOnly);
         }
+        let source_ino = u32::try_from(expected_src_ino).map_err(|_| FsError::Invalid)?;
+        if source_ino == old_parent_ext2.ino {
+            return Err(FsError::NotSupported);
+        }
+        let src_inode = fs.load_inode(source_ino)?;
         let parent_ino = old_parent_ext2.ino;
         let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
         let block_size_us = fs.block_size as usize;
@@ -13326,10 +14149,14 @@ impl FileSystem for Ext2Fs {
         // Lock order mirrors create/write_mutation.
         let _parent_guard = old_parent_ext2.write_lock.lock();
         let mut raw_guard = old_parent_ext2.raw.write();
+        let source_raw = src_inode.raw.read();
         let _meta = fs.meta_lock.lock();
         fs.ensure_io_healthy()?;
         let committed_parent = *raw_guard;
-        if committed_parent.flags & EXT2_IMMUTABLE_FL != 0 {
+        if committed_parent.links_count == 0 {
+            return Err(FsError::NotFound);
+        }
+        if (committed_parent.flags | source_raw.flags) & (EXT2_IMMUTABLE_FL | EXT2_APPEND_FL) != 0 {
             return Err(FsError::PermDenied);
         }
         if committed_parent.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
@@ -13420,13 +14247,12 @@ impl FileSystem for Ext2Fs {
         }
         let rec_len = src_rec_len;
         // Verify the source inode matches the caller's expectation and is a
-        // regular file (directory rename is out of scope).  load_inode reads
-        // the source inode from disk — it does NOT take the parent's raw lock.
+        // regular file. The source was pinned before the metadata gate; this
+        // avoids both recursive metadata locking and raw/meta lock inversion.
         if src_ino as u64 != expected_src_ino {
             return Err(FsError::PermDenied);
         }
-        let src_inode = fs.load_inode(src_ino)?;
-        if !src_inode.is_file_inner() {
+        if source_raw.mode & EXT2_S_IFMT != EXT2_S_IFREG {
             return Err(FsError::NotSupported);
         }
         // The dir-data home is the last block (re-derive it for the plan).
@@ -13490,7 +14316,7 @@ impl FileSystem for Ext2Fs {
         };
         match fs.commit_metadata_transaction(
             journal,
-            JournalMetadataPlan::Rename(plan),
+            JournalMetadataPlan::Rename(&plan),
             &mut scratch,
         ) {
             Ok(()) => {}
@@ -13523,12 +14349,27 @@ pub struct Ext2Inode {
     fs: Weak<Ext2Fs>,
     fs_id: u64,
     ino: u32,
+    cache_id: u64,
+    unlinked: AtomicBool,
     /// On-disk inode data (protected for write updates)
     raw: RwLock<Ext2InodeRaw>,
     /// File size (atomic for concurrent reads)
     size: AtomicU64,
     /// Serialize writes to this inode
     write_lock: Mutex<()>,
+}
+
+impl Drop for Ext2Inode {
+    fn drop(&mut self) {
+        page_cache::PAGE_CACHE.retire_inode(self.cache_id);
+        if self.unlinked.load(Ordering::Acquire) && self.raw.get_mut().mode != 0 {
+            if let Some(fs) = self.fs.upgrade() {
+                // A busy metadata/orphan lane leaves a durable orphan for the
+                // next sync/mutation. Reentrant drops must never wait on it.
+                let _ = fs.reap_orphans();
+            }
+        }
+    }
 }
 
 impl Ext2Inode {
@@ -13561,7 +14402,11 @@ impl Ext2Inode {
 
         let mut offset = 0u64;
         let file_size = self.size.load(Ordering::Acquire);
-        let raw = *self.raw.read();
+        let raw_guard = self.raw.read();
+        let raw = *raw_guard;
+        if raw.links_count == 0 {
+            return Err(FsError::NotFound);
+        }
         // R178-29 FIX: Fallible directory listing buffer allocation (up to 64 KiB).
         let mut block_buf = Vec::new();
         block_buf
@@ -13642,9 +14487,8 @@ impl Ext2Inode {
 
         let block_size = fs.block_size as usize;
 
-        // Create unique inode_id for page cache: combine fs_id and ino
-        // Use upper 32 bits for fs_id, lower 32 bits for ino
-        let cache_inode_id = (self.fs_id << 32) | (self.ino as u64);
+        // Retired objects never lend cached pages to a reused disk inode.
+        let cache_inode_id = self.cache_id;
         // Writers retain `raw.write()` through their page-cache publication.
         // Hold the matching read guard through every cached-page copy so an
         // Uptodate fast-path reader cannot alias a concurrent raw-pointer write.
@@ -13788,7 +14632,7 @@ impl Ext2Inode {
     }
 
     fn publish_cached_write(&self, cursor: u64, data: &[u8]) {
-        let inode_id = (self.fs_id << 32) | self.ino as u64;
+        let inode_id = self.cache_id;
         let mut remaining = data.len();
         let mut cache_cursor = cursor;
         let mut data_pos = 0usize;
@@ -13831,7 +14675,7 @@ impl Ext2Inode {
         if start >= end {
             return;
         }
-        let inode_id = (self.fs_id << 32) | self.ino as u64;
+        let inode_id = self.cache_id;
         for page_index in (start / PAGE_SIZE as u64)..=((end - 1) / PAGE_SIZE as u64) {
             let Some(page) = PAGE_CACHE.find_get_page(inode_id, page_index) else {
                 continue;
@@ -13861,7 +14705,11 @@ impl Ext2Inode {
     /// past each block before it leaves the bitmap. A crash therefore leaves a
     /// shorter, consistent file, and a retry finishes the job.
     fn truncate_mutation(&self, new_size: u64) -> Result<(), FsError> {
-        if !self.is_file_inner() {
+        self.truncate_mutation_inner(new_size, false)
+    }
+
+    fn truncate_mutation_inner(&self, new_size: u64, reclaim: bool) -> Result<(), FsError> {
+        if !reclaim && !self.is_file_inner() {
             return Err(FsError::IsDir);
         }
         let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
@@ -13874,6 +14722,9 @@ impl Ext2Inode {
         let mut raw_guard = self.raw.write();
         let _meta = fs.meta_lock.lock();
         fs.ensure_io_healthy()?;
+        if reclaim && (raw_guard.links_count != 0 || new_size != 0) {
+            return Err(FsError::Invalid);
+        }
         if raw_guard.flags & (EXT2_IMMUTABLE_FL | EXT2_APPEND_FL) != 0 {
             return Err(FsError::PermDenied);
         }
@@ -14024,7 +14875,7 @@ impl Ext2Inode {
                         let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
                         let result = fs.commit_metadata_transaction(
                             journal,
-                            JournalMetadataPlan::IndirectRootFree(plan),
+                            JournalMetadataPlan::IndirectRootFree(&plan),
                             &mut scratch,
                         );
                         if !result.as_ref().is_err_and(|failure| !failure.committed) {
@@ -14065,7 +14916,7 @@ impl Ext2Inode {
                 let result = fs.commit_metadata_transaction(
                     journal,
                     JournalMetadataPlan::IndirectData {
-                        plan,
+                        plan: &plan,
                         freeing: true,
                     },
                     &mut scratch,
@@ -14107,7 +14958,7 @@ impl Ext2Inode {
             let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
             let result = fs.commit_metadata_transaction(
                 journal,
-                JournalMetadataPlan::DirectFree(plan),
+                JournalMetadataPlan::DirectFree(&plan),
                 &mut scratch,
             );
             if !result.as_ref().is_err_and(|failure| !failure.committed) {
@@ -14187,7 +15038,16 @@ impl Ext2Inode {
     /// before the first write. Earlier durable chunks are returned as a POSIX
     /// short-write prefix if a later chunk fails.
     fn write_mutation(&self, mode: Ext2WriteMode, data: &[u8]) -> Result<(usize, u64), FsError> {
-        if !self.is_file_inner() {
+        self.write_mutation_inner(mode, data, false)
+    }
+
+    fn write_mutation_inner(
+        &self,
+        mode: Ext2WriteMode,
+        data: &[u8],
+        initializing: bool,
+    ) -> Result<(usize, u64), FsError> {
+        if !initializing && !self.is_file_inner() {
             return Err(FsError::IsDir);
         }
         let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
@@ -14211,6 +15071,12 @@ impl Ext2Inode {
         // both pointer-block TOCTOU and lost updates between those inodes.
         let _meta = fs.meta_lock.lock();
         fs.ensure_io_healthy()?;
+        if initializing
+            && (raw_guard.links_count != 0
+                || !matches!(raw_guard.mode & EXT2_S_IFMT, EXT2_S_IFDIR | EXT2_S_IFLNK))
+        {
+            return Err(FsError::Invalid);
+        }
         let current_size = self.size.load(Ordering::Acquire);
         let offset = match mode {
             Ext2WriteMode::Positioned(offset) => offset,
@@ -14403,7 +15269,7 @@ impl Ext2Inode {
                 }
                 let transaction_failure = match fs.commit_metadata_transaction(
                     journal,
-                    JournalMetadataPlan::IndirectRootAllocation(plan),
+                    JournalMetadataPlan::IndirectRootAllocation(&plan),
                     &mut scratch,
                 ) {
                     Ok(()) => None,
@@ -14441,16 +15307,20 @@ impl Ext2Inode {
                 Err(error) => return fail(error, written),
             };
             debug_assert_eq!(plan.file_block, file_block);
+            let indirect_plan;
             let metadata_plan = if indirect {
-                match fs.indirect_data_plan(plan, committed_raw.block[EXT2_IND_BLOCK], journal) {
-                    Ok(plan) => JournalMetadataPlan::IndirectData {
-                        plan,
-                        freeing: false,
-                    },
-                    Err(error) => return fail(error, written),
+                indirect_plan =
+                    match fs.indirect_data_plan(plan, committed_raw.block[EXT2_IND_BLOCK], journal)
+                    {
+                        Ok(plan) => plan,
+                        Err(error) => return fail(error, written),
+                    };
+                JournalMetadataPlan::IndirectData {
+                    plan: &indirect_plan,
+                    freeing: false,
                 }
             } else {
-                JournalMetadataPlan::DirectAllocation(plan)
+                JournalMetadataPlan::DirectAllocation(&plan)
             };
 
             // Ordered-data rule: initialize and durably flush the complete new
@@ -14585,7 +15455,13 @@ impl Inode for Ext2Inode {
         }
 
         let file_size = self.size.load(Ordering::Acquire);
-        let raw = *self.raw.read();
+        let raw_guard = self.raw.read();
+        let raw = *raw_guard;
+        if raw.links_count == 0 {
+            return Ok(None);
+        }
+        let _meta = fs.meta_lock.lock();
+        fs.ensure_io_healthy()?;
         let block_size = fs.block_size as u64;
         // R178-29 FIX: Fallible directory lookup buffer allocation (up to 64 KiB).
         let mut block_buf = Vec::new();
@@ -14745,9 +15621,26 @@ impl Inode for Ext2Inode {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        if !self.is_file_inner() {
-            return Err(FsError::IsDir);
+        let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
+        fs.ensure_io_healthy()?;
+        let raw = self.raw.read();
+        match raw.mode & EXT2_S_IFMT {
+            EXT2_S_IFREG => {}
+            EXT2_S_IFLNK if raw.blocks_lo == 0 && raw.size_lo < 60 => {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(raw.size_lo as usize);
+                let len = buf.len().min(raw.size_lo as usize - start);
+                for (index, byte) in buf[..len].iter_mut().enumerate() {
+                    let source = start + index;
+                    *byte = (raw.block[source / 4] >> ((source % 4) * 8)) as u8;
+                }
+                return Ok(len);
+            }
+            EXT2_S_IFLNK => {}
+            _ => return Err(FsError::IsDir),
         }
+        drop(raw);
         self.read_file_at(offset, buf)
     }
 
@@ -14858,6 +15751,7 @@ mod st_k4_barrier_tests {
             inode_size: size_of::<Ext2InodeRaw>() as u16,
             root: RwLock::new(None),
             inode_cache: WeakArcCache::new(),
+            orphan_lock: Mutex::new(()),
             meta_lock: Mutex::new(()),
             journal: Mutex::new(None),
             resize_reserved_blocks: RwLock::new(Vec::new()),
