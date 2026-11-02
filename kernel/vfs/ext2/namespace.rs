@@ -314,15 +314,14 @@ impl NamespacePlan {
         if i.parent_ino == 0
             || i.physical == 0
             || x.predecessor != 0
-            || i.old_inode.mode & EXT2_S_IFMT != EXT2_S_IFDIR
-            || i.old_inode.links_count < 2
+            || fs.check_directory_shape(&i.old_inode).is_err()
             || i.old_inode.flags
                 & (EXT2_IMMUTABLE_FL
+                    | EXT2_INDEX_FL
                     | EXT2_UNSUPPORTED_WRITE_LAYOUT_FL
                     | if i.kind == UNLINK { EXT2_APPEND_FL } else { 0 })
                 != 0
             || x.old_child.flags & (EXT2_IMMUTABLE_FL | EXT2_APPEND_FL) != 0
-            || !i.old_inode.block[..EXT2_NDIR_BLOCKS].contains(&i.physical)
             || fs.is_structural_metadata_block(i.physical)?
             || i.rename_old_name_len == 0
         {
@@ -758,12 +757,14 @@ impl Ext2Fs {
         let inline = raw.mode & EXT2_S_IFMT == EXT2_S_IFLNK
             && raw.blocks_lo == 0
             && (raw.size_lo as usize) < size_of_val(&raw.block);
-        if !inline
-            && (raw.block[EXT2_DIND_BLOCK..].iter().any(|b| *b != 0)
-                || ((raw.size_high_or_dir_acl as u64) << 32 | raw.size_lo as u64)
-                    > self.single_indirect_block_limit() * self.block_size as u64)
-        {
+        if raw.mode & EXT2_S_IFMT == EXT2_S_IFDIR && raw.flags & EXT2_INDEX_FL != 0 {
             return Err(FsError::NotSupported);
+        }
+        if !inline {
+            self.check_tree_size(
+                raw,
+                (u64::from(raw.size_high_or_dir_acl) << 32) | u64::from(raw.size_lo),
+            )?;
         }
         Ok(())
     }
@@ -902,7 +903,7 @@ impl Ext2Fs {
         mut visit: F,
     ) -> Result<(), FsError>
     where
-        F: FnMut(DirectorySlot, &[u8]) -> Result<(), FsError>,
+        F: FnMut(DirectorySlot, &[u8], &[u8]) -> Result<(), FsError>,
     {
         if raw.mode & EXT2_S_IFMT != EXT2_S_IFDIR {
             return Err(FsError::NotDir);
@@ -911,14 +912,14 @@ impl Ext2Fs {
         if raw.size_high_or_dir_acl != 0
             || raw.size_lo == 0
             || raw.size_lo % self.block_size != 0
-            || blocks > EXT2_NDIR_BLOCKS as u64
-            || raw.block[EXT2_NDIR_BLOCKS..].iter().any(|b| *b != 0)
+            || blocks > MAX_OWNERSHIP_REFERENCES as u64
+            || raw.flags & EXT2_INDEX_FL != 0
         {
             return Err(FsError::NotSupported);
         }
-        for index in 0..blocks as usize {
+        for index in 0..blocks as u32 {
             let home = self
-                .validate_block(raw.block[index])?
+                .map_file_block_with_scratch(raw, index, scratch)?
                 .ok_or(FsError::Invalid)?;
             if self.is_structural_metadata_block(home)? {
                 return Err(FsError::Invalid);
@@ -958,6 +959,7 @@ impl Ext2Fs {
                         file_type: head[7],
                     },
                     &bytes[offset + 8..name_end],
+                    bytes,
                 )?;
                 previous = offset as u32;
                 previous_length = length;
@@ -974,7 +976,7 @@ impl Ext2Fs {
         scratch: &mut Ext2MutationScratch,
     ) -> Result<DirectorySlot, FsError> {
         let mut found = None;
-        self.walk_namespace_directory(raw, scratch, |slot, bytes| {
+        self.walk_namespace_directory(raw, scratch, |slot, bytes, _block| {
             if slot.inode != 0 && bytes == name.as_bytes() {
                 if found.is_some() {
                     return Err(FsError::Invalid);
@@ -995,7 +997,7 @@ impl Ext2Fs {
     ) -> Result<(), FsError> {
         let mut dot = false;
         let mut dotdot = false;
-        self.walk_namespace_directory(raw, scratch, |slot, name| {
+        self.walk_namespace_directory(raw, scratch, |slot, name, _block| {
             if slot.inode == 0 {
                 return Ok(());
             }
@@ -1117,7 +1119,7 @@ impl Ext2Fs {
                 }
                 for index in 0..blocks {
                     let physical = self
-                        .map_file_block_with_scratch(&raw, index, scratch)?
+                        .map_tree_block(&raw, index, overlay, images, scratch)?
                         .ok_or(FsError::Invalid)?;
                     self.read_virtual_block(journal, overlay, images, physical, scratch)?;
                     let bytes = scratch.block();
@@ -1181,7 +1183,7 @@ impl Ext2Fs {
             // Directory trees are immutable to the existing writer except for
             // namespace data homes. Map the accepted inode, then read the overlay.
             let physical = self
-                .map_file_block_with_scratch(raw, index as u32, scratch)?
+                .map_tree_block(raw, index as u32, overlay, images, scratch)?
                 .ok_or(FsError::Invalid)?;
             self.read_virtual_block(journal, overlay, images, physical, scratch)?;
             let bytes = scratch.block();
@@ -1281,6 +1283,7 @@ impl Ext2Fs {
         if parent_raw.links_count == 0 || child_raw.links_count == 0 {
             return Err(FsError::NotFound);
         }
+        self.check_directory_shape(&parent_raw)?;
         if (parent_raw.flags | child_raw.flags) & (EXT2_IMMUTABLE_FL | EXT2_APPEND_FL) != 0 {
             return Err(FsError::PermDenied);
         }
@@ -1356,6 +1359,7 @@ impl Ext2Fs {
             rename_rec_len: slot.length,
             rename_old_name_len: name.len() as u8,
             rename_old_name: old_name,
+            tree_level: 0,
             namespace: NamespaceExtra {
                 old_child: *child_raw,
                 old_head,
@@ -1482,6 +1486,7 @@ impl Ext2Fs {
                 rename_rec_len: 0,
                 rename_old_name_len: 0,
                 rename_old_name: [0; 255],
+                tree_level: 0,
                 namespace: NamespaceExtra {
                     old_child: *raw,
                     old_head: self.superblock.read().last_orphan,
@@ -1545,50 +1550,53 @@ impl Ext2Fs {
     ) -> Result<DirectorySlot, FsError> {
         let needed = (8 + name.len() + 3) & !3;
         let mut selected = None;
-        self.walk_namespace_directory(parent, scratch, |slot, bytes| {
+        self.walk_namespace_directory(parent, scratch, |slot, bytes, block| {
             if slot.inode != 0 && bytes == name.as_bytes() {
                 return Err(FsError::Exists);
             }
-            if selected.is_none() {
+            if selected.is_some() {
+                return Ok(());
+            }
+            let minimum = (8 + bytes.len() + 3) & !3;
+            let candidate =
                 if slot.inode == 0 && bytes.is_empty() && usize::from(slot.length) >= needed {
-                    selected = Some(DirectorySlot {
+                    Some(DirectorySlot {
                         previous: NO_PREVIOUS,
                         previous_length: 0,
                         ..slot
-                    });
-                } else if slot.inode != 0 {
-                    let minimum = (8 + bytes.len() + 3) & !3;
-                    if usize::from(slot.length) >= minimum + needed {
-                        selected = Some(DirectorySlot {
-                            home: slot.home,
-                            offset: slot.offset + minimum as u32,
-                            previous: slot.offset,
-                            previous_length: slot.length,
-                            inode: 0,
-                            length: slot.length - minimum as u16,
-                            file_type: 0,
-                        });
-                    }
+                    })
+                } else if slot.inode != 0 && usize::from(slot.length) >= minimum + needed {
+                    Some(DirectorySlot {
+                        home: slot.home,
+                        offset: slot.offset + minimum as u32,
+                        previous: slot.offset,
+                        previous_length: slot.length,
+                        inode: 0,
+                        length: slot.length - minimum as u16,
+                        file_type: 0,
+                    })
+                } else {
+                    None
+                };
+            if let Some(candidate) = candidate {
+                // Dirty slack is valid Ext2 data. Skip it rather than erasing it
+                // outside a transaction or inventing an unreconstructible preimage.
+                let mut expected = [0u8; 263];
+                if candidate.previous == NO_PREVIOUS {
+                    expected[4..6].copy_from_slice(&candidate.length.to_le_bytes());
+                }
+                let off = candidate.offset as usize;
+                if block
+                    .get(off..off + 8 + name.len())
+                    .ok_or(FsError::Invalid)?
+                    == &expected[..8 + name.len()]
+                {
+                    selected = Some(candidate);
                 }
             }
             Ok(())
         })?;
-        let slot = selected.ok_or(FsError::NoSpace)?;
-        self.read_block(slot.home, scratch.block_mut())?;
-        let mut expected = [0u8; 263];
-        if slot.previous == NO_PREVIOUS {
-            expected[4..6].copy_from_slice(&slot.length.to_le_bytes());
-        }
-        let off = slot.offset as usize;
-        if scratch
-            .block()
-            .get(off..off + 8 + name.len())
-            .ok_or(FsError::Invalid)?
-            != &expected[..8 + name.len()]
-        {
-            return Err(FsError::NotSupported);
-        }
-        Ok(slot)
+        selected.ok_or(FsError::NoSpace)
     }
 
     fn vacant_namespace_inode(
@@ -1667,7 +1675,7 @@ impl Ext2Fs {
             return Err(FsError::ReadOnly);
         }
         let directory = mode.is_dir();
-        if !directory && !mode.is_symlink() {
+        if !directory && !mode.is_symlink() && !mode.is_file() {
             return Err(FsError::NotSupported);
         }
         if let Some(target) = target {
@@ -1677,7 +1685,7 @@ impl Ext2Fs {
             if target.len() >= self.block_size as usize || target.len() >= 4096 {
                 return Err(FsError::NameTooLong);
             }
-        } else if !directory {
+        } else if !directory && !mode.is_file() {
             return Err(FsError::Invalid);
         }
         let mut scratch = Ext2MutationScratch::try_new_admitted(self.block_size)?;
@@ -1690,10 +1698,11 @@ impl Ext2Fs {
         if parent_raw.links_count == 0 {
             return Err(FsError::NotFound);
         }
+        self.check_directory_shape(&parent_raw)?;
         if parent_raw.flags & EXT2_IMMUTABLE_FL != 0 {
             return Err(FsError::PermDenied);
         }
-        if parent_raw.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
+        if parent_raw.flags & (EXT2_INDEX_FL | EXT2_UNSUPPORTED_WRITE_LAYOUT_FL) != 0 {
             return Err(FsError::NotSupported);
         }
         if directory && parent_raw.links_count == u16::MAX {
@@ -1709,12 +1718,21 @@ impl Ext2Fs {
                 return Err(FsError::NoSpace);
             }
             drop(chain);
-            let slot = self.insertion_slot(&parent_raw, name, &mut scratch)?;
+            let slot = match self.insertion_slot(&parent_raw, name, &mut scratch) {
+                Ok(slot) => slot,
+                Err(FsError::NoSpace) => {
+                    self.grow_directory(parent, &mut parent_raw, journal, &mut scratch)?;
+                    self.insertion_slot(&parent_raw, name, &mut scratch)?
+                }
+                Err(error) => return Err(error),
+            };
             let (ino, old_child) = self.vacant_namespace_inode(parent.ino, &mut scratch)?;
             let sb = *self.superblock.read();
             let mut raw = Ext2InodeRaw::default();
             raw.mode = if directory {
                 EXT2_S_IFDIR | (mode.perm & 0o7777) | (parent_raw.mode & 0o2000)
+            } else if mode.is_file() {
+                EXT2_S_IFREG | (mode.perm & 0o7777)
             } else {
                 EXT2_S_IFLNK | 0o777
             };
@@ -1748,6 +1766,7 @@ impl Ext2Fs {
                 rename_rec_len: 0,
                 rename_old_name_len: 0,
                 rename_old_name: [0; 255],
+                tree_level: 0,
                 namespace: NamespaceExtra {
                     old_child,
                     old_head: sb.last_orphan,
@@ -1833,6 +1852,7 @@ impl Ext2Fs {
             rename_rec_len: slot.length,
             rename_old_name_len: name.len() as u8,
             rename_old_name: name_bytes,
+            tree_level: 0,
             namespace: NamespaceExtra {
                 old_child: *child_raw,
                 old_head: self.superblock.read().last_orphan,
@@ -1841,6 +1861,8 @@ impl Ext2Fs {
                 previous_length: slot.previous_length,
                 file_type: self.disk_dirent_type(if directory {
                     EXT2_FT_DIR
+                } else if mode.is_file() {
+                    EXT2_FT_REG_FILE
                 } else {
                     EXT2_FT_SYMLINK
                 }),
@@ -1916,8 +1938,8 @@ impl Ext2Fs {
         let count = parent.size_lo / self.block_size;
         if parent.size_lo == 0
             || parent.size_lo % self.block_size != 0
-            || count as usize > EXT2_NDIR_BLOCKS
-            || parent.block[EXT2_NDIR_BLOCKS..].iter().any(|p| *p != 0)
+            || count as usize > MAX_OWNERSHIP_REFERENCES
+            || parent.flags & EXT2_INDEX_FL != 0
         {
             return Err(FsError::Invalid);
         }
@@ -1926,11 +1948,11 @@ impl Ext2Fs {
             (post, usize::from(intent.kind == PUBLISH)),
         ] {
             let mut found = 0;
-            for physical in &parent.block[..count as usize] {
-                if *physical == 0 {
-                    return Err(FsError::Invalid);
-                }
-                self.read_virtual_block(journal, overlay, images, *physical, scratch)?;
+            for logical in 0..count {
+                let physical = self
+                    .map_tree_block(parent, logical, overlay, images, scratch)?
+                    .ok_or(FsError::Invalid)?;
+                self.read_virtual_block(journal, overlay, images, physical, scratch)?;
                 let bytes = scratch.block();
                 let mut off = 0;
                 while off < bytes.len() {
@@ -1952,7 +1974,7 @@ impl Ext2Fs {
                             == intent.rename_old_name[..usize::from(intent.rename_old_name_len)]
                     {
                         if ino != intent.new_ino
-                            || *physical != intent.physical
+                            || physical != intent.physical
                             || off != intent.rename_dir_off as usize
                         {
                             return Err(FsError::Invalid);
@@ -1972,12 +1994,15 @@ impl Ext2Fs {
             let mut dotdot = false;
             if child.size_lo == 0
                 || child.size_lo % self.block_size != 0
-                || child.size_lo / self.block_size > EXT2_NDIR_BLOCKS as u32
+                || child.size_lo / self.block_size > MAX_OWNERSHIP_REFERENCES as u32
             {
                 return Err(FsError::Invalid);
             }
-            for physical in &child.block[..(child.size_lo / self.block_size) as usize] {
-                self.read_virtual_block(journal, overlay, pre, *physical, scratch)?;
+            for logical in 0..child.size_lo / self.block_size {
+                let physical = self
+                    .map_tree_block(child, logical, overlay, pre, scratch)?
+                    .ok_or(FsError::Invalid)?;
+                self.read_virtual_block(journal, overlay, pre, physical, scratch)?;
                 let bytes = scratch.block();
                 let mut off = 0;
                 while off < bytes.len() {

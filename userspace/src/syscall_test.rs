@@ -2143,6 +2143,63 @@ fn test_ext2_mut_syscalls(results: &mut TestResult) {
             if is_error(fd) {
                 return false;
             }
+            // Touch both deep levels on the actual filesystem geometry, including
+            // a >4 GiB sparse offset for 4 KiB blocks. Exercise cached tail clearing.
+            let mut stat = userspace::syscall::Stat::default();
+            if userspace::syscall::sys_fstat(fd, &mut stat) != 0 || stat.blksize < 1024 {
+                return false;
+            }
+            let block = stat.blksize as u64;
+            let pointers = block / 4;
+            for logical in [
+                12 + pointers,
+                12 + pointers + pointers * pointers + pointers + 1,
+            ] {
+                let off = logical * block + 17;
+                let mut bytes = [0u8; 8];
+                if syscall4(18, fd, b"deep".as_ptr() as u64, 4, off) != 4
+                    || syscall4(17, fd, bytes.as_mut_ptr() as u64, 8, off - 4) != 8
+                    || bytes != *b"\0\0\0\0deep"
+                    || syscall2(77, fd, off + 1) != 0
+                    || syscall2(77, fd, off + 4) != 0
+                    || syscall4(17, fd, bytes.as_mut_ptr() as u64, 4, off) != 4
+                    || bytes[..4] != *b"d\0\0\0"
+                    || syscall2(77, fd, 0) != 0
+                {
+                    return false;
+                }
+            }
+            // Long names force the directory beyond all twelve direct blocks.
+            // Keep all entries live until the expanded directory has been observed.
+            let mut path = [b'n'; 320];
+            let prefix = b"/mnt/test/.ext2-mut-sys/";
+            path[..prefix.len()].copy_from_slice(prefix);
+            let end = prefix.len() + 255;
+            path[end] = 0;
+            let entries = 12 * (block / 264) + 1;
+            for index in 0..entries {
+                path[prefix.len()] = b'A' + (index / 26) as u8;
+                path[prefix.len() + 1] = b'a' + (index % 26) as u8;
+                let created = sys_open(path.as_ptr(), 2 | 0o100 | 0o200, 0o600);
+                if is_error(created) || sys_close(created) != 0 {
+                    return false;
+                }
+            }
+            let dir_fd = sys_open(DIR.as_ptr(), 0o200000, 0);
+            if is_error(dir_fd)
+                || userspace::syscall::sys_fstat(dir_fd, &mut stat) != 0
+                || stat.size <= (12 * block) as i64
+                || sys_close(dir_fd) != 0
+            {
+                return false;
+            }
+            for index in 0..entries {
+                path[prefix.len()] = b'A' + (index / 26) as u8;
+                path[prefix.len() + 1] = b'a' + (index % 26) as u8;
+                if syscall1(87, path.as_ptr() as u64) != 0 {
+                    return false;
+                }
+            }
             let page = [0x4Du8; PAGE];
             for index in 0..16 {
                 if syscall4(

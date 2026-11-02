@@ -175,7 +175,9 @@ const JBD2_SUPER_UUID_OFFSET: usize = 48;
 const JBD2_SUPER_NR_USERS_OFFSET: usize = 64;
 
 mod namespace;
+mod tree;
 use namespace::{NamespaceExtra, NamespacePlan};
+use tree::{TreeCursor, TreeEdge, TreePlan};
 
 // Page-cache identities belong to object lifetimes, never reusable inode numbers.
 static NEXT_EXT2_CACHE_ID: AtomicU64 = AtomicU64::new(1);
@@ -688,6 +690,7 @@ pub fn run_ext2_mutation_scratch_self_test() {
             rename_old_name_len: 0,
             rename_old_name: [0; 255],
             namespace: NamespaceExtra::default(),
+            tree_level: 0,
         };
         let writes_before_recovery_validation = device.writes.load(Ordering::Relaxed);
         assert!(fs
@@ -2072,9 +2075,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     drop(_fs);
     drop(device);
 
-    // A journal makes direct and single-indirect holes allocatable, but a
-    // double-indirect hole anywhere in the range still rejects the whole request
-    // before its first write.
+    // One write crosses the single/double boundary and allocates both paths.
     let mut indirect_hole = base.clone();
     let file_offset = 5 * BLOCK_SIZE + (FILE_INO as usize - 1) * size_of::<Ext2InodeRaw>();
     let mut sparse_file: Ext2InodeRaw = read_struct(&indirect_hole, file_offset);
@@ -2093,9 +2094,9 @@ pub fn run_ext2_journal_transaction_self_test() {
             (single_indirect_end - BLOCK_SIZE) as u64,
             &cross_direct_limit
         ),
-        Err(FsError::NotSupported)
+        Ok(BLOCK_SIZE + 1)
     );
-    assert_eq!(device.operation.load(Ordering::Acquire), 0);
+    assert!(device.operation.load(Ordering::Acquire) > 0);
     drop(cross_direct_limit);
     drop(file);
     drop(_fs);
@@ -3118,6 +3119,7 @@ pub fn run_ext2_journal_transaction_self_test() {
 
     run_truncate_scenarios(&synthetic_image());
     run_indirect_scenarios(&synthetic_image());
+    run_deep_tree_scenarios(&synthetic_image());
 
     /// Every block the file owns: direct pointers, the mapping block, and its
     /// pointers. It must match the bitmap, the counts and `blocks_lo` exactly.
@@ -3239,6 +3241,131 @@ pub fn run_ext2_journal_transaction_self_test() {
         }
     }
 
+    // lint-fallible-fn: INFALLIBLE-OK(boot/hosted crash oracle; disposable images)
+    fn run_deep_tree_scenarios(empty: &[u8]) {
+        let p = (BLOCK_SIZE / 4) as u64;
+        let stride = if cfg!(test) { 1 } else { 11 };
+        let mut sealed = [false; 2];
+        // Only a direct/root transaction fits. The first byte is already durable
+        // when the later five-home data attachment fails: return that prefix.
+        {
+            let (device, fs, file) = mount_image(empty.to_vec());
+            fs.journal.lock().as_mut().unwrap().max_len = 7;
+            let offset = 12 * BLOCK_SIZE as u64 - 1;
+            assert_eq!(file.write_at(offset, b"xy"), Ok(1));
+            assert_eq!(disk_bytes(&fs, &file, offset as usize, 1), b"x");
+            assert_eq!(file.stat().unwrap().size, offset + 1);
+            drop((file, fs, device));
+        }
+        for logical in [12 + p, 12 + p + p * p, 12 + p + p * p + p + 1] {
+            let offset = logical * BLOCK_SIZE as u64 + 17;
+            let (device, fs, file) = mount_image(empty.to_vec());
+            assert_eq!(file.write_at(offset, b"deep"), Ok(4));
+            assert_eq!(disk_bytes(&fs, &file, offset as usize - 5, 5), [0; 5]);
+            assert_eq!(disk_bytes(&fs, &file, offset as usize, 4), b"deep");
+            let complete = device.durable_snapshot();
+            drop((file, fs, device));
+            let (device, fs, file) = mount_image(complete.clone());
+            file.truncate(offset + 1).expect("deep partial tail");
+            file.truncate(offset + 4).expect("deep sparse grow");
+            assert_eq!(disk_bytes(&fs, &file, offset as usize, 4), b"d\0\0\0");
+            file.truncate(0).expect("deep postorder reclaim");
+            assert_eq!(fs.superblock.read().free_blocks_count, 16);
+            assert_eq!(file.raw.read().block, [0; 15]);
+            drop((file, fs, device));
+            for freeing in [false, true] {
+                for persist in [false, true] {
+                    let mut boundary = 1;
+                    loop {
+                        let (device, fs, file) = mount_image(if freeing {
+                            complete.clone()
+                        } else {
+                            empty.to_vec()
+                        });
+                        device.arm(boundary, if persist { boundary - 1 } else { 0 });
+                        if freeing {
+                            let _ = file.truncate(0);
+                        } else {
+                            let _ = file.write_at(offset, b"deep");
+                        }
+                        let reached = device.failed.load(Ordering::Acquire);
+                        let image = device.durable_snapshot();
+                        drop((file, fs, device));
+                        if cfg!(test) && journal_start(&image) != 0 {
+                            for count in [4, 5] {
+                                let commit = journal_logical_offset(count + 2);
+                                if read_be_u32(&image, commit + 4).ok() != Some(JBD2_COMMIT_BLOCK) {
+                                    continue;
+                                }
+                                let kind = image[commit + ZERO_INTENT_KIND_OFFSET];
+                                if !matches!(kind, tree::ATTACH | tree::DETACH)
+                                    || image[commit + ZERO_INTENT_COUNT_OFFSET] != count as u8
+                                    || read_be_u32(&image, commit + 8).unwrap()
+                                        != read_be_u32(
+                                            &image,
+                                            journal_logical_offset(0) + JBD2_SUPER_SEQUENCE_OFFSET,
+                                        )
+                                        .unwrap()
+                                {
+                                    continue;
+                                }
+                                let mut probe = image.clone();
+                                resign_private_transaction(&mut probe, count as usize);
+                                if probe
+                                    [commit + ZERO_INTENT_DIGEST_OFFSET..commit + ZERO_INTENT_END]
+                                    != image[commit + ZERO_INTENT_DIGEST_OFFSET
+                                        ..commit + ZERO_INTENT_END]
+                                {
+                                    continue;
+                                }
+                                drop(probe);
+                                sealed[usize::from(kind == tree::DETACH)] = true;
+                                for corrupt in 0..3 {
+                                    let mut bad = image.clone();
+                                    match corrupt {
+                                        0 => bad[commit + ZERO_INTENT_END] = 4,
+                                        1 => {
+                                            write_be_u32(
+                                                &mut bad,
+                                                commit + ZERO_INTENT_PHYSICAL_OFFSET,
+                                                JOURNAL_FIRST_PHYS,
+                                            )
+                                            .unwrap();
+                                        }
+                                        _ => bad[commit + ZERO_INTENT_KIND_OFFSET] = tree::DIR_GROW,
+                                    }
+                                    resign_private_transaction(&mut bad, count as usize);
+                                    let device =
+                                        Arc::try_new(CrashBlockDevice::new(bad.clone())).unwrap();
+                                    assert!(mount_device(&device).is_err(), "forged tree intent accepted kind={kind} count={count} corrupt={corrupt} boundary={boundary}");
+                                    assert_eq!(device.operation.load(Ordering::Acquire), 0);
+                                    assert_eq!(device.durable_snapshot(), bad);
+                                }
+                            }
+                        }
+                        let (device, fs, file) = mount_image(image);
+                        if !freeing && file.stat().unwrap().size != 0 {
+                            assert_eq!(disk_bytes(&fs, &file, offset as usize, 4), b"deep");
+                        }
+                        file.truncate(0)
+                            .expect("deep crash retry, including empty mapping chains");
+                        assert_eq!(fs.superblock.read().free_blocks_count, 16);
+                        assert_eq!(file.raw.read().blocks_lo, 0);
+                        drop((file, fs, device));
+                        if !reached {
+                            break;
+                        }
+                        boundary += stride;
+                        assert!(boundary < 160, "unbounded deep transaction sequence");
+                    }
+                }
+            }
+        }
+        if cfg!(test) {
+            assert_eq!(sealed, [true; 2]);
+        }
+    }
+
     /// EXT2-MUT slice 2. The synthetic image has 16 free 1 KiB blocks, enough for 12
     /// direct blocks, the mapping block and three more.
     // lint-fallible-fn: INFALLIBLE-OK(boot self-test; OOM here is boot-fatal by policy)
@@ -3301,8 +3428,9 @@ pub fn run_ext2_journal_transaction_self_test() {
         drop(fs);
         drop(device);
 
-        // Past the single-indirect range nothing happens at all.
-        let past_limit = ((EXT2_NDIR_BLOCKS + BLOCK_SIZE / 4) * BLOCK_SIZE) as u64;
+        // Past the complete tree geometry nothing happens at all.
+        let p = (BLOCK_SIZE / 4) as u64;
+        let past_limit = (12 + p + p * p + p * p * p) * BLOCK_SIZE as u64;
         let (device, _fs, file) = mount_image(written.clone());
         device.arm(0, 0);
         assert_eq!(file.write_at(past_limit, b"x"), Err(FsError::NotSupported));
@@ -3495,6 +3623,7 @@ pub fn run_ext2_journal_transaction_self_test() {
             rename_old_name_len: 0,
             rename_old_name: [0; 255],
             namespace: NamespaceExtra::default(),
+            tree_level: 0,
         };
         let mut valid = old;
         valid.blocks_lo = 2;
@@ -3805,7 +3934,7 @@ pub fn run_ext2_journal_transaction_self_test() {
         file.truncate(payload.len() as u64)
             .expect("same-size truncate");
         assert_eq!(
-            file.truncate(((EXT2_NDIR_BLOCKS + BLOCK_SIZE / 4) * BLOCK_SIZE + 1) as u64),
+            file.truncate(_fs.tree_block_limit() * BLOCK_SIZE as u64 + 1),
             Err(FsError::NotSupported)
         );
         device.arm(0, 0);
@@ -3816,7 +3945,7 @@ pub fn run_ext2_journal_transaction_self_test() {
         assert_eq!(file.truncate(0), Err(FsError::PermDenied));
         file.raw.write().flags &= !EXT2_IMMUTABLE_FL;
         file.raw.write().block[EXT2_DIND_BLOCK] = FIRST_FREE_BLOCK + 7;
-        assert_eq!(file.truncate(0), Err(FsError::NotSupported));
+        assert!(file.truncate(0).is_err());
         file.raw.write().block[EXT2_DIND_BLOCK] = 0;
         assert_eq!(device.operation.load(Ordering::Acquire), 0);
         drop(file);
@@ -4103,6 +4232,7 @@ pub const EXT2_FT_SYMLINK: u8 = 7;
 /// Inode flags
 pub const EXT2_IMMUTABLE_FL: u32 = 0x00000010;
 pub const EXT2_APPEND_FL: u32 = 0x00000020;
+const EXT2_INDEX_FL: u32 = 0x0000_1000;
 const EXT2_COMPR_FL: u32 = 0x0000_0004;
 const EXT3_JOURNAL_DATA_FL: u32 = 0x0000_4000;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
@@ -4489,6 +4619,7 @@ struct JournalCommitIntent {
     rename_old_name_len: u8,
     rename_old_name: [u8; 255],
     namespace: NamespaceExtra,
+    tree_level: u8,
 }
 
 struct OwnershipWork {
@@ -5009,6 +5140,7 @@ impl FileCreatePlan {
 /// the parent directory data block and the parent inode's table block.
 #[derive(Clone, Copy)]
 struct RenamePlan {
+    logical: Option<u32>,
     parent_ino: u32,
     parent_target: InodeWriteTarget,
     old_parent_inode: Ext2InodeRaw,
@@ -5035,6 +5167,7 @@ struct IndirectDataPlan<'a> {
 
 #[derive(Clone, Copy)]
 enum JournalMetadataPlan<'a> {
+    Tree(&'a TreePlan<'a>),
     Namespace(&'a NamespacePlan),
     DirectAllocation(&'a DirectAllocationPlan),
     InodeUpdate {
@@ -5069,6 +5202,7 @@ impl JournalMetadataPlan<'_> {
     #[inline]
     fn metadata_blocks(self) -> usize {
         match self {
+            Self::Tree(plan) => plan.metadata_blocks(),
             Self::Namespace(plan) => usize::from(plan.intent.metadata_count),
             Self::DirectAllocation(_)
             | Self::DirectFree(_)
@@ -5742,6 +5876,61 @@ pub fn run_ext2_create_self_test() {
             .copy_from_slice(&digest);
     }
 
+    // lint-fallible-fn: INFALLIBLE-OK(boot/hosted forgery oracle, disposable images)
+    fn check_legacy_parent_log(image: &[u8]) {
+        if !cfg!(test) {
+            return;
+        }
+        let journal = JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE;
+        if read_be_u32(image, journal + JBD2_SUPER_START_OFFSET).unwrap() == 0 {
+            return;
+        }
+        let sequence = read_be_u32(image, journal + JBD2_SUPER_SEQUENCE_OFFSET).unwrap();
+        for count in [2, 5, 6] {
+            let commit = journal + (count + 2) * BLOCK_SIZE;
+            if !matches!(
+                image[commit + ZERO_INTENT_KIND_OFFSET],
+                ZERO_INTENT_KIND_FILE_CREATE | ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME
+            ) || image[commit + ZERO_INTENT_COUNT_OFFSET] != count as u8
+                || read_be_u32(image, commit + 4).ok() != Some(JBD2_COMMIT_BLOCK)
+                || read_be_u32(image, commit + 8).ok() != Some(sequence)
+            {
+                continue;
+            }
+            let mut verified = image.to_vec();
+            resign_namespace_log(&mut verified, count);
+            if verified != image {
+                continue;
+            }
+            let ino = read_be_u32(image, commit + ZERO_INTENT_INODE_OFFSET).unwrap();
+            let offset = (ino as usize - 1) * size_of::<Ext2InodeRaw>();
+            let home = 5 + offset / BLOCK_SIZE;
+            let mut tag = journal + BLOCK_SIZE + JBD2_HEADER_BYTES;
+            for order in 0..count {
+                if read_be_u32(image, tag).unwrap() as usize == home {
+                    for field in [
+                        core::mem::offset_of!(Ext2InodeRaw, uid),
+                        core::mem::offset_of!(Ext2InodeRaw, mode),
+                    ] {
+                        let mut forged = image.to_vec();
+                        forged[journal + (order + 2) * BLOCK_SIZE + offset % BLOCK_SIZE + field] ^=
+                            1;
+                        resign_namespace_log(&mut forged, count);
+                        let device =
+                            Arc::try_new(CreateCrashDevice::new(forged.clone(), 0)).unwrap();
+                        assert!(
+                            Ext2Fs::mount(device.clone()).is_err(),
+                            "legacy parent permission forgery accepted"
+                        );
+                        assert_eq!(device.operation.load(Ordering::Acquire), 0);
+                        assert_eq!(device.durable_image(), forged);
+                    }
+                }
+                tag += JBD2_TAG_BYTES + if order == 0 { 16 } else { 0 };
+            }
+        }
+    }
+
     // lint-fallible-fn: INFALLIBLE-OK(boot self-test; OOM here is boot-fatal by policy)
     fn check_namespace_log(image: &[u8], seen: &mut [bool; 4]) {
         let journal = JOURNAL_FIRST_PHYS as usize * BLOCK_SIZE;
@@ -6351,6 +6540,7 @@ pub fn run_ext2_create_self_test() {
         );
         drop(root);
         drop(fs);
+        check_legacy_parent_log(&device.durable_image());
         let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
             .expect("remount device");
         let dev2_dyn: Arc<dyn BlockDevice> = dev2;
@@ -6384,6 +6574,7 @@ pub fn run_ext2_create_self_test() {
         );
         drop(root);
         drop(fs);
+        check_legacy_parent_log(&device.durable_image());
         let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
             .expect("remount device");
         let dev2_dyn: Arc<dyn BlockDevice> = dev2;
@@ -6618,6 +6809,7 @@ pub fn run_ext2_create_self_test() {
         drop(sub);
         drop(root);
         drop(fs);
+        check_legacy_parent_log(&device.durable_image());
         let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
             .expect("remount device");
         let dev2_dyn: Arc<dyn BlockDevice> = dev2;
@@ -6800,6 +6992,70 @@ pub fn run_ext2_create_self_test() {
         );
     }
 
+    // A mountable malformed parent must never produce a committed intent that
+    // recovery rejects. Exercise both the legacy and namespace writer paths.
+    for misaligned in [false, true] {
+        let mut image = build_rename_image();
+        let inode = 5 * BLOCK_SIZE + size_of::<Ext2InodeRaw>();
+        if misaligned {
+            image[inode + 4..inode + 8].copy_from_slice(&((BLOCK_SIZE - 1) as u32).to_le_bytes());
+        } else {
+            image[inode + 26..inode + 28].copy_from_slice(&1u16.to_le_bytes());
+        }
+        let device = Arc::try_new(CreateCrashDevice::new(image.clone(), 0)).unwrap();
+        let fs = Ext2Fs::mount(device.clone()).expect("malformed parent read admission");
+        // Clean mount may enroll the private journal feature. The attempted
+        // mutations themselves must perform no write or flush after admission.
+        let before = device.operation.load(Ordering::Acquire);
+        let image = device.durable_image();
+        let root = fs.root_inode();
+        for mode in [FileMode::regular(0o600), FileMode::directory(0o700)] {
+            assert!(fs
+                .create(&root, "new", mode, &crate::topology::write().setup(0, 0))
+                .is_err());
+        }
+        assert!(fs
+            .symlink(
+                &root,
+                "link",
+                "target",
+                &crate::topology::write().setup(0, 0)
+            )
+            .is_err());
+        assert!(fs
+            .rename(
+                &root,
+                "oldfile",
+                &root,
+                "newfile",
+                true,
+                NEW_INO as u64,
+                None,
+                &crate::topology::write().setup(0, 0)
+            )
+            .is_err());
+        assert!(fs
+            .unlink(
+                &root,
+                "oldfile",
+                NEW_INO as u64,
+                Some(false),
+                &crate::topology::write().setup(0, 0)
+            )
+            .is_err());
+        let parent = root.as_any().downcast_ref::<Ext2Inode>().unwrap();
+        let _write = parent.write_lock.lock();
+        let mut raw = parent.raw.write();
+        let _meta = fs.meta_lock.lock();
+        let mut journal = fs.journal.lock();
+        let mut scratch = Ext2MutationScratch::try_new(BLOCK_SIZE as u32).unwrap();
+        assert!(fs
+            .grow_directory(parent, &mut raw, journal.as_mut().unwrap(), &mut scratch)
+            .is_err());
+        assert_eq!(device.operation.load(Ordering::Acquire), before);
+        assert_eq!(device.durable_image(), image);
+    }
+
     // Scenario E: rename happy path — "oldfile" → "newfile" in place.
     {
         let device =
@@ -6850,34 +7106,47 @@ pub fn run_ext2_create_self_test() {
     // counter (fetch_update returns the new value) makes the commit write +
     // its flush land at op 10 for the 2-home rename tx; the first checkpoint
     // home write is op 11.  Failing at op 11 leaves the commit durable.
-    {
-        let device = Arc::try_new(CreateCrashDevice::new(build_rename_image(), 11))
-            .expect("rename crash device");
-        let dev: Arc<dyn BlockDevice> = device.clone();
-        let fs = Ext2Fs::mount(dev).expect("mount rename crash image");
-        let root = fs.root_inode();
-        assert!(
-            fs.rename(
-                &root,
-                "oldfile",
-                &root,
-                "newfile",
-                true,
-                NEW_INO as u64,
-                None,
-                &crate::topology::write().setup(0, 0),
-            )
-            .is_err(),
-            "rename must fail when the checkpoint write crashes"
-        );
-        drop(root);
-        drop(fs);
-        let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
-            .expect("remount device");
-        let dev2_dyn: Arc<dyn BlockDevice> = dev2;
-        let fs2 = Ext2Fs::mount(dev2_dyn).expect("remount after rename crash");
-        assert_rename_state(&fs2, true);
-        klog_always!("    Ext2Fs::rename crash-after-commit replay passed");
+    for dirty in [false, true] {
+        for boundary in [0, 11] {
+            let mut image = build_rename_image();
+            if dirty {
+                image[7 * BLOCK_SIZE + 40..8 * BLOCK_SIZE].fill(0xA5);
+            }
+            let device =
+                Arc::try_new(CreateCrashDevice::new(image, boundary)).expect("rename crash device");
+            let dev: Arc<dyn BlockDevice> = device.clone();
+            let fs = Ext2Fs::mount(dev).expect("mount rename crash image");
+            let root = fs.root_inode();
+            assert!(
+                fs.rename(
+                    &root,
+                    "oldfile",
+                    &root,
+                    "newfile",
+                    true,
+                    NEW_INO as u64,
+                    None,
+                    &crate::topology::write().setup(0, 0),
+                )
+                .is_err()
+                    == (boundary != 0),
+                "rename result must match the injected checkpoint fault"
+            );
+            drop(root);
+            drop(fs);
+            check_legacy_parent_log(&device.durable_image());
+            let dev2 = Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0))
+                .expect("remount device");
+            let dev2_dyn: Arc<dyn BlockDevice> = dev2.clone();
+            let fs2 = Ext2Fs::mount(dev2_dyn).expect("remount after rename crash");
+            assert_rename_state(&fs2, true);
+            if dirty {
+                assert!(dev2.durable_image()[7 * BLOCK_SIZE + 40..8 * BLOCK_SIZE]
+                    .iter()
+                    .all(|b| *b == 0xA5));
+            }
+            klog_always!("    Ext2Fs::rename crash-after-commit replay passed");
+        }
     }
 
     // KSA-014: real create, descriptor stat, remount and committed-journal replay
@@ -8167,7 +8436,7 @@ impl Ext2Fs {
         // reaches it, and a shrink empties it before freeing it, so a crash can leave
         // one past the end of the file. It owns nothing else: the child check below
         // still refuses any pointer past the end.
-        if !(1..=3).contains(&level) || (logical_base >= logical_blocks && level != 1) {
+        if !(1..=3).contains(&level) {
             return Err(FsError::Invalid);
         }
         let root = self.push_ordinary_owner(journal, work, root)?;
@@ -8197,10 +8466,10 @@ impl Ext2Fs {
                         .ok_or(FsError::Invalid)?,
                 )
                 .ok_or(FsError::Invalid)?;
-            if child_base >= logical_blocks {
-                return Err(FsError::Invalid);
-            }
             if level == 1 {
+                if child_base >= logical_blocks {
+                    return Err(FsError::Invalid);
+                }
                 self.push_ordinary_owner(journal, work, child)?;
                 *inode_blocks = inode_blocks.checked_add(1).ok_or(FsError::Invalid)?;
             } else {
@@ -8704,6 +8973,9 @@ impl Ext2Fs {
         intent: &JournalCommitIntent,
         new: &Ext2InodeRaw,
     ) -> Result<(), FsError> {
+        if tree::is_kind(intent.kind) {
+            return self.validate_tree_transition(intent, new);
+        }
         let old = &intent.old_inode;
         let orphan = old.links_count == 0 && new.links_count == 0;
         let kind = old.mode & EXT2_S_IFMT;
@@ -8730,6 +9002,7 @@ impl Ext2Fs {
         }
         let old_size = ((old.size_high_or_dir_acl as u64) << 32) | old.size_lo as u64;
         let new_size = ((new.size_high_or_dir_acl as u64) << 32) | new.size_lo as u64;
+        self.check_tree_size(new, new_size)?;
         let shrinking = matches!(
             intent.kind,
             ZERO_INTENT_KIND_DIRECT_FREE
@@ -8913,7 +9186,7 @@ impl Ext2Fs {
         if intent.kind == ZERO_INTENT_KIND_FILE_CREATE {
             return self.validate_recovery_file_create(intent, overlay, post_images);
         }
-        if intent.kind == ZERO_INTENT_KIND_FILE_RENAME {
+        if matches!(intent.kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME) {
             return self.validate_recovery_rename(intent, overlay, post_images);
         }
 
@@ -8947,16 +9220,31 @@ impl Ext2Fs {
             .map_err(|_| FsError::NoMem)?;
         pre_images.extend_from_slice(post_images);
 
+        let tree_edge = if tree::is_kind(intent.kind) {
+            let mut scratch = Ext2MutationScratch::try_new(self.block_size)?;
+            Some(self.tree_edge(
+                &intent.old_inode,
+                intent.file_block,
+                intent.tree_level,
+                overlay,
+                post_images,
+                &mut scratch,
+            )?)
+        } else {
+            None
+        };
         let freeing = matches!(
             intent.kind,
-            ZERO_INTENT_KIND_DIRECT_FREE
+            tree::DETACH
+                | ZERO_INTENT_KIND_DIRECT_FREE
                 | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
                 | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
         );
-        let with_mapping = matches!(
-            intent.kind,
-            ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
-        );
+        let with_mapping = tree_edge.is_some_and(|edge| edge.parent.is_some())
+            || matches!(
+                intent.kind,
+                ZERO_INTENT_KIND_INDIRECT_DATA_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
+            );
         match intent.kind {
             ZERO_INTENT_KIND_INODE_UPDATE | ZERO_INTENT_KIND_INODE_SHRINK => {
                 if overlay.len() != 1 || inode_entry.order != 0 {
@@ -8973,7 +9261,10 @@ impl Ext2Fs {
                     .ok_or(FsError::Invalid)?;
                 Self::replace_inode_in_block(pre, inode_target, &intent.old_inode)?;
             }
-            ZERO_INTENT_KIND_DIRECT_ALLOCATION
+            tree::ATTACH
+            | tree::DETACH
+            | tree::DIR_GROW
+            | ZERO_INTENT_KIND_DIRECT_ALLOCATION
             | ZERO_INTENT_KIND_DIRECT_FREE
             | ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION
             | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
@@ -9010,7 +9301,9 @@ impl Ext2Fs {
                     0,
                 ];
                 if with_mapping {
-                    expected_homes[3] = intent.old_inode.block[EXT2_IND_BLOCK];
+                    expected_homes[3] = tree_edge
+                        .and_then(|edge| edge.parent)
+                        .map_or(intent.old_inode.block[EXT2_IND_BLOCK], |parent| parent.0);
                     expected_homes[4] = inode_target.block;
                 }
                 for order in 0..home_count {
@@ -9025,13 +9318,18 @@ impl Ext2Fs {
                 if with_mapping {
                     // The pointer must hold exactly this intent's block after the
                     // edit, and exactly nothing (or this block) before it.
-                    let pointer = usize::try_from(
-                        intent
-                            .file_block
-                            .checked_sub(EXT2_NDIR_BLOCKS as u32)
-                            .ok_or(FsError::Invalid)?,
-                    )
-                    .map_err(|_| FsError::Invalid)?;
+                    let pointer = if let Some((_, pointer)) = tree_edge.and_then(|edge| edge.parent)
+                    {
+                        pointer
+                    } else {
+                        usize::try_from(
+                            intent
+                                .file_block
+                                .checked_sub(EXT2_NDIR_BLOCKS as u32)
+                                .ok_or(FsError::Invalid)?,
+                        )
+                        .map_err(|_| FsError::Invalid)?
+                    };
                     let mapping_entry = overlay
                         .iter()
                         .find(|entry| entry.order == 3)
@@ -9351,6 +9649,7 @@ impl Ext2Fs {
                 return Err(FsError::Invalid);
             }
         }
+        self.validate_legacy_create_contents(intent, overlay, &pre_images, post_images, dir_block)?;
         Ok(pre_images)
     }
 
@@ -9427,12 +9726,35 @@ impl Ext2Fs {
             return Err(FsError::NotSupported);
         }
         let parent_target = self.inode_write_target(parent_ino)?;
-        // Dir-data home: the parent's last non-zero direct block (block array
-        // unchanged by rename, so old_inode agrees).
         let mut dir_block = 0u32;
-        for i in 0..EXT2_NDIR_BLOCKS {
-            if intent.old_inode.block[i] != 0 {
-                dir_block = intent.old_inode.block[i];
+        if intent.kind == tree::RENAME {
+            let parent = &intent.old_inode;
+            if parent.mode & EXT2_S_IFMT != EXT2_S_IFDIR
+                || parent.size_lo % self.block_size != 0
+                || parent.size_high_or_dir_acl != 0
+                || parent.flags & EXT2_INDEX_FL != 0
+                || intent.file_block >= parent.size_lo / self.block_size
+            {
+                return Err(FsError::Invalid);
+            }
+            let mut scratch = Ext2MutationScratch::try_new(self.block_size)?;
+            dir_block = self
+                .map_tree_block(
+                    parent,
+                    intent.file_block,
+                    overlay,
+                    post_images,
+                    &mut scratch,
+                )?
+                .ok_or(FsError::Invalid)?;
+            if dir_block != intent.physical {
+                return Err(FsError::Invalid);
+            }
+        } else {
+            for i in 0..EXT2_NDIR_BLOCKS {
+                if intent.old_inode.block[i] != 0 {
+                    dir_block = intent.old_inode.block[i];
+                }
             }
         }
         if dir_block == 0 {
@@ -9491,17 +9813,39 @@ impl Ext2Fs {
                     // absolute dir_off+rec_len.
                     let slot_end = dir_off.checked_add(rec_len).ok_or(FsError::Invalid)?;
                     let slot = image.get_mut(dir_off..slot_end).ok_or(FsError::Invalid)?;
+                    let new_len = usize::from(slot[6]);
                     slot[6] = intent.rename_old_name_len;
                     let old_len = usize::from(intent.rename_old_name_len);
                     let name_end = 8usize.checked_add(old_len).ok_or(FsError::Invalid)?;
                     slot.get_mut(8..name_end)
                         .ok_or(FsError::Invalid)?
                         .copy_from_slice(&intent.rename_old_name[..old_len]);
-                    slot.get_mut(name_end..rec_len)
+                    let clear_end = if intent.kind == tree::RENAME {
+                        name_end.max(8 + new_len)
+                    } else {
+                        rec_len
+                    };
+                    slot.get_mut(name_end..clear_end)
                         .ok_or(FsError::Invalid)?
                         .fill(0);
                 }
                 1 => {
+                    let end = parent_target
+                        .start
+                        .checked_add(size_of::<Ext2InodeRaw>())
+                        .ok_or(FsError::Invalid)?;
+                    let bytes = image
+                        .get(parent_target.start..end)
+                        .ok_or(FsError::Invalid)?;
+                    // SAFETY: checked 128-byte integer-only on-disk inode.
+                    let new: Ext2InodeRaw =
+                        unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) };
+                    let mut expected = intent.old_inode;
+                    expected.mtime = new.mtime;
+                    expected.ctime = new.mtime;
+                    if Self::inode_bytes(&expected) != bytes {
+                        return Err(FsError::Invalid);
+                    }
                     Self::replace_inode_in_block(image, parent_target, &intent.old_inode)?;
                 }
                 _ => return Err(FsError::Invalid),
@@ -9521,6 +9865,7 @@ impl Ext2Fs {
                 return Err(FsError::Invalid);
             }
         }
+        self.validate_rename_contents(intent, overlay, &pre_images, post_images, dir_block)?;
         Ok(pre_images)
     }
 
@@ -9793,8 +10138,23 @@ impl Ext2Fs {
                         if namespace::is_kind(intent.kind)
                             && intent.physical != 0
                             && entry.home == intent.physical
-                            && intent.old_inode.block[..EXT2_NDIR_BLOCKS].contains(&entry.home)
                         {
+                            continue;
+                        }
+                        if tree::is_kind(intent.kind) {
+                            let edge = self.tree_edge(
+                                &intent.old_inode,
+                                intent.file_block,
+                                intent.tree_level,
+                                overlay,
+                                post_images,
+                                &mut scratch.control,
+                            )?;
+                            if edge.parent.is_some_and(|(parent, _)| parent == entry.home) {
+                                continue;
+                            }
+                        }
+                        if intent.kind == tree::RENAME && entry.home == intent.physical {
                             continue;
                         }
                         // EXT2-MUT: the single-indirect block named by the inode is
@@ -9836,7 +10196,8 @@ impl Ext2Fs {
             if matches!(
                 intent.kind,
                 ZERO_INTENT_KIND_INDIRECT_ROOT_ALLOCATION | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
-            ) {
+            ) || (tree::is_kind(intent.kind) && intent.tree_level != 0)
+            {
                 let root = self
                     .validate_block(intent.physical)?
                     .ok_or(FsError::Invalid)?;
@@ -9847,6 +10208,22 @@ impl Ext2Fs {
             }
         }
 
+        if let Some(intent) = intent.filter(|i| i.kind == tree::DIR_GROW) {
+            self.read_virtual_block(
+                journal,
+                overlay,
+                post_images,
+                intent.physical,
+                &mut scratch.control,
+            )?;
+            let bytes = scratch.control.block();
+            if self.block_size > u16::MAX as u32
+                || bytes[4..6] != (self.block_size as u16).to_le_bytes()
+                || bytes[..4].iter().chain(bytes[6..].iter()).any(|b| *b != 0)
+            {
+                return Err(FsError::Invalid);
+            }
+        }
         let original = *self.superblock.read();
         let (super_home, super_offset) = self.superblock_home_target();
         self.read_virtual_block(
@@ -10185,7 +10562,7 @@ impl Ext2Fs {
                         return Err(FsError::Invalid);
                     }
                     let freed_here = intent.is_some_and(|intent| {
-                        intent.kind == ZERO_INTENT_KIND_DIRECT_FREE
+                        (intent.kind == ZERO_INTENT_KIND_DIRECT_FREE || intent.kind == tree::DETACH)
                             && intent.file_block as usize == index
                             && physical == 0
                     });
@@ -10218,9 +10595,10 @@ impl Ext2Fs {
                         return Err(FsError::Invalid);
                     }
                     let root_freed = physical == 0
-                        && index == EXT2_IND_BLOCK
                         && intent.is_some_and(|intent| {
-                            intent.kind == ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
+                            (index == EXT2_IND_BLOCK
+                                && intent.kind == ZERO_INTENT_KIND_INDIRECT_ROOT_FREE)
+                                || (intent.kind == tree::DETACH && intent.tree_level == level)
                         });
                     if changed
                         && !root_freed
@@ -10359,13 +10737,15 @@ impl Ext2Fs {
         // in [ZERO_INTENT_END..ZERO_INTENT_FILE_CREATE_END); every other kind
         // keeps the whole [ZERO_INTENT_END..] region zero, so its on-disk format
         // is unchanged.
-        let trailing_ok = if namespace::is_kind(kind) {
+        let trailing_ok = if tree::is_kind(kind) {
+            block.len() >= tree::INTENT_END && block[tree::INTENT_END..].iter().all(|b| *b == 0)
+        } else if namespace::is_kind(kind) {
             block.len() >= namespace::INTENT_END
                 && block[namespace::INTENT_END..].iter().all(|b| *b == 0)
         } else if kind == ZERO_INTENT_KIND_FILE_CREATE {
             block.len() >= ZERO_INTENT_FILE_CREATE_END
                 && block[ZERO_INTENT_FILE_CREATE_END..].iter().all(|b| *b == 0)
-        } else if kind == ZERO_INTENT_KIND_FILE_RENAME {
+        } else if matches!(kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME) {
             block.len() >= ZERO_INTENT_FILE_RENAME_END
                 && block[ZERO_INTENT_FILE_RENAME_END..].iter().all(|b| *b == 0)
         } else {
@@ -10387,12 +10767,16 @@ impl Ext2Fs {
         } else {
             0
         };
-        let rename_dir_off = if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
+        let rename_dir_off = if matches!(kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME)
+            || namespace::is_kind(kind)
+        {
             read_be_u32(block, ZERO_INTENT_RENAME_DIR_OFF_OFFSET)?
         } else {
             0
         };
-        let rename_rec_len = if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
+        let rename_rec_len = if matches!(kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME)
+            || namespace::is_kind(kind)
+        {
             u16::from_be_bytes([
                 block[ZERO_INTENT_RENAME_REC_LEN_OFFSET],
                 block[ZERO_INTENT_RENAME_REC_LEN_OFFSET + 1],
@@ -10400,19 +10784,30 @@ impl Ext2Fs {
         } else {
             0
         };
-        let rename_old_name_len =
-            if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
-                block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET]
-            } else {
-                0
-            };
+        let rename_old_name_len = if matches!(kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME)
+            || namespace::is_kind(kind)
+        {
+            block[ZERO_INTENT_RENAME_OLD_NAME_LEN_OFFSET]
+        } else {
+            0
+        };
         let mut rename_old_name = [0u8; 255];
-        if kind == ZERO_INTENT_KIND_FILE_RENAME || namespace::is_kind(kind) {
+        if matches!(kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME) || namespace::is_kind(kind) {
             rename_old_name.copy_from_slice(
                 &block
                     [ZERO_INTENT_RENAME_OLD_NAME_OFFSET..ZERO_INTENT_RENAME_OLD_NAME_OFFSET + 255],
             );
         }
+        let tree_level = if tree::is_kind(kind) {
+            block[ZERO_INTENT_END]
+        } else {
+            0
+        };
+        let valid_tree = tree::is_kind(kind)
+            && matches!(metadata_count, 4 | 5)
+            && physical != 0
+            && tree_level <= 3
+            && (kind != tree::DIR_GROW || tree_level == 0);
         let valid_update = (kind == ZERO_INTENT_KIND_INODE_UPDATE
             || kind == ZERO_INTENT_KIND_INODE_SHRINK)
             && metadata_count == 1
@@ -10442,10 +10837,10 @@ impl Ext2Fs {
             && new_ino != 0
             && parent_ino != 0
             && inode_number == parent_ino;
-        let valid_file_rename = kind == ZERO_INTENT_KIND_FILE_RENAME
+        let valid_file_rename = matches!(kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME)
             && metadata_count == 2
-            && file_block == u32::MAX
-            && physical == 0
+            && ((kind == ZERO_INTENT_KIND_FILE_RENAME && file_block == u32::MAX && physical == 0)
+                || (kind == tree::RENAME && physical != 0))
             && inode_number != 0
             && rename_dir_off != u32::MAX
             && rename_rec_len >= size_of::<Ext2DirEntryHead>() as u16
@@ -10466,7 +10861,8 @@ impl Ext2Fs {
                 && !valid_indirect
                 && !valid_file_create
                 && !valid_file_rename
-                && !valid_namespace)
+                && !valid_namespace
+                && !valid_tree)
         {
             return Err(FsError::Invalid);
         }
@@ -10505,6 +10901,7 @@ impl Ext2Fs {
             rename_old_name_len,
             rename_old_name,
             namespace,
+            tree_level,
         })
     }
 
@@ -11521,6 +11918,14 @@ impl Ext2Fs {
         index: usize,
     ) -> Option<(JournalMetadataPlan<'a>, usize)> {
         match plan {
+            JournalMetadataPlan::Tree(plan) if plan.edge.parent.is_none() || index != 3 => {
+                let direct = if plan.kind == tree::DETACH {
+                    JournalMetadataPlan::DirectFree(plan.block)
+                } else {
+                    JournalMetadataPlan::DirectAllocation(plan.block)
+                };
+                Some((direct, if index == 4 { 3 } else { index }))
+            }
             JournalMetadataPlan::IndirectRootAllocation(plan) => {
                 Some((JournalMetadataPlan::DirectAllocation(plan), index))
             }
@@ -11548,6 +11953,7 @@ impl Ext2Fs {
             return self.metadata_home_block(plan, index);
         }
         match plan {
+            JournalMetadataPlan::Tree(plan) => Ok(plan.edge.parent.ok_or(FsError::Invalid)?.0),
             JournalMetadataPlan::Namespace(plan) => plan.home(index),
             JournalMetadataPlan::IndirectData { plan, .. } => Ok(plan.mapping_block),
             JournalMetadataPlan::IndirectRootAllocation(_)
@@ -11607,6 +12013,23 @@ impl Ext2Fs {
         let block = scratch.block_mut();
         let freeing = matches!(plan, JournalMetadataPlan::DirectFree(_));
         match plan {
+            JournalMetadataPlan::Tree(plan) => {
+                let (_, pointer) = plan.edge.parent.ok_or(FsError::Invalid)?;
+                let before = if plan.kind == tree::DETACH {
+                    plan.block.phys_block
+                } else {
+                    0
+                };
+                if read_u32_le(block, pointer)? != before {
+                    return Err(FsError::Invalid);
+                }
+                let after = if plan.kind == tree::DETACH {
+                    0
+                } else {
+                    plan.block.phys_block
+                };
+                block[pointer * 4..pointer * 4 + 4].copy_from_slice(&after.to_le_bytes());
+            }
             JournalMetadataPlan::Namespace(_) => return Err(FsError::Invalid),
             JournalMetadataPlan::IndirectData { plan, freeing } => {
                 let after = if freeing { 0 } else { plan.block.phys_block };
@@ -11778,7 +12201,12 @@ impl Ext2Fs {
             .copy_from_slice(&plan.new_name[..new_len]);
         // Zero the padding between the new name and the entry's rec_len end so
         // the preimage reversal (restore old name + zero tail) is exact.
-        slot.get_mut(name_end..slot_len)
+        let clear_end = if plan.logical.is_some() {
+            name_end.max(8 + usize::from(plan.old_name_len))
+        } else {
+            slot_len
+        };
+        slot.get_mut(name_end..clear_end)
             .ok_or(FsError::Invalid)?
             .fill(0);
         Ok(())
@@ -11862,6 +12290,15 @@ impl Ext2Fs {
         }
         let freeing = matches!(plan, JournalMetadataPlan::DirectFree(_));
         match plan {
+            JournalMetadataPlan::Tree(plan) => {
+                let (_, pointer) = plan.edge.parent.ok_or(FsError::Invalid)?;
+                let before = if plan.kind == tree::DETACH {
+                    plan.block.phys_block
+                } else {
+                    0
+                };
+                Self::hash_block_replacement(post_image, pointer * 4, &before.to_le_bytes())
+            }
             JournalMetadataPlan::Namespace(plan) => {
                 plan.home(index)?;
                 Ok(plan.intent.preimage_hashes[index])
@@ -12046,7 +12483,12 @@ impl Ext2Fs {
                         slot.get_mut(8..name_end)
                             .ok_or(FsError::Invalid)?
                             .copy_from_slice(&plan.old_name[..old_len]);
-                        slot.get_mut(name_end..rec_len)
+                        let clear_end = if plan.logical.is_some() {
+                            name_end.max(8 + usize::from(plan.new_name_len))
+                        } else {
+                            rec_len
+                        };
+                        slot.get_mut(name_end..clear_end)
                             .ok_or(FsError::Invalid)?
                             .fill(0);
                     }
@@ -12068,6 +12510,16 @@ impl Ext2Fs {
         plan: JournalMetadataPlan<'_>,
         preimage_hashes: [[u8; 32]; JOURNAL_MAX_METADATA_BLOCKS],
     ) -> JournalCommitIntent {
+        if let JournalMetadataPlan::Tree(plan) = plan {
+            let mut intent = Self::intent_for_plan(
+                JournalMetadataPlan::DirectAllocation(plan.block),
+                preimage_hashes,
+            );
+            intent.kind = plan.kind;
+            intent.metadata_count = plan.metadata_blocks() as u8;
+            intent.tree_level = plan.edge.level;
+            return intent;
+        }
         let block_kind = match plan {
             JournalMetadataPlan::DirectFree(_) => ZERO_INTENT_KIND_DIRECT_FREE,
             JournalMetadataPlan::IndirectRootAllocation(_) => {
@@ -12130,6 +12582,7 @@ impl Ext2Fs {
                     rename_old_name_len: 0,
                     rename_old_name: [0; 255],
                     namespace: NamespaceExtra::default(),
+                    tree_level: 0,
                 }
             }
             JournalMetadataPlan::InodeUpdate {
@@ -12156,6 +12609,7 @@ impl Ext2Fs {
                 rename_old_name_len: 0,
                 rename_old_name: [0; 255],
                 namespace: NamespaceExtra::default(),
+                tree_level: 0,
             },
             JournalMetadataPlan::FileCreate(plan) => JournalCommitIntent {
                 kind: ZERO_INTENT_KIND_FILE_CREATE,
@@ -12175,18 +12629,28 @@ impl Ext2Fs {
                 rename_old_name_len: 0,
                 rename_old_name: [0; 255],
                 namespace: NamespaceExtra::default(),
+                tree_level: 0,
             },
             JournalMetadataPlan::IndirectRootAllocation(_)
             | JournalMetadataPlan::IndirectRootFree(_)
-            | JournalMetadataPlan::IndirectData { .. } => {
+            | JournalMetadataPlan::IndirectData { .. }
+            | JournalMetadataPlan::Tree(_) => {
                 unreachable!("indirect intents return above")
             }
             JournalMetadataPlan::Rename(plan) => JournalCommitIntent {
-                kind: ZERO_INTENT_KIND_FILE_RENAME,
+                kind: if plan.logical.is_some() {
+                    tree::RENAME
+                } else {
+                    ZERO_INTENT_KIND_FILE_RENAME
+                },
                 metadata_count: 2,
                 inode_number: plan.parent_ino,
-                file_block: u32::MAX,
-                physical: 0,
+                file_block: plan.logical.unwrap_or(u32::MAX),
+                physical: if plan.logical.is_some() {
+                    plan.dir_block
+                } else {
+                    0
+                },
                 preimage_hashes,
                 old_inode: plan.old_parent_inode,
                 new_ino: 0,
@@ -12196,6 +12660,7 @@ impl Ext2Fs {
                 rename_old_name_len: plan.old_name_len,
                 rename_old_name: plan.old_name,
                 namespace: NamespaceExtra::default(),
+                tree_level: 0,
             },
         }
     }
@@ -12237,14 +12702,20 @@ impl Ext2Fs {
                 .copy_from_slice(&intent.rename_old_name);
             return namespace::encode_extra(block, intent);
         }
-        if intent.kind == ZERO_INTENT_KIND_FILE_CREATE {
+        if tree::is_kind(intent.kind) {
+            if block.len() < tree::INTENT_END {
+                return Err(FsError::Invalid);
+            }
+            block[ZERO_INTENT_END] = intent.tree_level;
+            block[tree::INTENT_END..].fill(0);
+        } else if intent.kind == ZERO_INTENT_KIND_FILE_CREATE {
             if block.len() < ZERO_INTENT_FILE_CREATE_END {
                 return Err(FsError::Invalid);
             }
             write_be_u32(block, ZERO_INTENT_NEW_INO_OFFSET, intent.new_ino)?;
             write_be_u32(block, ZERO_INTENT_PARENT_INO_OFFSET, intent.parent_ino)?;
             block[ZERO_INTENT_FILE_CREATE_END..].fill(0);
-        } else if intent.kind == ZERO_INTENT_KIND_FILE_RENAME {
+        } else if matches!(intent.kind, ZERO_INTENT_KIND_FILE_RENAME | tree::RENAME) {
             if block.len() < ZERO_INTENT_FILE_RENAME_END {
                 return Err(FsError::Invalid);
             }
@@ -12424,12 +12895,6 @@ impl Ext2Fs {
             }
         }
         Ok(plan)
-    }
-
-    /// EXT2-MUT: file blocks reachable through direct and single-indirect pointers.
-    /// Allocation and truncate stop here; double-indirect stays read-only.
-    fn single_indirect_block_limit(&self) -> u64 {
-        EXT2_NDIR_BLOCKS as u64 + (self.block_size / 4) as u64
     }
 
     /// EXT2-MUT: wrap a block plan with the mapping-block edit. An indirect data
@@ -12997,71 +13462,7 @@ impl Ext2Fs {
         file_block: u32,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<Option<u32>, FsError> {
-        let ptrs_per_block = self.block_size / 4; // 4 bytes per u32 pointer
-
-        // Direct blocks (0-11)
-        if file_block < EXT2_NDIR_BLOCKS as u32 {
-            let block = raw.block[file_block as usize];
-            return self.validate_block(block);
-        }
-
-        let file_block = file_block - EXT2_NDIR_BLOCKS as u32;
-
-        // Single indirect (block 12)
-        if file_block < ptrs_per_block {
-            // R28-5 Fix: Validate indirect block pointer
-            let ind_block = match self.validate_block(raw.block[EXT2_IND_BLOCK])? {
-                Some(b) => b,
-                None => return Ok(None),
-            };
-
-            self.read_block(ind_block, scratch.block_mut())?;
-
-            // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
-            // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
-            let ptr = read_u32_le(scratch.block(), file_block as usize)?;
-            // R28-5 Fix: Validate data block pointer
-            return self.validate_block(ptr);
-        }
-
-        let file_block = file_block - ptrs_per_block;
-
-        // Double indirect (block 13)
-        // R156-11 FIX: Use checked_mul to prevent overflow with crafted superblocks.
-        let double_indirect_limit = ptrs_per_block
-            .checked_mul(ptrs_per_block)
-            .ok_or(FsError::Invalid)?;
-        if file_block < double_indirect_limit {
-            // R28-5 Fix: Validate double indirect block pointer
-            let dind_block = match self.validate_block(raw.block[EXT2_DIND_BLOCK])? {
-                Some(b) => b,
-                None => return Ok(None),
-            };
-
-            self.read_block(dind_block, scratch.block_mut())?;
-
-            let ind_index = file_block / ptrs_per_block;
-            // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
-            // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
-            let ind_ptr = read_u32_le(scratch.block(), ind_index as usize)?;
-            // R28-5 Fix: Validate indirect block pointer from double indirect table
-            let ind_block = match self.validate_block(ind_ptr)? {
-                Some(b) => b,
-                None => return Ok(None),
-            };
-
-            self.read_block(ind_block, scratch.block_mut())?;
-
-            let block_index = file_block % ptrs_per_block;
-            // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
-            // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
-            let ptr = read_u32_le(scratch.block(), block_index as usize)?;
-            // R28-5 Fix: Validate data block pointer
-            return self.validate_block(ptr);
-        }
-
-        // Triple indirect would go here, but for simplicity we return an error
-        Err(FsError::Invalid)
+        self.map_tree_block(raw, file_block, &[], &[], scratch)
     }
 
     fn validate_sparse_gap_identity(
@@ -13195,146 +13596,37 @@ impl Ext2Fs {
         if gap_start >= gap_end {
             return Ok(());
         }
-        let block_size = self.block_size as u64;
-        let first = u32::try_from(gap_start / block_size).map_err(|_| FsError::Invalid)?;
-        let last = u32::try_from((gap_end - 1) / block_size).map_err(|_| FsError::Invalid)?;
-        let ptrs = self.block_size / 4;
-        let single_first = EXT2_NDIR_BLOCKS as u32;
-        let double_first = single_first.checked_add(ptrs).ok_or(FsError::Invalid)?;
-        let double_span = ptrs.checked_mul(ptrs).ok_or(FsError::Invalid)?;
-        let supported_end = double_first
-            .checked_add(double_span)
-            .ok_or(FsError::Invalid)?;
-        if last >= supported_end {
-            return Err(FsError::NotSupported);
-        }
-
-        scratch.branches.clear();
-        let mut loaded_bitmap_group = None;
-        let direct_last = last.min(EXT2_NDIR_BLOCKS as u32 - 1);
-        if first <= direct_last {
-            for file_block in first..=direct_last {
-                let physical = raw.block[file_block as usize];
-                if physical != 0 {
-                    self.visit_sparse_gap_target(
-                        journal,
-                        physical,
-                        file_block,
-                        gap_start,
-                        gap_end,
-                        &mut scratch.bitmap,
-                        &mut loaded_bitmap_group,
-                        visitor,
-                    )?;
-                }
+        self.check_tree_size(raw, gap_end)?;
+        let mut cursor = TreeCursor::new(
+            gap_start / u64::from(self.block_size),
+            (gap_end - 1) / u64::from(self.block_size) + 1,
+            false,
+        );
+        let mut loaded = None;
+        while let Some((edge, exiting)) = cursor.next(self, raw, mapping)? {
+            if exiting {
+                continue;
             }
-        }
-
-        if last >= single_first && first < double_first && raw.block[EXT2_IND_BLOCK] != 0 {
-            let start = first.max(single_first);
-            let end = last.min(double_first - 1);
-            let indirect = self.visit_sparse_gap_mapping_node(
-                journal,
-                raw.block[EXT2_IND_BLOCK],
-                None,
-                &mut scratch.bitmap,
-                &mut loaded_bitmap_group,
-                visitor,
-            )?;
-            self.read_physical_block(indirect, mapping.block_mut())?;
-            for file_block in start..=end {
-                let index =
-                    usize::try_from(file_block - single_first).map_err(|_| FsError::Invalid)?;
-                let physical = read_u32_le(mapping.block(), index)?;
-                if physical != 0 {
-                    self.visit_sparse_gap_target(
-                        journal,
-                        physical,
-                        file_block,
-                        gap_start,
-                        gap_end,
-                        &mut scratch.bitmap,
-                        &mut loaded_bitmap_group,
-                        visitor,
-                    )?;
-                }
-            }
-        }
-
-        if last >= double_first && raw.block[EXT2_DIND_BLOCK] != 0 {
-            let start = first.max(double_first);
-            let end = last;
-            let first_branch = (start - double_first) / ptrs;
-            let last_branch = (end - double_first) / ptrs;
-            let double = self.visit_sparse_gap_mapping_node(
-                journal,
-                raw.block[EXT2_DIND_BLOCK],
-                None,
-                &mut scratch.bitmap,
-                &mut loaded_bitmap_group,
-                visitor,
-            )?;
-            self.read_physical_block(double, mapping.block_mut())?;
-            let mut present_branches = 0usize;
-            for branch in first_branch..=last_branch {
-                if read_u32_le(mapping.block(), branch as usize)? != 0 {
-                    present_branches = present_branches.checked_add(1).ok_or(FsError::NoMem)?;
-                    if present_branches > MAX_SPARSE_GAP_MAPPING_NODES {
-                        return Err(FsError::NoMem);
-                    }
-                }
-            }
-            scratch.prepare_branches(present_branches)?;
-            for branch in first_branch..=last_branch {
-                let indirect = read_u32_le(mapping.block(), branch as usize)?;
-                if indirect == 0 {
-                    continue;
-                }
-                let indirect = self.visit_sparse_gap_mapping_node(
+            if edge.level != 0 {
+                self.visit_sparse_gap_mapping_node(
                     journal,
-                    indirect,
-                    Some(u16::try_from(branch).map_err(|_| FsError::Invalid)?),
+                    edge.physical,
+                    edge.parent.map(|(_, index)| index as u16),
                     &mut scratch.bitmap,
-                    &mut loaded_bitmap_group,
+                    &mut loaded,
                     visitor,
                 )?;
-                if scratch.branches.len() >= MAX_SPARSE_GAP_MAPPING_NODES
-                    || scratch.branches.len() == scratch.branches.capacity()
-                {
-                    return Err(FsError::Invalid);
-                }
-                // lint-fallible: PREALLOCATED(capacity re-checked at the guard just above; branches reserved by prepare_branches)
-                scratch.branches.push(SparseGapBranch {
-                    index: branch,
-                    physical: indirect,
-                });
-            }
-            if scratch.branches.len() != present_branches {
-                return Err(FsError::Invalid);
-            }
-            for branch in scratch.branches.iter().copied() {
-                self.read_physical_block(branch.physical, mapping.block_mut())?;
-                let branch_first = double_first
-                    .checked_add(branch.index.checked_mul(ptrs).ok_or(FsError::Invalid)?)
-                    .ok_or(FsError::Invalid)?;
-                let branch_last = branch_first.checked_add(ptrs - 1).ok_or(FsError::Invalid)?;
-                for file_block in start.max(branch_first)..=end.min(branch_last) {
-                    let index =
-                        usize::try_from(file_block - branch_first).map_err(|_| FsError::Invalid)?;
-                    let physical = read_u32_le(mapping.block(), index)?;
-                    if physical != 0 {
-                        self.visit_sparse_gap_target(
-                            journal,
-                            physical,
-                            file_block,
-                            gap_start,
-                            gap_end,
-                            &mut scratch.bitmap,
-                            &mut loaded_bitmap_group,
-                            visitor,
-                        )?;
-                    }
-                }
+            } else {
+                self.visit_sparse_gap_target(
+                    journal,
+                    edge.physical,
+                    edge.logical,
+                    gap_start,
+                    gap_end,
+                    &mut scratch.bitmap,
+                    &mut loaded,
+                    visitor,
+                )?;
             }
         }
         Ok(())
@@ -13358,116 +13650,29 @@ impl Ext2Fs {
         if gap_start >= gap_end {
             return Ok(());
         }
-        let block_size = self.block_size as u64;
-        let first = u32::try_from(gap_start / block_size).map_err(|_| FsError::Invalid)?;
-        let last = u32::try_from((gap_end - 1) / block_size).map_err(|_| FsError::Invalid)?;
-        let ptrs = self.block_size / 4;
-        let single_first = EXT2_NDIR_BLOCKS as u32;
-        let double_first = single_first.checked_add(ptrs).ok_or(FsError::Invalid)?;
-        let double_span = ptrs.checked_mul(ptrs).ok_or(FsError::Invalid)?;
-        let supported_end = double_first
-            .checked_add(double_span)
-            .ok_or(FsError::Invalid)?;
-        if last >= supported_end {
-            return Err(FsError::NotSupported);
-        }
-
-        let direct_last = last.min(EXT2_NDIR_BLOCKS as u32 - 1);
-        if first <= direct_last {
-            for file_block in first..=direct_last {
-                let physical = raw.block[file_block as usize];
-                if physical != 0 {
-                    let physical = self.validate_sparse_gap_identity(journal, physical)?;
-                    collector.data_target(
-                        file_block,
-                        self.sparse_gap_target(physical, file_block, gap_start, gap_end)?,
-                    )?;
-                }
+        self.check_tree_size(raw, gap_end)?;
+        let mut cursor = TreeCursor::new(
+            gap_start / u64::from(self.block_size),
+            (gap_end - 1) / u64::from(self.block_size) + 1,
+            false,
+        );
+        while let Some((edge, exiting)) = cursor.next(self, raw, mapping)? {
+            if exiting {
+                continue;
             }
-        }
-
-        if last >= single_first && first < double_first && raw.block[EXT2_IND_BLOCK] != 0 {
-            let start = first.max(single_first);
-            let end = last.min(double_first - 1);
-            let indirect = self.validate_sparse_gap_identity(journal, raw.block[EXT2_IND_BLOCK])?;
-            collector.mapping_node(indirect, None)?;
-            self.read_physical_block(indirect, mapping.block_mut())?;
-            for file_block in start..=end {
-                let index =
-                    usize::try_from(file_block - single_first).map_err(|_| FsError::Invalid)?;
-                let physical = read_u32_le(mapping.block(), index)?;
-                if physical != 0 {
-                    let physical = self.validate_sparse_gap_identity(journal, physical)?;
-                    collector.data_target(
-                        file_block,
-                        self.sparse_gap_target(physical, file_block, gap_start, gap_end)?,
-                    )?;
-                }
-            }
-        }
-
-        if last >= double_first && raw.block[EXT2_DIND_BLOCK] != 0 {
-            let start = first.max(double_first);
-            let end = last;
-            let first_branch = (start - double_first) / ptrs;
-            let last_branch = (end - double_first) / ptrs;
-            let double = self.validate_sparse_gap_identity(journal, raw.block[EXT2_DIND_BLOCK])?;
-            collector.mapping_node(double, None)?;
-            self.read_physical_block(double, mapping.block_mut())?;
-            let node_base = collector.mapping_nodes.len();
-            let branch_base = collector.branch_indices.len();
-            for branch in first_branch..=last_branch {
-                let indirect = read_u32_le(mapping.block(), branch as usize)?;
-                if indirect == 0 {
-                    continue;
-                }
-                let indirect = self.validate_sparse_gap_identity(journal, indirect)?;
-                let branch = u16::try_from(branch).map_err(|_| FsError::Invalid)?;
-                collector.mapping_node(indirect, Some(branch))?;
-            }
-            let branch_count = collector
-                .branch_indices
-                .len()
-                .checked_sub(branch_base)
-                .ok_or(FsError::Invalid)?;
-            if collector
-                .mapping_nodes
-                .len()
-                .checked_sub(node_base)
-                .ok_or(FsError::Invalid)?
-                != branch_count
-            {
-                return Err(FsError::Invalid);
-            }
-            for index in 0..branch_count {
-                let branch = collector.branch_indices[branch_base + index] as u32;
-                let indirect = collector.mapping_nodes[node_base + index];
-                self.read_physical_block(indirect, mapping.block_mut())?;
-                let branch_first = double_first
-                    .checked_add(branch.checked_mul(ptrs).ok_or(FsError::Invalid)?)
-                    .ok_or(FsError::Invalid)?;
-                let branch_last = branch_first.checked_add(ptrs - 1).ok_or(FsError::Invalid)?;
-                for file_block in start.max(branch_first)..=end.min(branch_last) {
-                    let pointer =
-                        usize::try_from(file_block - branch_first).map_err(|_| FsError::Invalid)?;
-                    let physical = read_u32_le(mapping.block(), pointer)?;
-                    if physical != 0 {
-                        let physical = self.validate_sparse_gap_identity(journal, physical)?;
-                        collector.data_target(
-                            file_block,
-                            self.sparse_gap_target(physical, file_block, gap_start, gap_end)?,
-                        )?;
-                    }
-                }
+            let physical = self.validate_sparse_gap_identity(journal, edge.physical)?;
+            if edge.level != 0 {
+                collector.mapping_node(physical, edge.parent.map(|(_, index)| index as u16))?;
+            } else {
+                collector.data_target(
+                    edge.logical,
+                    self.sparse_gap_target(physical, edge.logical, gap_start, gap_end)?,
+                )?;
             }
         }
         Ok(())
     }
 
-    /// RF180-13/RF180-34: validate and count the complete sparse gap before
-    /// reserving exact retained storage, then re-walk under the same inode,
-    /// metadata, and journal locks.  No allocation or validation can occur
-    /// after the first persistent zeroing write.
     fn preflight_sparse_gap(
         &self,
         raw: &Ext2InodeRaw,
@@ -13691,10 +13896,11 @@ impl Ext2Fs {
         if committed_parent.links_count == 0 {
             return Err(FsError::NotFound);
         }
+        fs.check_directory_shape(&committed_parent)?;
         if committed_parent.flags & EXT2_IMMUTABLE_FL != 0 {
             return Err(FsError::PermDenied);
         }
-        if committed_parent.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
+        if committed_parent.flags & (EXT2_INDEX_FL | EXT2_UNSUPPORTED_WRITE_LAYOUT_FL) != 0 {
             return Err(FsError::NotSupported);
         }
         let journal_inum = fs.superblock.read().journal_inum;
@@ -13719,10 +13925,10 @@ impl Ext2Fs {
         // Case A).  An indirect-mapped last block (last_block_idx >=
         // EXT2_NDIR_BLOCKS) would commit a home recovery cannot re-derive, so a
         // crash after the commit would make the filesystem unmountable.  Reject
-        // indirect last blocks up front (this driver never grows a directory,
-        // so >12-block directories are out of scope anyway).
+        // indirect last blocks here; create() falls back to namespace insertion
+        // and directory growth with an authenticated mapped directory home.
         if last_block_idx >= EXT2_NDIR_BLOCKS as u32 {
-            return Err(FsError::NotSupported);
+            return Err(FsError::NoSpace);
         }
         let dir_block_home = match fs.map_file_block_with_scratch(
             &committed_parent,
@@ -13775,8 +13981,8 @@ impl Ext2Fs {
         let new_rec_len = usize::from(last_rec_len) - last_minimal;
         let new_entry_min = (8usize + name.len() + 3) & !3;
         if new_rec_len < new_entry_min {
-            // No room in this block; directory growth is out of scope.
-            return Err(FsError::NotSupported);
+            // Full direct directory: retry through growable namespace insertion.
+            return Err(FsError::NoSpace);
         }
         let dir_new_off = last_off.checked_add(last_minimal).ok_or(FsError::Invalid)?;
         let dir_old_rec_len = last_rec_len;
@@ -13788,7 +13994,7 @@ impl Ext2Fs {
             .checked_add(new_rec_len)
             .ok_or(FsError::Invalid)?;
         if dir_block[dir_new_off..carve_end].iter().any(|&b| b != 0) {
-            return Err(FsError::NotSupported);
+            return Err(FsError::NoSpace);
         }
 
         // Allocate an inode in the parent's group (single-group scope).
@@ -14104,7 +14310,10 @@ impl FileSystem for Ext2Fs {
         if mode.is_dir() {
             return self.create_namespace(parent, name, mode, None, context);
         }
-        self.create_regular(parent, name, mode, context)
+        match self.create_regular(parent, name, mode, context) {
+            Err(FsError::NoSpace) => self.create_namespace(parent, name, mode, None, context),
+            result => result,
+        }
     }
 
     /// Transactional same-directory rename for a regular file (renameat2
@@ -14186,10 +14395,11 @@ impl FileSystem for Ext2Fs {
         if committed_parent.links_count == 0 {
             return Err(FsError::NotFound);
         }
+        fs.check_directory_shape(&committed_parent)?;
         if (committed_parent.flags | source_raw.flags) & (EXT2_IMMUTABLE_FL | EXT2_APPEND_FL) != 0 {
             return Err(FsError::PermDenied);
         }
-        if committed_parent.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
+        if committed_parent.flags & (EXT2_INDEX_FL | EXT2_UNSUPPORTED_WRITE_LAYOUT_FL) != 0 {
             return Err(FsError::NotSupported);
         }
         let journal_inum = fs.superblock.read().journal_inum;
@@ -14201,8 +14411,8 @@ impl FileSystem for Ext2Fs {
 
         // Under-lock revalidation via a MANUAL directory walk (dir_lookup would
         // take raw.read() while we hold raw.write() → self-deadlock).  Walk all
-        // direct blocks: find the source (must be in the LAST block for recovery
-        // home re-derivation) and verify the dest is globally absent (NOREPLACE).
+        // mapped blocks: find the source and verify that the destination name
+        // is globally absent (NOREPLACE). Kind 18 authenticates non-tail homes.
         let dir_size = committed_parent.size_lo as u64;
         if dir_size == 0 {
             return Err(FsError::NotSupported);
@@ -14211,15 +14421,12 @@ impl FileSystem for Ext2Fs {
         let last_block_idx =
             u32::try_from(dir_size.checked_sub(1).ok_or(FsError::Invalid)? / block_size)
                 .map_err(|_| FsError::Invalid)?;
-        if last_block_idx >= EXT2_NDIR_BLOCKS as u32 {
-            return Err(FsError::NotSupported);
-        }
         let head_size = size_of::<Ext2DirEntryHead>();
         let mut src_ino: u32 = 0;
         let mut dir_off = 0usize;
         let mut src_rec_len = 0u16;
         let mut found_src = false;
-        let mut src_in_last = false;
+        let mut source_block = 0;
         for block_idx in 0..=last_block_idx {
             let dir_block_home =
                 match fs.map_file_block_with_scratch(&committed_parent, block_idx, &mut scratch)? {
@@ -14256,23 +14463,20 @@ impl FileSystem for Ext2Fs {
                         return Err(FsError::Exists);
                     }
                     if nb == old_name.as_bytes() {
-                        if block_idx == last_block_idx {
-                            src_ino = head.inode;
-                            dir_off = off;
-                            src_rec_len = head.rec_len;
-                            found_src = true;
-                            src_in_last = true;
-                        } else {
-                            // Source in an earlier block — recovery can't
-                            // re-derive the dir-data home.
-                            src_in_last = false;
+                        if found_src {
+                            return Err(FsError::Invalid);
                         }
+                        src_ino = head.inode;
+                        dir_off = off;
+                        src_rec_len = head.rec_len;
+                        found_src = true;
+                        source_block = block_idx;
                     }
                 }
                 off = off.checked_add(rec_len).ok_or(FsError::Invalid)?;
             }
         }
-        if !found_src || !src_in_last {
+        if !found_src {
             return Err(FsError::NotSupported);
         }
         let rec_len = src_rec_len;
@@ -14286,18 +14490,30 @@ impl FileSystem for Ext2Fs {
             return Err(FsError::NotSupported);
         }
         // The dir-data home is the last block (re-derive it for the plan).
-        let dir_block_home = match fs.map_file_block_with_scratch(
-            &committed_parent,
-            last_block_idx,
-            &mut scratch,
-        )? {
-            Some(phys) => phys,
-            None => return Err(FsError::NotSupported),
-        };
+        let dir_block_home =
+            match fs.map_file_block_with_scratch(&committed_parent, source_block, &mut scratch)? {
+                Some(phys) => phys,
+                None => return Err(FsError::NotSupported),
+            };
 
         // Dest name must fit in the source entry's rec_len (in-place rewrite).
         let new_entry_min = (8usize + new_name.len() + 3) & !3;
         if new_entry_min > usize::from(rec_len) {
+            return Err(FsError::NotSupported);
+        }
+
+        fs.read_block(dir_block_home, scratch.block_mut())?;
+        let old_end = dir_off + 8 + old_name.len();
+        let new_end = dir_off + 8 + new_name.len();
+        let tail_end = dir_off + usize::from(rec_len);
+        let clean_tail = scratch.block()[old_end..tail_end]
+            .iter()
+            .all(|byte| *byte == 0);
+        if new_end > old_end
+            && scratch.block()[old_end..new_end]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
             return Err(FsError::NotSupported);
         }
 
@@ -14332,6 +14548,11 @@ impl FileSystem for Ext2Fs {
         let mut new_name_buf = [0u8; 255];
         new_name_buf[..new_name.len()].copy_from_slice(new_name.as_bytes());
         let plan = RenamePlan {
+            logical: if clean_tail && source_block == last_block_idx && source_block < 12 {
+                None
+            } else {
+                Some(source_block)
+            },
             parent_ino,
             parent_target,
             old_parent_inode: committed_parent,
@@ -14706,10 +14927,12 @@ impl Ext2Inode {
             return;
         }
         let inode_id = self.cache_id;
-        for page_index in (start / PAGE_SIZE as u64)..=((end - 1) / PAGE_SIZE as u64) {
-            let Some(page) = PAGE_CACHE.find_get_page(inode_id, page_index) else {
-                continue;
-            };
+        let mut next = start / PAGE_SIZE as u64;
+        while let Some(page) =
+            PAGE_CACHE.next_inode_page(inode_id, next, (end - 1) / PAGE_SIZE as u64)
+        {
+            let page_index = page.index;
+            next = page_index + 1;
             let _io_lock = page.lock_io();
             if !page.is_uptodate() {
                 continue;
@@ -14727,9 +14950,8 @@ impl Ext2Inode {
         }
     }
 
-    /// EXT2-MUT: set the file size, for files held in direct and single-indirect
-    /// blocks. A double- or triple-indirect root, or a size past that range, returns
-    /// `NotSupported`.
+    /// EXT2-MUT: set file size through all three indirect levels. Shrink visits
+    /// allocated leaves and empty mapping nodes without scanning sparse holes.
     ///
     /// Shrinking frees one block per transaction, highest first, lowering the size
     /// past each block before it leaves the bitmap. A crash therefore leaves a
@@ -14772,19 +14994,9 @@ impl Ext2Inode {
         }
 
         let block_size = fs.block_size as u64;
-        let size_limit = fs
-            .single_indirect_block_limit()
-            .checked_mul(block_size)
-            .ok_or(FsError::Invalid)?;
         let old_size = self.size.load(Ordering::Acquire);
-        if raw_guard.block[EXT2_DIND_BLOCK..]
-            .iter()
-            .any(|block| *block != 0)
-            || old_size > size_limit
-            || new_size > size_limit
-        {
-            return Err(FsError::NotSupported);
-        }
+        fs.check_tree_size(&raw_guard, old_size)?;
+        fs.check_tree_size(&raw_guard, new_size)?;
 
         let now = TimeSpec::now();
         let stamped = |raw: &Ext2InodeRaw, size: u64| {
@@ -14800,13 +15012,7 @@ impl Ext2Inode {
             faulted: &fs.io_faulted,
             pending: false,
         };
-        // Root attachment is a separate durable transaction. A crashed sparse
-        // first write can leave size zero with an empty root; a same-size
-        // truncate must still detach that root instead of returning early.
-        let empty_root_past_end = new_size == old_size
-            && new_size <= EXT2_NDIR_BLOCKS as u64 * block_size
-            && raw_guard.block[EXT2_IND_BLOCK] != 0;
-        if new_size >= old_size && !empty_root_past_end {
+        if new_size > old_size {
             // Growing never allocates. Clear any stale bytes the new size would
             // expose before the size that exposes them can commit.
             let journal = journal_guard.as_ref().ok_or(FsError::ReadOnly)?;
@@ -14862,143 +15068,62 @@ impl Ext2Inode {
             }
         }
 
-        let first_freed =
-            usize::try_from(new_size.div_ceil(block_size)).map_err(|_| FsError::Invalid)?;
-
-        // Empty the mapping block from the top, then free it once nothing below the
-        // new size needs it. Each step stays a consistent, shorter file.
-        let mapping_block = raw_guard.block[EXT2_IND_BLOCK];
-        if mapping_block != 0 {
-            let pointers = (fs.block_size / 4) as usize;
-            loop {
-                fs.read_block(mapping_block, scratch.block_mut())?;
-                let mut highest = None;
-                for pointer in (0..pointers).rev() {
-                    let physical = read_u32_le(scratch.block(), pointer)?;
-                    if physical != 0 {
-                        highest = Some((pointer, physical));
-                        break;
-                    }
+        let first_freed = new_size.div_ceil(block_size);
+        let mut cursor = TreeCursor::new(first_freed, fs.tree_block_limit(), true);
+        while let Some((edge, exiting)) = cursor.next(&fs, &raw_guard, &mut scratch)? {
+            cursor.invalidate_buffer();
+            if edge.level != 0 {
+                if !exiting {
+                    continue;
                 }
-                let Some((pointer, physical)) =
-                    highest.filter(|(pointer, _)| EXT2_NDIR_BLOCKS + *pointer >= first_freed)
-                else {
-                    let mapping_empty = highest.is_none();
-                    if mapping_empty && first_freed <= EXT2_NDIR_BLOCKS {
-                        let committed_raw = *raw_guard;
-                        let current_size = self.size.load(Ordering::Acquire);
-                        let step_size = current_size
-                            .min(EXT2_NDIR_BLOCKS as u64 * block_size)
-                            .max(new_size);
-                        let journal = journal_guard.as_ref().ok_or(FsError::ReadOnly)?;
-                        let plan = fs.plan_direct_free(
-                            self.ino,
-                            &committed_raw,
-                            stamped(&committed_raw, step_size),
-                            EXT2_IND_BLOCK as u32,
-                            Some(EXT2_IND_BLOCK),
-                            mapping_block,
-                            inode_target,
-                            journal,
-                            &mut scratch,
-                        )?;
-                        let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
-                        let result = fs.commit_metadata_transaction(
-                            journal,
-                            JournalMetadataPlan::IndirectRootFree(&plan),
-                            &mut scratch,
-                        );
-                        if !result.as_ref().is_err_and(|failure| !failure.committed) {
-                            fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
-                            fs.group_descs.write()[plan.group] = plan.new_group_desc;
-                        }
-                        self.finish_truncate_step(
-                            &fs,
-                            &mut raw_guard,
-                            plan.new_inode,
-                            current_size,
-                            step_size,
-                            result,
-                        )?;
-                    }
-                    break;
-                };
-                let file_block = EXT2_NDIR_BLOCKS + pointer;
-                let committed_raw = *raw_guard;
-                let current_size = self.size.load(Ordering::Acquire);
-                let step_size = current_size
-                    .min(file_block as u64 * block_size)
-                    .max(new_size);
-                let journal = journal_guard.as_ref().ok_or(FsError::ReadOnly)?;
-                let block = fs.plan_direct_free(
-                    self.ino,
-                    &committed_raw,
-                    stamped(&committed_raw, step_size),
-                    file_block as u32,
-                    None,
-                    physical,
-                    inode_target,
-                    journal,
-                    &mut scratch,
-                )?;
-                let plan = fs.indirect_data_plan(&block, mapping_block, journal)?;
-                let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
-                let result = fs.commit_metadata_transaction(
-                    journal,
-                    JournalMetadataPlan::IndirectData {
-                        plan: &plan,
-                        freeing: true,
-                    },
-                    &mut scratch,
-                );
-                if !result.as_ref().is_err_and(|failure| !failure.committed) {
-                    fs.superblock.write().free_blocks_count = block.new_super_free_blocks;
-                    fs.group_descs.write()[block.group] = block.new_group_desc;
+                fs.read_block(edge.physical, scratch.block_mut())?;
+                if scratch.block().iter().any(|byte| *byte != 0) {
+                    continue;
                 }
-                self.finish_truncate_step(
-                    &fs,
-                    &mut raw_guard,
-                    block.new_inode,
-                    current_size,
-                    step_size,
-                    result,
-                )?;
             }
-        }
-
-        for index in (first_freed..EXT2_NDIR_BLOCKS).rev() {
             let committed_raw = *raw_guard;
-            if committed_raw.block[index] == 0 {
-                continue;
-            }
             let current_size = self.size.load(Ordering::Acquire);
-            let step_size = current_size.min((index as u64) * block_size).max(new_size);
-            let journal = journal_guard.as_ref().ok_or(FsError::ReadOnly)?;
-            let plan = fs.plan_direct_free(
+            let step_size = current_size
+                .min(u64::from(edge.logical) * block_size)
+                .max(new_size);
+            let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+            let block = fs.plan_direct_free(
                 self.ino,
                 &committed_raw,
                 stamped(&committed_raw, step_size),
-                index as u32,
-                Some(index),
-                committed_raw.block[index],
+                edge.logical,
+                edge.parent.is_none().then_some(edge.root),
+                edge.physical,
                 inode_target,
                 journal,
                 &mut scratch,
             )?;
-            let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
-            let result = fs.commit_metadata_transaction(
-                journal,
-                JournalMetadataPlan::DirectFree(&plan),
-                &mut scratch,
-            );
+            let tree_plan = fs.tree_metadata_plan(&block, edge, tree::DETACH, journal)?;
+            let indirect_plan;
+            let metadata = if edge.root < 12 {
+                JournalMetadataPlan::DirectFree(&block)
+            } else if edge.root == EXT2_IND_BLOCK && edge.level == 0 {
+                indirect_plan =
+                    fs.indirect_data_plan(&block, edge.parent.ok_or(FsError::Invalid)?.0, journal)?;
+                JournalMetadataPlan::IndirectData {
+                    plan: &indirect_plan,
+                    freeing: true,
+                }
+            } else if edge.root == EXT2_IND_BLOCK && edge.level == 1 && step_size <= 12 * block_size
+            {
+                JournalMetadataPlan::IndirectRootFree(&block)
+            } else {
+                JournalMetadataPlan::Tree(&tree_plan)
+            };
+            let result = fs.commit_metadata_transaction(journal, metadata, &mut scratch);
             if !result.as_ref().is_err_and(|failure| !failure.committed) {
-                fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
-                fs.group_descs.write()[plan.group] = plan.new_group_desc;
+                fs.superblock.write().free_blocks_count = block.new_super_free_blocks;
+                fs.group_descs.write()[block.group] = block.new_group_desc;
             }
             self.finish_truncate_step(
                 &fs,
                 &mut raw_guard,
-                plan.new_inode,
+                block.new_inode,
                 current_size,
                 step_size,
                 result,
@@ -15139,6 +15264,12 @@ impl Ext2Inode {
             return Err(FsError::PermDenied);
         }
         let preflight_raw = *raw_guard;
+        fs.check_tree_size(
+            &preflight_raw,
+            offset
+                .checked_add(data.len() as u64)
+                .ok_or(FsError::Invalid)?,
+        )?;
         preflight_write_range(
             offset,
             data.len(),
@@ -15158,7 +15289,7 @@ impl Ext2Inode {
                     }
                     Ok(true)
                 }
-                None => Ok(journaled && (file_block as u64) < fs.single_indirect_block_limit()),
+                None => Ok(journaled && (file_block as u64) < fs.tree_block_limit()),
             },
         )?;
         let sparse_gap = fs.preflight_sparse_gap(
@@ -15260,69 +15391,24 @@ impl Ext2Inode {
                 continue;
             }
 
-            // Preflight permits a hole only when it is direct or single-indirect
-            // and an internal journal is present. Both conditions remain stable
-            // under the inode, metadata, and journal locks held for this mutation.
-            let Some(journal) = journal_guard.as_mut() else {
-                return fail(FsError::NotSupported, written);
-            };
-            if (file_block as u64) >= fs.single_indirect_block_limit() {
-                return fail(FsError::NotSupported, written);
+            let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+            if let Err(error) =
+                fs.ensure_tree_path(self, &mut raw_guard, file_block, journal, &mut scratch)
+            {
+                return fail(error, written);
             }
-            let indirect = file_block >= EXT2_NDIR_BLOCKS as u32;
-            if indirect && committed_raw.block[EXT2_IND_BLOCK] == 0 {
-                // Attach an empty mapping block in its own transaction. A crash
-                // here leaves a file that owns one empty block, which is consistent
-                // and which the next attempt simply reuses.
-                let mut root_raw = next_raw;
-                root_raw.size_lo = committed_raw.size_lo;
-                root_raw.size_high_or_dir_acl = committed_raw.size_high_or_dir_acl;
-                let plan = match fs.plan_direct_allocation(
-                    self.ino,
-                    &committed_raw,
-                    root_raw,
-                    EXT2_IND_BLOCK as u32,
-                    Some(EXT2_IND_BLOCK),
-                    inode_target,
-                    journal,
-                    &mut scratch,
-                ) {
-                    Ok(plan) => plan,
-                    Err(error) => return fail(error, written),
-                };
-                scratch.block_mut().fill(0);
-                if let Err(error) = fs
-                    .write_block(plan.phys_block, scratch.block())
-                    .and_then(|()| fs.flush_device())
-                {
-                    return fail(error, written);
-                }
-                let transaction_failure = match fs.commit_metadata_transaction(
-                    journal,
-                    JournalMetadataPlan::IndirectRootAllocation(&plan),
-                    &mut scratch,
-                ) {
-                    Ok(()) => None,
-                    Err(failure) if failure.committed => Some(failure),
-                    Err(failure) => {
-                        if failure.poison {
-                            fs.io_faulted.store(true, Ordering::Release);
-                        }
-                        return fail(failure.error, written);
-                    }
-                };
-                fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
-                fs.group_descs.write()[plan.group] = plan.new_group_desc;
-                *raw_guard = plan.new_inode;
-                if let Some(failure) = transaction_failure {
-                    if failure.poison {
-                        fs.io_faulted.store(true, Ordering::Release);
-                    }
-                    return fail(failure.error, written);
-                }
+            if raw_guard.blocks_lo != committed_raw.blocks_lo {
                 continue;
             }
-            let inode_pointer = (!indirect).then_some(file_block as usize);
+            let path = match fs.block_path(file_block) {
+                Ok(path) => path,
+                Err(error) => return fail(error, written),
+            };
+            let edge = match fs.tree_edge(&committed_raw, file_block, 0, &[], &[], &mut scratch) {
+                Ok(edge) => edge,
+                Err(error) => return fail(error, written),
+            };
+            let inode_pointer = edge.parent.is_none().then_some(edge.root);
             let plan = match fs.plan_direct_allocation(
                 self.ino,
                 &committed_raw,
@@ -15337,8 +15423,14 @@ impl Ext2Inode {
                 Err(error) => return fail(error, written),
             };
             debug_assert_eq!(plan.file_block, file_block);
+            let tree_plan = match fs.tree_metadata_plan(&plan, edge, tree::ATTACH, journal) {
+                Ok(plan) => plan,
+                Err(error) => return fail(error, written),
+            };
             let indirect_plan;
-            let metadata_plan = if indirect {
+            let metadata_plan = if path.depth > 1 {
+                JournalMetadataPlan::Tree(&tree_plan)
+            } else if path.depth == 1 {
                 indirect_plan = match fs.indirect_data_plan(
                     &plan,
                     committed_raw.block[EXT2_IND_BLOCK],

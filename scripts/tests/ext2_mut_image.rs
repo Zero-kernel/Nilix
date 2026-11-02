@@ -97,7 +97,12 @@ fn main() {
         "INPUT OUTPUT exercise|mkdir|symlink|unlink|indirect|recover [FAIL_AT] [PERSIST]"
     );
     mm::publish_heap_budgets();
-    let scenario = &args[3];
+    let prepare = args[3].starts_with("prepare-");
+    let scenario = args[3]
+        .strip_prefix("prepare-")
+        .unwrap_or(&args[3])
+        .to_string();
+    let prepared = args.get(6).is_some_and(|s| s == "prepared");
     let fail_at: u64 = args.get(4).map_or(0, |s| s.parse().unwrap());
     let persist = args.get(5).is_some_and(|s| s == "1");
     let device = Arc::new(Device::new(
@@ -107,6 +112,13 @@ fn main() {
     ));
     let fs = match Ext2Fs::mount(device.clone()) {
         Ok(fs) => fs,
+        Err(error) if scenario == "reject" => {
+            let state = device.0.lock().unwrap();
+            assert_eq!(state.operations, 0, "invalid log performed recovery I/O");
+            std::fs::write(&args[2], &state.durable).unwrap();
+            println!("REJECTED={error:?} OPERATIONS=0");
+            return;
+        }
         Err(error) if scenario == "recover" && fail_at != 0 => {
             std::fs::write(&args[2], &device.0.lock().unwrap().durable).unwrap();
             println!("RECOVERY_INTERRUPTED {error:?}");
@@ -114,26 +126,90 @@ fn main() {
         }
         Err(error) => panic!("mount: {error:?}"),
     };
+    assert_ne!(scenario, "reject", "invalid log was accepted");
     let manager = vfs::manager::Vfs::new();
     manager
         .mount_in_namespace(&kernel_core::ROOT_MNT_NAMESPACE, "/", fs.clone())
         .unwrap();
-    let setup_file: Option<Arc<dyn Inode>> =
-        if matches!(scenario.as_str(), "unlink" | "indirect" | "truncate") {
-            let file = manager
+    let setup_file: Option<Arc<dyn Inode>> = if matches!(
+        scenario.as_str(),
+        "unlink"
+            | "indirect"
+            | "truncate"
+            | "double"
+            | "triple"
+            | "triple-carry"
+            | "size-bounds"
+            | "deep-truncate"
+            | "deep-unlink"
+    ) {
+        let file = if prepared {
+            fs.lookup(&fs.root_inode(), "mutation").unwrap()
+        } else {
+            manager
                 .create_trusted("/mutation", FileMode::regular(0o600))
+                .unwrap()
+        };
+        if scenario == "unlink" && !prepared {
+            file.write_at(0, &[0x69; 8192]).unwrap();
+        }
+        if scenario == "truncate" && !prepared {
+            file.write_at(12 * u64::from(file.stat().unwrap().blksize), b"indirect")
                 .unwrap();
-            if scenario == "unlink" {
-                file.write_at(0, &[0x69; 8192]).unwrap();
+        }
+        if !prepared && matches!(scenario.as_str(), "deep-truncate" | "deep-unlink") {
+            let b = u64::from(file.stat().unwrap().blksize);
+            let p = b / 4;
+            for logical in [11, 12, 12 + p, 12 + p + p * p, 12 + p + p * p + p + 1] {
+                file.write_at(logical * b + 17, b"deep payload").unwrap();
             }
-            if scenario == "truncate" {
-                file.write_at(12 * u64::from(file.stat().unwrap().blksize), b"indirect")
+        }
+        Some(file)
+    } else {
+        None
+    };
+    let last_path = format!("/mutation/ffff{}", "n".repeat(251));
+    if !prepared
+        && matches!(
+            scenario.as_str(),
+            "directory" | "directory-rename" | "directory-unlink" | "directory-rmdir"
+        )
+    {
+        let dir = manager
+            .create_trusted("/mutation", FileMode::directory(0o700))
+            .unwrap();
+        let b = dir.stat().unwrap().blksize as usize;
+        for index in 0..12 * (b / 264) {
+            manager
+                .create_trusted(
+                    &format!("/mutation/{index:04}{}", "n".repeat(251)),
+                    FileMode::regular(0o600),
+                )
+                .unwrap();
+        }
+        assert_eq!(dir.stat().unwrap().size, 12 * b as u64);
+        if scenario != "directory" {
+            manager
+                .create_trusted(&last_path, FileMode::regular(0o600))
+                .unwrap();
+        }
+        if scenario == "directory-rmdir" {
+            for index in 0..12 * (b / 264) {
+                manager
+                    .unlink_trusted(
+                        &format!("/mutation/{index:04}{}", "n".repeat(251)),
+                        Some(false),
+                    )
                     .unwrap();
             }
-            Some(file)
-        } else {
-            None
-        };
+            manager.unlink_trusted(&last_path, Some(false)).unwrap();
+        }
+    }
+    if prepare {
+        std::fs::write(&args[2], &device.0.lock().unwrap().durable).unwrap();
+        println!("PREPARED={scenario}");
+        return;
+    }
     if scenario != "recover" {
         let mut state = device.0.lock().unwrap();
         state.fail_at = if fail_at == 0 {
@@ -161,6 +237,48 @@ fn main() {
             file.write_at(12 * u64::from(block_size), b"indirect")
                 .map(|_| ())
         }
+        "double" | "triple" | "triple-carry" => {
+            let file = setup_file.unwrap();
+            let b = u64::from(file.stat().unwrap().blksize);
+            let p = b / 4;
+            let logical = 12
+                + p
+                + match scenario.as_str() {
+                    "triple" => p * p,
+                    "triple-carry" => 2 * p * p + p + 1,
+                    _ => 0,
+                };
+            file.write_at(logical * b + 17, b"deep payload").map(|_| ())
+        }
+        "size-bounds" => {
+            let file = setup_file.unwrap();
+            let b = u64::from(file.stat().unwrap().blksize);
+            let p = b / 4;
+            let maximum = (12 + p + p * p + p * p * p).min(u64::from(u32::MAX) + 1) * b;
+            let before = device.0.lock().unwrap().operations;
+            assert!(file.write_at(maximum, b"x").is_err());
+            assert!(file.write_at(u64::MAX, b"x").is_err());
+            assert!(file.truncate(maximum + 1).is_err());
+            assert_eq!(device.0.lock().unwrap().operations, before);
+            assert_eq!(file.stat().unwrap().size, 0);
+            Ok(())
+        }
+        "deep-truncate" => setup_file.unwrap().truncate(0),
+        "deep-unlink" => {
+            let result = manager.unlink_trusted("/mutation", Some(false));
+            drop(setup_file);
+            result
+        }
+        "directory" => manager
+            .create_trusted(&last_path, FileMode::regular(0o600))
+            .map(|_| ()),
+        "directory-rename" => manager.rename_trusted(
+            &last_path,
+            &format!("/mutation/eeee{}", "n".repeat(251)),
+            true,
+        ),
+        "directory-unlink" => manager.unlink_trusted(&last_path, Some(false)),
+        "directory-rmdir" => manager.unlink_trusted("/mutation", Some(true)),
         "symlink-bounds" => {
             let maximum = fs.root_inode().stat().unwrap().blksize as usize - 1;
             for length in [59, 60, 61, maximum] {
