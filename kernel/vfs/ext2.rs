@@ -4187,6 +4187,13 @@ mod hosted_journal_tests {
     }
 
     #[test]
+    fn namespace_create_rename_and_orphan_crash_boundaries() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        super::run_ext2_create_self_test();
+    }
+
+    #[test]
     fn rf180_34_sparse_gap_plan_is_budget_bounded_without_cap_allocation() {
         mm::publish_heap_budgets();
         let mut traversal =
@@ -5945,7 +5952,90 @@ pub fn run_ext2_create_self_test() {
             &fs.lookup(&root, "newfile").expect("lookup")
         ));
         assert_state(&fs, true);
+        let before = device.durable_image();
+        let operations = device.operation.load(Ordering::Acquire);
+        assert!(matches!(
+            fs.create(
+                &root,
+                "newfile",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            ),
+            Err(FsError::Exists)
+        ));
+        assert_eq!(device.operation.load(Ordering::Acquire), operations);
+        assert_eq!(device.durable_image(), before);
+        for name in [".", ".."] {
+            assert!(matches!(
+                fs.create(
+                    &root,
+                    name,
+                    FileMode::regular(0o600),
+                    &crate::topology::write().setup(0, 0),
+                ),
+                Err(FsError::Invalid)
+            ));
+        }
+        assert_eq!(device.operation.load(Ordering::Acquire), operations);
         klog_always!("    Ext2Fs::create happy-path + 6-block commit passed");
+    }
+
+    // A free inode left by another Ext2 writer need not be zero. Its stale
+    // pointers are not owners. Creating a regular file must use the reversible
+    // namespace path, and every interrupted step must remain remountable.
+    for persist in [false, true] {
+        let mut reached_success = false;
+        for boundary in (1..=100).step_by(if cfg!(test) { 1 } else { 7 }) {
+            let mut image = build_image();
+            let mut deleted = Ext2InodeRaw::default();
+            deleted.mode = EXT2_S_IFREG | 0o640;
+            deleted.size_lo = 17;
+            deleted.blocks_lo = 2;
+            deleted.block[0] = FIRST_FREE_BLOCK;
+            deleted.dtime = 42;
+            put(
+                &mut image,
+                5 * BLOCK_SIZE + (NEW_INO as usize - 1) * size_of::<Ext2InodeRaw>(),
+                &deleted,
+            );
+            let device = Arc::try_new(CreateCrashDevice::new(image, 0)).unwrap();
+            let fs = Ext2Fs::mount(device.clone()).unwrap();
+            device.persist_before.store(persist, Ordering::Release);
+            device.fail_at.store(
+                device.operation.load(Ordering::Acquire) + boundary,
+                Ordering::Release,
+            );
+            let result = fs.create(
+                &fs.root_inode(),
+                "newfile",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            );
+            let failed = device.failed.load(Ordering::Acquire);
+            if !failed {
+                assert!(result.is_ok(), "reused inode create: {:?}", result.err());
+            }
+            let recovered_device =
+                Arc::try_new(CreateCrashDevice::new(device.durable_image(), 0)).unwrap();
+            let recovered = Ext2Fs::mount(recovered_device.clone()).unwrap();
+            let visible = recovered.lookup(&recovered.root_inode(), "newfile").is_ok();
+            assert_state(&recovered, visible);
+            assert_eq!(recovered.superblock.read().last_orphan, 0);
+            assert_eq!(recovered.superblock.read().free_blocks_count, 12);
+            Ext2Fs::mount(
+                Arc::try_new(CreateCrashDevice::new(recovered_device.durable_image(), 0)).unwrap(),
+            )
+            .expect("idempotent reused-inode recovery");
+            if !failed {
+                assert!(visible);
+                reached_success = true;
+                break;
+            }
+        }
+        assert!(
+            reached_success,
+            "reused inode crash range missed completion"
+        );
     }
 
     fn resign_namespace_log(image: &mut [u8], count: usize) {
@@ -13995,13 +14085,7 @@ impl Ext2Fs {
             // Directory and symlink initialization use the namespace builder.
             return Err(FsError::NotSupported);
         }
-        // Name validation: 1..=255 bytes, no NUL or '/'.
-        if name.is_empty()
-            || name.len() > 255
-            || name.as_bytes().iter().any(|&b| b == 0 || b == b'/')
-        {
-            return Err(FsError::Invalid);
-        }
+        namespace::valid_name(name)?;
         let parent_ext2 = parent
             .as_any()
             .downcast_ref::<Ext2Inode>()
@@ -14065,6 +14149,10 @@ impl Ext2Fs {
         if last_block_idx >= EXT2_NDIR_BLOCKS as u32 {
             return Err(FsError::NoSpace);
         }
+        // The legacy recovery grammar requires this name to be absent across
+        // the entire parent. Revalidate under the same lock as publication,
+        // including callers that enter the filesystem without a VFS lookup.
+        fs.require_absent_name(&committed_parent, name, &mut scratch)?;
         let dir_block_home = match fs.map_file_block_with_scratch(
             &committed_parent,
             last_block_idx,
@@ -14191,7 +14279,9 @@ impl Ext2Fs {
             .iter()
             .any(|&b| b != 0)
         {
-            return Err(FsError::NotSupported);
+            // Deleted Ext2 inodes can retain their old bytes. The namespace
+            // transaction records that preimage; the legacy create cannot.
+            return Err(FsError::NoSpace);
         }
         let now = TimeSpec::now();
         let mut new_inode_raw = Ext2InodeRaw::default();
@@ -14425,16 +14515,11 @@ impl FileSystem for Ext2Fs {
         )
     }
 
-    /// Transactional ext3 file creation.  All metadata homes — inode bitmap,
-    /// group descriptor, superblock, the new inode's table block, the parent
-    /// inode's table block (or one coalesced block), and the parent directory
-    /// data block — commit in a single JBD2 transaction or none do, so a crash
-    /// leaves either a fully created file or no visible change.
-    ///
-    /// Scope: regular files in a single block group whose parent directory's
-    /// last data block has room for the new dirent in the last entry's rec_len
-    /// tail.  Directory growth, multi-group allocation, and reused (non-zero)
-    /// inode slots return `NotSupported` rather than risking a partial commit.
+    /// Create through the legacy single-transaction path when the parent tail
+    /// and free inode slot are clean. Otherwise use orphan allocation and name
+    /// publication, including reused inodes, other groups and directory growth.
+    /// Recovery either publishes the complete name or reclaims the orphan;
+    /// a failed create may leave valid extra directory capacity.
     fn create(
         &self,
         parent: &Arc<dyn Inode>,
@@ -14460,8 +14545,8 @@ impl FileSystem for Ext2Fs {
     /// Scope: same-directory, regular-file source, NOREPLACE (dest absent),
     /// in-place name rewrite.  Cross-directory rename, directory rename,
     /// overwrite rename, and a dest name too long for the source entry's
-    /// rec_len return `NotSupported`.  The source dirent must live in the
-    /// parent's last direct block so recovery can re-derive the dir-data home.
+    /// rec_len return `NotSupported`. Kind 18 authenticates source entries in
+    /// any mapped directory block; clean last-direct entries retain kind 4.
     #[allow(clippy::too_many_arguments)]
     fn rename(
         &self,

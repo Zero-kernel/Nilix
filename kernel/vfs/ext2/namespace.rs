@@ -872,7 +872,7 @@ struct DirectorySlot {
     file_type: u8,
 }
 
-fn valid_name(name: &str) -> Result<(), FsError> {
+pub(super) fn valid_name(name: &str) -> Result<(), FsError> {
     if name.len() > 255 {
         return Err(FsError::NameTooLong);
     }
@@ -986,6 +986,19 @@ impl Ext2Fs {
             Ok(())
         })?;
         found.ok_or(FsError::NotFound)
+    }
+
+    pub(super) fn require_absent_name(
+        &self,
+        raw: &Ext2InodeRaw,
+        name: &str,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<(), FsError> {
+        match self.find_namespace_entry(raw, name, scratch) {
+            Ok(_) => Err(FsError::Exists),
+            Err(FsError::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn require_empty_directory(

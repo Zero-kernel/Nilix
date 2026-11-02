@@ -222,6 +222,9 @@ fn main() {
     let long_target =
         "./".repeat(((fs.root_inode().stat().unwrap().blksize as usize - 1) / 2).min(700));
     let operation = match scenario.as_str() {
+        "create" => manager
+            .create_trusted("/mutation", FileMode::regular(0o600))
+            .map(|_| ()),
         "mkdir" => manager
             .create_trusted("/mutation", FileMode::directory(0o750))
             .map(|_| ()),
