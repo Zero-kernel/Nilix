@@ -4894,12 +4894,15 @@ struct DirectAllocationPlan {
     group_desc_target: GroupDescWriteTarget,
     old_group_desc: Ext2GroupDesc,
     new_group_desc: Ext2GroupDesc,
-    old_superblock: Ext2Superblock,
-    new_superblock: Ext2Superblock,
+    old_super_free_blocks: u32,
+    new_super_free_blocks: u32,
     inode_target: InodeWriteTarget,
     old_inode: Ext2InodeRaw,
     new_inode: Ext2InodeRaw,
 }
+// Runtime plans cross several nested calls on a 32 KiB task stack. Keep
+// counter edits compact; a full superblock copy here consumes that budget.
+const _: () = assert!(size_of::<DirectAllocationPlan>() <= 512);
 
 /// Role of one metadata home within a FileCreate transaction.  The fixed
 /// commit-time ordering is: bitmap, group descriptor, superblock, then the
@@ -11643,18 +11646,13 @@ impl Ext2Fs {
                             .copy_from_slice(bytes);
                     }
                     2 => {
-                        let (_, offset) = self.superblock_home_target();
-                        let bytes = unsafe {
-                            core::slice::from_raw_parts(
-                                &plan.new_superblock as *const _ as *const u8,
-                                size_of::<Ext2Superblock>(),
-                            )
-                        };
-                        let end = offset.checked_add(bytes.len()).ok_or(FsError::Invalid)?;
-                        block
-                            .get_mut(offset..end)
-                            .ok_or(FsError::Invalid)?
-                            .copy_from_slice(bytes);
+                        let offset = self.superblock_home_target().1
+                            + core::mem::offset_of!(Ext2Superblock, free_blocks_count);
+                        let bytes = block.get_mut(offset..offset + 4).ok_or(FsError::Invalid)?;
+                        if bytes != plan.old_super_free_blocks.to_le_bytes() {
+                            return Err(FsError::Invalid);
+                        }
+                        bytes.copy_from_slice(&plan.new_super_free_blocks.to_le_bytes());
                     }
                     3 => Self::replace_inode_in_block(block, plan.inode_target, &plan.new_inode)?,
                     _ => return Err(FsError::Invalid),
@@ -11898,13 +11896,9 @@ impl Ext2Fs {
                     ),
                     2 => Self::hash_block_replacement(
                         post_image,
-                        self.superblock_home_target().1,
-                        unsafe {
-                            core::slice::from_raw_parts(
-                                &plan.old_superblock as *const Ext2Superblock as *const u8,
-                                size_of::<Ext2Superblock>(),
-                            )
-                        },
+                        self.superblock_home_target().1
+                            + core::mem::offset_of!(Ext2Superblock, free_blocks_count),
+                        &plan.old_super_free_blocks.to_le_bytes(),
                     ),
                     3 => Self::hash_block_replacement(
                         post_image,
@@ -12341,13 +12335,20 @@ impl Ext2Fs {
             .checked_sub(self.block_size / 512)
             .ok_or(FsError::Invalid)?;
 
-        let sb = *self.superblock.read();
+        let (first_data_block, blocks_per_group, blocks_count, old_super_free_blocks) = {
+            let sb = self.superblock.read();
+            (
+                sb.first_data_block,
+                sb.blocks_per_group,
+                sb.blocks_count,
+                sb.free_blocks_count,
+            )
+        };
         let relative = phys_block
-            .checked_sub(sb.first_data_block)
+            .checked_sub(first_data_block)
             .ok_or(FsError::Invalid)?;
-        let group =
-            usize::try_from(relative / sb.blocks_per_group).map_err(|_| FsError::Invalid)?;
-        let bit = relative % sb.blocks_per_group;
+        let group = usize::try_from(relative / blocks_per_group).map_err(|_| FsError::Invalid)?;
+        let bit = relative % blocks_per_group;
         let desc = self
             .group_descs
             .read()
@@ -12358,18 +12359,17 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
         self.read_physical_block(desc.block_bitmap, scratch.block_mut())?;
-        let group_start = sb
-            .first_data_block
+        let group_start = first_data_block
             .checked_add(
                 u32::try_from(group)
                     .map_err(|_| FsError::Invalid)?
-                    .checked_mul(sb.blocks_per_group)
+                    .checked_mul(blocks_per_group)
                     .ok_or(FsError::Invalid)?,
             )
             .ok_or(FsError::Invalid)?;
         let group_blocks = cmp::min(
-            sb.blocks_per_group,
-            sb.blocks_count
+            blocks_per_group,
+            blocks_count
                 .checked_sub(group_start)
                 .ok_or(FsError::Invalid)?,
         );
@@ -12395,9 +12395,7 @@ impl Ext2Fs {
             .free_blocks_count
             .checked_add(1)
             .ok_or(FsError::Invalid)?;
-        let mut new_super = sb;
-        new_super.free_blocks_count = new_super
-            .free_blocks_count
+        let new_super_free_blocks = old_super_free_blocks
             .checked_add(1)
             .ok_or(FsError::Invalid)?;
         let plan = DirectAllocationPlan {
@@ -12411,8 +12409,8 @@ impl Ext2Fs {
             group_desc_target: self.group_desc_write_target(group)?,
             old_group_desc: desc,
             new_group_desc: new_desc,
-            old_superblock: sb,
-            new_superblock: new_super,
+            old_super_free_blocks,
+            new_super_free_blocks,
             inode_target,
             old_inode: *committed_raw,
             new_inode: next_raw,
@@ -12490,18 +12488,25 @@ impl Ext2Fs {
             .checked_add(self.block_size / 512)
             .ok_or(FsError::Invalid)?;
 
-        let sb = *self.superblock.read();
-        if sb.free_blocks_count == 0 {
+        let (first_data_block, blocks_per_group, blocks_count, old_super_free_blocks) = {
+            let sb = self.superblock.read();
+            (
+                sb.first_data_block,
+                sb.blocks_per_group,
+                sb.blocks_count,
+                sb.free_blocks_count,
+            )
+        };
+        if old_super_free_blocks == 0 {
             return Err(FsError::NoSpace);
         }
         let group_descs = self.group_descs.read();
-        let groups_count = sb
-            .blocks_count
-            .checked_sub(sb.first_data_block)
+        let groups_count = blocks_count
+            .checked_sub(first_data_block)
             .ok_or(FsError::Invalid)?
-            .checked_add(sb.blocks_per_group - 1)
+            .checked_add(blocks_per_group - 1)
             .ok_or(FsError::Invalid)?
-            / sb.blocks_per_group;
+            / blocks_per_group;
         if groups_count as usize > group_descs.len() {
             return Err(FsError::Invalid);
         }
@@ -12518,15 +12523,14 @@ impl Ext2Fs {
 
             let group_offset = u32::try_from(group)
                 .map_err(|_| FsError::Invalid)?
-                .checked_mul(sb.blocks_per_group)
+                .checked_mul(blocks_per_group)
                 .ok_or(FsError::Invalid)?;
-            let group_start = sb
-                .first_data_block
+            let group_start = first_data_block
                 .checked_add(group_offset)
                 .ok_or(FsError::Invalid)?;
             let group_blocks = cmp::min(
-                sb.blocks_per_group,
-                sb.blocks_count
+                blocks_per_group,
+                blocks_count
                     .checked_sub(group_start)
                     .ok_or(FsError::Invalid)?,
             );
@@ -12578,9 +12582,7 @@ impl Ext2Fs {
                         .free_blocks_count
                         .checked_sub(1)
                         .ok_or(FsError::Invalid)?;
-                    let mut new_super = sb;
-                    new_super.free_blocks_count = new_super
-                        .free_blocks_count
+                    let new_super_free_blocks = old_super_free_blocks
                         .checked_sub(1)
                         .ok_or(FsError::Invalid)?;
                     if let Some(pointer) = inode_pointer {
@@ -12598,8 +12600,8 @@ impl Ext2Fs {
                         group_desc_target: self.group_desc_write_target(group)?,
                         old_group_desc: desc,
                         new_group_desc: new_desc,
-                        old_superblock: sb,
-                        new_superblock: new_super,
+                        old_super_free_blocks,
+                        new_super_free_blocks,
                         inode_target,
                         old_inode: *committed_raw,
                         new_inode: next_raw,
@@ -13637,110 +13639,20 @@ impl Ext2Fs {
     }
 }
 
-impl FileSystem for Ext2Fs {
-    /// ST-K4: `Ok` means the mount is healthy and a device barrier that the
-    /// device can stand behind completed after this call began. Writes are
-    /// write-through, so the barrier is all that remains to do.
-    fn sync(&self) -> Result<(), FsError> {
-        self.ensure_io_healthy()?;
-        if self.dev.is_read_only() {
-            return Ok(());
-        }
-        if self.dev.durability() == block::DurabilityGuarantee::Unsupported {
-            return Err(FsError::Io);
-        }
-        let owner = self.self_ref.lock().as_ref().and_then(Weak::upgrade);
-        if let Some(owner) = owner {
-            owner.reap_orphans()?;
-        }
-        self.flush_with_retry()?;
-        // A concurrent writer may have poisoned the mount during the barrier.
-        self.ensure_io_healthy()
-    }
-
-    fn check_io_health(&self) -> Result<(), FsError> {
-        self.ensure_io_healthy()
-    }
-
-    fn fs_id(&self) -> u64 {
-        self.fs_id
-    }
-
-    fn fs_type(&self) -> &'static str {
-        "ext2"
-    }
-
-    fn root_inode(&self) -> Arc<dyn Inode> {
-        self.root.read().as_ref().unwrap().clone()
-    }
-
-    fn lookup(&self, parent: &Arc<dyn Inode>, name: &str) -> Result<Arc<dyn Inode>, FsError> {
-        self.ensure_io_healthy()?;
-        // Downcast to Ext2Inode
-        let parent = parent
-            .as_any()
-            .downcast_ref::<Ext2Inode>()
-            .ok_or(FsError::Invalid)?;
-
-        if !parent.is_dir_inner() {
-            return Err(FsError::NotDir);
-        }
-
-        // Search directory entries
-        parent.dir_lookup(name)
-    }
-
-    fn unlink(
-        &self,
-        parent: &Arc<dyn Inode>,
-        name: &str,
-        expected_ino: u64,
-        must_be_dir: Option<bool>,
-        _context: &crate::topology::MutationContext<'_>,
-    ) -> Result<(), FsError> {
-        self.unlink_namespace(parent, name, expected_ino, must_be_dir)
-    }
-
-    fn symlink(
-        &self,
-        parent: &Arc<dyn Inode>,
-        name: &str,
-        target: &str,
-        context: &crate::topology::MutationContext<'_>,
-    ) -> Result<Arc<dyn Inode>, FsError> {
-        self.create_namespace(
-            parent,
-            name,
-            FileMode::symlink(0o777),
-            Some(target),
-            context,
-        )
-    }
-
-    /// Transactional ext3 file creation.  All metadata homes — inode bitmap,
-    /// group descriptor, superblock, the new inode's table block, the parent
-    /// inode's table block (or one coalesced block), and the parent directory
-    /// data block — commit in a single JBD2 transaction or none do, so a crash
-    /// leaves either a fully created file or no visible change.
-    ///
-    /// Scope: regular files in a single block group whose parent directory's
-    /// last data block has room for the new dirent in the last entry's rec_len
-    /// tail.  Directory growth, multi-group allocation, and reused (non-zero)
-    /// inode slots return `NotSupported` rather than risking a partial commit.
-    fn create(
+impl Ext2Fs {
+    // Do not reserve the regular-create plan frame while mkdir initializes a
+    // child through write_mutation_inner and the device/interrupt stack.
+    #[inline(never)]
+    fn create_regular(
         &self,
         parent: &Arc<dyn Inode>,
         name: &str,
         mode: FileMode,
         context: &crate::topology::MutationContext<'_>,
     ) -> Result<Arc<dyn Inode>, FsError> {
-        if mode.is_dir() {
-            return self.create_namespace(parent, name, mode, None, context);
-        }
         self.ensure_io_healthy()?;
         if !mode.is_file() {
-            // mkdir is out of scope: it needs a directory data block and the
-            // "." / ".." seed entries.
+            // Directory and symlink initialization use the namespace builder.
             return Err(FsError::NotSupported);
         }
         // Name validation: 1..=255 bytes, no NUL or '/'.
@@ -14089,6 +14001,110 @@ impl FileSystem for Ext2Fs {
             return Err(failure.error);
         }
         Ok(new_inode as Arc<dyn Inode>)
+    }
+}
+
+impl FileSystem for Ext2Fs {
+    /// ST-K4: `Ok` means the mount is healthy and a device barrier that the
+    /// device can stand behind completed after this call began. Writes are
+    /// write-through, so the barrier is all that remains to do.
+    fn sync(&self) -> Result<(), FsError> {
+        self.ensure_io_healthy()?;
+        if self.dev.is_read_only() {
+            return Ok(());
+        }
+        if self.dev.durability() == block::DurabilityGuarantee::Unsupported {
+            return Err(FsError::Io);
+        }
+        let owner = self.self_ref.lock().as_ref().and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            owner.reap_orphans()?;
+        }
+        self.flush_with_retry()?;
+        // A concurrent writer may have poisoned the mount during the barrier.
+        self.ensure_io_healthy()
+    }
+
+    fn check_io_health(&self) -> Result<(), FsError> {
+        self.ensure_io_healthy()
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn fs_type(&self) -> &'static str {
+        "ext2"
+    }
+
+    fn root_inode(&self) -> Arc<dyn Inode> {
+        self.root.read().as_ref().unwrap().clone()
+    }
+
+    fn lookup(&self, parent: &Arc<dyn Inode>, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+        self.ensure_io_healthy()?;
+        // Downcast to Ext2Inode
+        let parent = parent
+            .as_any()
+            .downcast_ref::<Ext2Inode>()
+            .ok_or(FsError::Invalid)?;
+
+        if !parent.is_dir_inner() {
+            return Err(FsError::NotDir);
+        }
+
+        // Search directory entries
+        parent.dir_lookup(name)
+    }
+
+    fn unlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        expected_ino: u64,
+        must_be_dir: Option<bool>,
+        _context: &crate::topology::MutationContext<'_>,
+    ) -> Result<(), FsError> {
+        self.unlink_namespace(parent, name, expected_ino, must_be_dir)
+    }
+
+    fn symlink(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        target: &str,
+        context: &crate::topology::MutationContext<'_>,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        self.create_namespace(
+            parent,
+            name,
+            FileMode::symlink(0o777),
+            Some(target),
+            context,
+        )
+    }
+
+    /// Transactional ext3 file creation.  All metadata homes — inode bitmap,
+    /// group descriptor, superblock, the new inode's table block, the parent
+    /// inode's table block (or one coalesced block), and the parent directory
+    /// data block — commit in a single JBD2 transaction or none do, so a crash
+    /// leaves either a fully created file or no visible change.
+    ///
+    /// Scope: regular files in a single block group whose parent directory's
+    /// last data block has room for the new dirent in the last entry's rec_len
+    /// tail.  Directory growth, multi-group allocation, and reused (non-zero)
+    /// inode slots return `NotSupported` rather than risking a partial commit.
+    fn create(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        mode: FileMode,
+        context: &crate::topology::MutationContext<'_>,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        if mode.is_dir() {
+            return self.create_namespace(parent, name, mode, None, context);
+        }
+        self.create_regular(parent, name, mode, context)
     }
 
     /// Transactional same-directory rename for a regular file (renameat2
@@ -14893,7 +14909,7 @@ impl Ext2Inode {
                             &mut scratch,
                         );
                         if !result.as_ref().is_err_and(|failure| !failure.committed) {
-                            *fs.superblock.write() = plan.new_superblock;
+                            fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
                             fs.group_descs.write()[plan.group] = plan.new_group_desc;
                         }
                         self.finish_truncate_step(
@@ -14936,7 +14952,7 @@ impl Ext2Inode {
                     &mut scratch,
                 );
                 if !result.as_ref().is_err_and(|failure| !failure.committed) {
-                    *fs.superblock.write() = block.new_superblock;
+                    fs.superblock.write().free_blocks_count = block.new_super_free_blocks;
                     fs.group_descs.write()[block.group] = block.new_group_desc;
                 }
                 self.finish_truncate_step(
@@ -14976,7 +14992,7 @@ impl Ext2Inode {
                 &mut scratch,
             );
             if !result.as_ref().is_err_and(|failure| !failure.committed) {
-                *fs.superblock.write() = plan.new_superblock;
+                fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
                 fs.group_descs.write()[plan.group] = plan.new_group_desc;
             }
             self.finish_truncate_step(
@@ -15295,7 +15311,7 @@ impl Ext2Inode {
                         return fail(failure.error, written);
                     }
                 };
-                *fs.superblock.write() = plan.new_superblock;
+                fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
                 fs.group_descs.write()[plan.group] = plan.new_group_desc;
                 *raw_guard = plan.new_inode;
                 if let Some(failure) = transaction_failure {
@@ -15367,7 +15383,7 @@ impl Ext2Inode {
             // The commit is durable at this point even when checkpoint or log
             // clearing subsequently failed. Publish exactly the state recovery
             // will reconstruct, count this chunk, then fail-stop the mount.
-            *fs.superblock.write() = plan.new_superblock;
+            fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
             fs.group_descs.write()[plan.group] = plan.new_group_desc;
             *raw_guard = plan.new_inode;
             self.size.store(published_size, Ordering::Release);
