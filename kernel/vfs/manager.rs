@@ -1405,13 +1405,20 @@ fn vfs_sync_file_range_callback(
     nbytes: i64,
     flags: u32,
 ) -> Result<(), SyscallError> {
-    let file = durability_handle(fd, SyscallError::ESPIPE)?;
-    if file.flags().is_path() {
+    // A valid pipe/socket descriptor still gets argument validation before
+    // ESPIPE. Bad descriptors and O_PATH retain precedence over EINVAL.
+    let file = match durability_handle(fd, SyscallError::ESPIPE) {
+        Ok(file) => Some(file),
+        Err(SyscallError::ESPIPE) => None,
+        Err(error) => return Err(error),
+    };
+    if file.as_ref().is_some_and(|file| file.flags().is_path()) {
         return Err(SyscallError::EBADF);
     }
     if !sync_file_range_args_valid(offset, nbytes, flags) {
         return Err(SyscallError::EINVAL);
     }
+    let file = file.ok_or(SyscallError::ESPIPE)?;
     match file.sync_file_range().map_err(durability_error)? {
         true => Ok(()),
         false => Err(SyscallError::ESPIPE),

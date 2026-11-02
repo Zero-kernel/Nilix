@@ -2172,7 +2172,7 @@ fn test_durability_syscalls(results: &mut TestResult) {
     let pipe_read = pipe_fds[0] as u64;
     let saved_stdout = unsafe { syscall1(SYS_DUP, 1) };
 
-    let checks: [(&str, u64, i32); 22] = [
+    let checks: [(&str, u64, i32); 28] = [
         ("fsync bad fd", fsync(u64::MAX), EBADF),
         ("fdatasync unused fd", fdatasync(200), EBADF),
         ("fsync O_PATH", fsync(path_only), EBADF),
@@ -2191,6 +2191,28 @@ fn test_durability_syscalls(results: &mut TestResult) {
         ("range O_PATH", range(path_only, 0, 0, 0), EBADF),
         ("range pipe", range(pipe_read, 0, 0, 0), ESPIPE),
         ("range console", range(console, 0, 0, 0), ESPIPE),
+        ("range pipe unknown flag", range(pipe_read, 0, 0, 8), EINVAL),
+        (
+            "range pipe negative offset",
+            range(pipe_read, -1, 0, 0),
+            EINVAL,
+        ),
+        (
+            "range pipe negative length",
+            range(pipe_read, 0, -1, 0),
+            EINVAL,
+        ),
+        (
+            "range pipe overflow",
+            range(pipe_read, i64::MAX, 1, 0),
+            EINVAL,
+        ),
+        ("range bad fd before flags", range(u64::MAX, 0, 0, 8), EBADF),
+        (
+            "range O_PATH before flags",
+            range(path_only, 0, 0, 8),
+            EBADF,
+        ),
         ("range unknown flag", range(file, 0, 0, 8), EINVAL),
         ("range negative offset", range(file, -1, 0, 0), EINVAL),
         ("range negative length", range(file, 0, -1, 0), EINVAL),
