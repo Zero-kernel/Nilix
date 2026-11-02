@@ -3220,6 +3220,78 @@ pub fn run_ext2_journal_transaction_self_test() {
         drop(fs);
         drop(_device);
 
+        // Ordered tail zeroing has already changed visible data when a later
+        // metadata read fails. The mount must stop serving stale cache bytes.
+        for failing_home in [3u64, 6u64] {
+            let (device, fs, file) = mount_image(written.to_vec());
+            let physical = file.raw.read().block[1] as usize;
+            device.arm_short_read(failing_home * (BLOCK_SIZE as u64 / 512));
+            assert_eq!(file.truncate(KEEP as u64), Err(FsError::Io));
+            let durable = device.durable_snapshot();
+            assert!(
+                durable[physical * BLOCK_SIZE + 500..(physical + 1) * BLOCK_SIZE]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
+            assert!(
+                fs.io_faulted.load(Ordering::Acquire),
+                "tail changed on disk but failed truncate left the mount healthy"
+            );
+            assert_eq!(file.stat().err(), Some(FsError::Io));
+        }
+
+        // An attacker can recompute both the intent digest and preimage hashes.
+        // Recovery must still refuse a fully sealed shrink of an append-only file.
+        for (target, kind, count) in [
+            (
+                0,
+                ZERO_INTENT_KIND_DIRECT_FREE,
+                DIRECT_ALLOCATION_METADATA_BLOCKS,
+            ),
+            (payload.len() as u64 - 1, ZERO_INTENT_KIND_INODE_SHRINK, 1),
+        ] {
+            let commit = journal_logical_offset((count + 2) as u32);
+            let mut active = None;
+            for boundary in 1..24 {
+                let (device, fs, file) = mount_image(written.to_vec());
+                device.arm(boundary, 0);
+                let _ = file.truncate(target);
+                let image = device.durable_snapshot();
+                if journal_start(&image) != 0
+                    && read_be_u32(&image, commit).ok() == Some(JBD2_MAGIC)
+                    && read_be_u32(&image, commit + 8).ok() == Some(journal_sequence(&image))
+                    && image[commit + ZERO_INTENT_KIND_OFFSET] == kind
+                {
+                    active = Some(image);
+                    break;
+                }
+                drop((file, fs, device));
+            }
+            let mut image = active.expect("committed truncate intent before checkpoint");
+            let inode_offset = (FILE_INO as usize - 1) * size_of::<Ext2InodeRaw>();
+            let inode_home = 5 * BLOCK_SIZE + inode_offset;
+            let within_block = inode_offset % BLOCK_SIZE;
+            let post = journal_logical_offset((count + 1) as u32) + within_block;
+            for offset in [inode_home, post, commit + ZERO_INTENT_OLD_INODE_OFFSET] {
+                let mut raw: Ext2InodeRaw = read_struct(&image, offset);
+                raw.flags |= EXT2_APPEND_FL;
+                copy_struct(&mut image, offset, &raw);
+            }
+            let preimage = Sha256::digest(&image[6 * BLOCK_SIZE..7 * BLOCK_SIZE]);
+            let hash = commit + ZERO_INTENT_PREIMAGE_HASHES_OFFSET + (count - 1) * 32;
+            image[hash..hash + 32].copy_from_slice(&preimage);
+            resign_private_transaction(&mut image, count);
+            let before = image.clone();
+            let device = Arc::try_new(CrashBlockDevice::new(image)).expect("sealed shrink forgery");
+            let dev: Arc<dyn BlockDevice> = device.clone();
+            assert!(
+                Ext2Fs::mount(dev).is_err(),
+                "recovery accepted append-only truncation"
+            );
+            assert_eq!(device.operation.load(Ordering::Acquire), 0);
+            assert_eq!(device.durable_snapshot(), before);
+        }
+
         // A same-size call changes nothing but succeeds; refusals touch nothing.
         let (device, _fs, file) = mount_image(written.to_vec());
         file.truncate(payload.len() as u64)
@@ -4471,6 +4543,22 @@ impl JournalMetadataPlan {
             Self::InodeUpdate { .. } | Self::InodeShrink { .. } => 1,
             Self::FileCreate(plan) => plan.home_count(),
             Self::Rename(_) => 2,
+        }
+    }
+}
+
+/// Ordered data may become durable before its inode transaction. Until the
+/// corresponding cache/size publication completes, every early return must
+/// stop I/O rather than serve cache bytes that disagree with the device.
+struct Ext2DataPublication<'a> {
+    faulted: &'a AtomicBool,
+    pending: bool,
+}
+
+impl Drop for Ext2DataPublication<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.faulted.store(true, Ordering::Release);
         }
     }
 }
@@ -7458,7 +7546,7 @@ impl Ext2Fs {
             intent.kind,
             ZERO_INTENT_KIND_DIRECT_FREE | ZERO_INTENT_KIND_INODE_SHRINK
         );
-        if new_size < old_size && !shrinking {
+        if (new_size < old_size && !shrinking) || (shrinking && old.flags & EXT2_APPEND_FL != 0) {
             return Err(FsError::NotSupported);
         }
         match intent.kind {
@@ -13077,6 +13165,10 @@ impl Ext2Inode {
             next
         };
 
+        let mut publication = Ext2DataPublication {
+            faulted: &fs.io_faulted,
+            pending: false,
+        };
         if new_size >= old_size {
             // Growing never allocates. Clear any stale bytes the new size would
             // expose before the size that exposes them can commit.
@@ -13084,6 +13176,7 @@ impl Ext2Inode {
             let committed_raw = *raw_guard;
             let sparse_gap =
                 fs.preflight_sparse_gap(&committed_raw, old_size, new_size, journal, &mut scratch)?;
+            publication.pending = !sparse_gap.targets.is_empty();
             fs.zero_sparse_gap(&sparse_gap, &mut scratch)?;
             drop(sparse_gap);
             let next_raw = stamped(&committed_raw, new_size);
@@ -13098,7 +13191,7 @@ impl Ext2Inode {
                 },
                 &mut scratch,
             );
-            return self.finish_truncate_step(
+            let result = self.finish_truncate_step(
                 &fs,
                 &mut raw_guard,
                 next_raw,
@@ -13106,6 +13199,8 @@ impl Ext2Inode {
                 new_size,
                 result,
             );
+            publication.pending = result.is_err() && publication.pending;
+            return result;
         }
 
         // Ordered-data rule: clear the kept block's tail first, or a later cache
@@ -13119,6 +13214,7 @@ impl Ext2Inode {
             {
                 fs.read_block(physical, scratch.block_mut())?;
                 scratch.block_mut()[offset_in_block..].fill(0);
+                publication.pending = true;
                 if let Err(error) = fs
                     .write_block(physical, scratch.block())
                     .and_then(|()| fs.flush_device())
@@ -13192,6 +13288,7 @@ impl Ext2Inode {
                 result,
             )?;
         }
+        publication.pending = false;
         Ok(())
     }
 
