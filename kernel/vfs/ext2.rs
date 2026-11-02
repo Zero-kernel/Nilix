@@ -3246,6 +3246,32 @@ pub fn run_ext2_journal_transaction_self_test() {
         drop(fs);
         drop(device);
 
+        // A sparse first write can commit its empty mapping root before any
+        // data or size. Retrying truncate(0) after that crash must release it.
+        let mut found_empty_root = false;
+        for boundary in 1..40 {
+            let (device, fs, file) = mount_image(empty.to_vec());
+            device.arm(boundary, 0);
+            let _ = file.write_at((EXT2_NDIR_BLOCKS * BLOCK_SIZE) as u64, b"x");
+            let image = device.durable_snapshot();
+            drop((file, fs, device));
+            let (_device, fs, file) = mount_image(image);
+            if file.size.load(Ordering::Acquire) == 0 && file.raw.read().block[EXT2_IND_BLOCK] != 0
+            {
+                found_empty_root = true;
+                file.truncate(0)
+                    .expect("retry zero-size truncate after root attach");
+                assert_eq!(
+                    file.raw.read().block[EXT2_IND_BLOCK],
+                    0,
+                    "empty root leaked after truncate(0)"
+                );
+                assert_eq!(fs.superblock.read().free_blocks_count, 16);
+                break;
+            }
+        }
+        assert!(found_empty_root, "matrix missed the root-only crash state");
+
         // Shrinks that keep the root, drop it, and clear the whole file.
         for (new_size, root_kept, free) in [
             (13 * BLOCK_SIZE - 10, true, 2u32),
@@ -7954,9 +7980,7 @@ impl Ext2Fs {
                 | ZERO_INTENT_KIND_INDIRECT_ROOT_FREE
                 | ZERO_INTENT_KIND_INDIRECT_DATA_FREE
         );
-        if (new_size < old_size && !shrinking)
-            || (shrinking && old.flags & EXT2_APPEND_FL != 0)
-        {
+        if (new_size < old_size && !shrinking) || (shrinking && old.flags & EXT2_APPEND_FL != 0) {
             return Err(FsError::NotSupported);
         }
         let sectors = self.block_size / 512;
@@ -13895,7 +13919,13 @@ impl Ext2Inode {
             faulted: &fs.io_faulted,
             pending: false,
         };
-        if new_size >= old_size {
+        // Root attachment is a separate durable transaction. A crashed sparse
+        // first write can leave size zero with an empty root; a same-size
+        // truncate must still detach that root instead of returning early.
+        let empty_root_past_end = new_size == old_size
+            && new_size <= EXT2_NDIR_BLOCKS as u64 * block_size
+            && raw_guard.block[EXT2_IND_BLOCK] != 0;
+        if new_size >= old_size && !empty_root_past_end {
             // Growing never allocates. Clear any stale bytes the new size would
             // expose before the size that exposes them can commit.
             let journal = journal_guard.as_ref().ok_or(FsError::ReadOnly)?;
