@@ -3268,6 +3268,20 @@ pub fn run_ext2_journal_transaction_self_test() {
                 drop((file, fs, device));
             }
             let mut image = active.expect("committed truncate intent before checkpoint");
+            // Even a payload that fails decoding must not be cleared if the
+            // complete transaction is sealed; some homes may be checkpointed.
+            let mut malformed = image.clone();
+            write_be_u16(
+                &mut malformed,
+                commit + ZERO_INTENT_VERSION_OFFSET,
+                u16::MAX,
+            )
+            .unwrap();
+            resign_private_transaction(&mut malformed, count);
+            let device = Arc::try_new(CrashBlockDevice::new(malformed.clone())).unwrap();
+            assert!(Ext2Fs::mount(device.clone()).is_err());
+            assert_eq!(device.operation.load(Ordering::Acquire), 0);
+            assert_eq!(device.durable_snapshot(), malformed);
             let inode_offset = (FILE_INO as usize - 1) * size_of::<Ext2InodeRaw>();
             let inode_home = 5 * BLOCK_SIZE + inode_offset;
             let within_block = inode_offset % BLOCK_SIZE;
@@ -9108,22 +9122,6 @@ impl Ext2Fs {
         })
     }
 
-    fn commit_candidate(
-        block: &[u8],
-        sequence: u32,
-        expected_count: u8,
-    ) -> Option<JournalCommitIntent> {
-        if read_be_u32(block, 0).ok() != Some(JBD2_MAGIC)
-            || read_be_u32(block, 4).ok() != Some(JBD2_COMMIT_BLOCK)
-            || read_be_u32(block, 8).ok() != Some(sequence)
-        {
-            return None;
-        }
-        Self::decode_commit_intent(block)
-            .ok()
-            .filter(|intent| intent.metadata_count == expected_count)
-    }
-
     fn plan_recovery_candidate(
         &self,
         journal: &Ext2Journal,
@@ -9140,10 +9138,12 @@ impl Ext2Fs {
         {
             return Err(FsError::Invalid);
         }
-        let Some(intent) = Self::commit_candidate(commit, journal.next_sequence, expected_count)
-        else {
+        if read_be_u32(commit, 0).ok() != Some(JBD2_MAGIC)
+            || read_be_u32(commit, 4).ok() != Some(JBD2_COMMIT_BLOCK)
+            || read_be_u32(commit, 8).ok() != Some(journal.next_sequence)
+        {
             return Ok(None);
-        };
+        }
         let expected_bytes = usize::from(expected_count)
             .checked_mul(self.block_size as usize)
             .ok_or(FsError::Invalid)?;
@@ -9162,6 +9162,14 @@ impl Ext2Fs {
             // block.  It is not authoritative until the complete transaction
             // digest matches the current descriptor and post-images.
             return Ok(None);
+        }
+
+        // A sealed transaction is authoritative even when its typed payload is
+        // invalid. Do not discard it as a torn/uncommitted tail: checkpoints may
+        // already have changed homes. Reject before any replay or journal clear.
+        let intent = Self::decode_commit_intent(commit)?;
+        if intent.metadata_count != expected_count {
+            return Err(FsError::Invalid);
         }
 
         // The descriptor grammar is part of candidate selection, not a check
