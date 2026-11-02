@@ -13,6 +13,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -78,8 +79,15 @@ def main() -> None:
             fsck(image, name)
             records.append({"name": name, "image": pack(image), "fsck": 0})
         for scenario in ("mkdir", "symlink", "unlink", "indirect", "truncate"):
+            name = f"{block_size}-{scenario}-complete"
+            completed = out / f"{name}.img"
+            text = run([helper, str(base), str(completed), scenario], out / f"{name}.log")
+            operations = int(re.search(r"MUTATION_OPERATIONS=(\d+)", text).group(1))
+            fsck(completed, name)
+            records.append({"name": name, "image": pack(completed), "fsck": 0,
+                            "mutation_operations": operations})
             for persist in (0, 1):
-                for boundary in (1, 8, 12, 16, 22, 28, 38, 52, 70, 92):
+                for boundary in range(1, operations + 2):
                     name = f"{block_size}-{scenario}-{persist}-{boundary}"
                     crash = out / f"{name}-crash.img"
                     recovered = out / f"{name}-recovered.img"

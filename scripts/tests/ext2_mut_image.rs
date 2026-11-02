@@ -142,6 +142,7 @@ fn main() {
             state.operations + fail_at
         };
     }
+    let mutation_start = device.0.lock().unwrap().operations;
     let long_target =
         "./".repeat(((fs.root_inode().stat().unwrap().blksize as usize - 1) / 2).min(700));
     let operation = match scenario.as_str() {
@@ -241,7 +242,9 @@ fn main() {
     let state = device.0.lock().unwrap();
     std::fs::write(&args[2], &state.durable).unwrap();
     println!(
-        "SCENARIO={scenario} OPERATIONS={} FAILED={}",
-        state.operations, state.failed
+        "SCENARIO={scenario} OPERATIONS={} MUTATION_OPERATIONS={} FAILED={}",
+        state.operations,
+        state.operations - mutation_start,
+        state.failed
     );
 }
