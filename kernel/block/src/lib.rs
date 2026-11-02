@@ -468,6 +468,17 @@ impl fmt::Debug for Bio {
 // Block Device Trait
 // ============================================================================
 
+/// What a successful [`BlockDevice::flush`] proves about completed writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityGuarantee {
+    /// `flush` issues a real device cache barrier.
+    FlushBarrier,
+    /// The device guarantees completed writes are persistent.
+    WriteThrough,
+    /// `flush` cannot establish persistence; never report it as durable.
+    Unsupported,
+}
+
 /// Block device abstraction trait.
 ///
 /// All block device drivers must implement this trait. It provides the
@@ -527,6 +538,11 @@ pub trait BlockDevice: Send + Sync {
     /// Flush the device write cache.
     fn flush(&self) -> Result<(), BlockError> {
         Err(BlockError::NotSupported)
+    }
+
+    /// The persistence guarantee behind `flush`. Unknown devices fail closed.
+    fn durability(&self) -> DurabilityGuarantee {
+        DurabilityGuarantee::Unsupported
     }
 
     /// Quiesce a newly probed device whose publication transaction failed.
@@ -1331,6 +1347,17 @@ mod tests {
             block_mmio_windows(&addrs),
             Err(BlockError::Invalid)
         ));
+    }
+
+    #[test]
+    fn an_unknown_device_makes_no_durability_promise() {
+        let device = RollbackTestDevice {
+            rollbacks: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::new(AtomicUsize::new(0)),
+            fail_rollback: false,
+        };
+        assert_eq!(device.durability(), DurabilityGuarantee::Unsupported);
+        assert!(matches!(device.flush(), Err(BlockError::NotSupported)));
     }
 
     struct RollbackTestDevice {

@@ -1334,10 +1334,9 @@ static CombinedRoundResult run_combined_round(void) {
     result.process_ops = 1u;
 
     /*
-     * I/O: buffered writes only. Durability is deliberately not claimed here:
-     * there is no fsync in the kernel yet, which is why the block profile is
-     * fail-closed. The combined profile only needs the writes to land in the
-     * page cache for io_ops to be meaningful.
+     * I/O: buffered writes only. Durability is deliberately not claimed here;
+     * that is the block profile's job. The combined profile only needs the
+     * writes to land in the page cache for io_ops to be meaningful.
      */
     const int fd = open(COMBINED_IO_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
@@ -1570,6 +1569,246 @@ static ThreadRoundReport run_thread_round(uint64_t seq) {
  * Runs one round for the configured profile, emits its profile marker, and
  * returns the round checksum plus the cumulative operation count.
  */
+/* ------------------------------------------------------------------ */
+/* Block profile: fsync-backed commits, host crash, exact-disk recovery */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Each record fills one page: magic, run id, generation and slot, a payload
+ * derived from the seed, then a SHA-256 over everything before it. A torn page
+ * cannot verify. Generation g lives in slot g % io_slots, which is
+ * the rotation the host validator requires. BLOCK_COMMIT is printed only after
+ * fsync returned, so the host can hold the recovery boot to every commit it saw.
+ */
+#define BLOCK_DATA_PATH STRESS_GUEST_ROOT "/stress-data.bin"
+#define BLOCK_RECORD_MAGIC "NILBLK2"
+#define BLOCK_DIGEST_OFFSET (PAGE_BYTES - 32u)
+#define BLOCK_PAYLOAD_OFFSET ((size_t)32)
+
+typedef struct {
+    uint32_t valid_slots;
+    uint32_t invalid_slots;
+    uint32_t invalid_slot;
+    uint64_t min_generation;
+    uint64_t max_generation;
+    uint64_t max_checksum;
+} BlockScan;
+
+static int block_fd = -1;
+static uint64_t block_successor_generation;
+static uint64_t block_successor_checksum;
+
+static void block_seal_digest(const uint8_t *record, uint8_t digest[32]) {
+    Sha256 sha;
+    sha256_init(&sha);
+    sha256_update(&sha, record, BLOCK_DIGEST_OFFSET);
+    sha256_final(&sha, digest);
+}
+
+static uint64_t block_build_record(uint8_t *record, uint64_t generation) {
+    const uint32_t slot = (uint32_t)(generation % config.io_slots);
+    memset(record, 0, PAGE_BYTES);
+    memcpy(record, BLOCK_RECORD_MAGIC, sizeof(BLOCK_RECORD_MAGIC));
+    memcpy(record + 8, &config.run_id, sizeof(config.run_id));
+    memcpy(record + 16, &generation, sizeof(generation));
+    memcpy(record + 24, &slot, sizeof(slot));
+    uint64_t word = checksum_mix(config.seed, generation);
+    for (size_t offset = BLOCK_PAYLOAD_OFFSET; offset < BLOCK_DIGEST_OFFSET; offset += 8u) {
+        word = checksum_mix(word, offset);
+        memcpy(record + offset, &word, sizeof(word));
+    }
+    uint8_t digest[32];
+    block_seal_digest(record, digest);
+    memcpy(record + BLOCK_DIGEST_OFFSET, digest, sizeof(digest));
+    return load_u64(digest, 0);
+}
+
+/* True when the page is a complete record for this run and slot. */
+static int block_verify_record(const uint8_t *record, uint32_t slot, uint64_t *generation,
+                               uint64_t *checksum) {
+    if (memcmp(record, BLOCK_RECORD_MAGIC, sizeof(BLOCK_RECORD_MAGIC)) != 0 ||
+        load_u64(record, 8) != config.run_id) {
+        return 0;
+    }
+    const uint64_t candidate = load_u64(record, 16);
+    if (candidate == 0u || candidate % config.io_slots != slot || load_u32(record, 24) != slot) {
+        return 0;
+    }
+    uint8_t digest[32];
+    block_seal_digest(record, digest);
+    if (memcmp(digest, record + BLOCK_DIGEST_OFFSET, sizeof(digest)) != 0) {
+        return 0;
+    }
+    *generation = candidate;
+    *checksum = load_u64(digest, 0);
+    return 1;
+}
+
+/* Opens the data file and reports whether an earlier boot already wrote to it. */
+static int block_open_data(void) {
+    block_fd = open(BLOCK_DATA_PATH, O_RDWR);
+    if (block_fd < 0) {
+        fail("block_open", errno, 0);
+    }
+    const off_t size = lseek(block_fd, 0, SEEK_END);
+    if (size < 0) {
+        fail("block_size", errno, 0);
+    }
+    return size != 0;
+}
+
+/* Writes one record and returns only after fsync reported it durable. */
+static uint64_t block_commit(uint64_t generation) {
+    static uint8_t record[PAGE_BYTES];
+    const uint64_t checksum = block_build_record(record, generation);
+    const off_t offset = (off_t)((generation % config.io_slots) * PAGE_BYTES);
+    size_t written = 0;
+    while (written < PAGE_BYTES) {
+        const ssize_t count =
+            pwrite(block_fd, record + written, PAGE_BYTES - written, offset + (off_t)written);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            fail("block_write", count < 0 ? errno : 0, generation);
+        }
+        written += (size_t)count;
+    }
+    if (fsync(block_fd) != 0) {
+        fail("block_fsync", errno, generation);
+    }
+    return checksum;
+}
+
+static void block_scan(BlockScan *scan) {
+    static uint8_t record[PAGE_BYTES];
+    memset(scan, 0, sizeof(*scan));
+    scan->min_generation = UINT64_MAX;
+    for (uint32_t slot = 0; slot < config.io_slots; ++slot) {
+        const off_t offset = (off_t)((size_t)slot * PAGE_BYTES);
+        size_t got = 0;
+        while (got < PAGE_BYTES) {
+            const ssize_t count =
+                pread(block_fd, record + got, PAGE_BYTES - got, offset + (off_t)got);
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count < 0) {
+                fail("block_read", errno, slot);
+            }
+            if (count == 0) {
+                break;
+            }
+            got += (size_t)count;
+        }
+        uint64_t generation = 0;
+        uint64_t checksum = 0;
+        if (got == PAGE_BYTES && block_verify_record(record, slot, &generation, &checksum)) {
+            scan->valid_slots += 1u;
+            if (generation < scan->min_generation) {
+                scan->min_generation = generation;
+            }
+            if (generation > scan->max_generation) {
+                scan->max_generation = generation;
+                scan->max_checksum = checksum;
+            }
+        } else {
+            scan->invalid_slots += 1u;
+            scan->invalid_slot = slot;
+        }
+    }
+    /* A valid digest alone also admits a page from an older rotation. Every
+     * surviving slot must belong to the latest io_slots generations. Slot
+     * identity was checked above, so this range uniquely fixes each generation.
+     * Only the next slot may be torn by the single in-flight write at crash. */
+    if (scan->max_generation < config.io_slots ||
+        scan->min_generation <= scan->max_generation - config.io_slots) {
+        fail("block_stale_record", 0, scan->min_generation);
+    }
+    if (scan->invalid_slots > 1u ||
+        (scan->invalid_slots == 1u &&
+         scan->invalid_slot != (scan->max_generation + 1u) % config.io_slots)) {
+        fail("block_lost_record", 0, scan->invalid_slot);
+    }
+}
+
+/* Fills every slot, arms the host, then commits until SIGKILL. */
+static _Noreturn void block_run_writer(void) {
+    uint64_t generation = 0;
+    uint64_t checksum = 0;
+    while (generation < config.io_slots) {
+        generation += 1u;
+        checksum = block_commit(generation);
+    }
+    BlockScan scan;
+    block_scan(&scan);
+    if (scan.valid_slots != config.io_slots || scan.max_generation != generation) {
+        fail("block_baseline_scan", 0, scan.valid_slots);
+    }
+    emit("NILIX_STRESS_V2_BLOCK_BASELINE run=%016" PRIx64 " generation=%" PRIu64
+         " checksum=%016" PRIx64,
+         config.run_id, generation, checksum);
+    emit("NILIX_STRESS_V2_BLOCK_CRASH_ARMED run=%016" PRIx64 " generation=%" PRIu64,
+         config.run_id, generation);
+    for (uint64_t since_scan = 0;;) {
+        generation += 1u;
+        checksum = block_commit(generation);
+        emit("NILIX_STRESS_V2_BLOCK_COMMIT run=%016" PRIx64 " generation=%" PRIu64
+             " slot=%" PRIu64 " checksum=%016" PRIx64,
+             config.run_id, generation, generation % config.io_slots, checksum);
+        since_scan += 1u;
+        if (since_scan == config.io_writes_per_round) {
+            since_scan = 0;
+            block_scan(&scan);
+            if (scan.valid_slots != config.io_slots || scan.max_generation != generation) {
+                fail("block_writer_scan", 0, generation);
+            }
+        }
+    }
+}
+
+/*
+ * The mount already replayed the journal. A crash can leave at most the one
+ * in-flight slot invalid, and the successor overwrites exactly that slot.
+ */
+static void block_recover(void) {
+    BlockScan scan;
+    block_scan(&scan);
+    if (scan.valid_slots == 0u) {
+        fail("block_no_valid_record", 0, config.io_slots);
+    }
+    emit("NILIX_STRESS_V2_BLOCK_RECOVERED run=%016" PRIx64 " generation=%" PRIu64
+         " valid_slots=%" PRIu32 " invalid_slots=%" PRIu32 " checksum=%016" PRIx64,
+         config.run_id, scan.max_generation, scan.valid_slots, scan.invalid_slots,
+         scan.max_checksum);
+    block_successor_generation = scan.max_generation + 1u;
+    block_successor_checksum = block_commit(block_successor_generation);
+    emit("NILIX_STRESS_V2_BLOCK_RECOVERY_WRITE run=%016" PRIx64 " generation=%" PRIu64
+         " slot=%" PRIu64 " checksum=%016" PRIx64,
+         config.run_id, block_successor_generation,
+         block_successor_generation % config.io_slots, block_successor_checksum);
+}
+
+/* Read-only verification of the recovered state; only round 1 accounts a write. */
+static uint64_t block_recovery_round(uint64_t seq, uint64_t *cumulative_ops) {
+    BlockScan scan;
+    block_scan(&scan);
+    if (scan.valid_slots != config.io_slots) {
+        fail("block_recovered_slots", 0, scan.valid_slots);
+    }
+    if (scan.max_generation != block_successor_generation ||
+        scan.max_checksum != block_successor_checksum) {
+        fail("block_recovered_successor", 0, scan.max_generation);
+    }
+    *cumulative_ops += config.io_slots;
+    emit("NILIX_STRESS_V2_BLOCK run=%016" PRIx64 " seq=%" PRIu64 " generation=%" PRIu64
+         " valid_slots=%" PRIu32 " read_bytes=%zu write_bytes=%zu checksum=%016" PRIx64,
+         config.run_id, seq, scan.max_generation, scan.valid_slots,
+         (size_t)config.io_slots * PAGE_BYTES, seq == 1u ? PAGE_BYTES : (size_t)0,
+         block_successor_checksum);
+    return block_successor_checksum;
+}
+
 static uint64_t run_round(uint64_t seq, uint64_t *cumulative_ops) {
     uint64_t checksum = 0;
 
@@ -1696,15 +1935,10 @@ static uint64_t run_round(uint64_t seq, uint64_t *cumulative_ops) {
         break;
     }
     case PROFILE_BLOCK:
+        checksum = block_recovery_round(seq, cumulative_ops);
+        break;
     default:
-        /*
-         * The block profile is a crash-consistency test: it must durably commit
-         * a record, let the host kill QEMU mid-flight, and prove the journal
-         * recovered. The kernel has no fsync/fdatasync yet (syscalls 74/75 are
-         * unbound and Ext2Fs never overrides FileSystem::sync), so a "commit"
-         * here would be a lie. Refuse rather than emit an unbacked proof.
-         */
-        fail("fsync_unsupported", -ENOSYS, PROFILE_BLOCK);
+        fail("unknown_profile", 0, config.profile);
         break;
     }
 
@@ -1724,11 +1958,22 @@ int main(void) {
          config.run_id, profile_name(), config.digest_hex, config.vcpus, config.workers);
 
     /*
-     * Only the block profile has writer/recovery modes, and it is fail-closed
-     * below, so a surviving run is always "normal".
+     * Only the block profile has writer/recovery modes. The host starts each
+     * attempt with an empty data file, so non-empty means this is the boot after
+     * a crash. The writer never returns: the host kills it mid-transaction.
      */
-    emit("NILIX_STRESS_V2_READY run=%016" PRIx64 " profile=%s mode=normal", config.run_id,
-         profile_name());
+    const char *mode = "normal";
+    if (config.profile == PROFILE_BLOCK) {
+        mode = block_open_data() ? "recovery" : "writer";
+    }
+    emit("NILIX_STRESS_V2_READY run=%016" PRIx64 " profile=%s mode=%s", config.run_id,
+         profile_name(), mode);
+    if (config.profile == PROFILE_BLOCK) {
+        if (strcmp(mode, "writer") == 0) {
+            block_run_writer();
+        }
+        block_recover();
+    }
 
     /*
      * Only the memory and process profiles assert against cgroup counters, and
@@ -1772,6 +2017,12 @@ int main(void) {
              config.run_id, profile_name(), seq, cycles, cumulative_ops, checksum);
         if (seq % SCHEDSTAT_SAMPLE_ROUNDS == 1u) {
             emit_schedstat(seq);
+        }
+        if (config.profile == PROFILE_BLOCK) {
+            /* Recovery only re-reads the disk; pace it, after the heartbeat, so
+             * the host's stop lands between complete rounds. */
+            const struct timespec pause = {.tv_sec = 0, .tv_nsec = 100000000};
+            (void)nanosleep(&pause, NULL);
         }
     }
 }

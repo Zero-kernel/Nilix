@@ -9423,6 +9423,27 @@ impl Ext2Fs {
         self.dev.flush().map_err(|_| FsError::Io)
     }
 
+    /// ST-K4: device barrier for fsync. Transient resource exhaustion is retried
+    /// a bounded number of times. No failure here poisons the mount: writes flush
+    /// before they return, so a failed barrier cannot have lost pending data.
+    fn flush_with_retry(&self) -> Result<(), FsError> {
+        const FLUSH_ATTEMPTS: usize = 4;
+        for attempt in 0..FLUSH_ATTEMPTS {
+            match self.dev.flush() {
+                Ok(()) => return Ok(()),
+                Err(block::BlockError::Busy | block::BlockError::NoMem)
+                    if attempt + 1 < FLUSH_ATTEMPTS =>
+                {
+                    for _ in 0..(1usize << (attempt * 4)) {
+                        core::hint::spin_loop();
+                    }
+                }
+                Err(_) => return Err(FsError::Io),
+            }
+        }
+        Err(FsError::Io)
+    }
+
     /// R186-7: is `ino`'s inode-bitmap bit set?
     ///
     /// This is the authority that binds an on-disk inode NUMBER to an actually
@@ -11517,6 +11538,26 @@ impl Ext2Fs {
 }
 
 impl FileSystem for Ext2Fs {
+    /// ST-K4: `Ok` means the mount is healthy and a device barrier that the
+    /// device can stand behind completed after this call began. Writes are
+    /// write-through, so the barrier is all that remains to do.
+    fn sync(&self) -> Result<(), FsError> {
+        self.ensure_io_healthy()?;
+        if self.dev.is_read_only() {
+            return Ok(());
+        }
+        if self.dev.durability() == block::DurabilityGuarantee::Unsupported {
+            return Err(FsError::Io);
+        }
+        self.flush_with_retry()?;
+        // A concurrent writer may have poisoned the mount during the barrier.
+        self.ensure_io_healthy()
+    }
+
+    fn check_io_health(&self) -> Result<(), FsError> {
+        self.ensure_io_healthy()
+    }
+
     fn fs_id(&self) -> u64 {
         self.fs_id
     }
@@ -12996,5 +13037,174 @@ impl Inode for Ext2Inode {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod st_k4_barrier_tests {
+    use super::*;
+    use block::{BlockError, DurabilityGuarantee};
+    use core::sync::atomic::AtomicUsize;
+
+    struct BarrierDevice {
+        durability: DurabilityGuarantee,
+        read_only: bool,
+        flushes: AtomicUsize,
+        transient_failures: AtomicUsize,
+        hard_failure: AtomicBool,
+        poison_during_flush: Mutex<Weak<Ext2Fs>>,
+    }
+
+    impl BlockDevice for BarrierDevice {
+        fn name(&self) -> &str {
+            "ext2-st-k4-barrier"
+        }
+        fn capacity_sectors(&self) -> u64 {
+            1
+        }
+        fn submit_bio(&self, _bio: block::Bio) -> Result<(), BlockError> {
+            Err(BlockError::NotSupported)
+        }
+        fn is_read_only(&self) -> bool {
+            self.read_only
+        }
+        fn durability(&self) -> DurabilityGuarantee {
+            self.durability
+        }
+        fn flush(&self) -> Result<(), BlockError> {
+            // lint-fetch-add: allow (test-only call counter)
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            if let Some(fs) = self.poison_during_flush.lock().upgrade() {
+                fs.io_faulted.store(true, Ordering::Release);
+            }
+            if self.hard_failure.load(Ordering::SeqCst) {
+                return Err(BlockError::Io);
+            }
+            if self
+                .transient_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(BlockError::Busy);
+            }
+            Ok(())
+        }
+    }
+
+    fn fixture(
+        durability: DurabilityGuarantee,
+        read_only: bool,
+    ) -> (Arc<BarrierDevice>, Arc<Ext2Fs>) {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let device = Arc::try_new(BarrierDevice {
+            durability,
+            read_only,
+            flushes: AtomicUsize::new(0),
+            transient_failures: AtomicUsize::new(0),
+            hard_failure: AtomicBool::new(false),
+            poison_during_flush: Mutex::new(Weak::new()),
+        })
+        .expect("barrier device");
+        let dev: Arc<dyn BlockDevice> = device.clone();
+        // SAFETY: Ext2Superblock contains only integers and byte arrays, for which
+        // all-zero is valid. Barrier paths never consult the superblock.
+        let superblock: Ext2Superblock = unsafe { core::mem::zeroed() };
+        let fs = Arc::try_new(Ext2Fs {
+            fs_id: crate::identity::allocate_fs_id().expect("filesystem ID"),
+            dev,
+            superblock: RwLock::new(superblock),
+            group_descs: RwLock::new(Vec::new()),
+            block_size: 4096,
+            sector_size: 512,
+            blocks_count: 1,
+            blocks_per_group: 1,
+            inodes_per_group: 1,
+            inode_size: size_of::<Ext2InodeRaw>() as u16,
+            root: RwLock::new(None),
+            inode_cache: WeakArcCache::new(),
+            meta_lock: Mutex::new(()),
+            journal: Mutex::new(None),
+            resize_reserved_blocks: RwLock::new(Vec::new()),
+            io_faulted: AtomicBool::new(false),
+            self_ref: Mutex::new(None),
+        })
+        .expect("synthetic ext2 filesystem");
+        (device, fs)
+    }
+
+    fn poisoned(fs: &Ext2Fs) -> bool {
+        fs.io_faulted.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn success_requires_one_barrier_after_entry() {
+        let (device, fs) = fixture(DurabilityGuarantee::FlushBarrier, false);
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_device_without_a_guarantee_is_never_acknowledged() {
+        let (device, fs) = fixture(DurabilityGuarantee::Unsupported, false);
+        assert_eq!(FileSystem::sync(&*fs), Err(FsError::Io));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+        assert!(!poisoned(&fs));
+    }
+
+    #[test]
+    fn a_read_only_mount_has_nothing_to_flush() {
+        let (device, fs) = fixture(DurabilityGuarantee::FlushBarrier, true);
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_poisoned_mount_fails_without_a_barrier() {
+        let (device, fs) = fixture(DurabilityGuarantee::FlushBarrier, false);
+        fs.io_faulted.store(true, Ordering::Release);
+        assert_eq!(FileSystem::sync(&*fs), Err(FsError::Io));
+        assert_eq!(FileSystem::check_io_health(&*fs), Err(FsError::Io));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn poison_set_during_the_barrier_is_reported() {
+        let (device, fs) = fixture(DurabilityGuarantee::FlushBarrier, false);
+        *device.poison_during_flush.lock() = Arc::downgrade(&fs);
+        assert_eq!(FileSystem::sync(&*fs), Err(FsError::Io));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn transient_failures_retry_a_bounded_number_of_times_without_poison() {
+        let (device, fs) = fixture(DurabilityGuarantee::FlushBarrier, false);
+        device.transient_failures.store(3, Ordering::SeqCst);
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 4);
+
+        device.flushes.store(0, Ordering::SeqCst);
+        device
+            .transient_failures
+            .store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(FileSystem::sync(&*fs), Err(FsError::Io));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 4);
+        assert!(!poisoned(&fs));
+    }
+
+    #[test]
+    fn a_failed_barrier_is_reported_once_and_does_not_poison() {
+        let (device, fs) = fixture(DurabilityGuarantee::FlushBarrier, false);
+        device.hard_failure.store(true, Ordering::SeqCst);
+        assert_eq!(FileSystem::sync(&*fs), Err(FsError::Io));
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 1);
+        assert!(!poisoned(&fs));
+
+        device.hard_failure.store(false, Ordering::SeqCst);
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
     }
 }

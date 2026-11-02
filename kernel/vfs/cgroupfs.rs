@@ -262,6 +262,11 @@ impl CgroupFs {
 }
 
 impl FileSystem for CgroupFs {
+    /// ST-K4: synthetic and volatile; success says nothing about persistent media.
+    fn sync(&self) -> Result<(), FsError> {
+        Ok(())
+    }
+
     fn directory_parent(
         &self,
         inode: &Arc<dyn Inode>,

@@ -42,7 +42,7 @@ Nilix 以“一次验证一个契约”的方式逐步实现 Linux 兼容，始�
   SMEP/SMAP/UMIP、KASLR、hash/HMAC 审计，以及在 QEMU 中测试过的 VT-d 路径。
 - **存储与网络**：带 ramfs/ext2/JBD2 子集与 procfs/devfs/cgroupfs 的 VFS、virtio-blk，以及
   支持 IPv4/TCP/UDP 和默认 DROP 防火墙的 virtio-net。
-- **以证据代替宣称**：每个 profile 515 个 hosted 单元测试，QEMU 启动/SMP/musl/Ring-3 门禁、
+- **以证据代替宣称**：每个 profile 632 个 hosted 单元测试，QEMU 启动/SMP/musl/Ring-3 门禁、
   KCOV fuzz、900 秒压力浸泡和独立安全审计。*qualified* 结果从不记作通过。
 
 ## 当前状态
@@ -74,7 +74,7 @@ Nilix 以“一次验证一个契约”的方式逐步实现 Linux 兼容，始�
 | 内存管理 | buddy/全局堆、准入计费容器、保护页、匿名 mmap/munmap/mprotect/brk、COW fork、缓存/OOM 机制；mmap flag 白名单、按需分页的共享匿名区域、私有匿名 `mremap`（原地扩缩 + `MREMAP_MAYMOVE`）以及有界的 slab/NUMA/swap/THP 原语 | MM 切片的独立评审（远程门禁与 Ring-3 oracle 已通过）；MAP_FIXED/文件映射、共享匿名 `mremap`，以及集成的 slab/NUMA/swap/THP 后端尚未验收 |
 | 进程生命周期 | 静态 ELF、fork/exec/exit/wait4、僵尸与 PID namespace 身份保留、清理路径测试；`waitid`（`P_ALL`/`P_PID`、`WNOHANG`/`WNOWAIT`、`siginfo_t` 回写）与 `wait4` 共用同一套收割引擎；根 PID namespace 的 init 通过正常 PID 链路注册；WNOWAIT 后续收割、copyout 故障、ROOT-INIT 孤儿收养与 `pids.max` 下的 fork 拒绝已经 guest 验证 | `waitid` 的 `P_PGID` 与 `WUNTRACED`/`WCONTINUED` 按失败关闭返回 EINVAL；PID1 退出、reaper 竞态以及 attach 阶段与 fd 计费回滚路径尚无覆盖 |
 | 线程与 TLS | 所有构建均支持线程组（CLONE_VM/SIGHAND/THREAD/FILES/FS）：共享信号表与组级待决集、fs 上下文与 fd 表；组退出、致命信号与停止；tkill/tgkill；恰好一次收割与组共享子进程；leader 或任一线程 exec；procfs `task/` 列表。SMP 迁移时 FS/user-GS 恢复。musl `pthread_create`/`join`/互斥量/条件变量/TLS/信号于 1-16 CPU 通过 | 阻塞在 LOCK_PI 中的线程要等调用返回才运行信号处理函数（无重启）；无 sigaltstack 与 rt_tgsigqueueinfo；信号帧仅限主栈或 mmap 栈；已评审的 D3-D5 债务见[设计](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/gap-5-slice4-thread-group-design.md) |
-| 调度与 SMP | 每 CPU MLFQ、抢占、从所有 CPU 工作窃取/平衡、亲和性/cpuset、APIC/IPI/TLB、RCU/锁序、锁外格式化的 SCHED-TRAP 与切换哨兵；`/proc/schedstat` 每 CPU 切换/迁移计数；memory/cpu/smp/thread 压力浸泡在 4 vCPU 上合格 | process/block/combined 浸泡配置、物理与更长时间高核数验证；64 核可在 QEMU 启动且为拒绝上限，不是已验证负载 |
+| 调度与 SMP | 每 CPU MLFQ、抢占、从所有 CPU 工作窃取/平衡、亲和性/cpuset、APIC/IPI/TLB、RCU/锁序、锁外格式化的 SCHED-TRAP 与切换哨兵；`/proc/schedstat` 每 CPU 切换/迁移计数；memory/cpu/smp/process 压力浸泡合格（2026-10-27 运行） | 16 vCPU 下的 thread 浸泡（心跳间隔 94-114 秒）、block 与 combined 配置、物理与更长时间高核数验证；64 核可在 QEMU 启动且为拒绝上限，不是已验证负载 |
 
 ### IPC、文件、存储与网络
 
@@ -83,7 +83,7 @@ Nilix 以“一次验证一个契约”的方式逐步实现 Linux 兼容，始�
 | IPC 与信号 | capability 管道、按地址空间取键的 Linux futex 操作（WAIT/WAKE、真正的 REQUEUE/CMP_REQUEUE、WAKE_OP、部分位掩码、带优先级继承的 PI 加锁/尝试加锁/解锁、requeue-PI）、robust 清理、屏蔽/处理/返回、阻塞信号测试、poll/select | 完整原生同步 IPC/共享内存、sigaltstack/RT 队列/重启语义、PI ABBA `EDEADLK` 检测 |
 | 文件描述符 | fd 0/1/2 已表驱动，dup/close/fork/exec/CLOEXEC、共享状态、O_NONBLOCK 消费者、NOFILE 限制 | 更完整的 fcntl/rlimit 语义 |
 | VFS 与路径 | ramfs/ext2/JBD2 子集、procfs/devfs/CPIO/cgroupfs；cwd/root/pivot、symlink/jail、DAC/UID/GID、挂载表回收 | 通用 dirfd、chown/statx/硬链接、真实终端状态、完整 POSIX/文件系统兼容 |
-| 存储与块 I/O | BIO/完成回调所有权、virtio-blk、512B/4096B 几何与 guest I/O 验证 | fsync/fdatasync/sync/sync_file_range 未接线；掉电/恢复/缓存语义待验证 |
+| 存储与块 I/O | BIO/完成回调所有权、virtio-blk、512B/4096B 几何与 guest I/O 验证 | 待验证：fsync/fdatasync/sync/sync_file_range 已实现真实设备屏障和失败关闭路径；仍缺掉电、缓存与 Ext2 变更操作验证 |
 | 网络 | virtio-net、Ethernet/ARP/IPv4/ICMP/UDP/TCP、conntrack/默认 DROP 防火墙、namespace 状态及进程上下文 RX | veth/子 namespace RX/路由管理/防火墙管理/完整 loopback、IPv6、线上互通；设备迁移仍禁用 |
 
 ### 隔离与安全
@@ -174,7 +174,7 @@ bash scripts/ci/entrypoint.sh musl      # 1 与 4 CPU 的 musl guest
 
 | 指标 | 数量 |
 | --- | --- |
-| hosted 单元测试 | debug/release 各 **515** 个，另有 CpuLocal doctest 与 3 组测试代码编译检查 |
+| hosted 单元测试 | debug/release 各 **632** 个，另有 CpuLocal doctest 与 3 组测试代码编译检查 |
 | 发现的运行时测试 | **74** 个 `RuntimeTest` 实现（源码计数，不代表 74 个 guest 测试通过） |
 | stress-v2 场景 | **7** 种，每种 900 秒 |
 | fuzz campaign | **11** 个定时 campaign，另有确定性 KCOV smoke |
@@ -197,8 +197,8 @@ qualified 的诊断结果与严格 PASS 分开记录。guest 门禁默认对失�
 1. **审计线程组批次**：对 2026-10-21 的工作做安全审计与评审修复，然后处理遗留的线程债务
    （PI 等待中的信号处理、串口控制台锁）。
 2. **严格验收**：核对 R188 评审证据，完成严格的 guest 验收。
-3. **发布条件**：全部七种压力场景（process、block、combined 仍需 `RLIMIT_NPROC`、`fsync`
-   与 `open` 模式）、严格的网络/SMP/安全矩阵，以及新的完整审计发布条件。
+3. **发布条件**：全部七种压力场景（thread 需查明心跳间隔原因，block 需要完成 900 秒验收，
+   combined 需要 Ext2 截断、间接块分配与 unlink）、严格的网络/SMP/安全矩阵，以及新的完整审计发布条件。
 4. **验收之后**：原生 capability/IPC、静态 ABI 缺项、personality/动态链接、容器网络和可测量的运维/性能工作。
 
 依赖与验收：[roadmap](https://github.com/Zero-kernel/Nilix-docs/blob/main/roadmap.md#10-forward-roadmap) ·

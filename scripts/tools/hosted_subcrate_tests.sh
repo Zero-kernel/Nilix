@@ -178,7 +178,7 @@ run_suite mm 50 0 \
     --features host_harness \
     --lib --locked
 
-run_suite block 25 0 \
+run_suite block 26 0 \
     --manifest-path kernel/block/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -189,7 +189,7 @@ run_suite compliance 1 0 \
     --target x86_64-unknown-linux-gnu \
     --lib --locked
 
-run_suite seccomp 15 0 \
+run_suite seccomp 16 0 \
     --manifest-path kernel/seccomp/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -226,7 +226,7 @@ run_suite ipc-robust-futex 25 17 \
     --features mm/host_harness \
     --lib --locked -- robust_ futex_parity_ futex_pi_
 
-run_suite vfs 72 0 \
+run_suite vfs 86 0 \
     --manifest-path kernel/vfs/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \

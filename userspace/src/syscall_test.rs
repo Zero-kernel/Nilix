@@ -13,9 +13,9 @@
 use userspace::libc::{print, print_hex, print_int, println};
 use userspace::syscall::{
     errno, is_error, sys_close, sys_fork, sys_getpid, sys_getppid, sys_getrandom, sys_gettid,
-    sys_open, sys_read, sys_set_robust_list, sys_set_tid_address, sys_wait, syscall1, syscall2,
-    syscall3, syscall4, syscall5, syscall6, SYS_BRK, SYS_FSTAT, SYS_MMAP, SYS_MREMAP, SYS_MUNMAP,
-    SYS_READ, SYS_WRITE,
+    sys_open, sys_read, sys_set_robust_list, sys_set_tid_address, sys_wait, syscall0, syscall1,
+    syscall2, syscall3, syscall4, syscall5, syscall6, SYS_BRK, SYS_FSTAT, SYS_MMAP, SYS_MREMAP,
+    SYS_MUNMAP, SYS_READ, SYS_WRITE,
 };
 
 /// One 4 KiB page — the granularity of every mapping operation below.
@@ -246,6 +246,9 @@ pub extern "C" fn _start() -> ! {
     // ST-K3-WAITID: the guest leg for syscall 247. Runs after the memory legs
     // because it forks; it maps nothing, so it cannot perturb their layout.
     test_waitid(&mut results);
+
+    // ST-K4: the durability family, decided by descriptor kind.
+    test_durability_syscalls(&mut results);
 
     // ROOT-INIT: this binary runs as root-namespace PID 1, so an orphaned
     // grandchild must be reparented to *us*. Last, because it forks twice.
@@ -2104,6 +2107,145 @@ fn spawn_exiting_child(code: u64) -> Option<u64> {
 fn reap_quietly(pid: u64) {
     let mut info = SigInfo::poisoned();
     let _ = waitid(P_PID, pid, &mut info, WEXITED);
+}
+
+const SYS_FSYNC: u64 = 74;
+const SYS_FDATASYNC: u64 = 75;
+const SYS_SYNC: u64 = 162;
+const SYS_SYNC_FILE_RANGE: u64 = 277;
+const ESPIPE: i32 = 29;
+
+/// ST-K4: durability syscalls answer by object kind, never by fd number. This
+/// runs on ramfs, whose explicit volatile sync is not a persistence claim; the
+/// real barrier is covered by the hosted fault-injection tests and the block
+/// stress profile.
+fn test_durability_syscalls(results: &mut TestResult) {
+    const NAME: &str = "durability syscalls decide by descriptor kind and validate ranges";
+    const O_RDONLY: i32 = 0;
+    const O_RDWR: i32 = 2;
+    const O_CREAT: i32 = 0o100;
+    const O_PATH: i32 = 0o10000000;
+    const SYS_DUP2: u64 = 33;
+
+    print("Testing fsync family (syscalls 74/75/162/277)... ");
+
+    fn expect(what: &str, got: u64, want_errno: i32, results: &mut TestResult) -> bool {
+        let actual = if is_error(got) { errno(got) } else { 0 };
+        if actual == want_errno {
+            return true;
+        }
+        println("");
+        print("  ");
+        print(what);
+        print(": expected errno ");
+        print_int(want_errno as i64);
+        print(", got ");
+        print_int(actual as i64);
+        println("");
+        results.fail(NAME);
+        false
+    }
+    let fsync = |fd: u64| unsafe { syscall1(SYS_FSYNC, fd) };
+    let fdatasync = |fd: u64| unsafe { syscall1(SYS_FDATASYNC, fd) };
+    let range = |fd: u64, offset: i64, nbytes: i64, flags: u64| unsafe {
+        syscall4(SYS_SYNC_FILE_RANGE, fd, offset as u64, nbytes as u64, flags)
+    };
+    let open = |path: &[u8], flags: i32| unsafe { sys_open(path.as_ptr(), flags, 0o600) };
+
+    let file = open(b"/st-k4-durability\0", O_RDWR | O_CREAT);
+    let read_only = open(b"/st-k4-durability\0", O_RDONLY);
+    let path_only = open(b"/st-k4-durability\0", O_PATH);
+    let directory = open(b"/\0", O_RDONLY);
+    let console = open(b"/dev/console\0", O_RDONLY);
+    for fd in [file, read_only, path_only, directory, console] {
+        if is_error(fd) {
+            println("");
+            results.fail(NAME);
+            return;
+        }
+    }
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as u64, 0) } != 0 {
+        results.fail(NAME);
+        return;
+    }
+    let pipe_read = pipe_fds[0] as u64;
+    let saved_stdout = unsafe { syscall1(SYS_DUP, 1) };
+
+    let checks: [(&str, u64, i32); 28] = [
+        ("fsync bad fd", fsync(u64::MAX), EBADF),
+        ("fdatasync unused fd", fdatasync(200), EBADF),
+        ("fsync O_PATH", fsync(path_only), EBADF),
+        ("fsync pipe", fsync(pipe_read), EINVAL),
+        ("fdatasync pipe", fdatasync(pipe_read), EINVAL),
+        ("fsync console", fsync(console), EINVAL),
+        ("fsync regular", fsync(file), 0),
+        ("fdatasync regular", fdatasync(file), 0),
+        ("fsync read-only", fsync(read_only), 0),
+        ("fsync directory", fsync(directory), 0),
+        ("sync", unsafe { syscall0(SYS_SYNC) }, 0),
+        ("range regular", range(file, 0, 0, 0), 0),
+        ("range all flags", range(file, 4096, 4096, 7), 0),
+        ("range read-only", range(read_only, 0, 1, 2), 0),
+        ("range bad fd", range(u64::MAX, 0, 0, 0), EBADF),
+        ("range O_PATH", range(path_only, 0, 0, 0), EBADF),
+        ("range pipe", range(pipe_read, 0, 0, 0), ESPIPE),
+        ("range console", range(console, 0, 0, 0), ESPIPE),
+        ("range pipe unknown flag", range(pipe_read, 0, 0, 8), EINVAL),
+        (
+            "range pipe negative offset",
+            range(pipe_read, -1, 0, 0),
+            EINVAL,
+        ),
+        (
+            "range pipe negative length",
+            range(pipe_read, 0, -1, 0),
+            EINVAL,
+        ),
+        (
+            "range pipe overflow",
+            range(pipe_read, i64::MAX, 1, 0),
+            EINVAL,
+        ),
+        ("range bad fd before flags", range(u64::MAX, 0, 0, 8), EBADF),
+        (
+            "range O_PATH before flags",
+            range(path_only, 0, 0, 8),
+            EBADF,
+        ),
+        ("range unknown flag", range(file, 0, 0, 8), EINVAL),
+        ("range negative offset", range(file, -1, 0, 0), EINVAL),
+        ("range negative length", range(file, 0, -1, 0), EINVAL),
+        ("range overflow", range(file, i64::MAX, 1, 0), EINVAL),
+    ];
+    for (what, got, want) in checks {
+        if !expect(what, got, want, results) {
+            return;
+        }
+    }
+
+    // A regular file duplicated onto fd 1 is a regular file: KSA-005 made the
+    // standard descriptors ordinary, so no numeric special case may apply. The
+    // reverse also holds: the console on fd 1 refuses. Restore before printing.
+    let console_stdout = fsync(1);
+    unsafe { syscall2(SYS_DUP2, file, 1) };
+    let file_stdout = fsync(1);
+    unsafe { syscall2(SYS_DUP2, saved_stdout, 1) };
+    if !expect("fsync console on fd 1", console_stdout, EINVAL, results)
+        || !expect("fsync regular file on fd 1", file_stdout, 0, results)
+    {
+        return;
+    }
+
+    for fd in [file, read_only, path_only, directory, console, saved_stdout] {
+        unsafe { sys_close(fd) };
+    }
+    unsafe {
+        sys_close(pipe_fds[0] as u64);
+        sys_close(pipe_fds[1] as u64);
+    }
+    println("done");
+    results.pass(NAME);
 }
 
 fn test_waitid(results: &mut TestResult) {

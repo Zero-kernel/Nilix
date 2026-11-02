@@ -694,7 +694,17 @@ run_block_profile() {
     fi
     if ! "$PYTHON" "$PROTOCOL" journal-probe --image "$directory/disk.img" \
         --require-clean --output "$directory/clean-journal.json" >/dev/null; then
-        echo "  FAIL: JBD2 s_start/Ext3 RECOVER were not cleared after recovery"
+        echo "  FAIL: JBD2 log was not empty after recovery"
+        result=$TEST_FAIL
+    fi
+    if ! "$PYTHON" "$PROTOCOL" fsck-recovered --image "$directory/disk.img" >/dev/null; then
+        echo "  FAIL: e2fsck rejected the recovered filesystem"
+        result=$TEST_FAIL
+    fi
+    if ! "$PYTHON" "$PROTOCOL" validate-block-durability \
+        --writer-serial "$directory/writer/serial.log" \
+        --recovery-serial "$directory/recovery/serial.log" >/dev/null; then
+        echo "  FAIL: recovery lost a commit that fsync acknowledged"
         result=$TEST_FAIL
     fi
     validate_current_log "$directory/stress.cfg" recovery "$STRESS_MIN_HEARTBEATS" 0

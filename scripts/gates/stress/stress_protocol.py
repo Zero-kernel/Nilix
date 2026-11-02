@@ -16,9 +16,11 @@ import hmac
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -634,15 +636,54 @@ def probe_journal(image_path: str | os.PathLike[str]) -> dict[str, Any]:
     }
 
 
+def strip_private_journal_bits(path: str | os.PathLike[str]) -> None:
+    """Make a scratch copy of a replayed image readable by host e2fsprogs.
+
+    The kernel marks its journal with a private incompat bit that e2fsck must
+    reject on a live image. With an empty log, that bit and RECOVER carry no
+    pending state, so clearing both on a copy changes nothing fsck inspects.
+    """
+    probe = probe_journal(path)
+    if probe["journal_start"] != 0:
+        raise StressProtocolError("refusing to strip an image with a pending journal")
+    with open(path, "r+b") as image:
+        image.seek(1024 + 96)
+        image.write(
+            struct.pack("<I", probe["ext_feature_incompat"] & ~EXT3_FEATURE_INCOMPAT_RECOVER)
+        )
+        image.seek(probe["journal_first_block"] * probe["block_size"] + 40)
+        image.write(
+            struct.pack(
+                ">I", probe["jbd2_feature_incompat"] & ~JBD2_FEATURE_INCOMPAT_ZERO_INTENT
+            )
+        )
+
+
+def command_fsck_recovered(args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(dir=Path(args.image).resolve().parent) as scratch:
+        copy = Path(scratch) / "fsck.img"
+        shutil.copyfile(args.image, copy)
+        strip_private_journal_bits(copy)
+        result = subprocess.run(
+            ["e2fsck", "-fn", str(copy)], capture_output=True, text=True, check=False
+        )
+    if result.returncode != 0:
+        raise StressProtocolError(
+            f"e2fsck status {result.returncode} on the recovered image:\n{result.stdout}"
+        )
+    return 0
+
+
 def command_journal_probe(args: argparse.Namespace) -> int:
     probe = probe_journal(args.image)
     if args.require_active and not probe["active"]:
         raise StressProtocolError("image does not contain an active Zero-Intent JBD2 tail")
     if args.require_clean:
+        # Only an empty log proves replay finished. RECOVER cannot be required
+        # clear: the kernel sets it at the first writable mount and has no unmount
+        # path, so a guest the host killed always leaves it set.
         if probe["journal_start"] != 0:
             raise StressProtocolError("JBD2 s_start is nonzero after recovery")
-        if probe["recover"]:
-            raise StressProtocolError("Ext3 RECOVER remains set after recovery")
     if args.output:
         Path(args.output).write_text(json.dumps(probe, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(probe, sort_keys=True))
@@ -1029,8 +1070,8 @@ def protocol_lines(path: str | os.PathLike[str], *, live: bool = False) -> list[
     return lines
 
 
-def parse_protocol_log(path: str | os.PathLike[str]) -> list[Marker]:
-    return [parse_marker(line) for line in protocol_lines(path)]
+def parse_protocol_log(path: str | os.PathLike[str], live: bool = False) -> list[Marker]:
+    return [parse_marker(line) for line in protocol_lines(path, live=live)]
 
 
 def require_marker_identity(marker: Marker, config: StressConfig) -> None:
@@ -1305,6 +1346,43 @@ def validate_writer_markers(markers: Sequence[Marker], config: StressConfig) -> 
     return commits
 
 
+def validate_block_durability(
+    writer_serial: str | os.PathLike[str], recovery_serial: str | os.PathLike[str]
+) -> dict[str, Any]:
+    """Hold the recovery boot to every commit the writer boot acknowledged.
+
+    A BLOCK_COMMIT is printed only after fsync returned, so its generation must
+    survive the crash. A later generation is allowed: a write can land before
+    fsync returns and before the marker reaches the serial log.
+    """
+    writer = parse_protocol_log(writer_serial, live=True)
+    committed = [marker for marker in writer if marker.kind in {"block_baseline", "block_commit"}]
+    if not committed:
+        raise StressProtocolError("writer boot acknowledged no durable generation")
+    last = committed[-1]
+    recovered = [
+        marker for marker in parse_protocol_log(recovery_serial) if marker.kind == "block_recovered"
+    ]
+    if len(recovered) != 1:
+        raise StressProtocolError("recovery boot must report exactly one BLOCK_RECOVERED")
+    if writer[0].fields["run"] != recovered[0].fields["run"]:
+        raise StressProtocolError("writer and recovery boots belong to different runs")
+    if recovered[0].fields["generation"] < last.fields["generation"]:
+        raise StressProtocolError(
+            f"recovery lost an acknowledged commit: recovered generation "
+            f"{recovered[0].fields['generation']}, committed {last.fields['generation']}"
+        )
+    if (
+        recovered[0].fields["generation"] == last.fields["generation"]
+        and recovered[0].fields["checksum"] != last.fields["checksum"]
+    ):
+        raise StressProtocolError("recovered record differs from the acknowledged commit")
+    return {
+        "committed_generation": last.fields["generation"],
+        "recovered_generation": recovered[0].fields["generation"],
+    }
+
+
 SUMMARY_RE = re.compile(
     r"Test Summary:\s*([0-9]+) passed,\s*([0-9]+) deferred[^,]*,\s*([0-9]+) failed"
 )
@@ -1445,7 +1523,8 @@ def validate_log(
     qmp_before_path: str | None = None,
     qmp_after_path: str | None = None,
 ) -> dict[str, Any]:
-    markers = parse_protocol_log(serial_path)
+    # A writer boot ends in SIGKILL, which can cut its last marker mid-line.
+    markers = parse_protocol_log(serial_path, live=mode == "writer")
     validate_header(markers, config, mode)
     runtime = validate_runtime_evidence(serial_path)
     validate_diagnostics(serial_path, interrupt_path, qemu_stderr_path)
@@ -1487,6 +1566,11 @@ def validate_log(
         "commits": len(commits),
         "runtime": runtime,
     }
+
+
+def command_validate_block_durability(args: argparse.Namespace) -> int:
+    print(json.dumps(validate_block_durability(args.writer_serial, args.recovery_serial)))
+    return 0
 
 
 def command_validate_log(args: argparse.Namespace) -> int:
@@ -1685,6 +1769,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     wait_marker.add_argument("--poll-ms", type=parse_uint, default=100)
     wait_marker.add_argument("--pid", type=parse_uint)
     wait_marker.set_defaults(handler=command_wait_marker)
+
+    fsck = subparsers.add_parser(
+        "fsck-recovered", help="run e2fsck on a scratch copy of a replayed image"
+    )
+    fsck.add_argument("--image", required=True)
+    fsck.set_defaults(handler=command_fsck_recovered)
+
+    durability = subparsers.add_parser(
+        "validate-block-durability", help="prove recovery kept every acknowledged commit"
+    )
+    durability.add_argument("--writer-serial", required=True)
+    durability.add_argument("--recovery-serial", required=True)
+    durability.set_defaults(handler=command_validate_block_durability)
 
     now = subparsers.add_parser("now-ns", help="print the host wall-clock nanoseconds")
     now.set_defaults(handler=command_now_ns)

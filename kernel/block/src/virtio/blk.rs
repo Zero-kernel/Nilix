@@ -1949,6 +1949,17 @@ impl BlockDevice for VirtioBlkDevice {
         self.do_request(sector, SyncRequestData::Write(buf))
     }
 
+    fn durability(&self) -> crate::DurabilityGuarantee {
+        // ST-K4: flush() below returns Ok without the feature. The spec lets a
+        // driver deduce write-through then, but legacy devices make that unsafe
+        // to promise, so only a negotiated barrier counts.
+        if self.features & blk_features::VIRTIO_BLK_F_FLUSH != 0 {
+            crate::DurabilityGuarantee::FlushBarrier
+        } else {
+            crate::DurabilityGuarantee::Unsupported
+        }
+    }
+
     fn flush(&self) -> Result<(), BlockError> {
         // R106-3: Reject I/O immediately if device is failed/resetting.
         if self.device_failed.load(Ordering::Acquire) {

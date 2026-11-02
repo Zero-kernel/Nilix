@@ -48,7 +48,7 @@ already run.
   QEMU.
 - **Storage and networking**: a VFS with ramfs/ext2/JBD2 subsets and procfs/devfs/cgroupfs,
   virtio-blk, and virtio-net with IPv4/TCP/UDP and a default-DROP firewall.
-- **Evidence over claims**: 515 hosted unit tests per profile, QEMU boot/SMP/musl/Ring-3
+- **Evidence over claims**: 632 hosted unit tests per profile, QEMU boot/SMP/musl/Ring-3
   gates, KCOV fuzzing, 900-second stress soaks and independent security audits.
   A *qualified* result is never reported as a pass.
 
@@ -83,7 +83,7 @@ just because its API or source files exist.
 | Memory | Buddy/global heap, charged fallible containers, guards, anonymous mmap/munmap/mprotect/brk, COW fork, cache/OOM machinery; mmap flag allowlist, demand-paged shared-anonymous regions, private-anonymous `mremap` (in-place grow/shrink + `MREMAP_MAYMOVE`) and bounded slab/NUMA/swap/THP primitives | Independent review of the MM slice (its remote gates and the Ring-3 oracle pass); MAP_FIXED/file mappings, shared-anonymous `mremap`, and integrated slab/NUMA/swap/THP backends remain unqualified |
 | Process lifecycle | Static ELF, fork/exec/exit/wait4, zombie/namespace identity and teardown tests; `waitid` (`P_ALL`/`P_PID`, `WNOHANG`/`WNOWAIT`, `siginfo_t` copyout) sharing one reap engine with `wait4`; root PID-namespace init registered through the normal PID chain; WNOWAIT-then-reap, copyout faults, ROOT-INIT orphan adoption and fork refusal under `pids.max` are guest-verified | `waitid` `P_PGID` and `WUNTRACED`/`WCONTINUED` fail closed with EINVAL; PID1 exit, reaper races and the attach-time/fd-charge rollback paths are uncovered |
 | Threads and TLS | Thread groups in every build (CLONE_VM/SIGHAND/THREAD/FILES/FS): shared signal table with a group pending set, fs context and fd table; group exit, fatal signals and stop; tkill/tgkill; exactly-once reaping and group-wide children; exec from the leader or any thread; procfs `task/` lists. FS/user-GS restoration across SMP migration. musl `pthread_create`/`join`/mutex/condition variables/TLS/signals pass on 1-16 CPUs | A handler signal waits while a thread is blocked in LOCK_PI (no restart); no sigaltstack or rt_tgsigqueueinfo; sigframes only on the main or an mmap'd stack; reviewed D3-D5 debt in the [design](https://github.com/Zero-kernel/Nilix-docs-private/blob/main/design/gap-5-slice4-thread-group-design.md) |
-| Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing from every CPU, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering, guard-free SCHED-TRAP and a switch sentinel; `/proc/schedstat` per-CPU switch/migration counters; memory/cpu/smp/thread stress soaks qualify on 4 vCPUs | Process/block/combined soak profiles, physical and longer high-core qualification; 64 CPUs boot in QEMU as a reject ceiling, not a tested workload |
+| Scheduler and SMP | Per-CPU MLFQ/preemption, work stealing from every CPU, balancing, affinity/cpuset, APIC/IPI/TLB, RCU/lock ordering, guard-free SCHED-TRAP and a switch sentinel; `/proc/schedstat` per-CPU switch/migration counters; memory/cpu/smp/process stress soaks qualify (2026-10-27 run) | Thread soak at 16 vCPUs (94-114 s heartbeat gaps), block and combined profiles, physical and longer high-core qualification; 64 CPUs boot in QEMU as a reject ceiling, not a tested workload |
 
 ### IPC, files, storage and networking
 
@@ -92,7 +92,7 @@ just because its API or source files exist.
 | IPC and signals | Capability-backed pipes, Linux futex ops (WAIT/WAKE, true REQUEUE/CMP_REQUEUE, WAKE_OP, partial bitsets, PI lock/trylock/unlock with priority inheritance, requeue-PI) keyed by address space, robust cleanup, masks/handlers/return, blocked-signal tests, poll/select | Native synchronous IPC/shared-memory completion, sigaltstack/queued-RT/restart semantics, PI ABBA `EDEADLK` detection |
 | File descriptors | Ordinary fd 0/1/2, dup/close/fork/exec/CLOEXEC, shared status flags, O_NONBLOCK consumers and NOFILE enforcement | Broader fcntl/rlimit semantics |
 | VFS and paths | ramfs/ext2/JBD2 subset, procfs/devfs/CPIO/cgroupfs; cwd/root/pivot, symlink/jail resolution, DAC/UID/GID, mount retirement | General dirfd, chown/statx/hard links, terminal fidelity and full POSIX/filesystem compatibility |
-| Storage | Owned BIO/completion, virtio-blk, checked 512B/4096B geometry and guest I/O evidence | fsync/fdatasync/sync/sync_file_range not wired; power-loss/recovery/cache qualification |
+| Storage | Owned BIO/completion, virtio-blk, checked 512B/4096B geometry and guest I/O evidence | Verification pending: fsync/fdatasync/sync/sync_file_range with a real device barrier and a fail-closed unsupported path. Still missing: power-loss, cache and Ext2 mutation qualification |
 | Networking | virtio-net, Ethernet/ARP/IPv4/ICMP/UDP/TCP, conntrack/default-DROP firewall machinery, per-netns state and process-context RX | veth/child RX/routes/admin/loopback breadth, IPv6 and wire interoperability; device transfer remains disabled |
 
 ### Isolation and security
@@ -186,7 +186,7 @@ bash scripts/ci/entrypoint.sh musl      # musl guest on 1 and 4 CPUs
 
 | Measure | Count |
 | --- | --- |
-| Hosted unit tests | **515** per debug/release profile, plus CpuLocal doctests and 3 test-code compile checks |
+| Hosted unit tests | **632** per debug/release profile, plus CpuLocal doctests and 3 test-code compile checks |
 | Runtime tests discovered | **74** `RuntimeTest` implementations (a source count, not 74 guest passes) |
 | Stress-v2 profiles | **7**, 900 seconds each |
 | Fuzz campaigns | **11** scheduled campaigns, plus deterministic KCOV smoke |
@@ -212,8 +212,8 @@ workload gaps, and fuzz sampling is not proof of completeness.
    2026-10-21 work, then the open thread debt (PI handler signals, a serial console lock).
 2. **Strict qualification**: reconcile the R188 review lineage and complete strict guest
    qualification.
-3. **Release conditions**: all seven stress profiles (process, block and combined still
-   need `RLIMIT_NPROC`, `fsync` and `open` modes), strict network/SMP/security matrices
+3. **Release conditions**: all seven stress profiles (thread needs its heartbeat gaps explained,
+   block needs its accepted 900-second run, combined needs Ext2 truncate, indirect allocation and unlink), strict network/SMP/security matrices
    and fresh full-audit conditions.
 4. **After qualification**: native capability/IPC, static ABI residuals,
    personality/dynamic linking, container networking and measured operations/performance.

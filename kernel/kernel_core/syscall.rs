@@ -2572,6 +2572,14 @@ pub type VfsReaddirCallback = fn(i32, usize, *mut u8, VfsDirCopyout) -> Result<u
 /// 参数: (fd, length) -> () 或错误
 pub type VfsTruncateCallback = fn(i32, u64) -> Result<(), SyscallError>;
 
+/// ST-K4 durability callbacks, registered together by the VFS.
+#[derive(Clone, Copy)]
+struct VfsDurabilityCallbacks {
+    fsync: fn(i32) -> Result<(), SyscallError>,
+    sync: fn() -> Result<(), SyscallError>,
+    sync_file_range: fn(i32, i64, i64, u32) -> Result<(), SyscallError>,
+}
+
 /// VFS positioned read callback type (pread64).
 /// Reads from fd at offset without changing the fd's offset.
 pub type VfsPreadCallback = fn(i32, &mut [u8], u64) -> Result<usize, SyscallError>;
@@ -2705,6 +2713,8 @@ lazy_static::lazy_static! {
     static ref VFS_READDIR_CALLBACK: spin::Mutex<Option<VfsReaddirCallback>> = spin::Mutex::new(None);
     /// VFS 截断回调
     static ref VFS_TRUNCATE_CALLBACK: spin::Mutex<Option<VfsTruncateCallback>> = spin::Mutex::new(None);
+    /// ST-K4 durability callbacks
+    static ref VFS_DURABILITY_CALLBACKS: spin::Mutex<Option<VfsDurabilityCallbacks>> = spin::Mutex::new(None);
     /// VFS positioned read callback (pread64)
     static ref VFS_PREAD_CALLBACK: spin::Mutex<Option<VfsPreadCallback>> = spin::Mutex::new(None);
     /// VFS positioned write callback (pwrite64)
@@ -2793,6 +2803,19 @@ pub fn register_vfs_readdir_callback(cb: VfsReaddirCallback) {
 /// 注册 VFS 截断回调
 pub fn register_vfs_truncate_callback(cb: VfsTruncateCallback) {
     *VFS_TRUNCATE_CALLBACK.lock() = Some(cb);
+}
+
+/// ST-K4: register fsync/fdatasync, sync and sync_file_range.
+pub fn register_vfs_durability_callbacks(
+    fsync: fn(i32) -> Result<(), SyscallError>,
+    sync: fn() -> Result<(), SyscallError>,
+    sync_file_range: fn(i32, i64, i64, u32) -> Result<(), SyscallError>,
+) {
+    *VFS_DURABILITY_CALLBACKS.lock() = Some(VfsDurabilityCallbacks {
+        fsync,
+        sync,
+        sync_file_range,
+    });
 }
 
 /// 注册 VFS positioned read 回调 (pread64)
@@ -4501,6 +4524,10 @@ pub fn syscall_dispatcher(
         72 => sys_fcntl(arg0 as i32, arg1 as i32, arg2),
         292 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as i32),
         77 => sys_ftruncate(arg0 as i32, arg1 as i64),
+        74 => sys_fsync(arg0 as i32),
+        75 => sys_fdatasync(arg0 as i32),
+        162 => sys_sync(),
+        277 => sys_sync_file_range(arg0 as i32, arg1 as i64, arg2 as i64, arg3 as u32),
         217 => sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         293 => sys_pipe2(arg0 as *mut i32, arg1 as i32),
 
@@ -12331,6 +12358,7 @@ const DISPATCHED_PROMISED: &[u64] = &[
     24, 39, // sched_yield getpid
     56, 57, 59, 60, 61, 62,  // clone fork execve exit wait4 kill
     247, // waitid (ST-K3, dispatched 2026-09-25)
+    74, 75, 162, 277, // fsync fdatasync sync sync_file_range (ST-K4)
     82, 83, 84, 87, // rename mkdir rmdir unlink  (82 = M0-6 slice 2)
     86, 88, 89, // link (fixed EPERM, R173-09) symlink readlink
     90, 91, // chmod fchmod (fixed EOPNOTSUPP, R72)
@@ -21659,6 +21687,54 @@ fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
     // 通过回调执行截断
     let truncate_fn = VFS_TRUNCATE_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
     truncate_fn(fd, length as u64)?;
+    Ok(0)
+}
+
+/// ST-K4: copy the callbacks out so no registry lock is held across device I/O.
+fn durability_callbacks() -> Result<VfsDurabilityCallbacks, SyscallError> {
+    VFS_DURABILITY_CALLBACKS.lock().ok_or(SyscallError::ENOSYS)
+}
+
+/// fsync(2): returns 0 only after a device barrier the device can stand behind.
+fn sys_fsync(fd: i32) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        coverage::trace_pc(1303); // sys_fsync entry
+    }
+    (durability_callbacks()?.fsync)(fd)?;
+    Ok(0)
+}
+
+/// fdatasync(2): identical to fsync under write-through, where metadata commits
+/// before write() returns.
+fn sys_fdatasync(fd: i32) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        coverage::trace_pc(1304); // sys_fdatasync entry
+    }
+    (durability_callbacks()?.fsync)(fd)?;
+    Ok(0)
+}
+
+/// sync(2) over the caller's mount namespace. Unlike Linux it reports failure;
+/// libc's `sync()` returns void, so only raw callers can see the difference.
+fn sys_sync() -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        coverage::trace_pc(1305); // sys_sync entry
+    }
+    (durability_callbacks()?.sync)()?;
+    Ok(0)
+}
+
+/// sync_file_range(2). As on Linux this is not a durability barrier; under
+/// write-through the range is already on the device.
+fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> SyscallResult {
+    #[cfg(feature = "kcov")]
+    {
+        coverage::trace_pc(1306); // sys_sync_file_range entry
+    }
+    (durability_callbacks()?.sync_file_range)(fd, offset, nbytes, flags)?;
     Ok(0)
 }
 
