@@ -5024,8 +5024,8 @@ struct RenamePlan {
 /// EXT2-MUT: one data block entering or leaving the single-indirect mapping block.
 /// `block` carries the same bitmap, count and inode edits as a direct allocation.
 #[derive(Clone, Copy)]
-struct IndirectDataPlan {
-    block: DirectAllocationPlan,
+struct IndirectDataPlan<'a> {
+    block: &'a DirectAllocationPlan,
     mapping_block: u32,
     pointer_offset: usize,
 }
@@ -5057,7 +5057,7 @@ enum JournalMetadataPlan<'a> {
     /// EXT2-MUT: same homes and edits as `DirectFree`, on pointer 12.
     IndirectRootFree(&'a DirectAllocationPlan),
     IndirectData {
-        plan: &'a IndirectDataPlan,
+        plan: &'a IndirectDataPlan<'a>,
         freeing: bool,
     },
 }
@@ -11526,9 +11526,9 @@ impl Ext2Fs {
             }
             JournalMetadataPlan::IndirectData { plan, freeing } if index != 3 => {
                 let direct = if freeing {
-                    JournalMetadataPlan::DirectFree(&plan.block)
+                    JournalMetadataPlan::DirectFree(plan.block)
                 } else {
-                    JournalMetadataPlan::DirectAllocation(&plan.block)
+                    JournalMetadataPlan::DirectAllocation(plan.block)
                 };
                 Some((direct, if index == 4 { 3 } else { index }))
             }
@@ -12091,7 +12091,7 @@ impl Ext2Fs {
         let plan = match plan {
             JournalMetadataPlan::IndirectData { plan, .. } => {
                 let mut intent = Self::intent_for_plan(
-                    JournalMetadataPlan::DirectAllocation(&plan.block),
+                    JournalMetadataPlan::DirectAllocation(plan.block),
                     preimage_hashes,
                 );
                 intent.kind = block_kind;
@@ -12437,12 +12437,12 @@ impl Ext2Fs {
     /// EXT2-MUT: wrap a block plan with the mapping-block edit. An indirect data
     /// transaction is one home larger than the smallest journal must hold, so a
     /// journal too small for it refuses before anything is written.
-    fn indirect_data_plan(
+    fn indirect_data_plan<'a>(
         &self,
-        block: DirectAllocationPlan,
+        block: &'a DirectAllocationPlan,
         mapping_block: u32,
         journal: &Ext2Journal,
-    ) -> Result<IndirectDataPlan, FsError> {
+    ) -> Result<IndirectDataPlan<'a>, FsError> {
         let blocks = INDIRECT_DATA_METADATA_BLOCKS as u32 + 2;
         if journal
             .first
@@ -14925,7 +14925,7 @@ impl Ext2Inode {
                     journal,
                     &mut scratch,
                 )?;
-                let plan = fs.indirect_data_plan(block, mapping_block, journal)?;
+                let plan = fs.indirect_data_plan(&block, mapping_block, journal)?;
                 let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
                 let result = fs.commit_metadata_transaction(
                     journal,
@@ -15323,12 +15323,14 @@ impl Ext2Inode {
             debug_assert_eq!(plan.file_block, file_block);
             let indirect_plan;
             let metadata_plan = if indirect {
-                indirect_plan =
-                    match fs.indirect_data_plan(plan, committed_raw.block[EXT2_IND_BLOCK], journal)
-                    {
-                        Ok(plan) => plan,
-                        Err(error) => return fail(error, written),
-                    };
+                indirect_plan = match fs.indirect_data_plan(
+                    &plan,
+                    committed_raw.block[EXT2_IND_BLOCK],
+                    journal,
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => return fail(error, written),
+                };
                 JournalMetadataPlan::IndirectData {
                     plan: &indirect_plan,
                     freeing: false,
