@@ -803,6 +803,25 @@ impl GlobalPageCache {
         true
     }
 
+    /// Find the next resident page without retaining the cache index lock while
+    /// its caller takes the page I/O lock. Callers serialize fills/removal through
+    /// their inode guard; holes cost no work and require no temporary allocation.
+    pub fn next_inode_page(
+        &self,
+        inode_id: InodeId,
+        first: PageIndex,
+        last: PageIndex,
+    ) -> Option<Arc<PageCacheEntry>> {
+        if first > last {
+            return None;
+        }
+        self.index
+            .read()
+            .range((inode_id, first)..=(inode_id, last))
+            .next()
+            .map(|(_, page)| page.clone())
+    }
+
     /// Retire a write-through inode after its final reference disappears.
     /// The caller guarantees no new I/O can use this identity. Walk only cache
     /// entries, including sparse files with huge offsets, without allocating.
