@@ -9076,10 +9076,8 @@ pub fn current_euid() -> Option<u32> {
 /// namespace euid 通过 UserNamespace::map_uid_from_ns() 转换为 host UID。
 /// 对于 root namespace 进程，map_uid_from_ns 返回 identity（input == output）。
 ///
-/// 如果 UID 未映射，返回 OVERFLOW_UID (65534) 以确保 fail-closed。
+/// 未映射的 UID 返回 None。65534 是有效的 host UID，不能用作授权哨兵。
 pub fn current_host_euid() -> Option<u32> {
-    const OVERFLOW_UID: u32 = 65534;
-
     let pid = current_pid()?;
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
@@ -9092,7 +9090,7 @@ pub fn current_host_euid() -> Option<u32> {
     drop(proc);
     drop(table);
 
-    Some(user_ns.map_uid_from_ns(ns_euid).unwrap_or(OVERFLOW_UID))
+    user_ns.map_uid_from_ns(ns_euid)
 }
 
 /// R133-1 FIX: 判断当前进程是否为 host root（host-mapped euid == 0）。

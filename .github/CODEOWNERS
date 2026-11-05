@@ -8,6 +8,7 @@
 * @YUZHEthefool
 
 /.github/ @YUZHEthefool
+/scripts/ci/ @YUZHEthefool
 /.githooks/ @YUZHEthefool
 /.pre-commit-config.yaml @YUZHEthefool
 /Cargo.toml @YUZHEthefool

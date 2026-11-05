@@ -5,6 +5,21 @@ device, and ABI inputs. Potential vulnerabilities must be reported privately so
 maintainers can reproduce, remediate, and coordinate disclosure before details
 become public.
 
+## CI trust boundary
+
+Pull-request job selection and the `CI result` aggregate execute scripts from
+the event's base commit. Selection reads the PR diff as data, and Python runs
+in isolated mode so PR modules cannot replace its imports. Missing trusted
+scripts fail the control job. Push/manual runs use their triggering commit.
+
+The workflow YAML and individual build/test commands remain reviewable PR
+content. Repository rules must require Code Owner approval for changes to
+`.github/` and `scripts/ci/`, dismiss stale approvals, and require the `CI result`
+check; loading base scripts alone does not protect a PR that edits the workflow
+itself or removes tests. These settings are administered on GitHub, separately
+from this source change. Keep PR execution on `pull_request` with read-only
+permissions; do not run PR code with a privileged trigger or repository secrets.
+
 ## Supported versions
 
 Security work targets the current `main` branch. Nilix does not currently offer

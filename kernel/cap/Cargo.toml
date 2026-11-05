@@ -22,3 +22,5 @@ mm = { path = "../mm" }
 
 [features]
 default = []
+# Hosted authorization tests use the same table locks without privileged CLI/STI.
+host_harness = ["mm/host_harness"]

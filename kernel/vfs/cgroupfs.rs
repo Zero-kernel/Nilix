@@ -650,13 +650,32 @@ struct CgroupCtrlInode {
 }
 
 impl CgroupCtrlInode {
+    /// Apply the same host-root / ADMIN / delegation boundary as cgroup stats
+    /// syscalls. Recheck on every read, including inherited or already-open FDs.
+    fn authorized_cgroup(&self) -> Result<CgroupArc, FsError> {
+        let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
+        if !can_access_control(
+            &cgroup,
+            kernel_core::current_host_euid(),
+            kernel_core::current_has_cap_rights(kernel_core::CapRights::ADMIN),
+        ) {
+            return Err(FsError::PermDenied);
+        }
+        Ok(cgroup)
+    }
+
     /// Read control file content
     fn read_content(&self) -> Result<String, FsError> {
-        let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
+        let cgroup = self.authorized_cgroup()?;
+        Ok(self.format_content(&cgroup))
+    }
+
+    /// Formatting only; callers must authorize before exposing these values.
+    fn format_content(&self, cgroup: &CgroupArc) -> String {
         let limits = cgroup.limits();
         let stats = cgroup.get_stats();
 
-        Ok(match self.kind {
+        match self.kind {
             CtrlKind::Procs => {
                 // List attached task PIDs
                 let mut pids = String::new();
@@ -765,7 +784,7 @@ impl CgroupCtrlInode {
                 None => String::from("max\n"),
             },
             CtrlKind::VfsDirCurrent => format!("{}\n", stats.vfs_dir_current),
-        })
+        }
     }
 
     /// Write control file content
@@ -778,17 +797,17 @@ impl CgroupCtrlInode {
         // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
         // R134-2 FIX: Use host-mapped euid for delegation identity matching.
         // Namespace-relative euid can collide across user namespaces.
-        let euid = kernel_core::current_host_euid().ok_or(FsError::PermDenied)?;
-        let is_root = kernel_core::current_is_host_root();
+        let euid = kernel_core::current_host_euid();
+        let is_root = euid == Some(0);
         let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
-        let is_delegate = !is_root && cgroup.is_delegated_to(euid);
+        let is_delegate = !is_root && euid.is_some_and(|uid| cgroup.is_delegated_to(uid));
         let has_cap_admin = kernel_core::current_has_cap_rights(kernel_core::CapRights::ADMIN);
 
         // RF180-2 FIX: root, CAP_SYS_ADMIN, and delegation are a union of
         // independent grants.  The old outer gate rejected CAP-only callers
         // before the shared migration authorizer could apply its descendant
         // rule.
-        if !is_root && !has_cap_admin && !is_delegate {
+        if !can_access_control(&cgroup, euid, has_cap_admin) {
             return Err(FsError::PermDenied);
         }
 
@@ -829,7 +848,7 @@ impl CgroupCtrlInode {
                 cgroup::authorize_cgroup_migrate(
                     old_cgroup_id,
                     self.cgroup_id,
-                    Some(euid),
+                    euid,
                     is_root,
                     has_cap_admin,
                 )
@@ -925,7 +944,7 @@ impl CgroupCtrlInode {
                 cgroup::authorize_cgroup_migrate(
                     from_id,
                     self.cgroup_id,
-                    Some(euid),
+                    euid,
                     is_root,
                     has_cap_admin,
                 )
@@ -1184,28 +1203,14 @@ impl Inode for CgroupCtrlInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        // R153-8 FIX: Reflect actual write permission in reported mode.
-        // Previously all writable control files reported 0o644 regardless
-        // of delegation status, making them appear writable to everyone
-        // despite write_content() enforcing root/delegate checks. Now we
-        // check delegation status and only report 0o644 for root or the
-        // delegated UID; others see 0o444 for defense-in-depth at the
-        // VFS DAC layer.
-        let mode = if self.kind.is_readonly() {
+        // Reflect the read boundary in DAC metadata as well. The operation
+        // checks remain authoritative if credentials or delegation change.
+        let mode = if self.authorized_cgroup().is_err() {
+            FileMode::regular(0)
+        } else if self.kind.is_readonly() {
             FileMode::regular(0o444)
         } else {
-            // Check if current caller would be allowed to write
-            let can_write = kernel_core::current_is_host_root()
-                || kernel_core::current_host_euid()
-                    .and_then(|euid| {
-                        cgroup::lookup_cgroup(self.cgroup_id).filter(|cg| cg.is_delegated_to(euid))
-                    })
-                    .is_some();
-            if can_write {
-                FileMode::regular(0o644)
-            } else {
-                FileMode::regular(0o444)
-            }
+            FileMode::regular(0o644)
         };
 
         // P1-3: Reflect delegated owner in DAC metadata so non-root
@@ -1239,6 +1244,7 @@ impl Inode for CgroupCtrlInode {
             return Err(FsError::PermDenied);
         }
 
+        self.authorized_cgroup()?;
         let inode: Arc<dyn Inode> = self;
         Ok(prepared.finalize(inode, flags, true))
     }
@@ -1282,6 +1288,12 @@ impl Inode for CgroupCtrlInode {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+fn can_access_control(cgroup: &CgroupArc, host_euid: Option<u32>, has_cap_admin: bool) -> bool {
+    host_euid == Some(0)
+        || has_cap_admin
+        || host_euid.is_some_and(|uid| cgroup.is_delegated_to(uid))
+}
 
 /// P1-3: Resolve the effective owner UID for a cgroup inode.
 ///
@@ -1392,14 +1404,11 @@ fn controllers_string(controllers: CgroupControllers) -> String {
 /// Verifies the control-file surface exposing the FILES / NET / MEMORY-vfs_dir
 /// enforcement that J.2 items 7/8/10 landed: filename round-trip, read-only
 /// classification, controller-gated visibility, append-only inode safety, and
-/// the read/format path (numeric, unlimited="max", and *.current gauges).
+/// formatting (numeric, unlimited="max", and *.current gauges).
 ///
-/// The WRITE path (`write_content`) is intentionally NOT driven here: it is
-/// process-credential-gated (`current_host_euid` / host-root) and would be
-/// environment-dependent in boot context. Its RW arms are structural twins of
-/// the proven `memory.max`/`pids.max` arms (parse → `CgroupLimits` → `apply_limit`)
-/// and are covered by the Codex convergence review. Limits are instead set via
-/// the `set_limit` primitive and read back through `read_content`.
+/// Boot has no caller credentials. Exercise the private formatter here;
+/// cgroup_access hosted integration tests drive the authorized inode operations
+/// with real process identities and namespace mappings.
 ///
 /// Any failure panics — detected by `make test` / `make boot-check`.
 pub fn run_cgroupfs_j2_abi_self_test() {
@@ -1453,8 +1462,7 @@ pub fn run_cgroupfs_j2_abi_self_test() {
             kind,
             _heap_charge: None,
         }
-        .read_content()
-        .expect("cgroupfs self-test: read_content")
+        .format_content(&cg)
     };
     assert_eq!(read(CtrlKind::FilesMax), "7\n");
     assert_eq!(read(CtrlKind::PortsMax), "11\n");
@@ -1475,8 +1483,7 @@ pub fn run_cgroupfs_j2_abi_self_test() {
         kind: CtrlKind::FilesMax,
         _heap_charge: None,
     }
-    .read_content()
-    .expect("cgroupfs self-test: read cg2 files.max");
+    .format_content(&cg2);
     assert_eq!(files_max_cg2, "max\n");
 
     // 4. Controller-gated visibility.

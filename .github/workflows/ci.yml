@@ -34,8 +34,14 @@ jobs:
           fetch-depth: 0
           filter: blob:none
       - id: select
-        run: python3 scripts/ci/select_jobs.py
+        # Never execute the PR's selector (or import its Python modules).
+        # Keep the merge checkout for the diff; extract only trusted code.
+        run: |
+          control_dir=$(mktemp -d "$RUNNER_TEMP/ci-control.XXXXXX")
+          git show "${CI_CONTROL_REF}:scripts/ci/select_jobs.py" > "$control_dir/select_jobs.py"
+          python3 -I "$control_dir/select_jobs.py"
         env:
+          CI_CONTROL_REF: ${{ github.event.pull_request.base.sha || github.sha }}
           CI_EVENT: ${{ github.event_name }}
           CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -226,8 +232,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The required verdict is computed by base-owned code. Do not load
+          # PR files, local actions, caches or artifacts in this job.
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
       # A job the change did not select must be skipped; a selected one must pass.
-      - run: python3 scripts/ci/ci_report.py --aggregate
+      - run: python3 -I scripts/ci/ci_report.py --aggregate
         env:
           CI_JOB_RESULTS: ${{ toJSON(needs) }}
           CI_PLANNED_JOBS: ${{ needs.changes.outputs.jobs }}

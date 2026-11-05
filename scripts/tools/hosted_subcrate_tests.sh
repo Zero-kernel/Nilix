@@ -232,6 +232,13 @@ run_suite vfs 87 0 \
     --features host_harness \
     --lib --locked
 
+# Owns the current-process table so it must run in a separate integration binary.
+run_suite cgroup-access 1 0 \
+    --manifest-path kernel/vfs/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features host_harness \
+    --test cgroup_access --locked
+
 run_suite kernel-core 140 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
