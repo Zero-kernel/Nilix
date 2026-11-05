@@ -99,7 +99,18 @@ use mm::{
     arc_charge_bytes, try_reserve_heap, vec_charge_bytes, HeapCharge, HeapClass, HeapReservation,
 };
 use spin::Mutex;
+#[cfg(not(feature = "host_harness"))]
 use x86_64::instructions::interrupts;
+
+#[cfg(all(feature = "host_harness", target_os = "none"))]
+compile_error!("cap/host_harness must never be enabled for a bare-metal kernel");
+
+#[cfg(feature = "host_harness")]
+mod interrupts {
+    pub fn without_interrupts<R>(body: impl FnOnce() -> R) -> R {
+        body()
+    }
+}
 
 pub mod types;
 

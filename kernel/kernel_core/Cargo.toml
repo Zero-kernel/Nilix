@@ -34,7 +34,7 @@ stall_dump = []
 kcov = ["coverage"]
 # Hosted unit-test harness: disable the bare-metal MM allocator and use the
 # CPU-local hosted fallbacks so dependency tests can allocate normally.
-host_harness = ["mm/host_harness", "cpu_local/host_harness"]
+host_harness = ["mm/host_harness", "cpu_local/host_harness", "cap/host_harness"]
 # Default-off boot probes before any Ring-3 task is scheduled.
 namespace_probe = []
 open_fault_probe = []
