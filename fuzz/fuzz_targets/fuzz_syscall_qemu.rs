@@ -30,8 +30,21 @@ fuzz_target!(|data: &[u8]| {
             eprintln!("{}\n{}", info.serial_log, info.qemu_stderr);
             panic!("kernel/QEMU crash: {}", info.classification);
         }
-        Ok(ExecutionResult::Timeout) => panic!("QEMU boot timeout before guest BEGIN"),
+        Ok(ExecutionResult::BootFailure(info)) => {
+            eprintln!("{}\n{}", info.serial_log, info.qemu_stderr);
+            fail_boot(&info.classification);
+        }
+        Ok(ExecutionResult::Timeout) => fail_boot("timeout before guest BEGIN"),
         Ok(ExecutionResult::Hang) => panic!("guest hung after BEGIN"),
         Err(error) => panic!("QEMU execution failed: {error:#}"),
     }
 });
+
+fn fail_boot(reason: &str) -> ! {
+    eprintln!("QEMU boot failure; campaign incomplete: {reason}");
+    // execute() already reaped QEMU and retained its private receipt/logs.
+    // libFuzzer's atexit hook turns even process::exit() into a crash artifact.
+    // Bypass that hook so CI sees a nonzero exit WITHOUT a syscall candidate.
+    // Do not return success: the submitted program has never executed.
+    unsafe { nix::libc::_exit(2) }
+}

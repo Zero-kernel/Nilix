@@ -127,6 +127,10 @@ pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
 /// Physical memory the [`PHYSICAL_MEMORY_OFFSET`] direct map covers (the
 /// bootloader allocates every page-table frame below it).
 const DIRECT_MAP_LIMIT: u64 = 1 << 30;
+
+#[path = "mmio_access.rs"]
+mod mmio_access;
+pub use mmio_access::{with_kernel_mmio_mapping, MmioAccessError};
 /// Physical-address field of a page-table entry (bits 12..=51).
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 /// End of the lower canonical half, the user half of every address space.

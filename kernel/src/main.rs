@@ -1083,6 +1083,10 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
     // Phase C: Block Layer and Storage Foundation
     klog_always!("[7.55/8] Initializing Block Layer...");
     block::init();
+    #[cfg(feature = "block_probe")]
+    unsafe {
+        block::run_mmio_access_self_test();
+    }
     // Probe for virtio-blk devices and publish them transactionally.
     if let Some(probed) = block::probe_devices(iommu_required) {
         let name = probed.name();

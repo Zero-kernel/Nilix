@@ -1227,6 +1227,7 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
                 1 => "vdb",
                 _ => "vdx",
             };
+            klog_always!("[BLOCK-PROBE] mmio candidate {} begin", idx);
             match unsafe { virtio::VirtioBlkDevice::probe_mmio(base, mmio_virt_offset, name) } {
                 Ok(device) => {
                     let capacity = device.capacity_sectors();
@@ -1247,7 +1248,7 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
                     return Some(ProbedBlockDevice::new(device, name));
                 }
                 Err(BlockError::NotFound) => {
-                    // No device at this address, continue silently
+                    klog_always!("[BLOCK-PROBE] mmio candidate {} absent", idx);
                 }
                 Err(e) => {
                     klog!(Warn, "    MMIO virtio-blk at {:#x} failed: {:?}", base, e);
@@ -1257,7 +1258,9 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
     }
 
     // Then, try PCI transport (virtio-pci modern)
+    klog_always!("[BLOCK-PROBE] pci scan begin");
     if let Some((pci_id, pci_addrs, name)) = pci::probe_virtio_blk(iommu_required) {
+        klog_always!("[BLOCK-PROBE] pci capabilities ready; map begin");
         let mapping = match unsafe { map_block_pci_mmio(&pci_addrs) } {
             Ok(mapping) => mapping,
             Err(e) => {
@@ -1273,6 +1276,7 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
             }
         };
         let virt_offset = mapping.virt_offset;
+        klog_always!("[BLOCK-PROBE] pci windows mapped; device init begin");
 
         match unsafe { virtio::VirtioBlkDevice::probe_pci(pci_id, pci_addrs, virt_offset, name) } {
             Ok(device) => {
@@ -1316,6 +1320,11 @@ pub fn probe_devices(iommu_required: bool) -> Option<ProbedBlockDevice> {
 
     None
 }
+
+#[cfg(feature = "probe")]
+mod probe_test;
+#[cfg(feature = "probe")]
+pub use probe_test::run_mmio_access_self_test;
 
 // ============================================================================
 // Tests

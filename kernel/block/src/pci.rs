@@ -512,7 +512,10 @@ pub fn probe_virtio_blk(
                 // R94-14 FIX: Handle NotAvailable explicitly - proceed with warning
                 // for legacy systems without IOMMU, but fail on other errors.
                 let pci_id = PciDeviceId::from_bdf(bus, dev, func);
-                match attach_device(pci_id) {
+                klog_always!("[BLOCK-PROBE] pci device found; IOMMU attach begin");
+                let attachment = attach_device(pci_id);
+                klog_always!("[BLOCK-PROBE] pci IOMMU attach returned");
+                match attachment {
                     Ok(()) => {}
                     Err(iommu::IommuError::NotAvailable) => {
                         // R171-G5-01-C FIX: Secure profile refuses bus-master for a

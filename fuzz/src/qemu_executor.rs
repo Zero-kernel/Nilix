@@ -192,8 +192,22 @@ mod tests {
         let result = executor.execute(&program).unwrap();
         assert_eq!(std::fs::read(root.join("started")).unwrap(), b"launched\n");
         assert!(
-            matches!(result, ExecutionResult::Crash(info) if info.classification.contains("exit status: 7"))
+            matches!(result, ExecutionResult::BootFailure(info) if info.classification.contains("exit status: 7"))
         );
+        let retained: Vec<_> = std::fs::read_dir(root.join("artifacts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(retained.len(), 1);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(retained[0].join("outcome.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["outcome"], "boot_failure");
+        assert_eq!(receipt["guest_began"], false);
+        assert!(receipt["classification"]
+            .as_str()
+            .unwrap()
+            .contains("exit status: 7"));
         assert_eq!(
             std::fs::read(source.join("NvVars")).unwrap(),
             b"preserve source firmware state"

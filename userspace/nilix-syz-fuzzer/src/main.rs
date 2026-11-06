@@ -182,6 +182,10 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            ExecutionResult::BootFailure(info) => {
+                // Do not persist an unexecuted program as a crash reproducer.
+                anyhow::bail!("QEMU boot failed before BEGIN: {}", info.classification);
+            }
             ExecutionResult::Timeout => {
                 stats.timeouts += 1;
             }
