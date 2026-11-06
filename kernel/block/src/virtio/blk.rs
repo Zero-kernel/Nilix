@@ -672,7 +672,23 @@ impl VirtioBlkDevice {
         virt_offset: u64,
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
-        let transport = MmioTransport::probe(mmio_phys, virt_offset).ok_or(BlockError::NotFound)?;
+        let virt = mmio_phys
+            .checked_add(virt_offset)
+            .ok_or(BlockError::NotFound)?;
+        // The fixed platform addresses are only hints. A missing direct-map
+        // page must not turn optional device discovery into a kernel #PF.
+        // Keep the header read under PT_LOCK, but release it before DMA/page
+        // allocation in probe_with_transport to avoid recursive lock acquisition.
+        let transport =
+            match mm::page_table::with_kernel_mmio_mapping(virt, mmio_phys, 4096, || {
+                MmioTransport::probe(mmio_phys, virt_offset)
+            }) {
+                Ok(transport) => transport.ok_or(BlockError::NotFound)?,
+                Err(reason) => {
+                    klog::klog_always!("[BLOCK-PROBE] mmio mapping rejected: {:?}", reason);
+                    return Err(BlockError::NotFound);
+                }
+            };
         Self::probe_with_transport(VirtioTransport::Mmio(transport), None, virt_offset, name)
     }
 

@@ -38,6 +38,7 @@ kcov = ["coverage/kcov", "kernel_core/kcov"]
 host_harness = ["mm/host_harness", "kernel_core/host_harness"]
 # Dedicated terminal fault-probe image; never a normal boot configuration.
 iommu_init_probe = ["iommu/init_probe", "mm/mmio_probe"]
+block_probe = ["block/probe"]
 namespace_probe = ["arch/namespace_probe", "kernel_core/namespace_probe", "vfs/namespace_probe"]
 open_fault_probe = ["musl_test", "vfs/open_fault_probe", "kernel_core/open_fault_probe"]
 iommu_device_probe = ["iommu/device_probe", "arch/iommu_device_probe"]
