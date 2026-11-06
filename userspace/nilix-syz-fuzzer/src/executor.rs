@@ -28,6 +28,9 @@ static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub enum ExecutionResult {
     Success(Vec<u8>),
     Crash(CrashInfo),
+    /// The emulator failed before an authenticated BEGIN for this program.
+    /// Keep the diagnostics, but do not attribute this failure to its syscalls.
+    BootFailure(CrashInfo),
     Timeout,
     Hang,
 }
@@ -246,6 +249,13 @@ impl QemuExecutor {
                 serial_log,
                 qemu_stderr,
             })),
+            Observation::BootFailure(classification) => {
+                Ok(ExecutionResult::BootFailure(CrashInfo {
+                    classification,
+                    serial_log,
+                    qemu_stderr,
+                }))
+            }
             Observation::Timeout { began: false } => Ok(ExecutionResult::Timeout),
             Observation::Timeout { began: true } => Ok(ExecutionResult::Hang),
         }
@@ -260,6 +270,7 @@ fn execution_receipt(
     let (outcome, classification) = match result {
         Ok(ExecutionResult::Success(_)) => ("success", String::new()),
         Ok(ExecutionResult::Crash(info)) => ("crash", info.classification.clone()),
+        Ok(ExecutionResult::BootFailure(info)) => ("boot_failure", info.classification.clone()),
         Ok(ExecutionResult::Timeout) => ("boot_timeout", String::new()),
         Ok(ExecutionResult::Hang) => ("guest_hang", String::new()),
         // An execution error is not, by itself, proof of a kernel defect.
@@ -287,6 +298,7 @@ enum Observation {
     Pass(PassMarker),
     GuestFailure { stage: String, code: i64 },
     Crash(String),
+    BootFailure(String),
     Timeout { began: bool },
 }
 
@@ -513,13 +525,13 @@ fn observe_execution(
         bail!("unterminated protocol marker after QEMU exit");
     }
     if let Some(reason) = final_serial.crash_classification() {
-        return Ok(Observation::Crash(reason));
+        return Ok(classify_observed_crash(reason, final_serial.tracker.began));
     }
     if !termination.expected() {
-        return Ok(Observation::Crash(classify_early_exit(
-            termination.status,
+        return Ok(classify_observed_crash(
+            classify_early_exit(termination.status, final_serial.tracker.began),
             final_serial.tracker.began,
-        )));
+        ));
     }
     if let Some(failure) = final_serial.tracker.failure {
         return Ok(Observation::GuestFailure {
@@ -532,7 +544,26 @@ fn observe_execution(
             bail!("final serial completion differs from the observed PASS");
         }
     }
-    Ok(provisional)
+    // Reclassify only after QEMU has been reaped and the complete serial log
+    // has passed identity/protocol validation. A malformed or foreign BEGIN
+    // remains an error; a late BEGIN must never hide a post-BEGIN crash.
+    match provisional {
+        Observation::Crash(reason) => {
+            Ok(classify_observed_crash(reason, final_serial.tracker.began))
+        }
+        Observation::Timeout { .. } => Ok(Observation::Timeout {
+            began: final_serial.tracker.began,
+        }),
+        other => Ok(other),
+    }
+}
+
+fn classify_observed_crash(reason: String, began: bool) -> Observation {
+    if began {
+        Observation::Crash(reason)
+    } else {
+        Observation::BootFailure(reason)
+    }
 }
 
 fn monitor_execution(
@@ -1000,17 +1031,35 @@ mod tests {
     #[cfg(unix)]
     fn abnormal_process_exit_never_passes_even_with_a_valid_pass_marker() {
         let binding = binding();
-        for log in [
-            String::new(),
-            markers(&binding, false),
-            markers(&binding, true),
-        ] {
+        let Observation::BootFailure(reason) = observe_fixture("", &binding, true).unwrap() else {
+            panic!("pre-BEGIN exit must be a boot failure");
+        };
+        assert!(reason.contains("exit status: 7"));
+        for log in [markers(&binding, false), markers(&binding, true)] {
             let Observation::Crash(classification) = observe_fixture(&log, &binding, true).unwrap()
             else {
                 panic!("nonzero process exit must be a crash");
             };
             assert!(classification.contains("exit status: 7"));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_begin_panic_is_a_boot_failure_but_post_begin_panic_is_a_crash() {
+        let binding = binding();
+        let panic_log = "Block layer initialized\n[PF ENTRY] err=0x0\nKERNEL PANIC\n";
+        assert!(matches!(
+            observe_fixture(panic_log, &binding, false).unwrap(),
+            Observation::BootFailure(reason) if reason == "kernel_panic"
+        ));
+        let log = format!("{}{panic_log}", markers(&binding, false));
+        assert!(matches!(
+            observe_fixture(&log, &binding, false).unwrap(),
+            Observation::Crash(reason) if reason == "kernel_panic"
+        ));
+        let foreign = log.replace("seq=0000000000000042", "seq=0000000000000043");
+        assert!(observe_fixture(&foreign, &binding, false).is_err());
     }
 
     #[test]
@@ -1073,6 +1122,37 @@ mod tests {
                 "shutdown failure was accepted"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn begin_during_shutdown_cannot_turn_a_guest_hang_into_a_boot_timeout() {
+        let binding = binding();
+        let directory = tempfile::tempdir().unwrap();
+        let serial = directory.path().join("serial.log");
+        std::fs::write(&serial, "").unwrap();
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "trap 'printf \"%s\" \"$2\" >> \"$1\"; exit 0' TERM; printf 'READY\\n' >> \"$1\"; while :; do sleep 0.01; done",
+                "fixture",
+            ])
+            .arg(&serial)
+            .arg(markers(&binding, false))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !std::fs::read_to_string(&serial).unwrap().contains("READY") {
+            if Instant::now() >= deadline {
+                let _ = terminate_qemu(&mut child);
+                panic!("fixture failed to install TERM trap");
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let result =
+            observe_execution(&mut child, &serial, &binding, Duration::from_millis(100)).unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(matches!(result, Observation::Timeout { began: true }));
     }
 
     #[test]

@@ -52,9 +52,23 @@ For campaigns, use `NILIX_FUZZ_FAILURE_ARTIFACTS` instead. It retains only faile
 executions, including execution/protocol errors, and removes successful guest
 disks. Each retained directory includes the submitted program, private guest
 image, disk, serial output, QEMU stderr and `outcome.json`. The receipt distinguishes
-crashes (with their observed classification), boot timeout, guest hang and
-execution errors; an execution error alone does not establish a kernel defect.
-Do not set both artifact-retention variables.
+crashes (with their observed classification), boot failure, boot timeout, guest
+hang and execution errors; an execution error alone does not establish a kernel
+defect. Do not set both artifact-retention variables.
+
+A panic or QEMU exit before a matching `NILIX_SYZ_V2_BEGIN` is a `boot_failure`,
+with the original cause (for example, `kernel_panic`) preserved in `classification`.
+The executor classifies it only after stopping QEMU and validating the final serial
+log. Malformed or foreign markers remain protocol errors. Post-BEGIN panics and
+hangs retain their existing crash behavior, including failures during shutdown.
+
+Boot failure and boot timeout stop cargo-fuzz with a nonzero exit without creating
+a `crash-*` input: the program never ran. CI marks the campaign incomplete, skips
+candidate creation and corpus caching, and still seals/uploads the private guest
+evidence. There is no automatic retry or successful coverage credit; maintainers
+must investigate boot reliability separately and rerun the campaign. This also
+bypasses libFuzzer's exit callback, which would otherwise manufacture a crash
+artifact even for an ordinary `process::exit()`.
 
 ### Private campaign evidence
 

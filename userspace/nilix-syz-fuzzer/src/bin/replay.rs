@@ -99,6 +99,7 @@ fn main() -> ExitCode {
     );
 
     let mut crashes = 0usize;
+    let mut boot_failures = 0usize;
     let mut timeouts = 0usize;
     let mut hangs = 0usize;
     let mut successes = 0usize;
@@ -143,6 +144,15 @@ fn main() -> ExitCode {
                 println!("{}", info.qemu_stderr);
                 println!("----------------------");
             }
+            Ok(ExecutionResult::BootFailure(info)) => {
+                boot_failures += 1;
+                println!(
+                    "[{i}/{}] BOOT FAILURE classification={}",
+                    args.repeat, info.classification
+                );
+                println!("----- serial log -----\n{}", info.serial_log);
+                println!("----- qemu stderr -----\n{}", info.qemu_stderr);
+            }
             Ok(ExecutionResult::Timeout) => {
                 timeouts += 1;
                 println!("[{i}/{}] TIMEOUT (no BEGIN marker observed)", args.repeat);
@@ -162,10 +172,10 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "\nSummary over {} runs: success={} crash={} timeout={} hang={} error={}",
-        args.repeat, successes, crashes, timeouts, hangs, errors
+        "\nSummary over {} runs: success={} crash={} boot_failure={} timeout={} hang={} error={}",
+        args.repeat, successes, crashes, boot_failures, timeouts, hangs, errors
     );
-    if crashes > 0 {
+    if crashes + boot_failures + timeouts + hangs + errors > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
