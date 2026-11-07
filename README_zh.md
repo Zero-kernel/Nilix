@@ -42,7 +42,7 @@ Nilix 以“一次验证一个契约”的方式逐步实现 Linux 兼容，始�
   SMEP/SMAP/UMIP、KASLR、hash/HMAC 审计，以及在 QEMU 中测试过的 VT-d 路径。
 - **存储与网络**：带 ramfs/ext2/JBD2 子集与 procfs/devfs/cgroupfs 的 VFS、virtio-blk，以及
   支持 IPv4/TCP/UDP 和默认 DROP 防火墙的 virtio-net。
-- **以证据代替宣称**：每个 profile 632 个 hosted 单元测试，QEMU 启动/SMP/musl/Ring-3 门禁、
+- **以证据代替宣称**：每个 profile 638 个 hosted 单元测试，QEMU 启动/SMP/musl/Ring-3 门禁、
   KCOV fuzz、900 秒压力浸泡和独立安全审计。*qualified* 结果从不记作通过。
 
 ## 当前状态
@@ -174,7 +174,7 @@ bash scripts/ci/entrypoint.sh musl      # 1 与 4 CPU 的 musl guest
 
 | 指标 | 数量 |
 | --- | --- |
-| hosted 单元测试 | debug/release 各 **632** 个，另有 CpuLocal doctest 与 3 组测试代码编译检查 |
+| hosted 单元测试 | debug/release 各 **638** 个，另有 CpuLocal doctest 与 3 组测试代码编译检查 |
 | 发现的运行时测试 | **74** 个 `RuntimeTest` 实现（源码计数，不代表 74 个 guest 测试通过） |
 | stress-v2 场景 | **7** 种，每种 900 秒 |
 | fuzz campaign | **11** 个定时 campaign，另有确定性 KCOV smoke |
