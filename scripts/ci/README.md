@@ -1,10 +1,19 @@
 # QEMU completion and stability scopes
 
-Functional gates default to `QEMU_GATE_MODE=completion`. Boot/runtime, 2/4-core
+Functional gates default to `QEMU_GATE_MODE=completion`. Boot/runtime,
 SMP, musl, Ring-3 and IOMMU activation use the same owned QEMU supervisor. Their
 existing timeout (normally 900 seconds) is a maximum deadline, not a mandatory
 sleep. The regular CI workflow selects this mode by default. Its manual dispatch
 input `qemu_gate_mode=window` runs the former full scope, including musl.
+
+Regular CI has an independent 32-vCPU SMP lane that reuses the normal build
+image. It requires all 32 CPUs online and exactly one 31/31 AP acknowledgement;
+a partial topology fails even when the general runtime result is QUALIFIED.
+The 32-vCPU gate runs once, without an automatic retry after a failure or stall.
+Extended has a separate 32-vCPU lane on each Ubuntu image with the full window.
+These are QEMU guest vCPUs sharing the runner's host CPUs, so the results cover
+functional correctness, not physical 32-core throughput. The original 8/16-vCPU
+suite and its qualification rules are unchanged.
 
 The supervisor waits for the runtime summary, the appropriate fixture's final
 result, PID 1's exit record, and exactly one matching
@@ -49,6 +58,12 @@ QEMU_GATE_MODE=window bash scripts/gates/boot/boot_check.sh esp
 
 # Ring-3 uses its own fault-tolerant assertions and completion profile.
 QEMU_GATE_MODE=completion make test-ring3-mm
+
+# Build and run only the 32-vCPU SMP functional check.
+make test-smp-32core
+
+# Use an existing normal image; defaults remain the 8/16-vCPU suite.
+EXTENDED_SMP_CPUS=32 bash scripts/gates/boot/extended_smp_test.sh esp
 ```
 
 `record_gate.py` retains logs during execution and hashes evidence after the gate

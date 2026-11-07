@@ -250,6 +250,7 @@ exit 0
         interrupts: str = "", timeout_stderr: str = TERM, iommu: bool = True,
         second_serial: str | None = None,
         termination_mode: str = "window", fake_mode: str = "normal",
+        extended_cpus: str = "8 16",
     ) -> subprocess.CompletedProcess:
         if name == "iommu_q35_check.sh" and iommu:
             serial = IOMMU + serial
@@ -274,6 +275,7 @@ exit 0
             "GATE_ARGUMENTS": self.shell_path(self.work / "qemu.arguments"),
             "GATE_STATUS": str(qemu_status),
             "QEMU_GATE_MODE": termination_mode,
+            "EXTENDED_SMP_CPUS": extended_cpus,
             "FAKE_MODE": fake_mode,
             "FAKE_SERIAL": self.shell_path(self.work / "fixture.serial"),
             "OVMF_PATH": self.shell_path(self.work / "firmware.fd"),
@@ -329,6 +331,9 @@ exit 0
                 self.assert_gate(self.run_gate(name, QUALIFIED, termination_mode="completion"), 3)
         self.assert_gate(self.run_gate("boot_check.sh", termination_mode="completion", fake_mode="quit-fault"), 1)
         self.assert_gate(self.run_gate("boot_check.sh", termination_mode="completion", fake_mode="quit-interrupt-fault"), 1)
+        serial32 = CLEAN.replace('4 CPU(s) online', '32 CPU(s) online').replace('3/3 APs', '31/31 APs')
+        self.assert_gate(self.run_gate("extended_smp_test.sh", serial32,
+                                       termination_mode="completion", extended_cpus="32"), 0)
 
     def test_process_status_and_kill_escalation_reach_callers(self):
         for name in self.scripts:
@@ -366,6 +371,31 @@ exit 0
     def test_extended_aggregate_does_not_turn_qualified_into_pass(self):
         self.assert_gate(self.run_gate("extended_smp_test.sh", second_serial=QUALIFIED), 3)
         self.assert_gate(self.run_gate("extended_smp_test.sh", FAILED, second_serial=""), 1)
+
+    def test_32_vcpu_selection_runs_exactly_one_requested_topology(self):
+        result = self.run_gate("extended_smp_test.sh", extended_cpus="32")
+        self.assert_gate(result, 0)
+        self.assertEqual(result.stdout.count('TEST 1: 32-vCPU SMP Validation'), 1)
+        self.assertIn('Total tests:  1', result.stdout)
+        self.assertNotIn('Testing 8-Core', result.stdout)
+        self.assertNotIn('Testing 16-Core', result.stdout)
+        self.assertIn('-smp\n32\n', (self.work / 'qemu.arguments').read_text())
+        self.assert_gate(self.run_gate("extended_smp_test.sh", QUALIFIED, extended_cpus="32"), 3)
+
+    def test_32_vcpu_partial_topology_or_ap_acknowledgement_is_failure(self):
+        acknowledgement = '[SMP] process-deferred gate complete: 3/3 APs acknowledged'
+        for serial in (CLEAN.replace('4 CPU(s) online', '24 CPU(s) online'),
+                       CLEAN.replace(acknowledgement, ''),
+                       CLEAN.replace('3/3 APs', '30/31 APs'),
+                       CLEAN + acknowledgement + '\n'):
+            with self.subTest(serial=serial):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", serial, extended_cpus="32"), 1)
+
+    def test_invalid_extended_topology_is_blocked_before_qemu_launch(self):
+        for cpus in ('0', '33', '64', '32 32', '8 16 32', '32\n8'):
+            with self.subTest(cpus=cpus):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", extended_cpus=cpus), 2)
+                self.assertFalse((self.work / 'qemu.arguments').exists())
 
     def test_q35_active_and_pid1_success_do_not_override_failed_summary(self):
         result = self.run_gate("iommu_q35_check.sh", Q35_FAILED, iommu=False)

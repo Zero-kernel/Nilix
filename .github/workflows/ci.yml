@@ -178,13 +178,21 @@ jobs:
           if-no-files-found: error
 
   runtime:
-    name: QEMU / boot and SMP
+    name: QEMU / ${{ matrix.gate.name }}
     needs: [changes, build]
     if: contains(fromJSON(needs.changes.outputs.jobs), 'runtime')
     runs-on: ubuntu-24.04
     # Functional gates finish after exit cleanup plus the diagnostic tail.
     # Each retains a 900-second deadline; Extended keeps full-window coverage.
-    timeout-minutes: 90
+    timeout-minutes: ${{ matrix.gate.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        gate:
+          - {name: boot and SMP, group: runtime, timeout: 90}
+          # Guest vCPUs share the runner's host CPUs; this is a correctness
+          # check, not a physical 32-core throughput benchmark.
+          - {name: SMP 32-vCPU, group: smp-32, timeout: 40}
     env:
       QEMU_GATE_MODE: ${{ inputs.qemu_gate_mode || 'completion' }}
     steps:
@@ -196,12 +204,14 @@ jobs:
         with:
           name: normal-boot-image
           path: esp
-      - run: bash scripts/ci/entrypoint.sh runtime
+      - run: bash scripts/ci/entrypoint.sh "$CI_GROUP"
+        env:
+          CI_GROUP: ${{ matrix.gate.group }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: ci-runtime
-          path: target/ci/runtime/
+          name: ci-${{ matrix.gate.group }}
+          path: target/ci/${{ matrix.gate.group }}/
           if-no-files-found: error
 
   qemu:

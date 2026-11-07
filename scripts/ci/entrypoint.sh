@@ -2,7 +2,7 @@
 # Shared local/Actions entrypoint. Each group owns a single artifact directory.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|musl|iommu|mitigation|qemu-fuzz|extended|extended-smp|extended-ext3|extended-stress}"
+group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|smp-32|musl|iommu|mitigation|qemu-fuzz|extended|extended-smp|extended-smp-32|extended-ext3|extended-stress}"
 out_root="${CI_ARTIFACTS:-target/ci/$group}"
 mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
@@ -85,6 +85,11 @@ check_guest() {
 extended_smp() {
     check_guest smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
 }
+smp_32() {
+    # Preserve the first 32-vCPU result; a stalled probe must not repeat a
+    # second 900-second run automatically.
+    check smp-32 --allow-qualified -- env EXTENDED_SMP_CPUS=32 bash scripts/gates/boot/extended_smp_test.sh esp
+}
 extended_ext3() {
     check_guest ext3 --allow-qualified -- bash -c '
         make ensure-ext3-image || exit
@@ -139,6 +144,10 @@ case "$group" in
         check_guest boot --allow-qualified -- bash scripts/gates/boot/boot_check.sh esp
         check_guest runtime --allow-qualified -- bash scripts/gates/boot/kernel_test.sh esp
         check_guest smp --allow-qualified -- bash scripts/gates/boot/smp_test_4core.sh esp
+        ;;
+    smp-32)
+        # Like runtime, consume the normal ESP from the build job.
+        smp_32
         ;;
     musl)
         gate build -- make build-musl-test
@@ -199,6 +208,10 @@ PY
     extended-smp)
         gate build -- make build
         extended_smp
+        ;;
+    extended-smp-32)
+        gate build -- make build
+        smp_32
         ;;
     extended-ext3)
         gate build -- make build

@@ -32,6 +32,16 @@ def workflow_lanes():
 
 
 class ExtendedLaneTests(unittest.TestCase):
+    def test_32_vcpu_is_an_independent_regular_and_extended_lane(self):
+        lanes = [lane for lane in workflow_lanes() if lane['name'] == 'smp-32']
+        self.assertEqual(len(lanes), 1)
+        self.assertEqual(lanes[0]['group'], 'extended-smp-32')
+        regular = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf8')
+        runtime = re.search(r'^  runtime:\n(.*?)^  qemu:', regular, re.M | re.S)[1]
+        self.assertIn('{name: SMP 32-vCPU, group: smp-32, timeout: 40}', runtime)
+        self.assertIn('name: normal-boot-image', runtime)
+        self.assertIn('name: ci-${{ matrix.gate.group }}', runtime)
+
     def test_extended_keeps_stability_windows_and_stress_duration(self):
         workflow = (ROOT / '.github/workflows/extended.yml').read_text(encoding='utf8')
         self.assertRegex(workflow, r'(?m)^      QEMU_GATE_MODE: window$')
