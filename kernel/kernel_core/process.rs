@@ -1184,6 +1184,10 @@ pub fn allocate_kernel_stack(
             // 清零栈区域
             core::ptr::write_bytes(stack_base.as_mut_ptr::<u8>(), 0, stack_size);
 
+            // ST-K2-P2(c): the tables built here outlive this stack.
+            #[cfg(feature = "syscall_test")]
+            crate::fork::shared_fault_test::note_kernel_stack_tables(pt_recorder.len);
+
             Ok((stack_base, stack_top, phys_start_frame))
         })
     };

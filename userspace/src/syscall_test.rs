@@ -299,6 +299,9 @@ pub extern "C" fn _start() -> ! {
     test_cow_sibling_read(&mut results);
     // ST-K2-P2(b): a page-table holder and a remote IF=0 shared fault.
     test_shared_fault_remote_holder(&mut results);
+    // ST-K2-P2(c): the last owner of a shared region exits after, or while,
+    // its parent unmaps it.
+    test_shared_final_owner_race(&mut results);
 
     // GAP-5 G8: /proc lists group leaders; /proc/<pid>/task lists members.
     test_proc_thread_listing(&mut results);
@@ -5563,6 +5566,335 @@ fn test_shared_fault_remote_holder(results: &mut TestResult) {
         results.fail(
             "shared-fault remote holder: munmap shootdown during a sibling's IF=0 Busy fault",
         );
+    }
+}
+
+/// ST-K2-P2(c): iterations per variant, fixed at fixture build time.
+fn final_owner_iterations() -> usize {
+    let iterations = option_env!("NILIX_ST_K2_FINAL_OWNER_ITERS")
+        .unwrap_or("200")
+        .parse::<usize>()
+        .expect("NILIX_ST_K2_FINAL_OWNER_ITERS must be an integer");
+    assert!((1..=1000).contains(&iterations));
+    iterations
+}
+
+/// Shared mmap/touch/munmap rounds the parent runs while the other owner of
+/// the race region is checking it and exiting.
+const FINAL_OWNER_CHURN: usize = 4;
+const FINAL_OWNER_WORDS: [u64; 2] = [0x4649_4e41_4c30, 0x4649_4e41_4c31];
+
+/// Root-cgroup `MemFree` from /proc/meminfo, in kB: the buddy's free pages
+/// times four.
+unsafe fn read_mem_free_kb() -> Option<u64> {
+    let fd = sys_open(b"/proc/meminfo\0".as_ptr(), 0, 0);
+    if is_error(fd) {
+        return None;
+    }
+    let mut buf = [0u8; 512];
+    let read = sys_read(fd, buf.as_mut_ptr(), buf.len() as u64);
+    let _ = sys_close(fd);
+    if is_error(read) {
+        return None;
+    }
+    let text = &buf[..read as usize];
+    let key = b"MemFree:";
+    let start = text.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut value = 0u64;
+    let mut digits = 0;
+    for &byte in &text[start..] {
+        match byte {
+            b' ' if digits == 0 => {}
+            b'0'..=b'9' => {
+                value = value.checked_mul(10)?.checked_add((byte - b'0') as u64)?;
+                digits += 1;
+            }
+            _ => break,
+        }
+    }
+    (digits != 0).then_some(value)
+}
+
+/// What (c) restores exactly: the cgroup's `memory.current`, and buddy free
+/// pages plus every kernel-stack page table built so far (those tables are
+/// kept for recycled PIDs, so they are counted rather than tolerated).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MemoryBaseline {
+    charged: u64,
+    free_pages: u64,
+}
+
+unsafe fn memory_baseline() -> Option<MemoryBaseline> {
+    let charged = read_memory_current()?;
+    let free_kb = read_mem_free_kb()?;
+    let tables = shared_fault_test(6, 0, 0);
+    if is_error(tables) {
+        return None;
+    }
+    Some(MemoryBaseline {
+        charged,
+        free_pages: (free_kb / 4).checked_add(tables)?,
+    })
+}
+
+/// Wait (bounded) for deferred teardown, such as the RCU-delayed kernel-stack
+/// reclaim of a reaped task, to land on `base` exactly.
+unsafe fn settle_to(base: MemoryBaseline) -> Result<(), MemoryBaseline> {
+    let mut last = MemoryBaseline {
+        charged: u64::MAX,
+        free_pages: u64::MAX,
+    };
+    for _ in 0..2000 {
+        if let Some(now) = memory_baseline() {
+            if now == base {
+                return Ok(());
+            }
+            last = now;
+        }
+        for _ in 0..20 {
+            userspace::syscall::sys_yield();
+        }
+    }
+    Err(last)
+}
+
+/// One process round: the parent first-touches a two-page shared region,
+/// forks a child (pinned to CPU 1 on SMP), and unmaps the region first. The
+/// child, now its last owner, checks and rewrites both pages and exits while
+/// the parent churns another shared region.
+unsafe fn final_owner_process_round(pinned: bool) -> Result<(), u64> {
+    let region = mmap_anon(2 * PAGE, true);
+    if region < 0 {
+        return Err(0xf0);
+    }
+    let region = region as usize;
+    for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+        core::ptr::write_volatile((region + page * PAGE) as *mut u64, *word);
+    }
+    let (mut to_child, mut to_parent) = ([-1i32; 2], [-1i32; 2]);
+    if syscall2(SYS_PIPE2, to_child.as_mut_ptr() as u64, 0) != 0
+        || syscall2(SYS_PIPE2, to_parent.as_mut_ptr() as u64, 0) != 0
+    {
+        return Err(0xf1);
+    }
+    let child = sys_fork();
+    if child == 0 {
+        let _ = sys_close(to_child[1] as u64);
+        let _ = sys_close(to_parent[0] as u64);
+        let mut byte = 0u8;
+        let code = if pinned && !cow_test_pin(2) {
+            0xf2
+        } else if syscall3(SYS_WRITE, to_parent[1] as u64, b"r".as_ptr() as u64, 1) != 1
+            || sys_read(to_child[0] as u64, &mut byte, 1) != 1
+        {
+            0xf3
+        } else {
+            // The parent has unmapped: this task holds the region's last pin.
+            let mut intact = true;
+            for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+                let addr = (region + page * PAGE) as *mut u64;
+                intact &= core::ptr::read_volatile(addr) == *word;
+                core::ptr::write_volatile(addr, !*word);
+                intact &= core::ptr::read_volatile(addr) == !*word;
+            }
+            if intact {
+                GROUP_LEG_OK
+            } else {
+                0xf4
+            }
+        };
+        raw_exit(SYS_EXIT_GROUP, code);
+    }
+    // Only the child keeps these ends, so its early exit reads as EOF here.
+    let _ = sys_close(to_parent[1] as u64);
+    let _ = sys_close(to_child[0] as u64);
+    let mut byte = 0u8;
+    let mut ok = !is_error(child) && sys_read(to_parent[0] as u64, &mut byte, 1) == 1;
+    ok &= munmap(region, 2 * PAGE) == 0;
+    ok &= syscall3(SYS_WRITE, to_child[1] as u64, b"u".as_ptr() as u64, 1) == 1;
+    for _ in 0..FINAL_OWNER_CHURN {
+        let churn = mmap_anon(PAGE, true);
+        if churn < 0 {
+            ok = false;
+            break;
+        }
+        core::ptr::write_volatile(churn as *mut u64, 1);
+        ok &= munmap(churn as usize, PAGE) == 0;
+    }
+    ok &= !is_error(child) && reap_pid(child) == Some(GROUP_LEG_OK);
+    let _ = sys_close(to_child[1] as u64);
+    let _ = sys_close(to_parent[0] as u64);
+    if ok {
+        Ok(())
+    } else {
+        Err(0xf5)
+    }
+}
+
+static FINAL_OWNER_REGION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FINAL_OWNER_PINNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static FINAL_OWNER_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The CLONE_VM thread: first-touches both pages, says so, and exits at once,
+/// racing the parent's munmap of the region.
+extern "C" fn final_owner_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    if FINAL_OWNER_PINNED.load(Ordering::Acquire) && !cow_test_pin(2) {
+        FINAL_OWNER_STAGE.store(0xe1, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    let region = FINAL_OWNER_REGION.load(Ordering::Acquire) as usize;
+    for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((region + page * PAGE) as *mut u64, *word) };
+    }
+    FINAL_OWNER_STAGE.store(1, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// One thread round: a CLONE_VM thread on CPU 1 faults the region in and
+/// exits while the parent checks the words, unmaps the region and churns.
+unsafe fn final_owner_thread_round(pinned: bool) -> Result<(), u64> {
+    use core::sync::atomic::Ordering;
+    let region = mmap_anon(2 * PAGE, true);
+    if region < 0 {
+        return Err(0xf6);
+    }
+    FINAL_OWNER_REGION.store(region as u64, Ordering::Release);
+    FINAL_OWNER_PINNED.store(pinned, Ordering::Release);
+    FINAL_OWNER_STAGE.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let thread = raw_clone(
+        THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+        group_stack_top(),
+        core::ptr::null_mut(),
+        GROUP_TID_WORD.as_ptr(),
+        final_owner_thread,
+    );
+    if is_error(thread) || thread == 0 {
+        return Err(0xf7);
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if FINAL_OWNER_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        userspace::syscall::sys_yield();
+    }
+    let mut ok = FINAL_OWNER_STAGE.load(Ordering::Acquire) == 1;
+    for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+        ok = ok && core::ptr::read_volatile((region as usize + page * PAGE) as *const u64) == *word;
+    }
+    ok &= munmap(region as usize, 2 * PAGE) == 0;
+    for _ in 0..FINAL_OWNER_CHURN {
+        let churn = mmap_anon(PAGE, true);
+        if churn < 0 {
+            ok = false;
+            break;
+        }
+        core::ptr::write_volatile(churn as *mut u64, 1);
+        ok &= munmap(churn as usize, PAGE) == 0;
+    }
+    ok &= g8_join_thread();
+    if ok {
+        Ok(())
+    } else {
+        Err(0xf8)
+    }
+}
+
+/// Runs `round` once to warm up, takes the baseline, then requires every one
+/// of `iterations` rounds to come back to it exactly.
+unsafe fn final_owner_variant(
+    name: &str,
+    iterations: usize,
+    round: unsafe fn(bool) -> Result<(), u64>,
+    pinned: bool,
+) -> Result<(), u64> {
+    round(pinned)?;
+    let mut base = None;
+    for _ in 0..2000 {
+        // Let the warm-up's deferred teardown finish before the baseline.
+        let first = memory_baseline();
+        for _ in 0..20 {
+            userspace::syscall::sys_yield();
+        }
+        if first.is_some() && memory_baseline() == first {
+            base = first;
+            break;
+        }
+    }
+    let base = base.ok_or(0xf9u64)?;
+    for iteration in 0..iterations {
+        round(pinned)?;
+        if let Err(now) = settle_to(base) {
+            let (mut a, mut b, mut c, mut d, mut e) =
+                ([0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20]);
+            println_parts(&[
+                "  final owner: ",
+                name,
+                " iteration ",
+                decimal(iteration, &mut a),
+                " charged ",
+                decimal(base.charged as usize, &mut b),
+                decimal(now.charged as usize, &mut c),
+            ]);
+            println_parts(&[
+                "  final owner: free pages+kstack tables ",
+                decimal(base.free_pages as usize, &mut d),
+                " -> ",
+                decimal(now.free_pages as usize, &mut e),
+            ]);
+            return Err(0xfa);
+        }
+    }
+    Ok(())
+}
+
+fn shared_final_owner_leg(pinned: bool) -> u64 {
+    if pinned && !cow_test_pin(1) {
+        return 0xfb;
+    }
+    let iterations = final_owner_iterations();
+    let process =
+        unsafe { final_owner_variant("process", iterations, final_owner_process_round, pinned) };
+    if let Err(code) = process {
+        return code;
+    }
+    let thread =
+        unsafe { final_owner_variant("thread", iterations, final_owner_thread_round, pinned) };
+    match thread {
+        Ok(()) => GROUP_LEG_OK,
+        Err(code) => code | 0x100,
+    }
+}
+
+/// ST-K2-P2(c): the last owner of a shared region is a fork child that exits
+/// after its parent unmapped first, or a CLONE_VM thread that exits while the
+/// parent unmaps, with another shared region churning on the other CPU. Every
+/// round returns `memory.current` and the buddy's free pages to the baseline.
+fn test_shared_final_owner_race(results: &mut TestResult) {
+    print("Testing shared-anon final owner and parent-first unmap... ");
+    let cpus = unsafe { shared_fault_test(0, 0, 0) };
+    let pinned = !is_error(cpus) && cpus & 3 == 3;
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, shared_final_owner_leg(pinned)) };
+    }
+    if !is_error(host) && reap_pid(host) == Some(GROUP_LEG_OK) {
+        let mut buf = [0u8; 20];
+        let iterations = decimal(final_owner_iterations(), &mut buf);
+        println("");
+        println_parts(&[
+            "ST-K2-FINAL-OWNER PASS variant=process iterations=",
+            iterations,
+        ]);
+        println_parts(&[
+            "ST-K2-FINAL-OWNER PASS variant=thread iterations=",
+            iterations,
+        ]);
+        results.pass("shared-anon final owner: a fork child or CLONE_VM thread outlives the parent's unmap; memory.current and buddy free pages return exactly every round");
+    } else {
+        results.fail("shared-anon final owner and parent-first unmap");
     }
 }
 

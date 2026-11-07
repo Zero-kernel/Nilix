@@ -6,6 +6,12 @@
 //! usercopy. The sibling cannot take the shootdown IPI, so the holder's wait
 //! completes only through the mailbox drain of the sibling's #PF Busy arm,
 //! which `mm::tlb_shootdown` counts.
+//!
+//! (c) Exact memory baselines: the page tables `allocate_kernel_stack` builds
+//! for a fresh kernel-stack slot stay linked after the stack is freed (a
+//! recycled PID reuses them), so buddy free pages fall by exactly that count
+//! as new PIDs reach new 2 MiB slots. The count lets a guest compare buddy free
+//! pages with zero tolerance.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -25,6 +31,7 @@ static UNMAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static COLD_PAGE: AtomicUsize = AtomicUsize::new(0);
 static BUSY_HITS: AtomicU64 = AtomicU64::new(0);
 static ACK_BASE: AtomicU64 = AtomicU64::new(0);
+static KERNEL_STACK_TABLES: AtomicU64 = AtomicU64::new(0);
 
 /// Bound on any pause, as in `cow_test`: a regressed kernel or a dead sibling
 /// must end in a failing verdict, never an unbounded wait under a lock.
@@ -43,10 +50,12 @@ fn active_root() -> usize {
 
 /// prctl operations: 0 = online CPU mask; 1 = arm(unmap base, cold shared
 /// page); 2 = state; 3 = ACKs delivered by #PF mailbox drains since arming;
-/// 4 = Busy faults counted on the cold page; 5 = disarm.
+/// 4 = Busy faults counted on the cold page; 5 = disarm; 6 = kernel-stack page
+/// tables built since boot.
 pub fn command(op: u64, a: u64, b: u64, pid: usize, root: usize) -> Result<u64, ()> {
     match op {
         0 => Ok(cpu_local::online_cpu_mask()),
+        6 => Ok(KERNEL_STACK_TABLES.load(Ordering::Acquire)),
         1 => {
             if root == 0 || !user_page(a) || !user_page(b) || a == b {
                 return Err(());
@@ -130,6 +139,13 @@ pub fn note_busy(fault_addr: usize) {
             BUSY_HITS.fetch_add(1, Ordering::AcqRel);
         }
         _ => {}
+    }
+}
+
+/// `allocate_kernel_stack` linked `tables` new page tables for a stack slot.
+pub fn note_kernel_stack_tables(tables: usize) {
+    if tables != 0 {
+        KERNEL_STACK_TABLES.fetch_add(tables as u64, Ordering::AcqRel);
     }
 }
 

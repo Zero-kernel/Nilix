@@ -126,6 +126,7 @@ mremap relocation of the largest mapping that fits moves every page in one hold,
 KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them
 heap quotas: oversized read refused, local isolation survives, fork shares the UID ceiling
 brk COW shrink flushes retained leaves before returning
+shared-anon final owner: a fork child or CLONE_VM thread outlives the parent's unmap; memory.current and buddy free pages return exactly every round
 console input belongs exclusively to the configured owner
 LEGS
 
@@ -154,6 +155,17 @@ if [ "${KERNEL_TEST_CPUS:-1}" -gt 1 ]; then
         || [ "$(grep -cx "ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps" "$serial" || true)" -ne 1 ]; then
         report_fail "expected exactly one 'ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps' marker"
     fi
+fi
+# ST-K2-P2(c): every round of both variants came back to the exact memory
+# baseline, at the fixture's NILIX_ST_K2_FINAL_OWNER_ITERS.
+final_iters="${NILIX_ST_K2_FINAL_OWNER_ITERS:-200}"
+for variant in process thread; do
+    if [ "$(grep -cx "ST-K2-FINAL-OWNER PASS variant=$variant iterations=$final_iters" "$serial" || true)" -ne 1 ]; then
+        report_fail "expected exactly one 'ST-K2-FINAL-OWNER PASS variant=$variant iterations=$final_iters' marker"
+    fi
+done
+if [ "$(grep -c 'ST-K2-FINAL-OWNER' "$serial" || true)" -ne 2 ]; then
+    report_fail "unexpected ST-K2-FINAL-OWNER markers"
 fi
 if grep -Eq '^\[FAIL\]' "$serial"; then
     report_fail "the guest reported a failing leg"
