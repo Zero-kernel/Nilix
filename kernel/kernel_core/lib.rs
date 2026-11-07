@@ -75,6 +75,7 @@ pub mod mount_namespace;
 #[cfg(feature = "namespace_probe")]
 pub mod namespace_probe;
 pub mod net_namespace;
+pub mod owner_lock;
 pub mod pid_namespace;
 pub mod poll;
 pub mod populate;

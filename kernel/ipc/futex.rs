@@ -60,6 +60,7 @@ use core::ptr::NonNull;
 #[cfg(test)]
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_core::owner_lock::OwnerCpuMutex;
 use kernel_core::process::{self, FutexKey, MmState, Priority, ProcessId};
 use kernel_core::request_resched_from_irq;
 use kernel_core::syscall::FutexWakeOp;
@@ -359,7 +360,7 @@ struct FutexBucket {
     /// address space itself) alive while this bucket exists, so the space id
     /// in the key cannot be reused by a new address space. `None` only for
     /// test buckets.
-    space_pin: Option<Weak<Mutex<MmState>>>,
+    space_pin: Option<Weak<OwnerCpuMutex<MmState>>>,
     /// GAP-5 PI parity: the owner of the PI state (Linux `pi_state->owner`).
     /// Present only while the PI futex at this address has kernel waiters, or
     /// while a waiter the kernel handed the lock to after its owner died has
@@ -387,7 +388,7 @@ struct FutexBucket {
 }
 
 impl FutexBucket {
-    fn new(queue: FutexQueueRef, space_pin: Option<Weak<Mutex<MmState>>>) -> Self {
+    fn new(queue: FutexQueueRef, space_pin: Option<Weak<OwnerCpuMutex<MmState>>>) -> Self {
         FutexBucket {
             queue,
             waiter_count: 0,
@@ -462,13 +463,13 @@ impl FutexBucket {
 #[derive(Clone)]
 pub struct FutexSpace {
     id: usize,
-    pin: Option<Weak<Mutex<MmState>>>,
+    pin: Option<Weak<OwnerCpuMutex<MmState>>>,
 }
 
 impl FutexSpace {
     /// The key space of an address space. The caller holds a strong
     /// reference, so the pin taken here is never the allocation's last.
-    pub fn of_mm(mm: &Arc<Mutex<MmState>>) -> Self {
+    pub fn of_mm(mm: &Arc<OwnerCpuMutex<MmState>>) -> Self {
         Self {
             id: Self::id_of_mm(mm),
             pin: Some(Arc::downgrade(mm)),
@@ -481,7 +482,7 @@ impl FutexSpace {
     }
 
     /// The space id alone, for lookups that never create a bucket.
-    pub fn id_of_mm(mm: &Arc<Mutex<MmState>>) -> usize {
+    pub fn id_of_mm(mm: &Arc<OwnerCpuMutex<MmState>>) -> usize {
         Arc::as_ptr(mm) as usize
     }
 
@@ -1054,7 +1055,7 @@ fn get_live_bucket_with(
 fn get_or_create_live_bucket(
     key: FutexKey,
     permit: &FutexPreparePermit,
-    space_pin: Option<&Weak<Mutex<MmState>>>,
+    space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
 ) -> Result<FutexBucketRef, FutexError> {
     get_live_bucket_with(|| get_or_create_bucket_with_permit(key, permit, space_pin))
 }
@@ -4207,7 +4208,7 @@ fn publish_futex_bucket_candidate(
 fn get_or_create_bucket_with_permit(
     key: FutexKey,
     _permit: &FutexPreparePermit,
-    space_pin: Option<&Weak<Mutex<MmState>>>,
+    space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
 ) -> Result<FutexBucketRef, FutexError> {
     {
         let table = FUTEX_TABLE.lock();
@@ -5559,11 +5560,11 @@ mod tests {
     #[test]
     fn futex_parity_key_space_follows_the_address_space() {
         let _serial = crate::HEAP_TEST_LOCK.lock();
-        let mm = Arc::new(Mutex::new(MmState::new(0)));
+        let mm = Arc::new(OwnerCpuMutex::new(MmState::new(0)));
         // A CLONE_VM sharer (thread or not) holds the same Arc.
         let sharer = Arc::clone(&mm);
         // fork gives the child a new MmState.
-        let forked = Arc::new(Mutex::new(MmState::new(0)));
+        let forked = Arc::new(OwnerCpuMutex::new(MmState::new(0)));
 
         let space = FutexSpace::of_mm(&mm);
         assert_eq!(space.id(), FutexSpace::of_mm(&sharer).id());

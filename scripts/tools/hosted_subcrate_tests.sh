@@ -239,7 +239,7 @@ run_suite cgroup-access 1 0 \
     --features host_harness \
     --test cgroup_access --locked
 
-run_suite kernel-core 140 0 \
+run_suite kernel-core 142 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -272,7 +272,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 140 \
+run_suite mitigation-mappings 5 142 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

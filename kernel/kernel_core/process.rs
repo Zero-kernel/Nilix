@@ -1,4 +1,5 @@
 use crate::fork::PAGE_REF_COUNT;
+use crate::owner_lock::OwnerCpuMutex;
 use crate::signal::PendingSignals;
 use crate::signal::{SigAction, NSIG};
 use crate::syscall::{SyscallError, VfsStat};
@@ -178,8 +179,8 @@ unsafe impl Allocator for ProcessArcAllocator {
     }
 }
 
-pub type ProcessArc = Arc<Mutex<Process>, ProcessArcAllocator>;
-pub type ProcessWeak = Weak<Mutex<Process>, ProcessArcAllocator>;
+pub type ProcessArc = Arc<OwnerCpuMutex<Process>, ProcessArcAllocator>;
+pub type ProcessWeak = Weak<OwnerCpuMutex<Process>, ProcessArcAllocator>;
 
 /// mmap 默认起始地址
 // ST-K3 FIX: moved 0x4000_0000 (1 GiB) → 0x10_0000_0000 (64 GiB). The old
@@ -3017,7 +3018,7 @@ pub struct Process {
     /// D3-ARC-MM-SHARED: Shared virtual memory metadata.
     /// Under CLONE_VM, siblings share the same Arc. Under fork, each gets a clone.
     /// Lock ordering: Process → MmState (never reverse).
-    pub mm: Arc<Mutex<MmState>>,
+    pub mm: Arc<OwnerCpuMutex<MmState>>,
 
     /// GAP-5 slice 3: this task's fd table behind its own leaf lock. Private
     /// today (fork and clone give the child its own table); a CLONE_FILES
@@ -3411,7 +3412,7 @@ pub struct Process {
 // conservative lower bound, the CoreProcess byte gate permits at most 1024
 // simultaneously live process Arc allocations.
 const _: () = assert!(
-    core::mem::size_of::<Mutex<Process>>()
+    core::mem::size_of::<OwnerCpuMutex<Process>>()
         >= HeapClass::CoreProcess.limit_bytes() / PROCESS_ARC_CHARGE_SLOTS
 );
 
@@ -3470,9 +3471,9 @@ impl Process {
     ///
     /// 默认以root权限运行（uid=0, gid=0），umask为标准0o022
     pub fn new(pid: ProcessId, ppid: ProcessId, name: String, priority: Priority) -> Self {
-        let mm = Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(
-            DEFAULT_MMAP_BASE,
-        ))));
+        let mm = Arc::new(OwnerCpuMutex::new(MmState::new(
+            security::randomized_mmap_base(DEFAULT_MMAP_BASE),
+        )));
         let cap_table = Arc::new(CapTable::new());
         let thread_group = Arc::new(
             ThreadGroup::try_new_for_uid(if ppid == 0 {
@@ -3521,11 +3522,11 @@ impl Process {
         name: ProcessNameSnapshot,
         priority: Priority,
     ) -> Result<ProcessArc, ProcessCreateError> {
-        let process_arc_bytes =
-            arc_charge_bytes::<Mutex<Process>>().map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let process_arc_bytes = arc_charge_bytes::<OwnerCpuMutex<Process>>()
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let mut fixed_total = 0usize;
         for bytes in [
-            arc_charge_bytes::<Mutex<MmState>>(),
+            arc_charge_bytes::<OwnerCpuMutex<MmState>>(),
             arc_charge_bytes::<ThreadGroup>(),
             arc_charge_bytes::<FilesTable>(),
             arc_charge_bytes::<crate::signal::SignalTable>(),
@@ -3566,9 +3567,9 @@ impl Process {
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
         owned_name.push_str(name.as_str());
 
-        let mm = Arc::try_new(Mutex::new(MmState::new(security::randomized_mmap_base(
-            DEFAULT_MMAP_BASE,
-        ))))
+        let mm = Arc::try_new(OwnerCpuMutex::new(MmState::new(
+            security::randomized_mmap_base(DEFAULT_MMAP_BASE),
+        )))
         .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let cap_table = CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?;
         let thread_group = Arc::try_new(
@@ -3620,7 +3621,7 @@ impl Process {
             drop(charge);
             ProcessCreateError::OutOfMemory
         })?;
-        match Arc::try_new_in(Mutex::new(process), allocator) {
+        match Arc::try_new_in(OwnerCpuMutex::new(process), allocator) {
             Ok(process) => Ok(process),
             Err(_) => {
                 allocator.cancel_failed_allocation();
@@ -3635,7 +3636,7 @@ impl Process {
     /// control block and its independent charge live until that Weak is dropped.
     pub fn run_arc_lifetime_self_test() {
         let before = mm::heap_class_snapshot(HeapClass::CoreProcess);
-        let outer_bytes = arc_charge_bytes::<Mutex<Process>>()
+        let outer_bytes = arc_charge_bytes::<OwnerCpuMutex<Process>>()
             .expect("RF180-40 process Arc charge must be representable");
         let process = Self::try_new_pcb(
             0x180_4001,
@@ -3774,7 +3775,7 @@ impl Process {
         ppid: ProcessId,
         name: String,
         priority: Priority,
-        mm: Arc<Mutex<MmState>>,
+        mm: Arc<OwnerCpuMutex<MmState>>,
         cap_table: Arc<CapTable>,
         thread_group: Arc<ThreadGroup>,
         files: Arc<FilesTable>,
@@ -4977,8 +4978,8 @@ fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup
 /// 使用 Option<Arc<Mutex<Process>>> 以支持 PID 作为直接索引。
 /// 索引 0 保留为空（PID 从 1 开始），实际进程存储在其 PID 对应的索引位置。
 lazy_static::lazy_static! {
-    pub static ref PROCESS_TABLE: Mutex<AdmittedVec<Option<ProcessArc>>> =
-        Mutex::new(AdmittedVec::new(HeapClass::CoreProcess));
+    pub static ref PROCESS_TABLE: OwnerCpuMutex<AdmittedVec<Option<ProcessArc>>> =
+        OwnerCpuMutex::new(AdmittedVec::new(HeapClass::CoreProcess));
     static ref SCHEDULER_CLEANUP: Mutex<Option<SchedulerCleanupCallback>> = Mutex::new(None);
     static ref IPC_CLEANUP: Mutex<Option<IpcCleanupCallback>> = Mutex::new(None);
     static ref ROBUST_FUTEX_CLEANUP: Mutex<Option<RobustFutexCleanupCallback>> = Mutex::new(None);
@@ -5074,7 +5075,7 @@ pub fn run_process_registry_txn_self_test() {
     const OTHER_SPACE: usize = 0x0E11_5000;
     let before = mm::heap_class_snapshot(HeapClass::CoreProcess);
     {
-        let table = Mutex::new(AdmittedVec::<Option<ProcessArc>>::new(
+        let table = OwnerCpuMutex::new(AdmittedVec::<Option<ProcessArc>>::new(
             HeapClass::CoreProcess,
         ));
         {
@@ -7089,7 +7090,7 @@ pub struct ProcessRegistryTxn<'t> {
 pub struct TxnProcessGuard<'a, 't> {
     txn: &'a ProcessRegistryTxn<'t>,
     pid: ProcessId,
-    guard: spin::MutexGuard<'a, Process>,
+    guard: crate::owner_lock::OwnerCpuMutexGuard<'a, Process>,
 }
 
 impl core::ops::Deref for TxnProcessGuard<'_, '_> {
@@ -7210,7 +7211,7 @@ impl<'t> ProcessRegistryTxn<'t> {
 /// acquires the table guard in THIS frame (drops strictly after every process guard
 /// — borrow-checker enforced), builds the txn over a reborrow, runs `f`.
 fn with_registry_txn_on<T>(
-    table: &Mutex<AdmittedVec<Option<ProcessArc>>>,
+    table: &OwnerCpuMutex<AdmittedVec<Option<ProcessArc>>>,
     f: impl FnOnce(&ProcessRegistryTxn<'_>) -> Result<T, RegistryTxnError>,
 ) -> Result<T, RegistryTxnError> {
     let guard = table.try_lock().ok_or(RegistryTxnError::Contention)?;

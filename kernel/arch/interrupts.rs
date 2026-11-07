@@ -1327,6 +1327,17 @@ extern "x86-interrupt" fn page_fault_handler(
                     mm::tlb_shootdown::handle_shootdown_ipi();
                     return;
                 }
+                kernel_core::fork::SharedFaultResult::Reentry(lock) => {
+                    // ST-K2-P2(a): the context this fault interrupted holds the
+                    // lock, so a retry through IRETQ would spin here forever
+                    // (with IF=0 on the usercopy path). Stop loudly instead.
+                    panic!(
+                        "same-CPU {} reentry during shared fault at {:#x} (pid {})",
+                        lock.name(),
+                        fault_addr,
+                        pid
+                    );
+                }
                 kernel_core::fork::SharedFaultResult::NotShared => {}
                 kernel_core::fork::SharedFaultResult::Fatal(reason) => {
                     klog_force!(

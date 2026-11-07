@@ -14963,7 +14963,7 @@ pub fn mmap_flags_to_perms(flags: usize) -> [u8; 4] {
 /// exit — after every inner `mm_arc.lock()` scope has ended — so re-locking
 /// `MmState` here cannot self-deadlock.
 struct BrkReservation {
-    mm: Arc<spin::Mutex<crate::process::MmState>>,
+    mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
     armed: bool,
 }
 
@@ -14997,7 +14997,7 @@ impl Drop for BrkReservation {
 /// explicitly subtracted in the SAME arm (commit or rollback) with no early-return in
 /// between, exactly like `brk_pending_growth` — so the guard never needs to undo it.
 struct StackGrowReservation {
-    mm: Arc<spin::Mutex<crate::process::MmState>>,
+    mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
     armed: bool,
 }
 
@@ -17326,7 +17326,8 @@ fn sys_mmap(
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
     let (base, end, update_next, cgroup_id, old_next_mmap_addr, mm_arc, shared_region) = {
         let mut proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -17803,7 +17804,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
     let (recorded_length, committed_flags, mm_arc) = {
         let mut proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -18188,7 +18190,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // D3-ARC-MM-SHARED: Phase 0 operates on shared MmState via mm Arc.
     let (prot_none_regions, real_regions, mm_arc) = {
         let proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -18783,7 +18786,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // new PTEs with old metadata. Claim every covered VMA before PT_LOCK and
     // retain the claim through the metadata commit.
     struct MprotectPteReservation {
-        mm: Arc<spin::Mutex<crate::process::MmState>>,
+        mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
         start: usize,
         end: usize,
         armed: bool,
@@ -26223,7 +26226,8 @@ fn sys_mremap(
     // destination under ONE Process → MmState critical section. ----
     let (tx_opt, mm_arc) = {
         let mut proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         // A second handle for the post-Phase-1 lock-free window: `mm` below
         // borrows `mm_arc`, so this clone is what leaves the block.
         let mm_arc_out = Arc::clone(&mm_arc);
