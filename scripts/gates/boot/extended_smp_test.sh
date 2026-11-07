@@ -27,6 +27,8 @@ set -u
 
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
 QEMU=qemu-system-x86_64
+# shellcheck source=scripts/ci/qemu_run.sh
+source "$ROOT/scripts/ci/qemu_run.sh"
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 
@@ -93,16 +95,16 @@ run_smp_test() {
         --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || return 2
     "$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || return 2
 
-    LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$timeout_val" \
-        bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+    run_gate_qemu "$timeout_val" "runtime" "$QEMU" -bios "$OVMF" \
         -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
         -smp "$cpu_count" \
         -m 512M -vga std -no-reboot -no-shutdown \
         -cpu qemu64,+smep,+smap,+umip,+rdrand \
         -display none -serial "file:$ser" \
-        -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+        -d int,cpu_reset -D "$intlog"
 
     local qemu_status=$?
+    printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 
     # Analyze results
     local nx cpu_resets supervisor_faults
@@ -161,7 +163,7 @@ run_smp_test() {
 
     # Determine pass/fail
     python3 "$ROOT/scripts/ci/gate_log.py" --serial "$ser" --intlog "$intlog" \
-        --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --json-output "$ser.counts.json"
+        --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json"
     local result=$?
     python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || result=1
 
@@ -220,10 +222,10 @@ run_smp_test() {
 
     printf '%s\n' "$result" > "$ser.gate.status"
     if [ "${EXTENDED_SMP_KEEP_LOGS:-0}" = 1 ]; then
-        echo "EXTENDED-SMP ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status"
+        echo "EXTENDED-SMP ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status termination=$ser.run.json qemu_status=$ser.qemu.status"
     else
         rm -rf -- "$ser.inputs"
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status"
     fi
     echo "End time: $(date)"
     echo ""

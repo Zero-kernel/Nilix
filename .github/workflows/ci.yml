@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      qemu_gate_mode:
+        description: QEMU observation scope
+        type: choice
+        default: completion
+        options: [completion, window]
 
 permissions:
   contents: read
@@ -176,9 +182,11 @@ jobs:
     needs: [changes, build]
     if: contains(fromJSON(needs.changes.outputs.jobs), 'runtime')
     runs-on: ubuntu-24.04
-    # Three sequential 15-minute observation windows plus setup/reporting and
-    # one bounded retry for a transient guest failure.
+    # Functional gates finish after exit cleanup plus the diagnostic tail.
+    # Each retains a 900-second deadline; Extended keeps full-window coverage.
     timeout-minutes: 90
+    env:
+      QEMU_GATE_MODE: ${{ inputs.qemu_gate_mode || 'completion' }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
@@ -202,6 +210,8 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.jobs), 'qemu')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      QEMU_GATE_MODE: ${{ inputs.qemu_gate_mode || 'completion' }}
     strategy:
       fail-fast: false
       matrix:

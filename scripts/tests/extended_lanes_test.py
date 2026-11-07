@@ -32,6 +32,13 @@ def workflow_lanes():
 
 
 class ExtendedLaneTests(unittest.TestCase):
+    def test_extended_keeps_stability_windows_and_stress_duration(self):
+        workflow = (ROOT / '.github/workflows/extended.yml').read_text(encoding='utf8')
+        self.assertRegex(workflow, r'(?m)^      QEMU_GATE_MODE: window$')
+        self.assertRegex(workflow, r"(?m)^      CI_STRESS_SECONDS: '900'$")
+        stress = (ROOT / 'scripts/gates/stress/stress_test.sh').read_text(encoding='utf8')
+        self.assertIn('STRESS_DURATION="${STRESS_DURATION:-900}"', stress)
+
     def test_every_stress_profile_has_exactly_one_lane(self):
         profiles = default_profiles()
         self.assertEqual(len(profiles), 7)

@@ -11,6 +11,11 @@ from pathlib import Path
 import re
 import sys
 
+try:
+    from qemu_run import termination_errors
+except ModuleNotFoundError:
+    from scripts.ci.qemu_run import termination_errors
+
 
 SUMMARY = re.compile(
     r"=== Test Summary: ([0-9]+) passed, ([0-9]+) deferred"
@@ -136,6 +141,8 @@ def evaluate(
     *,
     require_iommu: bool = False,
     strict: bool = False,
+    termination_mode: str = "window",
+    termination_receipt: dict | None = None,
 ) -> GateResult:
     failures = []
     incomplete = []
@@ -155,7 +162,11 @@ def evaluate(
 
     term_events = timeout_stderr.count(TERM_EVENT)
     kill_events = timeout_stderr.count(KILL_EVENT)
-    if qemu_status in (125, 126, 127):
+    if termination_mode == "completion":
+        failures.extend(termination_errors(serial, termination_mode, termination_receipt, qemu_status))
+    elif termination_mode != "window":
+        failures.append("unknown termination mode")
+    elif qemu_status in (125, 126, 127):
         incomplete.append(f"QEMU/timeout could not run (status={qemu_status})")
     elif qemu_status != 124 or term_events != 1 or kill_events != 0:
         failures.append(
@@ -230,6 +241,9 @@ def evaluate(
         if strict:
             status = 1
             reasons.append("strict mode rejects warnings, deferred tests and skips")
+    details["termination_mode"] = termination_mode
+    details["observation_scope"] = ("completion plus bounded tail" if termination_mode == "completion"
+                                    else "full configured window")
     return GateResult(status, counts, warning_markers, skipped_markers, tuple(reasons), details)
 
 
@@ -283,6 +297,8 @@ def main() -> int:
     parser.add_argument("--qemu-stderr", required=True, type=Path)
     parser.add_argument("--timeout-stderr", required=True, type=Path)
     parser.add_argument("--qemu-status", required=True, type=int)
+    parser.add_argument("--termination-mode", choices=("window", "completion"), default="window")
+    parser.add_argument("--termination-receipt", type=Path)
     parser.add_argument("--require-iommu", action="store_true")
     parser.add_argument("--strict", action="store_true", default=os.environ.get("ZERO_OS_STRICT_TESTS") == "1")
     parser.add_argument("--json-output", type=Path)
@@ -300,7 +316,15 @@ def main() -> int:
         except OSError as error:
             contents.append("")
             missing.append(f"cannot read {path}: {error}")
-    result = evaluate(*contents, arguments.qemu_status, require_iommu=arguments.require_iommu, strict=arguments.strict)
+    receipt = None
+    if arguments.termination_mode == "completion":
+        try:
+            receipt = json.loads(arguments.termination_receipt.read_text())
+        except (AttributeError, OSError, ValueError) as error:
+            missing.append(f"cannot read termination receipt: {error}")
+    result = evaluate(*contents, arguments.qemu_status, require_iommu=arguments.require_iommu,
+                      strict=arguments.strict, termination_mode=arguments.termination_mode,
+                      termination_receipt=receipt)
     if missing:
         result = GateResult(
             1 if result.status == 1 else 2,

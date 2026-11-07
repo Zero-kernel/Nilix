@@ -8,6 +8,10 @@ mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
 failed=0
 guest_retries="${CI_GUEST_RETRIES:-1}"
+case "$group" in
+    extended|extended-*) export QEMU_GATE_MODE="${QEMU_GATE_MODE:-window}" ;;
+    *) export QEMU_GATE_MODE="${QEMU_GATE_MODE:-completion}" ;;
+esac
 finish() {
     local status=$?
     trap - EXIT
@@ -21,6 +25,10 @@ finish() {
 trap finish EXIT
 if [[ ! "$guest_retries" =~ ^(0|1)$ ]]; then
     echo "CI_GUEST_RETRIES must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$QEMU_GATE_MODE" != completion && "$QEMU_GATE_MODE" != window ]]; then
+    echo "QEMU_GATE_MODE must be completion or window" >&2
     exit 2
 fi
 

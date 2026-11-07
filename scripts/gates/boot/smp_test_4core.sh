@@ -11,6 +11,8 @@ set -u
 
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
 QEMU=qemu-system-x86_64
+# shellcheck source=scripts/ci/qemu_run.sh
+source "$ROOT/scripts/ci/qemu_run.sh"
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 # RF180-52 FIX: match the two-core gate's bounded R180 boot window while
@@ -65,10 +67,10 @@ ordered_completion_seen() {
 }
 cleanup() {
     if [ "$keep_logs" = 1 ]; then
-        echo "SMP-4CORE-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status"
+        echo "SMP-4CORE-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status termination=$ser.run.json qemu_status=$ser.qemu.status"
     else
         rm -rf -- "$ser.inputs"
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status"
     fi
 }
 trap cleanup EXIT
@@ -83,22 +85,21 @@ echo "Configuration: 4 CPUs, 512MB RAM"
 echo "Timeout: ${TO}s"
 echo ""
 
-# RF180-57 FIX: GNU timeout owns, terminates, and reaps QEMU synchronously.
-# Waiting for the full bounded window preserves late-fault coverage without
-# duplicating a numeric-PID process supervisor in this test harness.
+# One shared supervisor owns completion-mode QEMU and retains its exit receipt.
+# QEMU_GATE_MODE=window preserves the full GNU-timeout stability contract.
 python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser.inputs" \
     --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
 "$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
 
-LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
-    bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+run_gate_qemu "$TO" "runtime" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     -smp 4 \
     -m 512M -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
-    -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+    -d int,cpu_reset -D "$intlog"
 qemu_status=$?
+printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 timeout_events=$(grep -acF 'timeout: sending signal TERM to command' "$timeoutlog" 2>/dev/null)
 timeout_events=${timeout_events:-0}
 kill_events=$(grep -acF 'timeout: sending signal KILL to command' "$timeoutlog" 2>/dev/null)
@@ -111,7 +112,7 @@ if ordered_completion_seen; then
     reached=1
 fi
 unexpected_exit=0
-if [ "$qemu_status" -ne 124 ] || [ "$timeout_events" -ne 1 ] || [ "$kill_events" -ne 0 ]; then
+if ! verify_gate_termination; then
     unexpected_exit=1
 fi
 
@@ -158,7 +159,7 @@ echo "Parsed: online_cpus=${online_cpus} deferred_summary=${ready_summary}/1 pid
 echo ""
 
 python3 "$ROOT/scripts/ci/gate_log.py" --serial "$ser" --intlog "$intlog" \
-    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --json-output "$ser.counts.json"
+    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json"
 rc=$?
 python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || rc=1
 if [ "$nx" -gt 0 ]; then
@@ -178,7 +179,7 @@ if [ "$fatal_exceptions" -gt 0 ]; then
     rc=1
 fi
 if [ "$unexpected_exit" -ne 0 ]; then
-    echo "FAIL: QEMU timeout contract failed (status=${qemu_status}, TERM=${timeout_events}/1, KILL=${kill_events}/0)"
+    echo "FAIL: QEMU termination contract failed (status=${qemu_status}, TERM=${timeout_events}/1, KILL=${kill_events}/0)"
     echo "--- timeout stderr ---"
     tail -20 "$timeoutlog" 2>/dev/null | sed 's/^/    /'
     echo "--- QEMU stderr ---"

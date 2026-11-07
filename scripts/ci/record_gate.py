@@ -49,7 +49,7 @@ def main():
     try:
         identity = source_identity(root, args.input_manifest, args.revision)
         identity["profile_environment"] = {key: value for key, value in environment.items()
-                                           if key.startswith(("ZERO_OS_", "CI_GUEST_", "KERNEL_TEST_", "SMP_", "IOMMU_Q35_", "BOOT_CHECK_", "MUSL_CHECK_"))}
+                                           if key.startswith(("ZERO_OS_", "CI_GUEST_", "KERNEL_TEST_", "SMP_", "IOMMU_Q35_", "BOOT_CHECK_", "MUSL_CHECK_", "QEMU_GATE_"))}
         binaries = tuple(f"{esp}/{name}" for esp in (
             "esp", "kernel-target/musl/esp", "kernel-target/mitigation/esp", "esp-kcov", "esp-syz", "esp-stress")
             for name in ("kernel.elf", "EFI/BOOT/BOOTX64.EFI"))
@@ -75,7 +75,8 @@ def main():
                "name": args.name or args.artifacts.name,
                "scope": "command process; nested make recipe outcomes are in retained gate sidecars/logs",
                "classification": ("incomplete-evidence" if error else "command-complete" if status == 0 else "command-nonzero"),
-               "error": error, "elapsed_seconds": time.monotonic() - started}
+               "error": error, "elapsed_seconds": time.monotonic() - started,
+               "configured_qemu_gate_mode": environment.get("QEMU_GATE_MODE")}
     qualified_accepted = (status == 3 and not error and args.allow_qualified
                           and environment.get("ZERO_OS_STRICT_TESTS") != "1")
     summary["allow_qualified"] = args.allow_qualified

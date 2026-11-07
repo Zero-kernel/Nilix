@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: ${{ matrix.lane.timeout }}
     env:
       CI_STRESS_SECONDS: '900'
+      # Retain post-completion stability coverage alongside finite PR checks.
+      QEMU_GATE_MODE: window
     strategy:
       fail-fast: false
       matrix:

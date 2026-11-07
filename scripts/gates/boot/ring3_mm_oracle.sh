@@ -37,7 +37,7 @@ trap 'rm -f -- "$BOOT_LOG"' EXIT
 # The boot gate's own status is NOT this gate's verdict: it will report failure
 # solely because of those `[PF ENTRY]` lines. Everything mechanical is
 # still reused, and its summary is printed for the record.
-KERNEL_TEST_KEEP_LOGS=1 bash "$ROOT/scripts/gates/boot/kernel_test.sh" "$ESP" > "$BOOT_LOG" 2>&1
+KERNEL_TEST_COMPLETION_PROFILE=ring3 KERNEL_TEST_KEEP_LOGS=1 bash "$ROOT/scripts/gates/boot/kernel_test.sh" "$ESP" > "$BOOT_LOG" 2>&1
 boot_status=$?
 grep -E 'GATE-LOG|KERNEL-TEST' "$BOOT_LOG" | sed 's/^/  boot-harness: /'
 
@@ -52,6 +52,17 @@ report_fail() {
     echo "RING3-MM FAIL: $1"
     fail=1
 }
+
+# The generic boot verdict includes deliberate fixture faults, but its process
+# termination proof is mandatory for this independent oracle as well.
+# shellcheck source=scripts/ci/qemu_run.sh
+source "$ROOT/scripts/ci/qemu_run.sh"
+ser="$serial"
+timeoutlog="$(sed -n 's/.* timeoutlog=\([^ ]*\).*/\1/p' "$BOOT_LOG" | tail -1)"
+qemu_status="$(cat "$ser.qemu.status" 2>/dev/null || echo 125)"
+if ! verify_gate_termination; then
+    report_fail "missing or invalid QEMU termination evidence"
+fi
 
 # 1. No terminal fault outcome anywhere in the serial.
 if grep -Eq "$FATAL" "$serial"; then

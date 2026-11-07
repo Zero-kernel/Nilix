@@ -185,7 +185,7 @@ class ShellTests(unittest.TestCase):
         self.work = Path(self.directory.name)
         for name in ("scripts", "esp", "bin", "tmp"):
             (self.work / name).mkdir()
-        for relative in (Path("ci/gate_log.py"), Path("ci/gate_inputs.py")):
+        for relative in (Path("ci/gate_log.py"), Path("ci/gate_inputs.py"), Path("ci/qemu_run.py"), Path("ci/qemu_run.sh")):
             destination = self.work / "scripts" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / "scripts" / relative, destination)
@@ -249,6 +249,7 @@ exit 0
         self, name: str, serial: str = CLEAN, *, qemu_status: int = 124,
         interrupts: str = "", timeout_stderr: str = TERM, iommu: bool = True,
         second_serial: str | None = None,
+        termination_mode: str = "window", fake_mode: str = "normal",
     ) -> subprocess.CompletedProcess:
         if name == "iommu_q35_check.sh" and iommu:
             serial = IOMMU + serial
@@ -272,6 +273,9 @@ exit 0
             "GATE_TIMEOUT_LOG": self.shell_path(self.work / "fixture.timeout"),
             "GATE_ARGUMENTS": self.shell_path(self.work / "qemu.arguments"),
             "GATE_STATUS": str(qemu_status),
+            "QEMU_GATE_MODE": termination_mode,
+            "FAKE_MODE": fake_mode,
+            "FAKE_SERIAL": self.shell_path(self.work / "fixture.serial"),
             "OVMF_PATH": self.shell_path(self.work / "firmware.fd"),
             "TMPDIR": self.shell_path(self.work / "tmp"),
             "IOMMU_Q35_LOG_DIR": self.shell_path(self.work / "retained logs"),
@@ -279,6 +283,10 @@ exit 0
             "SMP_4CORE_TEST_TIMEOUT": "1", "EXTENDED_SMP_TIMEOUT": "1", "IOMMU_Q35_TIMEOUT": "1",
             "BOOT_CHECK_KEEP_LOGS": "0", "SMP_TEST_KEEP_LOGS": "0", "SMP_4CORE_TEST_KEEP_LOGS": "0",
         })
+        if termination_mode == "completion":
+            for key in ("BOOT_CHECK_TIMEOUT", "KERNEL_TEST_TIMEOUT", "SMP_TEST_TIMEOUT",
+                        "SMP_4CORE_TEST_TIMEOUT", "EXTENDED_SMP_TIMEOUT", "IOMMU_Q35_TIMEOUT"):
+                environment[key] = "15"
         if second_serial is not None:
             (self.work / "second.serial").write_text(second_serial, encoding="utf-8", newline="\n")
             environment["GATE_SERIAL_16"] = self.shell_path(self.work / "second.serial")
@@ -306,6 +314,21 @@ exit 0
         for name in self.scripts:
             with self.subTest(script=name):
                 self.assert_gate(self.run_gate(name, CLEAN + "KERNEL PANIC\n"), 1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux QMP completion caller")
+    def test_completion_callers_collect_and_keep_their_final_oracles(self):
+        from scripts.tests.qemu_run_test import FAKE_QEMU
+        fake = FAKE_QEMU.replace(
+            'from pathlib import Path\n',
+            'from pathlib import Path\nif "--version" in sys.argv:\n    print("fixture QEMU version")\n    raise SystemExit(0)\n',
+        )
+        self.write_tool("qemu-system-x86_64", "#!/usr/bin/env python3\n" + fake)
+        for name in ("boot_check.sh", "kernel_test.sh", "smp_test_4core.sh", "iommu_q35_check.sh"):
+            with self.subTest(script=name):
+                self.assert_gate(self.run_gate(name, termination_mode="completion"), 0)
+                self.assert_gate(self.run_gate(name, QUALIFIED, termination_mode="completion"), 3)
+        self.assert_gate(self.run_gate("boot_check.sh", termination_mode="completion", fake_mode="quit-fault"), 1)
+        self.assert_gate(self.run_gate("boot_check.sh", termination_mode="completion", fake_mode="quit-interrupt-fault"), 1)
 
     def test_process_status_and_kill_escalation_reach_callers(self):
         for name in self.scripts:

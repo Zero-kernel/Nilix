@@ -44,14 +44,16 @@ set -u
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
 
 QEMU=qemu-system-x86_64
+# shellcheck source=scripts/ci/qemu_run.sh
+source "$ROOT/scripts/ci/qemu_run.sh"
 # ESP defaults to <repo>/esp; a relative override is resolved against the repo root
 # (so `bash scripts/gates/boot/musl_check.sh esp` works the same from anywhere), absolute kept.
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 # Default 900s: the boot self-test suite + the Ring-3 poll/select smoke (M0-6) push
-# the clean-exit marker past the old 25s window on a loaded remote. The gate still
-# observes to completion and re-greps the full log, so a wider window never weakens
-# it (it only fails-fast earlier on KERNEL PANIC).
+# the clean-exit marker past the old 25s limit on a loaded remote. Completion
+# mode retains this deadline but exits after cleanup and the diagnostic tail;
+# window mode keeps the full duration. Both recheck complete final logs.
 TO="${MUSL_CHECK_TIMEOUT:-900}"
 CPUS="${MUSL_CHECK_CPUS:-1}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ || ! "$CPUS" =~ ^(1|2|4|8|16)$ ]]; then
@@ -133,7 +135,7 @@ timeoutlog="$ser.timeout.stderr"
 cleanup() {
     if [ -z "${MUSL_CHECK_LOG_DIR:-}" ]; then
         rm -rf -- "$ser.inputs"
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.qemu.status" "$ser.gate.status"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.qemu.status" "$ser.gate.status" "$ser.run.json"
     fi
 }
 trap cleanup EXIT
@@ -141,20 +143,19 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Observe the full window, retaining process status and both diagnostic streams.
+# Observe exit cleanup plus the tail, or the full explicit stability window.
 python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser.inputs" \
     --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
 "$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
 
-LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
-    bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+run_gate_qemu "$TO" "musl" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     -netdev user,id=net0,restrict=on,ipv6=off \
     -device virtio-net-pci,netdev=net0,romfile= \
     -m 256M -smp "$CPUS" -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
-    -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+    -d int,cpu_reset -D "$intlog"
 qemu_status=$?
 printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 
@@ -177,8 +178,8 @@ rc=0
 python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || rc=1
 term_events=$(grep -cF 'timeout: sending signal TERM to command' "$timeoutlog" || true)
 kill_events=$(grep -cF 'timeout: sending signal KILL to command' "$timeoutlog" || true)
-if [ "$qemu_status" -ne 124 ] || [ "$term_events" -ne 1 ] || [ "$kill_events" -ne 0 ]; then
-    echo "MUSL-CHECK FAIL: QEMU timeout contract status=$qemu_status TERM=$term_events KILL=$kill_events"
+if ! verify_gate_termination; then
+    echo "MUSL-CHECK FAIL: QEMU termination contract status=$qemu_status TERM=$term_events KILL=$kill_events"
     rc=1
 fi
 for marker in MUSL-STANDARD-FD-OK MUSL-OPEN-TRUNC-OK MUSL-ROBUST-USERCOPY-OK MUSL-WAIT-NAMESPACE-OK MUSL-BLOCKED-SIGNAL-OK MUSL-FCNTL-LIMIT-OK MUSL-PTHREAD-SIGNAL-OK; do
