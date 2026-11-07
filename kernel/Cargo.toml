@@ -41,6 +41,8 @@ iommu_init_probe = ["iommu/init_probe", "mm/mmio_probe"]
 block_probe = ["block/probe"]
 namespace_probe = ["arch/namespace_probe", "kernel_core/namespace_probe", "vfs/namespace_probe"]
 open_fault_probe = ["musl_test", "vfs/open_fault_probe", "kernel_core/open_fault_probe"]
+# ST-K2-P2(a): dedicated same-CPU shared-fault reentry probe image.
+shared_fault_reentry_probe = ["musl_test", "kernel_core/shared_fault_reentry_probe"]
 iommu_device_probe = ["iommu/device_probe", "arch/iommu_device_probe"]
 
 [dependencies]

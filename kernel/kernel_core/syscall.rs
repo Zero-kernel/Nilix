@@ -19389,6 +19389,11 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
                 .map(|value| value as usize)
                 .map_err(|()| SyscallError::EINVAL)
         }
+        // ST-K2-P2(a): the dedicated reentry probe image only.
+        #[cfg(feature = "shared_fault_reentry_probe")]
+        crate::shared_fault_reentry_probe::PR_SHARED_FAULT_REENTRY_PROBE => {
+            crate::shared_fault_reentry_probe::run(arg2, arg3)
+        }
         // TD-LSM-1: the guest oracle marks its own pid for one LSM arm.
         #[cfg(feature = "syscall_test")]
         lsm::syscall_test::PR_SYSCALL_TEST_LSM_MARK => {

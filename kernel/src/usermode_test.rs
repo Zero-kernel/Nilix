@@ -197,10 +197,26 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("syscall_test.elf").len
 /// - syscalls (write, getpid, exit)
 #[cfg(all(
     feature = "musl_test",
-    not(any(feature = "open_fault_probe", feature = "mitigation_probe"))
+    not(any(
+        feature = "open_fault_probe",
+        feature = "mitigation_probe",
+        feature = "shared_fault_reentry_probe"
+    ))
 ))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("musl_test.elf").len() }> =
     AlignedElfData(*include_bytes!("musl_test.elf"));
+
+/// ST-K2-P2(a): the dedicated same-CPU reentry probe guest.
+#[cfg(feature = "shared_fault_reentry_probe")]
+static USER_ELF_ALIGNED: AlignedElfData<
+    { include_bytes!(env!("ZERO_OS_SHARED_REENTRY_PROBE_ELF")).len() },
+> = AlignedElfData(*include_bytes!(env!("ZERO_OS_SHARED_REENTRY_PROBE_ELF")));
+
+#[cfg(all(
+    feature = "shared_fault_reentry_probe",
+    any(feature = "open_fault_probe", feature = "mitigation_probe")
+))]
+compile_error!("shared_fault_reentry_probe selects its own guest workload");
 
 #[cfg(all(feature = "open_fault_probe", not(feature = "mitigation_probe")))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!(env!("ZERO_OS_OPEN_PROBE_ELF")).len() }> =
