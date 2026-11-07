@@ -1,0 +1,1 @@
+env KERNEL_TEST_CPUS=8 NILIX_ST_K2_REMOTE_REPS=300 make test-ring3-mm

@@ -1,0 +1,25 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "Extended SMP suite (8 and 16 CPUs)",
+  "gates": [
+    {
+      "command": "make build",
+      "status": 0,
+      "seconds": 199,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/sx/build.log",
+      "log_sha256": "4d8dd6d77f301c1272ff5d32e3b20eac2fa8ef28246f58d3991d237a53cce42a"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

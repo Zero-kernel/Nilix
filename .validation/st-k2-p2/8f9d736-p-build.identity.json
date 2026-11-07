@@ -1,0 +1,25 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "ST-K2-P2(a) same-CPU reentry probe image, one fresh guest per lock",
+  "gates": [
+    {
+      "command": "make build",
+      "status": 0,
+      "seconds": 208,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/p/build.log",
+      "log_sha256": "0093f40a6b7eff5139a3674f626c06de0a76a8de0c2c9c11183c64ffe9cb5313"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

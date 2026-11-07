@@ -1,0 +1,34 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "Diagnostic, not a gate verdict: ring3-mm at 16 vCPUs with only the known-hanging test_selective_wait_nested_zombie call removed (RING3-16-HANG)",
+  "gates": [
+    {
+      "command": "env KERNEL_TEST_CPUS=16 make test-ring3-mm",
+      "status": 2,
+      "seconds": 1152,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/d16a/ring3-16-diag.log",
+      "log_sha256": "2e27fa5a4000267ab3ebe14a047888bae2b45eb7a61b055e5b0f8b82472baa9e"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/st-k2-p2/8f9d736/d16a/ring3-16-diag.tmp.2aDla0vMAB.serial",
+      "serial_sha256": "13ab17934dad4b35cd78ccf0bddb1f8eace0caba17b89e751e9d64814ca2a2c6"
+    },
+    {
+      "patch": "/tmp/nilix-evidence/st-k2-p2/8f9d736/d16a/diagnostic.patch",
+      "sha256": "02b8d6c211e156617e18ccda4cf28b1b47611d24e8fe778d568b803d4a392ef6"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ],
+  "notes": "Diagnostic: (b), (c) and (d) passed at 16 vCPUs; the guest then hung in the R192 bounded-population leg."
+}

@@ -1,0 +1,40 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "ST-K2-P2(a) same-CPU reentry probe image, one fresh guest per lock",
+  "gates": [
+    {
+      "command": "python3 scripts/gates/qemu/shared_fault_reentry_probe.py --input-manifest /tmp/nilix-evidence/st-k2-p2/8f9d736/p/inputs.sha256 --revision 8f9d736 --artifacts /tmp/nilix-evidence/st-k2-p2/8f9d736/p/reentry",
+      "status": 0,
+      "seconds": 398,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/p/reentry.log",
+      "log_sha256": "1d02c4f4734f78df67c3b7c6955d9f61cea506c4c8fbaf682f924dea761207c2"
+    },
+    {
+      "case_result": "/tmp/nilix-evidence/st-k2-p2/8f9d736/p/reentry/shared-reentry-fh83nmsu/mm/result.json",
+      "sha256": "41b8fade524d3f7904a0915cf81aa99157d53c0b1cdce1016e1755353f565f5f",
+      "pass": true
+    },
+    {
+      "case_result": "/tmp/nilix-evidence/st-k2-p2/8f9d736/p/reentry/shared-reentry-fh83nmsu/pcb/result.json",
+      "sha256": "074cc269d95e00bfa8237476efc69759fb954bcb3cdba467bd8953da60394558",
+      "pass": true
+    },
+    {
+      "case_result": "/tmp/nilix-evidence/st-k2-p2/8f9d736/p/reentry/shared-reentry-fh83nmsu/table/result.json",
+      "sha256": "175c44847c639ff27347997209a07e83ac32a09a15a0af3e320bc35c8975f953",
+      "pass": true
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

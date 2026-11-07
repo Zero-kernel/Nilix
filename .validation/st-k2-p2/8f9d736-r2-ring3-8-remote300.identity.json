@@ -1,0 +1,30 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 8,
+    "mem": "256M"
+  },
+  "scope": "Ring-3 MM oracle at 8 and 16 vCPUs, and the remote-holder leg repeated 300 times at 8 vCPUs",
+  "gates": [
+    {
+      "command": "env KERNEL_TEST_CPUS=8 NILIX_ST_K2_REMOTE_REPS=300 make test-ring3-mm",
+      "status": 2,
+      "seconds": 1039,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/r2/ring3-8-remote300.log",
+      "log_sha256": "1f2948bf3fef07ba1dc8c6d18221fa25bdedfcfba80e62d39a72f8f3136b961e"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/st-k2-p2/8f9d736/r2/ring3-8-remote300.tmp.0QNcNKjNUk.serial",
+      "serial_sha256": "7a15fca87eceb777ff0b2a2bdaaf7eb86a242e4abdd9e15f64f5b6906a12399d"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ],
+  "notes": "All 300 remote-holder rounds passed (ST-K2-REMOTE-HOLDER-ACK PASS reps=300); the guest then hung inside the final-owner leg. Symbolized hot PCs: Scheduler::lock_ready_queue_or_defer, Scheduler::reschedule_now, arch::smp::ap_idle_loop, SocketTable::drain_deferred_port_uncharges, the same signature as the 16-vCPU hang on main. The rerun 8f9d736-r300b passed completely."
+}

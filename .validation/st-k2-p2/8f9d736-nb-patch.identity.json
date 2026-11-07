@@ -1,0 +1,29 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "Negative control for (b): the shared Busy arm without its mailbox drain",
+  "gates": [
+    {
+      "command": "git diff > /tmp/nilix-evidence/st-k2-p2/8f9d736/nb/negative-control.patch",
+      "status": 0,
+      "seconds": 0,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/nb/patch.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "patch": "/tmp/nilix-evidence/st-k2-p2/8f9d736/nb/negative-control.patch",
+      "sha256": "07b0cfef665daca0b9e7c1ac10aa7a79b2d784ee7b2f36cff55b1a7b0cbfc82c"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

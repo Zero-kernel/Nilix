@@ -1,0 +1,6 @@
+# Bare-metal kernel SHA-256, built locally with rustc 1.94.0-nightly (2025-12-07, pinned nightly-2025-12-08).
+# 8f9d736 and 99267d9 differ only in owner_lock.rs cfg attributes that select the hosted fallback.
+759d0e0994e6bde6206cbdf89475b2feb8abeca91ec04939c4180fb0ae275177  99267d9 default
+242744928140ba9eccd68bf402896802ef83864da2500f02994ce8815a8baa9a  99267d9 syscall_test
+759d0e0994e6bde6206cbdf89475b2feb8abeca91ec04939c4180fb0ae275177  8f9d736 default
+242744928140ba9eccd68bf402896802ef83864da2500f02994ce8815a8baa9a  8f9d736 syscall_test

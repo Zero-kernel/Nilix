@@ -1,0 +1,26 @@
+{
+  "revision": "99267d94b6ed",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "L0/L1: formatting, clippy, lint, build, usercopy table, hosted debug/release, quality and license groups",
+  "gates": [
+    {
+      "command": "bash scripts/ci/entrypoint.sh quality",
+      "status": 1,
+      "seconds": 414,
+      "log": "/tmp/nilix-evidence/st-k2-p2/99267d9/l1/quality.log",
+      "log_sha256": "2d922fabc81e59142279f1ab2033570d7ac3e7ae163357f19ee278bfb528b3ec"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/99267d9; only their SHA-256 is recorded here"
+  ],
+  "notes": "Exit 1 only because pytest reports 9 errors, all in private_fuzz_evidence_test (the 'age' tool is not installed on the host), as in the P0 baseline; 243 passed, 0 failed. lint, shell-syntax and ext3-fixture passed."
+}

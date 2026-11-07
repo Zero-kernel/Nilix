@@ -1,0 +1,34 @@
+{
+  "revision": "fa4b588c89f5",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "Diagnostic, not a gate verdict: r16 with the owner store kept but no LAPIC MMIO read",
+  "gates": [
+    {
+      "command": "env KERNEL_TEST_CPUS=16 make test-ring3-mm",
+      "status": 2,
+      "seconds": 1204,
+      "log": "/tmp/nilix-evidence/st-k2-p2/fa4b588/x16a/ring3-16-nommio.log",
+      "log_sha256": "3bd6a31806e0327875333d8b531e27a918c0d2a0da190b8efb1ec0f7bf5b2e83"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/st-k2-p2/fa4b588/x16a/ring3-16-nommio.tmp.54g7uxoHC0.serial",
+      "serial_sha256": "7f9007c18965951ac1fe79be562ab5df84d976fc6261f6d7bec7f7bf944da16b"
+    },
+    {
+      "patch": "/tmp/nilix-evidence/st-k2-p2/fa4b588/x16a/experiment.patch",
+      "sha256": "b1fe432934ac64c65a9750d0731bf3d037669c26e4e626a795c1251c07e2befc"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/fa4b588; only their SHA-256 is recorded here"
+  ],
+  "notes": "Owner store kept without the MMIO read: (b), (c) and (d) passed; then hung in a futex PI leg."
+}
