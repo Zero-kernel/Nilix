@@ -48,7 +48,7 @@ already run.
   QEMU.
 - **Storage and networking**: a VFS with ramfs/ext2/JBD2 subsets and procfs/devfs/cgroupfs,
   virtio-blk, and virtio-net with IPv4/TCP/UDP and a default-DROP firewall.
-- **Evidence over claims**: 632 hosted unit tests per profile, QEMU boot/SMP/musl/Ring-3
+- **Evidence over claims**: 638 hosted unit tests per profile, QEMU boot/SMP/musl/Ring-3
   gates, KCOV fuzzing, 900-second stress soaks and independent security audits.
   A *qualified* result is never reported as a pass.
 
@@ -186,7 +186,7 @@ bash scripts/ci/entrypoint.sh musl      # musl guest on 1 and 4 CPUs
 
 | Measure | Count |
 | --- | --- |
-| Hosted unit tests | **632** per debug/release profile, plus CpuLocal doctests and 3 test-code compile checks |
+| Hosted unit tests | **638** per debug/release profile, plus CpuLocal doctests and 3 test-code compile checks |
 | Runtime tests discovered | **74** `RuntimeTest` implementations (a source count, not 74 guest passes) |
 | Stress-v2 profiles | **7**, 900 seconds each |
 | Fuzz campaigns | **11** scheduled campaigns, plus deterministic KCOV smoke |
