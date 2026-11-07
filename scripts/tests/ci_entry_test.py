@@ -99,6 +99,17 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
         self.assertEqual(status, 1)
         self.assertEqual(events, ['stress-build', 'stress-thread', 'report'])
 
+    def test_extended_smp_failure_is_reported_without_retry(self):
+        for group, following in (('extended-smp', []), ('extended', ['ext3', 'stress-build', 'stress'])):
+            for failure in ('1', '2'):
+                with self.subTest(group=group, failure=failure):
+                    (self.root / 'events.jsonl').unlink(missing_ok=True)
+                    status, events = self.run_group(group, CI_GUEST_RETRIES='1',
+                                                    FAIL_GATE='smp-8-16', FAIL_ATTEMPTS='1',
+                                                    FAIL_STATUS=failure)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(events, ['build', 'smp-8-16', *following, 'report'])
+
     def test_32_vcpu_failure_is_reported_without_retry(self):
         for group, prefix in (('smp-32', []), ('extended-smp-32', ['build'])):
             with self.subTest(group=group):

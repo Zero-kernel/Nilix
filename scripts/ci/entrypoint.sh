@@ -83,7 +83,9 @@ check_guest() {
 }
 
 extended_smp() {
-    check_guest smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
+    # Two full 900-second windows already use half the 60-minute job budget.
+    # Keep the first result and leave time for build, log analysis and upload.
+    check smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
 }
 smp_32() {
     # Preserve the first 32-vCPU result; a stalled probe must not repeat a
