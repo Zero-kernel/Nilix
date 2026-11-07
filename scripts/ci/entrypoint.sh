@@ -89,7 +89,7 @@ extended_smp() {
 }
 smp_32() {
     # Preserve the first 32-vCPU result; a stalled probe must not repeat a
-    # second 900-second run automatically.
+    # second 3600-second run automatically.
     check smp-32 --allow-qualified -- env EXTENDED_SMP_CPUS=32 bash scripts/gates/boot/extended_smp_test.sh esp
 }
 extended_ext3() {

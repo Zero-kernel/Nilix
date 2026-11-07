@@ -38,7 +38,10 @@ class ExtendedLaneTests(unittest.TestCase):
         self.assertEqual(lanes[0]['group'], 'extended-smp-32')
         regular = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf8')
         runtime = re.search(r'^  runtime:\n(.*?)^  qemu:', regular, re.M | re.S)[1]
-        self.assertIn('{name: SMP 32-vCPU, group: smp-32, timeout: 40}', runtime)
+        regular_lane = re.search(r'\{name: SMP 32-vCPU, group: smp-32, timeout: (\d+)\}', runtime)
+        self.assertIsNotNone(regular_lane)
+        self.assertGreaterEqual(int(regular_lane[1]) * 60 - 3600, 30 * 60)
+        self.assertGreaterEqual(int(lanes[0]['timeout']) * 60 - 3600, 60 * 60)
         self.assertIn('name: normal-boot-image', runtime)
         self.assertIn('name: ci-${{ matrix.gate.group }}', runtime)
 

@@ -152,18 +152,20 @@ class SupervisorTests(unittest.TestCase):
                                  "", self.stderr.read_text(), "", status,
                                  termination_mode="completion", termination_receipt=receipt)
 
-    def test_collects_without_waiting_for_900_seconds_and_retains_tail(self):
-        process = self.start()
+    def test_collects_without_waiting_for_3600_seconds_and_retains_tail(self):
+        process = self.start(timeout=3600)
         receipt = self.finish(process)
         self.assertEqual(process.returncode, 0)
         self.assertEqual(receipt['reason'], 'completed')
+        self.assertEqual(receipt['deadline_seconds'], 3600)
         self.assertGreaterEqual(receipt['completion_seconds'], 0.20)
         self.assertGreaterEqual(receipt['stop_requested_seconds'] - receipt['completion_seconds'], 2)
         self.assertLess(receipt['elapsed_seconds'], 10)
         self.assertEqual(self.verdict(receipt).status, 0)
         for field, value in (('reason', 'deadline'), ('qemu_returncode', -15),
                              ('forced_kill', True), ('signal', 15), ('mode', 'window'),
-                             ('stop_requested_seconds', 0), ('settle_seconds', 0)):
+                             ('stop_requested_seconds', 0), ('settle_seconds', 0),
+                             ('deadline_seconds', 3601)):
             changed = copy.deepcopy(receipt)
             changed[field] = value
             self.assertEqual(self.verdict(changed).status, 1, field)

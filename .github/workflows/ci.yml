@@ -183,7 +183,7 @@ jobs:
     if: contains(fromJSON(needs.changes.outputs.jobs), 'runtime')
     runs-on: ubuntu-24.04
     # Functional gates finish after exit cleanup plus the diagnostic tail.
-    # Each retains a 900-second deadline; Extended keeps full-window coverage.
+    # The 32-vCPU deadline is 3600 seconds; other gates retain 900 seconds.
     timeout-minutes: ${{ matrix.gate.timeout }}
     strategy:
       fail-fast: false
@@ -192,7 +192,8 @@ jobs:
           - {name: boot and SMP, group: runtime, timeout: 90}
           # Guest vCPUs share the runner's host CPUs; this is a correctness
           # check, not a physical 32-core throughput benchmark.
-          - {name: SMP 32-vCPU, group: smp-32, timeout: 40}
+          # Leave 30 minutes beyond the guest deadline for setup and evidence.
+          - {name: SMP 32-vCPU, group: smp-32, timeout: 90}
     env:
       QEMU_GATE_MODE: ${{ inputs.qemu_gate_mode || 'completion' }}
     steps:

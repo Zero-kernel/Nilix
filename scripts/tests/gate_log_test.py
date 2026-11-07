@@ -200,6 +200,7 @@ class ShellTests(unittest.TestCase):
         (self.work / "firmware.fd").write_bytes(b"synthetic firmware placeholder")
         self.write_tool("python3", '#!/bin/bash\nexec "$GATE_PYTHON" "$@"\n')
         self.write_tool("timeout", """#!/bin/bash
+printf '%s\\n' "$@" >"$GATE_ARGUMENTS.timeout"
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 if [ "$#" -lt 3 ]; then exit 125; fi
 shift 2
@@ -251,6 +252,7 @@ exit 0
         second_serial: str | None = None,
         termination_mode: str = "window", fake_mode: str = "normal",
         extended_cpus: str = "8 16",
+        extended_timeout: str | None = "1",
     ) -> subprocess.CompletedProcess:
         if name == "iommu_q35_check.sh" and iommu:
             serial = IOMMU + serial
@@ -289,6 +291,10 @@ exit 0
             for key in ("BOOT_CHECK_TIMEOUT", "KERNEL_TEST_TIMEOUT", "SMP_TEST_TIMEOUT",
                         "SMP_4CORE_TEST_TIMEOUT", "EXTENDED_SMP_TIMEOUT", "IOMMU_Q35_TIMEOUT"):
                 environment[key] = "15"
+        elif extended_timeout is None:
+            environment.pop("EXTENDED_SMP_TIMEOUT", None)
+        else:
+            environment["EXTENDED_SMP_TIMEOUT"] = extended_timeout
         if second_serial is not None:
             (self.work / "second.serial").write_text(second_serial, encoding="utf-8", newline="\n")
             environment["GATE_SERIAL_16"] = self.shell_path(self.work / "second.serial")
@@ -381,6 +387,21 @@ exit 0
         self.assertNotIn('Testing 16-Core', result.stdout)
         self.assertIn('-smp\n32\n', (self.work / 'qemu.arguments').read_text())
         self.assert_gate(self.run_gate("extended_smp_test.sh", QUALIFIED, extended_cpus="32"), 3)
+
+    def test_extended_timeout_defaults_and_limits_follow_topology(self):
+        for cpus, seconds in (("8", "900"), ("16", "900"), ("8 16", "900"), ("32", "3600")):
+            with self.subTest(cpus=cpus):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", extended_cpus=cpus,
+                                               extended_timeout=None), 0)
+                self.assertIn(f"\n--\n{seconds}\n", (self.work / "qemu.arguments.timeout").read_text())
+        arguments = self.work / "qemu.arguments"
+        arguments.unlink()
+        for cpus, seconds in (("8", "901"), ("16", "3600"), ("8 16", "3600"),
+                              ("32", "3601"), ("32", "0"), ("32", "0900"), ("32", "1e3")):
+            with self.subTest(cpus=cpus, timeout=seconds):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", extended_cpus=cpus,
+                                               extended_timeout=seconds), 2)
+                self.assertFalse(arguments.exists())
 
     def test_32_vcpu_partial_topology_or_ap_acknowledgement_is_failure(self):
         acknowledgement = '[SMP] process-deferred gate complete: 3/3 APs acknowledged'

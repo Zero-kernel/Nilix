@@ -40,10 +40,14 @@ case "${EXTENDED_SMP_CPUS:-8 16}" in
     *) echo 'EXTENDED-SMP-TEST BLOCKED: EXTENDED_SMP_CPUS must be 8, 16, 32 or "8 16"'; exit 2 ;;
 esac
 
-# Test timeout (higher for more cores)
-EXTENDED_SMP_TIMEOUT="${EXTENDED_SMP_TIMEOUT:-900}"
-if [[ ! "$EXTENDED_SMP_TIMEOUT" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
-    echo "EXTENDED-SMP-TEST BLOCKED: EXTENDED_SMP_TIMEOUT must be an integer from 1 to 900"
+# Oversubscribed 32-vCPU guests need a longer deadline; retain 8/16 limits.
+timeout_limit=900
+if [[ "${cpu_counts[*]}" == 32 ]]; then
+    timeout_limit=3600
+fi
+EXTENDED_SMP_TIMEOUT="${EXTENDED_SMP_TIMEOUT:-$timeout_limit}"
+if [[ ! "$EXTENDED_SMP_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || (( EXTENDED_SMP_TIMEOUT > timeout_limit )); then
+    echo "EXTENDED-SMP-TEST BLOCKED: EXTENDED_SMP_TIMEOUT must be an integer from 1 to $timeout_limit"
     exit 2
 fi
 if ! command -v python3 >/dev/null 2>&1; then

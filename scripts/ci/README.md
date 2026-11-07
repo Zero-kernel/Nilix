@@ -7,14 +7,17 @@ sleep. The regular CI workflow selects this mode by default. Its manual dispatch
 input `qemu_gate_mode=window` runs the former full scope, including musl.
 
 Regular CI has an independent 32-vCPU SMP lane that reuses the normal build
-image. It requires all 32 CPUs online and exactly one 31/31 AP acknowledgement;
+image. Its default and maximum guest timeout is 3600 seconds; the 8/16-vCPU
+suite retains 900 seconds per topology. It requires all 32 CPUs online and exactly one 31/31 AP acknowledgement;
 a partial topology fails even when the general runtime result is QUALIFIED.
 Both the 8/16-vCPU suite and the 32-vCPU gate run once, without an automatic
 retry after a failure or stall. The 8/16-vCPU suite's two 900-second windows
 leave the rest of its 60-minute Extended job for build, analysis and upload;
 retrying both windows would consume that entire budget before this overhead.
 This single-attempt policy also applies in the combined local `extended` group.
-Extended has a separate 32-vCPU lane on each Ubuntu image with the full window.
+Extended has a separate 32-vCPU lane on each Ubuntu image with the full
+3600-second window. Regular and Extended 32-vCPU jobs allow 90 and 120 minutes,
+respectively, leaving time for setup/build, final log analysis and upload.
 These are QEMU guest vCPUs sharing the runner's host CPUs, so the results cover
 functional correctness, not physical 32-core throughput. The original 8/16-vCPU
 suite and its qualification rules are unchanged.

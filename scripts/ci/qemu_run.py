@@ -23,6 +23,7 @@ SUMMARY = re.compile(r"=== Test Summary: \d+ passed, \d+ deferred(?: \([^()\r\n]
 TERMINAL_FATAL = re.compile(r"\bKERNEL PANIC\b|\bpanicked at\b|\bPANIC:|\btriple fault\b", re.IGNORECASE)
 SETTLE_SECONDS = 2.0
 STOP_SECONDS = 10.0
+MAX_TIMEOUT_SECONDS = 3600
 
 
 def completion(serial: str, profile: str, *, final: bool = False) -> tuple[bool, str | None]:
@@ -87,7 +88,7 @@ def termination_errors(serial: str, mode: str, receipt: dict | None, status: int
         if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
                    for value in (started, stopped, deadline)):
             raise ValueError("non-numeric timing")
-        if not (0 <= started <= stopped <= deadline <= 900
+        if not (0 <= started <= stopped <= deadline <= MAX_TIMEOUT_SECONDS
                 and stopped - started >= SETTLE_SECONDS
                 and receipt.get("settle_seconds") == SETTLE_SECONDS):
             raise ValueError("invalid timing")
@@ -257,8 +258,8 @@ def main() -> int:
         for error in errors:
             print("QEMU-RUN FAIL: " + error)
         return int(bool(errors))
-    if not 1 <= args.timeout <= 900 or args.qemu_stderr is None:
-        parser.error("timeout must be 1..900 and --qemu-stderr is required")
+    if not 1 <= args.timeout <= MAX_TIMEOUT_SECONDS or args.qemu_stderr is None:
+        parser.error(f"timeout must be 1..{MAX_TIMEOUT_SECONDS} and --qemu-stderr is required")
     return run(args)
 
 
