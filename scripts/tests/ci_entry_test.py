@@ -44,8 +44,12 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
 
     def run_group(self, group, **environment):
         events = self.root / 'events.jsonl'
+        # The caller's own CI settings must not leak into the group under test:
+        # an exported CI_GUEST_RETRIES=0 would disable the retry these tests pin.
+        inherited = {key: value for key, value in os.environ.items()
+                     if key not in ('CI_GUEST_RETRIES', 'CI_STRESS_PROFILE')}
         result = subprocess.run(['bash', str(self.root / 'scripts/ci/entrypoint.sh'), group],
-                                cwd=self.root, env={**os.environ, 'EVENTS': str(events), **environment},
+                                cwd=self.root, env={**inherited, 'EVENTS': str(events), **environment},
                                 capture_output=True, text=True, timeout=15)
         observed = [json.loads(line) for line in events.read_text().splitlines()]
         return result.returncode, observed
