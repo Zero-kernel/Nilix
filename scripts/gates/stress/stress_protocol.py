@@ -1449,14 +1449,25 @@ def validate_diagnostics(
     serial = Path(serial_path).read_bytes().decode("utf-8", errors="replace")
     if "KERNEL PANIC" in serial:
         raise StressProtocolError("kernel panic detected")
-    diagnostics = ""
+    triple_fault = False
+    nx_violation = False
+    # Interrupt traces can exceed runner memory. Scan every file with bounded
+    # reads; keep enough decoded characters for either fixed-width signature
+    # to cross a chunk boundary, including Unicode IGNORECASE matches.
+    overlap = len("triple fault") - 1
     for path in (interrupt_path, qemu_stderr_path):
         if path:
-            diagnostics += Path(path).read_bytes().decode("utf-8", errors="replace")
-            diagnostics += "\n"
-    if re.search(r"triple fault", diagnostics, re.IGNORECASE):
+            tail = ""
+            with Path(path).open("r", encoding="utf-8", errors="replace", newline="") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    window = tail + chunk
+                    triple_fault |= bool(re.search(r"triple fault", window, re.IGNORECASE))
+                    nx_violation |= "v=0e e=0011" in window
+                    tail = window[-overlap:]
+    # Preserve error precedence across both files, as well as read failures.
+    if triple_fault:
         raise StressProtocolError("QEMU reported a triple fault")
-    if re.search(r"v=0e e=0011", diagnostics):
+    if nx_violation:
         raise StressProtocolError("NX-violation page-fault signature detected")
 
 
