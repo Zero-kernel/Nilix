@@ -10,6 +10,8 @@ ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 QEMU=qemu-system-x86_64
+# shellcheck source=scripts/ci/qemu_run.sh
+source "$ROOT/scripts/ci/qemu_run.sh"
 TO="${IOMMU_Q35_TIMEOUT:-900}"
 if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
     echo "IOMMU-Q35-CHECK BLOCKED: IOMMU_Q35_TIMEOUT must be an integer from 1 to 900"
@@ -57,20 +59,20 @@ python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser
     --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
 "$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
 
-LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
-    bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+run_gate_qemu "$TO" "runtime" "$QEMU" -bios "$OVMF" \
     -machine q35 \
     -device intel-iommu,intremap=on \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     -m 256M -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
-    -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+    -d int,cpu_reset -D "$intlog"
 qemu_status=$?
+printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 printf '%s\n' "$qemu_status" >"$log_dir/qemu.status" || exit 2
 
 python3 "$ROOT/scripts/ci/gate_log.py" --serial "$ser" --intlog "$intlog" \
-    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --json-output "$ser.counts.json" \
+    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json" \
     --require-iommu >"$log_dir/gate.result"
 rc=$?
 python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || rc=1

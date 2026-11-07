@@ -185,7 +185,7 @@ class ShellTests(unittest.TestCase):
         self.work = Path(self.directory.name)
         for name in ("scripts", "esp", "bin", "tmp"):
             (self.work / name).mkdir()
-        for relative in (Path("ci/gate_log.py"), Path("ci/gate_inputs.py")):
+        for relative in (Path("ci/gate_log.py"), Path("ci/gate_inputs.py"), Path("ci/qemu_run.py"), Path("ci/qemu_run.sh")):
             destination = self.work / "scripts" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / "scripts" / relative, destination)
@@ -200,6 +200,7 @@ class ShellTests(unittest.TestCase):
         (self.work / "firmware.fd").write_bytes(b"synthetic firmware placeholder")
         self.write_tool("python3", '#!/bin/bash\nexec "$GATE_PYTHON" "$@"\n')
         self.write_tool("timeout", """#!/bin/bash
+printf '%s\\n' "$@" >"$GATE_ARGUMENTS.timeout"
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 if [ "$#" -lt 3 ]; then exit 125; fi
 shift 2
@@ -249,6 +250,9 @@ exit 0
         self, name: str, serial: str = CLEAN, *, qemu_status: int = 124,
         interrupts: str = "", timeout_stderr: str = TERM, iommu: bool = True,
         second_serial: str | None = None,
+        termination_mode: str = "window", fake_mode: str = "normal",
+        extended_cpus: str = "8 16",
+        extended_timeout: str | None = "1",
     ) -> subprocess.CompletedProcess:
         if name == "iommu_q35_check.sh" and iommu:
             serial = IOMMU + serial
@@ -272,6 +276,10 @@ exit 0
             "GATE_TIMEOUT_LOG": self.shell_path(self.work / "fixture.timeout"),
             "GATE_ARGUMENTS": self.shell_path(self.work / "qemu.arguments"),
             "GATE_STATUS": str(qemu_status),
+            "QEMU_GATE_MODE": termination_mode,
+            "EXTENDED_SMP_CPUS": extended_cpus,
+            "FAKE_MODE": fake_mode,
+            "FAKE_SERIAL": self.shell_path(self.work / "fixture.serial"),
             "OVMF_PATH": self.shell_path(self.work / "firmware.fd"),
             "TMPDIR": self.shell_path(self.work / "tmp"),
             "IOMMU_Q35_LOG_DIR": self.shell_path(self.work / "retained logs"),
@@ -279,6 +287,14 @@ exit 0
             "SMP_4CORE_TEST_TIMEOUT": "1", "EXTENDED_SMP_TIMEOUT": "1", "IOMMU_Q35_TIMEOUT": "1",
             "BOOT_CHECK_KEEP_LOGS": "0", "SMP_TEST_KEEP_LOGS": "0", "SMP_4CORE_TEST_KEEP_LOGS": "0",
         })
+        if termination_mode == "completion":
+            for key in ("BOOT_CHECK_TIMEOUT", "KERNEL_TEST_TIMEOUT", "SMP_TEST_TIMEOUT",
+                        "SMP_4CORE_TEST_TIMEOUT", "EXTENDED_SMP_TIMEOUT", "IOMMU_Q35_TIMEOUT"):
+                environment[key] = "15"
+        elif extended_timeout is None:
+            environment.pop("EXTENDED_SMP_TIMEOUT", None)
+        else:
+            environment["EXTENDED_SMP_TIMEOUT"] = extended_timeout
         if second_serial is not None:
             (self.work / "second.serial").write_text(second_serial, encoding="utf-8", newline="\n")
             environment["GATE_SERIAL_16"] = self.shell_path(self.work / "second.serial")
@@ -306,6 +322,24 @@ exit 0
         for name in self.scripts:
             with self.subTest(script=name):
                 self.assert_gate(self.run_gate(name, CLEAN + "KERNEL PANIC\n"), 1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux QMP completion caller")
+    def test_completion_callers_collect_and_keep_their_final_oracles(self):
+        from scripts.tests.qemu_run_test import FAKE_QEMU
+        fake = FAKE_QEMU.replace(
+            'from pathlib import Path\n',
+            'from pathlib import Path\nif "--version" in sys.argv:\n    print("fixture QEMU version")\n    raise SystemExit(0)\n',
+        )
+        self.write_tool("qemu-system-x86_64", "#!/usr/bin/env python3\n" + fake)
+        for name in ("boot_check.sh", "kernel_test.sh", "smp_test_4core.sh", "iommu_q35_check.sh"):
+            with self.subTest(script=name):
+                self.assert_gate(self.run_gate(name, termination_mode="completion"), 0)
+                self.assert_gate(self.run_gate(name, QUALIFIED, termination_mode="completion"), 3)
+        self.assert_gate(self.run_gate("boot_check.sh", termination_mode="completion", fake_mode="quit-fault"), 1)
+        self.assert_gate(self.run_gate("boot_check.sh", termination_mode="completion", fake_mode="quit-interrupt-fault"), 1)
+        serial32 = CLEAN.replace('4 CPU(s) online', '32 CPU(s) online').replace('3/3 APs', '31/31 APs')
+        self.assert_gate(self.run_gate("extended_smp_test.sh", serial32,
+                                       termination_mode="completion", extended_cpus="32"), 0)
 
     def test_process_status_and_kill_escalation_reach_callers(self):
         for name in self.scripts:
@@ -343,6 +377,46 @@ exit 0
     def test_extended_aggregate_does_not_turn_qualified_into_pass(self):
         self.assert_gate(self.run_gate("extended_smp_test.sh", second_serial=QUALIFIED), 3)
         self.assert_gate(self.run_gate("extended_smp_test.sh", FAILED, second_serial=""), 1)
+
+    def test_32_vcpu_selection_runs_exactly_one_requested_topology(self):
+        result = self.run_gate("extended_smp_test.sh", extended_cpus="32")
+        self.assert_gate(result, 0)
+        self.assertEqual(result.stdout.count('TEST 1: 32-vCPU SMP Validation'), 1)
+        self.assertIn('Total tests:  1', result.stdout)
+        self.assertNotIn('Testing 8-Core', result.stdout)
+        self.assertNotIn('Testing 16-Core', result.stdout)
+        self.assertIn('-smp\n32\n', (self.work / 'qemu.arguments').read_text())
+        self.assert_gate(self.run_gate("extended_smp_test.sh", QUALIFIED, extended_cpus="32"), 3)
+
+    def test_extended_timeout_defaults_and_limits_follow_topology(self):
+        for cpus, seconds in (("8", "900"), ("16", "900"), ("8 16", "900"), ("32", "3600")):
+            with self.subTest(cpus=cpus):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", extended_cpus=cpus,
+                                               extended_timeout=None), 0)
+                self.assertIn(f"\n--\n{seconds}\n", (self.work / "qemu.arguments.timeout").read_text())
+        arguments = self.work / "qemu.arguments"
+        arguments.unlink()
+        for cpus, seconds in (("8", "901"), ("16", "3600"), ("8 16", "3600"),
+                              ("32", "3601"), ("32", "0"), ("32", "0900"), ("32", "1e3")):
+            with self.subTest(cpus=cpus, timeout=seconds):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", extended_cpus=cpus,
+                                               extended_timeout=seconds), 2)
+                self.assertFalse(arguments.exists())
+
+    def test_32_vcpu_partial_topology_or_ap_acknowledgement_is_failure(self):
+        acknowledgement = '[SMP] process-deferred gate complete: 3/3 APs acknowledged'
+        for serial in (CLEAN.replace('4 CPU(s) online', '24 CPU(s) online'),
+                       CLEAN.replace(acknowledgement, ''),
+                       CLEAN.replace('3/3 APs', '30/31 APs'),
+                       CLEAN + acknowledgement + '\n'):
+            with self.subTest(serial=serial):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", serial, extended_cpus="32"), 1)
+
+    def test_invalid_extended_topology_is_blocked_before_qemu_launch(self):
+        for cpus in ('0', '33', '64', '32 32', '8 16 32', '32\n8'):
+            with self.subTest(cpus=cpus):
+                self.assert_gate(self.run_gate("extended_smp_test.sh", extended_cpus=cpus), 2)
+                self.assertFalse((self.work / 'qemu.arguments').exists())
 
     def test_q35_active_and_pid1_success_do_not_override_failed_summary(self):
         result = self.run_gate("iommu_q35_check.sh", Q35_FAILED, iommu=False)

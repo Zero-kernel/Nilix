@@ -2,13 +2,15 @@
 # ============================================================================
 # Nilix Extended SMP Test - High Core Count Validation
 # ============================================================================
-# Tests SMP functionality and stability at higher core counts (8-core, 16-core).
+# Tests SMP functionality at 8/16 vCPUs by default, or one selected 8/16/32-vCPU
+# topology. QEMU vCPUs may outnumber host CPUs; this is not a scaling benchmark.
 # Validates scheduler scaling, lock contention, and IPI handling under high
 # CPU count scenarios that the standard 2/4-core tests don't expose.
 #
 # Test Configurations:
 #   1. 8-core stress test
 #   2. 16-core stress test (if CPU_MAX >= 16)
+#   EXTENDED_SMP_CPUS=32 selects the independent 32-vCPU test.
 #
 # Validates:
 #   - All CPUs come online properly
@@ -27,13 +29,25 @@ set -u
 
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
 QEMU=qemu-system-x86_64
+# shellcheck source=scripts/ci/qemu_run.sh
+source "$ROOT/scripts/ci/qemu_run.sh"
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 
-# Test timeout (higher for more cores)
-EXTENDED_SMP_TIMEOUT="${EXTENDED_SMP_TIMEOUT:-900}"
-if [[ ! "$EXTENDED_SMP_TIMEOUT" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
-    echo "EXTENDED-SMP-TEST BLOCKED: EXTENDED_SMP_TIMEOUT must be an integer from 1 to 900"
+case "${EXTENDED_SMP_CPUS:-8 16}" in
+    '8 16') cpu_counts=(8 16) ;;
+    8|16|32) cpu_counts=("$EXTENDED_SMP_CPUS") ;;
+    *) echo 'EXTENDED-SMP-TEST BLOCKED: EXTENDED_SMP_CPUS must be 8, 16, 32 or "8 16"'; exit 2 ;;
+esac
+
+# Oversubscribed 32-vCPU guests need a longer deadline; retain 8/16 limits.
+timeout_limit=900
+if [[ "${cpu_counts[*]}" == 32 ]]; then
+    timeout_limit=3600
+fi
+EXTENDED_SMP_TIMEOUT="${EXTENDED_SMP_TIMEOUT:-$timeout_limit}"
+if [[ ! "$EXTENDED_SMP_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || (( EXTENDED_SMP_TIMEOUT > timeout_limit )); then
+    echo "EXTENDED-SMP-TEST BLOCKED: EXTENDED_SMP_TIMEOUT must be an integer from 1 to $timeout_limit"
     exit 2
 fi
 if ! command -v python3 >/dev/null 2>&1; then
@@ -93,16 +107,16 @@ run_smp_test() {
         --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || return 2
     "$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || return 2
 
-    LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$timeout_val" \
-        bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+    run_gate_qemu "$timeout_val" "runtime" "$QEMU" -bios "$OVMF" \
         -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
         -smp "$cpu_count" \
         -m 512M -vga std -no-reboot -no-shutdown \
         -cpu qemu64,+smep,+smap,+umip,+rdrand \
         -display none -serial "file:$ser" \
-        -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+        -d int,cpu_reset -D "$intlog"
 
     local qemu_status=$?
+    printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 
     # Analyze results
     local nx cpu_resets supervisor_faults
@@ -161,7 +175,7 @@ run_smp_test() {
 
     # Determine pass/fail
     python3 "$ROOT/scripts/ci/gate_log.py" --serial "$ser" --intlog "$intlog" \
-        --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --json-output "$ser.counts.json"
+        --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json"
     local result=$?
     python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || result=1
 
@@ -185,6 +199,22 @@ run_smp_test() {
     if [ "$online_cpus" -lt "$min_expected_cpus" ]; then
         echo "❌ FAIL: Only $online_cpus CPUs online (expected at least $min_expected_cpus)"
         result=1
+    fi
+
+    # The new 32-vCPU lane must exercise every requested CPU. Preserve the
+    # older 8/16-vCPU qualification rules, but never qualify a partial 32 boot.
+    if [ "$cpu_count" -eq 32 ]; then
+        if [ "$online_cpus" -ne "$cpu_count" ]; then
+            echo "FAIL: 32-vCPU topology requires all 32 CPUs online, saw $online_cpus"
+            result=1
+        fi
+        local ack_records expected_ack
+        expected_ack='[SMP] process-deferred gate complete: 31/31 APs acknowledged'
+        ack_records=$(grep -acF '[SMP] process-deferred gate complete:' "$ser" || true)
+        if [ "$ack_records" -ne 1 ] || [ "$(grep -acFx "$expected_ack" "$ser" || true)" -ne 1 ]; then
+            echo 'FAIL: 32-vCPU topology requires one complete 31/31 AP acknowledgement'
+            result=1
+        fi
     fi
 
     if [ "$smp_online_passed" -eq 0 ]; then
@@ -220,10 +250,10 @@ run_smp_test() {
 
     printf '%s\n' "$result" > "$ser.gate.status"
     if [ "${EXTENDED_SMP_KEEP_LOGS:-0}" = 1 ]; then
-        echo "EXTENDED-SMP ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status"
+        echo "EXTENDED-SMP ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status termination=$ser.run.json qemu_status=$ser.qemu.status"
     else
         rm -rf -- "$ser.inputs"
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status"
     fi
     echo "End time: $(date)"
     echo ""
@@ -262,19 +292,13 @@ record_result() {
     esac
 }
 
-# Test 1: 8-core configuration
-echo "TEST 1: 8-Core SMP Validation"
-echo ""
-total_tests=$((total_tests + 1))
-run_smp_test 8 "$EXTENDED_SMP_TIMEOUT"
-record_result "$?"
-
-# Test 2: 16-core configuration (if supported)
-echo "TEST 2: 16-Core SMP Validation"
-echo ""
-total_tests=$((total_tests + 1))
-run_smp_test 16 "$EXTENDED_SMP_TIMEOUT"
-record_result "$?"
+for cpu_count in "${cpu_counts[@]}"; do
+    total_tests=$((total_tests + 1))
+    echo "TEST $total_tests: $cpu_count-vCPU SMP Validation"
+    echo ""
+    run_smp_test "$cpu_count" "$EXTENDED_SMP_TIMEOUT"
+    record_result "$?"
+done
 
 # Summary
 echo "=== Extended SMP Test Summary ==="
@@ -292,8 +316,9 @@ else
     echo "✅ EXTENDED-SMP-TEST PASS: All high-core-count tests passed"
     echo ""
     echo "Validated configurations:"
-    echo "  - 8-core SMP operation"
-    echo "  - 16-core SMP operation"
+    for cpu_count in "${cpu_counts[@]}"; do
+        echo "  - $cpu_count-vCPU SMP operation"
+    done
     echo "  - Scheduler scaling to high core count"
     echo "  - IPI/TLB shootdown at scale"
     exit 0

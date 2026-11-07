@@ -2,12 +2,16 @@
 # Shared local/Actions entrypoint. Each group owns a single artifact directory.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|musl|iommu|mitigation|qemu-fuzz|extended}"
+group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|smp-32|musl|iommu|mitigation|qemu-fuzz|extended|extended-smp|extended-smp-32|extended-ext3|extended-stress}"
 out_root="${CI_ARTIFACTS:-target/ci/$group}"
 mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
 failed=0
 guest_retries="${CI_GUEST_RETRIES:-1}"
+case "$group" in
+    extended|extended-*) export QEMU_GATE_MODE="${QEMU_GATE_MODE:-window}" ;;
+    *) export QEMU_GATE_MODE="${QEMU_GATE_MODE:-completion}" ;;
+esac
 finish() {
     local status=$?
     trap - EXIT
@@ -21,6 +25,10 @@ finish() {
 trap finish EXIT
 if [[ ! "$guest_retries" =~ ^(0|1)$ ]]; then
     echo "CI_GUEST_RETRIES must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$QEMU_GATE_MODE" != completion && "$QEMU_GATE_MODE" != window ]]; then
+    echo "QEMU_GATE_MODE must be completion or window" >&2
     exit 2
 fi
 
@@ -74,6 +82,33 @@ check_guest() {
     return 0
 }
 
+extended_smp() {
+    # Two full 900-second windows already use half the 60-minute job budget.
+    # Keep the first result and leave time for build, log analysis and upload.
+    check smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
+}
+smp_32() {
+    # Preserve the first 32-vCPU result; a stalled probe must not repeat a
+    # second 3600-second run automatically.
+    check smp-32 --allow-qualified -- env EXTENDED_SMP_CPUS=32 bash scripts/gates/boot/extended_smp_test.sh esp
+}
+extended_ext3() {
+    check_guest ext3 --allow-qualified -- bash -c '
+        make ensure-ext3-image || exit
+        image=$(mktemp "$PWD/.ci-ext3.XXXXXX") || exit
+        trap '\''rm -f -- "$image"'\'' EXIT
+        cp disk-ext2.img "$image" || exit
+        KERNEL_TEST_DISK="$image" bash scripts/gates/boot/kernel_test.sh esp
+    '
+}
+extended_stress() {
+    # Extra `NAME=value` arguments narrow the profile set for one job.
+    local name="$1"
+    shift
+    check_guest "$name" --allow-qualified -- env "$@" STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS=4 \
+        STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
+}
+
 case "$group" in
     quality)
         check lint -- make lint
@@ -111,6 +146,10 @@ case "$group" in
         check_guest boot --allow-qualified -- bash scripts/gates/boot/boot_check.sh esp
         check_guest runtime --allow-qualified -- bash scripts/gates/boot/kernel_test.sh esp
         check_guest smp --allow-qualified -- bash scripts/gates/boot/smp_test_4core.sh esp
+        ;;
+    smp-32)
+        # Like runtime, consume the normal ESP from the build job.
+        smp_32
         ;;
     musl)
         gate build -- make build-musl-test
@@ -160,18 +199,40 @@ PY
             --artifacts "$out/executor-evidence"
         ;;
     extended)
+        # Every extended gate in series, for local use. The workflow runs the
+        # extended-* groups below as parallel jobs with their own timeouts.
         gate build -- make build
-        check_guest smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
-        check_guest ext3 --allow-qualified -- bash -c '
-            make ensure-ext3-image || exit
-            image=$(mktemp "$PWD/.ci-ext3.XXXXXX") || exit
-            trap '\''rm -f -- "$image"'\'' EXIT
-            cp disk-ext2.img "$image" || exit
-            KERNEL_TEST_DISK="$image" bash scripts/gates/boot/kernel_test.sh esp
-        '
+        extended_smp
+        extended_ext3
         gate stress-build -- make build-stress
-        check_guest stress --allow-qualified -- env STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS=4 \
-            STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
+        extended_stress stress
+        ;;
+    extended-smp)
+        gate build -- make build
+        extended_smp
+        ;;
+    extended-smp-32)
+        gate build -- make build
+        smp_32
+        ;;
+    extended-ext3)
+        gate build -- make build
+        extended_ext3
+        ;;
+    extended-stress)
+        # EXT-CI: one profile per job. A failed 900-second soak is reported as it
+        # is: a retry would double the job and mix two runs' evidence.
+        profile="${CI_STRESS_PROFILE:-}"
+        case "$profile" in
+            memory|cpu|smp|thread|process|block|combined) ;;
+            *)
+                echo "CI_STRESS_PROFILE must be one of memory, cpu, smp, thread, process, block, combined" >&2
+                exit 2
+                ;;
+        esac
+        guest_retries=0
+        gate stress-build -- make build-stress
+        extended_stress "stress-$profile" STRESS_PROFILES="$profile" STRESS_PROFILE_LIMIT=1
         ;;
     *) echo "Unknown CI group: $group" >&2; exit 2 ;;
 esac

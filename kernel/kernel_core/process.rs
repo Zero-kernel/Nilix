@@ -11366,6 +11366,7 @@ pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
 /// main-path LSM rollback) use `cleanup_unscheduled_process()` instead, which avoids
 /// cross-subsystem detach on never-joined cgroup/cpuset/IPC subsystems.
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
+    let mut teardown_completed = false;
     if let Some(process) = get_process(pid) {
         let children_to_reparent: AdmittedVec<ProcessId>;
         let parent_pid: ProcessId;
@@ -11764,6 +11765,13 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // KSA-011: `group` and the other locals drop before the caller's
         // terminal switch abandons this stack.
         drop(group);
+        teardown_completed = true;
+    }
+    // EXT-CI: emit only after synchronous teardown, parent notification and
+    // local guard/Arc drops. This is not a scheduler-retirement or global
+    // quiescence claim; the host retains a tail window and final diagnostics.
+    if pid == 1 && teardown_completed {
+        klog_always!("CI-EXIT pid=1 code={} stage=teardown-complete", exit_code);
     }
 }
 

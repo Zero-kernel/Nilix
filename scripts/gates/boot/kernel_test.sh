@@ -13,6 +13,8 @@ set -u
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
 
 QEMU=qemu-system-x86_64
+# shellcheck source=scripts/ci/qemu_run.sh
+source "$ROOT/scripts/ci/qemu_run.sh"
 # ESP defaults to <repo>/esp; a relative override is resolved against the repo root
 # (so `bash scripts/gates/boot/boot_check.sh esp` works the same from anywhere), absolute kept.
 ESP="${1:-$ROOT/esp}"
@@ -66,10 +68,10 @@ qemuerr="$(mktemp)" || exit 2
 timeoutlog="$(mktemp)" || exit 2
 cleanup() {
     if [ "${KERNEL_TEST_KEEP_LOGS:-0}" = 1 ]; then
-        echo "KERNEL-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status"
+        echo "KERNEL-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status termination=$ser.run.json qemu_status=$ser.qemu.status"
     else
         rm -rf -- "$ser.inputs"
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status"
     fi
 }
 trap cleanup EXIT
@@ -98,8 +100,7 @@ python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser
     --firmware "$OVMF" --qemu "$(command -v "$QEMU")" || exit 2
 "$QEMU" --version > "$ser.inputs/qemu.version" 2>&1 || exit 2
 
-LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" \
-    bash -c 'qemuerr=$1; shift; exec "$@" 2>"$qemuerr"' _ "$qemuerr" "$QEMU" -bios "$OVMF" \
+run_gate_qemu "$TO" "${KERNEL_TEST_COMPLETION_PROFILE:-runtime}" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     "${disk_args[@]}" \
     -netdev user,id=net0,restrict=on,ipv6=off \
@@ -107,11 +108,12 @@ LC_ALL=C timeout --foreground --verbose --signal=TERM --kill-after=10s -- "$TO" 
     -m "$MEM" "${smp_args[@]}" -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \
     -display none -serial "file:$ser" \
-    -d int,cpu_reset -D "$intlog" >/dev/null 2>"$timeoutlog"
+    -d int,cpu_reset -D "$intlog"
 qemu_status=$?
+printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 
 python3 "$ROOT/scripts/ci/gate_log.py" --serial "$ser" --intlog "$intlog" \
-    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --json-output "$ser.counts.json"
+    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json"
 rc=$?
 python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || rc=1
 if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Fq 'R180-6 production JBD2 write path passed' "$ser"; then

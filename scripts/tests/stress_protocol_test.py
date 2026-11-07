@@ -7,6 +7,7 @@ import argparse
 import json
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -459,6 +460,73 @@ class RuntimeFatalPatternTests(unittest.TestCase):
             "triple fault",
         ):
             self.assertIsNotNone(protocol.STRESS_TERMINAL_FATAL.search(line), line)
+
+
+class DiagnosticTraceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.serial = self.root / "serial.log"
+        self.interrupts = self.root / "interrupts.log"
+        self.stderr = self.root / "qemu.stderr"
+        self.serial.write_bytes(b"")
+        self.stderr.write_bytes(b"")
+
+    def test_fault_signatures_cross_read_boundaries_and_unterminated_lines(self) -> None:
+        # Cover every split of both literals, including Unicode IGNORECASE and
+        # invalid UTF-8 around the marker. No newline limits the input size.
+        for marker, message in (("TRİPLE FAULT", "triple fault"),
+                                ("v=0e e=0011", "NX-violation")):
+            for split in range(1, len(marker)):
+                with self.subTest(marker=marker, split=split):
+                    self.interrupts.write_bytes(
+                        b"\xff" + b"x" * (1024 * 1024 - split - 1)
+                        + marker.encode("utf-8") + b"\xfe"
+                    )
+                    with self.assertRaisesRegex(protocol.StressProtocolError, message):
+                        protocol.validate_diagnostics(self.serial, self.interrupts, self.stderr)
+
+    def test_clean_trace_and_separate_files_do_not_form_a_false_marker(self) -> None:
+        self.interrupts.write_bytes(b"x" * (2 * 1024 * 1024) + b"triple ")
+        self.stderr.write_bytes(b"fault\nV=0E E=0011\n")
+        protocol.validate_diagnostics(self.serial, self.interrupts, self.stderr)
+
+    def test_stderr_fault_keeps_priority_over_interrupt_nx(self) -> None:
+        self.interrupts.write_bytes(b"v=0e e=0011\n")
+        self.stderr.write_bytes(b"TrIpLe FaUlT")
+        with self.assertRaisesRegex(protocol.StressProtocolError, "triple fault"):
+            protocol.validate_diagnostics(self.serial, self.interrupts, self.stderr)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux RLIMIT_AS")
+    def test_large_trace_is_scanned_to_the_end_under_a_memory_limit(self) -> None:
+        with self.interrupts.open("wb") as stream:
+            stream.seek(128 * 1024 * 1024)
+            stream.write(b"Triple fault\n")
+        probe = """
+import resource
+import sys
+from pathlib import Path
+from scripts.gates.stress import stress_protocol as protocol
+# Some Python builds reserve a large allocator arena at startup. Bound the
+# additional address space so the check is independent of that reservation.
+baseline = int(Path("/proc/self/statm").read_text().split()[0]) * resource.getpagesize()
+limit = baseline + 96 * 1024 * 1024
+resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+try:
+    protocol.validate_diagnostics(sys.argv[1], sys.argv[2], None)
+except protocol.StressProtocolError as error:
+    if str(error) != "QEMU reported a triple fault":
+        raise
+else:
+    raise SystemExit("late fault was not detected")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(self.serial), str(self.interrupts)],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class LiveProtocolLineTests(unittest.TestCase):
