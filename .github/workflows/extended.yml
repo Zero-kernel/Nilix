@@ -9,28 +9,62 @@ concurrency:
   group: extended-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  extended:
-    name: Extended / ${{ matrix.os }}
+  # EXT-CI: every guest gate runs to its full observation window, so the old
+  # single 180-minute job could not hold smp-8/16, ext3, all seven 900-second
+  # stress profiles and iommu in series. Each lane is now its own job with a
+  # budget for its own windows; durations, CPU counts and profiles are unchanged.
+  lane:
+    name: Extended / ${{ matrix.os }} / ${{ matrix.lane.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    timeout-minutes: ${{ matrix.lane.timeout }}
     env:
       CI_STRESS_SECONDS: '900'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
+        # Budgets: build, then each 900-second window plus boot and reporting.
+        # Block adds up to 12 bounded writer boots before its recovery soak.
+        lane:
+          - {name: smp-8-16, group: extended-smp, timeout: 60}
+          - {name: ext3, group: extended-ext3, timeout: 40}
+          - {name: iommu, group: iommu, timeout: 60}
+          - {name: stress-memory, group: extended-stress, profile: memory, timeout: 70}
+          - {name: stress-cpu, group: extended-stress, profile: cpu, timeout: 70}
+          - {name: stress-smp, group: extended-stress, profile: smp, timeout: 70}
+          - {name: stress-thread, group: extended-stress, profile: thread, timeout: 70}
+          - {name: stress-process, group: extended-stress, profile: process, timeout: 70}
+          - {name: stress-block, group: extended-stress, profile: block, timeout: 120}
+          - {name: stress-combined, group: extended-stress, profile: combined, timeout: 70}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
         with:
           qemu: 'true'
-          cache-key: extended-${{ matrix.os }}
-      - run: bash scripts/ci/entrypoint.sh extended
-      - if: always()
-        run: bash scripts/ci/entrypoint.sh iommu
+          cache-key: extended-${{ matrix.os }}-${{ matrix.lane.group }}
+      - run: bash scripts/ci/entrypoint.sh "$CI_GROUP"
+        env:
+          CI_GROUP: ${{ matrix.lane.group }}
+          CI_STRESS_PROFILE: ${{ matrix.lane.profile }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: extended-${{ matrix.os }}
+          name: extended-${{ matrix.os }}-${{ matrix.lane.name }}
           path: target/ci/
           if-no-files-found: error
+
+  result:
+    name: Extended result
+    needs: [lane]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Any failed, cancelled or skipped lane fails the run; per-lane verdicts
+      # are in each lane's job summary and artifact.
+      - run: python3 -I scripts/ci/ci_report.py --aggregate
+        env:
+          CI_JOB_RESULTS: ${{ toJSON(needs) }}

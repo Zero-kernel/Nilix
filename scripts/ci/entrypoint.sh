@@ -2,7 +2,7 @@
 # Shared local/Actions entrypoint. Each group owns a single artifact directory.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|musl|iommu|mitigation|qemu-fuzz|extended}"
+group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|musl|iommu|mitigation|qemu-fuzz|extended|extended-smp|extended-ext3|extended-stress}"
 out_root="${CI_ARTIFACTS:-target/ci/$group}"
 mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
@@ -72,6 +72,26 @@ check_guest() {
     retry_event "$name" 2 "$second_status" final-failure
     failed=1
     return 0
+}
+
+extended_smp() {
+    check_guest smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
+}
+extended_ext3() {
+    check_guest ext3 --allow-qualified -- bash -c '
+        make ensure-ext3-image || exit
+        image=$(mktemp "$PWD/.ci-ext3.XXXXXX") || exit
+        trap '\''rm -f -- "$image"'\'' EXIT
+        cp disk-ext2.img "$image" || exit
+        KERNEL_TEST_DISK="$image" bash scripts/gates/boot/kernel_test.sh esp
+    '
+}
+extended_stress() {
+    # Extra `NAME=value` arguments narrow the profile set for one job.
+    local name="$1"
+    shift
+    check_guest "$name" --allow-qualified -- env "$@" STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS=4 \
+        STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
 }
 
 case "$group" in
@@ -160,18 +180,36 @@ PY
             --artifacts "$out/executor-evidence"
         ;;
     extended)
+        # Every extended gate in series, for local use. The workflow runs the
+        # extended-* groups below as parallel jobs with their own timeouts.
         gate build -- make build
-        check_guest smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
-        check_guest ext3 --allow-qualified -- bash -c '
-            make ensure-ext3-image || exit
-            image=$(mktemp "$PWD/.ci-ext3.XXXXXX") || exit
-            trap '\''rm -f -- "$image"'\'' EXIT
-            cp disk-ext2.img "$image" || exit
-            KERNEL_TEST_DISK="$image" bash scripts/gates/boot/kernel_test.sh esp
-        '
+        extended_smp
+        extended_ext3
         gate stress-build -- make build-stress
-        check_guest stress --allow-qualified -- env STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS=4 \
-            STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
+        extended_stress stress
+        ;;
+    extended-smp)
+        gate build -- make build
+        extended_smp
+        ;;
+    extended-ext3)
+        gate build -- make build
+        extended_ext3
+        ;;
+    extended-stress)
+        # EXT-CI: one profile per job. A failed 900-second soak is reported as it
+        # is: a retry would double the job and mix two runs' evidence.
+        profile="${CI_STRESS_PROFILE:-}"
+        case "$profile" in
+            memory|cpu|smp|thread|process|block|combined) ;;
+            *)
+                echo "CI_STRESS_PROFILE must be one of memory, cpu, smp, thread, process, block, combined" >&2
+                exit 2
+                ;;
+        esac
+        guest_retries=0
+        gate stress-build -- make build-stress
+        extended_stress "stress-$profile" STRESS_PROFILES="$profile" STRESS_PROFILE_LIMIT=1
         ;;
     *) echo "Unknown CI group: $group" >&2; exit 2 ;;
 esac

@@ -84,6 +84,34 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
         self.assertEqual(status, 2)
         self.assertEqual(events, ['report'])
 
+    def test_extended_stress_requires_one_known_profile(self):
+        for environment in ({}, {'CI_STRESS_PROFILE': ''}, {'CI_STRESS_PROFILE': 'memory,cpu'},
+                            {'CI_STRESS_PROFILE': 'bogus'}):
+            with self.subTest(environment=environment):
+                (self.root / 'events.jsonl').unlink(missing_ok=True)
+                status, events = self.run_group('extended-stress', **environment)
+                self.assertEqual(status, 2)
+                self.assertEqual(events, ['report'])
+
+    def test_extended_stress_failure_is_reported_without_retry(self):
+        status, events = self.run_group('extended-stress', CI_STRESS_PROFILE='thread',
+                                        FAIL_GATE='stress-thread', FAIL_ATTEMPTS='1', FAIL_STATUS='1')
+        self.assertEqual(status, 1)
+        self.assertEqual(events, ['stress-build', 'stress-thread', 'report'])
+
+    def test_extended_split_groups_keep_the_combined_gate_order(self):
+        expected = {
+            'extended-smp': ['build', 'smp-8-16', 'report'],
+            'extended-ext3': ['build', 'ext3', 'report'],
+            'extended': ['build', 'smp-8-16', 'ext3', 'stress-build', 'stress', 'report'],
+        }
+        for group, gates in expected.items():
+            with self.subTest(group=group):
+                (self.root / 'events.jsonl').unlink(missing_ok=True)
+                status, events = self.run_group(group)
+                self.assertEqual(status, 0)
+                self.assertEqual(events, gates)
+
     def test_missing_stress_prerequisite_cannot_be_accepted_as_qualified(self):
         scripts = Path(__file__).resolve().parents[1]
         artifacts = self.root / 'stress-artifacts'
