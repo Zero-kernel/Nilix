@@ -16404,9 +16404,11 @@ impl EagerPopulator {
         if pages != 0 {
             let _ = pruned.try_reserve(populate_prune_reserve(pages));
         }
+        // ST-K2-P2(d) adds a re-armable failure of an exact smaller size.
         #[cfg(feature = "syscall_test")]
-        let fail_at = (pages == POPULATE_FAULT_PROBE_PAGES
+        let fail_at = ((pages == POPULATE_FAULT_PROBE_PAGES
             && POPULATE_FAULT_PROBE_ARMED.swap(false, AtomicOrdering::AcqRel))
+            || crate::fork::shared_fault_test::take_population_failure(pages))
         .then(|| pages - 1);
         Self {
             process: process.clone(),
@@ -16571,6 +16573,8 @@ impl crate::populate::PopulateBackend for EagerPopulator {
         #[cfg(feature = "syscall_test")]
         {
             if self.fail_at == Some(self.allocated) {
+                // ST-K2-P2(d): a re-armed failure may pause here first.
+                crate::fork::shared_fault_test::before_population_failure();
                 return None;
             }
             self.allocated += 1;

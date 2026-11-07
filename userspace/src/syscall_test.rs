@@ -302,6 +302,8 @@ pub extern "C" fn _start() -> ! {
     // ST-K2-P2(c): the last owner of a shared region exits after, or while,
     // its parent unmaps it.
     test_shared_final_owner_race(&mut results);
+    // ST-K2-P2(d): private population rollback beside a shared-fault table.
+    test_private_rollback_reclaim(&mut results);
 
     // GAP-5 G8: /proc lists group leaders; /proc/<pid>/task lists members.
     test_proc_thread_listing(&mut results);
@@ -5896,6 +5898,242 @@ fn test_shared_final_owner_race(results: &mut TestResult) {
     } else {
         results.fail("shared-anon final owner and parent-first unmap");
     }
+}
+
+/// ST-K2-P2(d): a shared page at the start of an otherwise unused PD (160 GiB)
+/// and the private population beside it. 515 pages run from the next page into
+/// the following 2 MiB block, and stay below the R192-RES-2 report size.
+const ROLLBACK_BASE: usize = 0x28_0000_0000;
+const ROLLBACK_PAGES: usize = 515;
+const ROLLBACK_CYCLES: usize = 3;
+const ROLLBACK_SHARED_WORD: u64 = 0x5348_4152_4544;
+const POP_PAUSED: u64 = 3;
+const POP_DONE: u64 = 5;
+
+unsafe fn mmap_hint(addr: usize, len: usize, shared: bool) -> i64 {
+    let kind = if shared { MAP_SHARED } else { MAP_PRIVATE };
+    syscall6(
+        SYS_MMAP,
+        addr as u64,
+        len as u64,
+        PROT_READ | PROT_WRITE,
+        kind | MAP_ANONYMOUS,
+        u64::MAX,
+        0,
+    ) as i64
+}
+
+/// Map and first-touch the shared page: its page table (and the PD above it)
+/// go to the shared-fault ledger.
+unsafe fn rollback_shared_page() -> Result<(), &'static str> {
+    if mmap_hint(ROLLBACK_BASE, PAGE, true) != ROLLBACK_BASE as i64 {
+        return Err("shared page: address hint unavailable");
+    }
+    core::ptr::write_volatile(ROLLBACK_BASE as *mut u64, ROLLBACK_SHARED_WORD);
+    Ok(())
+}
+
+/// After the armed population failed: exactly ENOMEM, the probe fired, and
+/// the shared page kept its word.
+unsafe fn rollback_failed(result: i64) -> Result<(), &'static str> {
+    if err_of(result) != ENOMEM {
+        return Err("the injected population did not fail with exactly ENOMEM");
+    }
+    if shared_fault_test(8, 0, 0) != POP_DONE {
+        return Err("the armed population failure did not fire");
+    }
+    Ok(())
+}
+
+/// mmap: the private population beside the shared page fails; nothing it
+/// charged survives, and unmapping the shared page restores the baseline.
+unsafe fn rollback_mmap_cycle() -> Result<(), &'static str> {
+    let base = read_memory_current().ok_or("memory.current")?;
+    rollback_shared_page()?;
+    let with_shared = read_memory_current().ok_or("memory.current")?;
+    if shared_fault_test(7, ROLLBACK_PAGES as u64, 0) != 0 {
+        return Err("mmap: arming the population failure");
+    }
+    rollback_failed(mmap_hint(
+        ROLLBACK_BASE + PAGE,
+        ROLLBACK_PAGES * PAGE,
+        false,
+    ))?;
+    if read_memory_current() != Some(with_shared) {
+        return Err("mmap: the failed population changed memory.current");
+    }
+    if core::ptr::read_volatile(ROLLBACK_BASE as *const u64) != ROLLBACK_SHARED_WORD {
+        return Err("mmap: the shared page lost its word");
+    }
+    if munmap(ROLLBACK_BASE, PAGE) != 0 || read_memory_current() != Some(base) {
+        return Err("mmap: unmapping the shared page did not restore the baseline");
+    }
+    Ok(())
+}
+
+/// mremap: a private page beside the shared one grows in place; its tail
+/// population fails and the page keeps its contents and charge.
+unsafe fn rollback_mremap_cycle() -> Result<(), &'static str> {
+    const WORD: u64 = 0x4d52_454d_4150;
+    let base = read_memory_current().ok_or("memory.current")?;
+    rollback_shared_page()?;
+    let private = ROLLBACK_BASE + PAGE;
+    if mmap_hint(private, PAGE, false) != private as i64 {
+        return Err("mremap: private page hint unavailable");
+    }
+    core::ptr::write_volatile(private as *mut u64, WORD);
+    let with_private = read_memory_current().ok_or("memory.current")?;
+    if shared_fault_test(7, ROLLBACK_PAGES as u64, 0) != 0 {
+        return Err("mremap: arming the population failure");
+    }
+    rollback_failed(mremap(private, PAGE, (1 + ROLLBACK_PAGES) * PAGE, 0))?;
+    if read_memory_current() != Some(with_private)
+        || core::ptr::read_volatile(private as *const u64) != WORD
+    {
+        return Err("mremap: the failed tail changed memory.current or the page");
+    }
+    if munmap(private, PAGE) != 0
+        || munmap(ROLLBACK_BASE, PAGE) != 0
+        || read_memory_current() != Some(base)
+    {
+        return Err("mremap: unmapping both pages did not restore the baseline");
+    }
+    Ok(())
+}
+
+static ROLLBACK_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The sibling on CPU 1: once the population is paused before its failing
+/// allocation, unmap the shared page (its table still holds the population's
+/// leaves, so this munmap cannot prune it) and let the population fail.
+extern "C" fn rollback_unmapper() -> ! {
+    use core::sync::atomic::Ordering;
+    if !cow_test_pin(2) {
+        ROLLBACK_STAGE.store(0xe1, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    ROLLBACK_STAGE.store(1, Ordering::Release);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if unsafe { shared_fault_test(8, 0, 0) } == POP_PAUSED {
+            let unmapped = unsafe { munmap(ROLLBACK_BASE, PAGE) } == 0;
+            let released = unsafe { shared_fault_test(9, 0, 0) } == 0;
+            ROLLBACK_STAGE.store(
+                if unmapped && released { 2 } else { 0xe2 },
+                Ordering::Release,
+            );
+            unsafe { raw_exit(SYS_EXIT, 0) };
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    ROLLBACK_STAGE.store(0xe3, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// Concurrent prune: the rollback itself empties the shared fault's page
+/// table and prunes it, so only `settle_failed_populate` can release its
+/// ledgered charge. The baseline is checked once the sibling is reaped.
+unsafe fn rollback_concurrent_cycle() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    let base = read_memory_current().ok_or("memory.current")?;
+    rollback_shared_page()?;
+    if shared_fault_test(7, ROLLBACK_PAGES as u64, 1) != 0 {
+        return Err("concurrent: arming the paused population failure");
+    }
+    ROLLBACK_STAGE.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let sibling = raw_clone(
+        THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+        group_stack_top(),
+        core::ptr::null_mut(),
+        GROUP_TID_WORD.as_ptr(),
+        rollback_unmapper,
+    );
+    if is_error(sibling) || sibling == 0 {
+        return Err("concurrent: clone");
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if ROLLBACK_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        userspace::syscall::sys_yield();
+    }
+    if ROLLBACK_STAGE.load(Ordering::Acquire) != 1 {
+        let _ = g8_join_thread();
+        return Err("concurrent: the sibling did not start on CPU 1");
+    }
+    let result = mmap_hint(ROLLBACK_BASE + PAGE, ROLLBACK_PAGES * PAGE, false);
+    let joined = g8_join_thread();
+    rollback_failed(result)?;
+    if !joined || ROLLBACK_STAGE.load(Ordering::Acquire) != 2 {
+        return Err("concurrent: the sibling did not unmap the shared page during the pause");
+    }
+    for _ in 0..2000 {
+        if read_memory_current() == Some(base) {
+            return Ok(());
+        }
+        for _ in 0..20 {
+            userspace::syscall::sys_yield();
+        }
+    }
+    Err("concurrent: the pruned shared-fault table stayed charged")
+}
+
+type RollbackCycle = unsafe fn() -> Result<(), &'static str>;
+
+fn private_rollback_leg(smp: bool) -> u64 {
+    let sites: [(RollbackCycle, bool); 3] = [
+        (rollback_mmap_cycle, true),
+        (rollback_mremap_cycle, true),
+        (rollback_concurrent_cycle, smp),
+    ];
+    if smp && !cow_test_pin(1) {
+        return 0xc0;
+    }
+    for (index, (cycle, run)) in sites.iter().enumerate() {
+        if !run {
+            continue;
+        }
+        for _ in 0..ROLLBACK_CYCLES {
+            if let Err(reason) = unsafe { cycle() } {
+                print("  private rollback: ");
+                println(reason);
+                return 0xc1 + index as u64;
+            }
+        }
+    }
+    GROUP_LEG_OK
+}
+
+/// ST-K2-P2(d): a private population beside a page table built by a shared
+/// fault fails by injection (mmap, mremap growth, and on SMP while a sibling
+/// unmaps the shared page); the errno and `memory.current` are exact.
+fn test_private_rollback_reclaim(results: &mut TestResult) {
+    print("Testing private rollback beside a shared-fault page table... ");
+    let cpus = unsafe { shared_fault_test(0, 0, 0) };
+    let smp = !is_error(cpus) && cpus & 3 == 3;
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, private_rollback_leg(smp)) };
+    }
+    if is_error(host) || reap_pid(host) != Some(GROUP_LEG_OK) {
+        results.fail("private rollback beside a shared-fault page table");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let cycles = decimal(ROLLBACK_CYCLES, &mut buf);
+    println("");
+    println_parts(&["ST-K2-PRIVATE-ROLLBACK PASS site=mmap cycles=", cycles]);
+    println_parts(&["ST-K2-PRIVATE-ROLLBACK PASS site=mremap cycles=", cycles]);
+    if smp {
+        println_parts(&[
+            "ST-K2-PRIVATE-ROLLBACK PASS site=mmap-concurrent cycles=",
+            cycles,
+        ]);
+    } else {
+        println("[SKIP] private rollback concurrent prune: requires CPUs 0 and 1");
+    }
+    results
+        .pass("private rollback beside a shared-fault page table: exact ENOMEM and memory.current");
 }
 
 // ---------------------------------------------------------------------------

@@ -127,6 +127,7 @@ KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a s
 heap quotas: oversized read refused, local isolation survives, fork shares the UID ceiling
 brk COW shrink flushes retained leaves before returning
 shared-anon final owner: a fork child or CLONE_VM thread outlives the parent's unmap; memory.current and buddy free pages return exactly every round
+private rollback beside a shared-fault page table: exact ENOMEM and memory.current
 console input belongs exclusively to the configured owner
 LEGS
 
@@ -155,6 +156,11 @@ if [ "${KERNEL_TEST_CPUS:-1}" -gt 1 ]; then
         || [ "$(grep -cx "ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps" "$serial" || true)" -ne 1 ]; then
         report_fail "expected exactly one 'ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps' marker"
     fi
+    # ST-K2-P2(d): the rollback that prunes a shared-fault table while a sibling
+    # unmaps the shared page needs a second CPU.
+    if [ "$(grep -cx 'ST-K2-PRIVATE-ROLLBACK PASS site=mmap-concurrent cycles=3' "$serial" || true)" -ne 1 ]; then
+        report_fail "expected exactly one concurrent private-rollback marker on SMP"
+    fi
 fi
 # ST-K2-P2(c): every round of both variants came back to the exact memory
 # baseline, at the fixture's NILIX_ST_K2_FINAL_OWNER_ITERS.
@@ -167,6 +173,12 @@ done
 if [ "$(grep -c 'ST-K2-FINAL-OWNER' "$serial" || true)" -ne 2 ]; then
     report_fail "unexpected ST-K2-FINAL-OWNER markers"
 fi
+# ST-K2-P2(d): exact ENOMEM and memory.current for both sequential sites.
+for site in mmap mremap; do
+    if [ "$(grep -cx "ST-K2-PRIVATE-ROLLBACK PASS site=$site cycles=3" "$serial" || true)" -ne 1 ]; then
+        report_fail "expected exactly one 'ST-K2-PRIVATE-ROLLBACK PASS site=$site cycles=3' marker"
+    fi
+done
 if grep -Eq '^\[FAIL\]' "$serial"; then
     report_fail "the guest reported a failing leg"
 fi

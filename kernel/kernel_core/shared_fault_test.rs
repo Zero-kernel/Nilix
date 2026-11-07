@@ -12,8 +12,15 @@
 //! recycled PID reuses them), so buddy free pages fall by exactly that count
 //! as new PIDs reach new 2 MiB slots. The count lets a guest compare buddy free
 //! pages with zero tolerance.
+//!
+//! (d) Private rollback reclamation: the next private population of exactly
+//! N pages in the arming address space fails at its last data frame, as the
+//! boot-armed R192-RES-2 probe does, but re-armable and below that probe's
+//! report size. Optionally it first pauses, with no lock held and IF=1, so a
+//! sibling can unmap a neighbouring shared page while the population still
+//! has leaves in the shared fault's page table.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const PR_SHARED_FAULT_TEST: i32 = 0x5a53_4654;
 
@@ -33,6 +40,22 @@ static BUSY_HITS: AtomicU64 = AtomicU64::new(0);
 static ACK_BASE: AtomicU64 = AtomicU64::new(0);
 static KERNEL_STACK_TABLES: AtomicU64 = AtomicU64::new(0);
 
+const POP_IDLE: usize = 0;
+const POP_ARMED: usize = 1;
+const POP_FIRED: usize = 2;
+const POP_PAUSED: usize = 3;
+const POP_RELEASED: usize = 4;
+const POP_DONE: usize = 5;
+const POP_TIMEOUT: usize = 6;
+/// Largest armable population: well below `POPULATE_REPORT_PAGES`, so these
+/// failures never print an R192-RES-2 marker.
+const POP_MAX_PAGES: u64 = 4096;
+static POP_STATE: AtomicUsize = AtomicUsize::new(POP_IDLE);
+static POP_OWNER: AtomicUsize = AtomicUsize::new(0);
+static POP_ROOT: AtomicUsize = AtomicUsize::new(0);
+static POP_PAGES: AtomicUsize = AtomicUsize::new(0);
+static POP_PAUSE: AtomicBool = AtomicBool::new(false);
+
 /// Bound on any pause, as in `cow_test`: a regressed kernel or a dead sibling
 /// must end in a failing verdict, never an unbounded wait under a lock.
 const PAUSE_TSC: u64 = 10_000_000_000;
@@ -51,11 +74,44 @@ fn active_root() -> usize {
 /// prctl operations: 0 = online CPU mask; 1 = arm(unmap base, cold shared
 /// page); 2 = state; 3 = ACKs delivered by #PF mailbox drains since arming;
 /// 4 = Busy faults counted on the cold page; 5 = disarm; 6 = kernel-stack page
-/// tables built since boot.
+/// tables built since boot; 7 = arm a population failure(pages, pause);
+/// 8 = population probe state; 9 = release a paused population.
 pub fn command(op: u64, a: u64, b: u64, pid: usize, root: usize) -> Result<u64, ()> {
     match op {
         0 => Ok(cpu_local::online_cpu_mask()),
         6 => Ok(KERNEL_STACK_TABLES.load(Ordering::Acquire)),
+        7 => {
+            if root == 0 || a == 0 || a > POP_MAX_PAGES || b > 1 {
+                return Err(());
+            }
+            let state = POP_STATE.load(Ordering::Acquire);
+            if !matches!(state, POP_IDLE | POP_DONE | POP_TIMEOUT) {
+                return Err(());
+            }
+            POP_STATE
+                .compare_exchange(state, POP_FIRED, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| ())?;
+            POP_OWNER.store(pid, Ordering::Relaxed);
+            POP_ROOT.store(root, Ordering::Relaxed);
+            POP_PAGES.store(a as usize, Ordering::Relaxed);
+            POP_PAUSE.store(b == 1, Ordering::Relaxed);
+            POP_STATE.store(POP_ARMED, Ordering::Release);
+            Ok(0)
+        }
+        8 | 9 if POP_ROOT.load(Ordering::Relaxed) == root => {
+            if op == 8 {
+                return Ok(POP_STATE.load(Ordering::Acquire) as u64);
+            }
+            POP_STATE
+                .compare_exchange(
+                    POP_PAUSED,
+                    POP_RELEASED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map(|_| 0)
+                .map_err(|_| ())
+        }
         1 => {
             if root == 0 || !user_page(a) || !user_page(b) || a == b {
                 return Err(());
@@ -142,6 +198,44 @@ pub fn note_busy(fault_addr: usize) {
     }
 }
 
+/// `EagerPopulator::new`: whether this population of `pages` pages is the armed
+/// one, in the arming address space. Consumes the arming.
+pub fn take_population_failure(pages: usize) -> bool {
+    POP_STATE.load(Ordering::Acquire) == POP_ARMED
+        && POP_PAGES.load(Ordering::Relaxed) == pages
+        && POP_ROOT.load(Ordering::Relaxed) == active_root()
+        && POP_STATE
+            .compare_exchange(POP_ARMED, POP_FIRED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
+/// The armed population's failing data-frame allocation, with no lock held:
+/// pause first if asked, until a sibling releases it (or the bound passes).
+pub fn before_population_failure() {
+    if POP_STATE.load(Ordering::Acquire) != POP_FIRED {
+        return;
+    }
+    if !POP_PAUSE.load(Ordering::Relaxed) {
+        POP_STATE.store(POP_DONE, Ordering::Release);
+        return;
+    }
+    POP_STATE.store(POP_PAUSED, Ordering::Release);
+    let start = crate::time::read_tsc();
+    while POP_STATE.load(Ordering::Acquire) == POP_PAUSED {
+        if crate::time::read_tsc().wrapping_sub(start) >= PAUSE_TSC {
+            let _ = POP_STATE.compare_exchange(
+                POP_PAUSED,
+                POP_TIMEOUT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    POP_STATE.store(POP_DONE, Ordering::Release);
+}
+
 /// `allocate_kernel_stack` linked `tables` new page tables for a stack slot.
 pub fn note_kernel_stack_tables(tables: usize) {
     if tables != 0 {
@@ -154,5 +248,9 @@ pub fn clear(pid: usize) {
     if OWNER.load(Ordering::Acquire) == pid {
         OWNER.store(0, Ordering::Relaxed);
         STATE.store(IDLE, Ordering::Release);
+    }
+    if POP_OWNER.load(Ordering::Acquire) == pid {
+        POP_OWNER.store(0, Ordering::Relaxed);
+        POP_STATE.store(POP_IDLE, Ordering::Release);
     }
 }
