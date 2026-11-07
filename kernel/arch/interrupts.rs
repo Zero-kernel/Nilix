@@ -1267,7 +1267,7 @@ extern "x86-interrupt" fn page_fault_handler(
                     // #PF already cleared AC and keeps IRQs disabled, satisfying
                     // the mailbox's single-consumer contract. The pending IPI
                     // will later drain an empty queue and send its normal EOI.
-                    mm::tlb_shootdown::handle_shootdown_ipi();
+                    mm::tlb_shootdown::drain_from_fault();
                     // Ordinary cross-CPU contention is never user-fatal. Return
                     // through IRETQ so interrupts and scheduling make progress,
                     // then retry the still-read-only instruction without a budget.
@@ -1324,7 +1324,9 @@ extern "x86-interrupt" fn page_fault_handler(
                             "ST-K2-FORCED-BUSY-USERCOPY-IF0\n"
                         ));
                     }
-                    mm::tlb_shootdown::handle_shootdown_ipi();
+                    #[cfg(feature = "syscall_test")]
+                    kernel_core::fork::shared_fault_test::note_busy(fault_addr);
+                    mm::tlb_shootdown::drain_from_fault();
                     return;
                 }
                 kernel_core::fork::SharedFaultResult::Reentry(lock) => {

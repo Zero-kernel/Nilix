@@ -17912,7 +17912,13 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             // even though a peer CPU still caches a removed leaf. Flush before
             // Phase 3 can drop that pin and reclaim the DATA frame.
             if removed_leaf {
+                // ST-K2-P2(b): the remote-holder oracle pauses here, holding
+                // PT_LOCK, until a sibling's IF=0 shared fault is spinning.
+                #[cfg(feature = "syscall_test")]
+                crate::fork::shared_fault_test::before_unmap_flush(pid, addr);
                 mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
+                #[cfg(feature = "syscall_test")]
+                crate::fork::shared_fault_test::after_unmap_flush(pid, addr);
             }
             for frame in frames_to_free {
                 frame_alloc.deallocate_frame(frame);
@@ -19386,6 +19392,15 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
             let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let root = process.lock().memory_space;
             crate::fork::cow_test::command(arg2, arg3, pid, root)
+                .map(|value| value as usize)
+                .map_err(|()| SyscallError::EINVAL)
+        }
+        #[cfg(feature = "syscall_test")]
+        crate::fork::shared_fault_test::PR_SHARED_FAULT_TEST => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let root = process.lock().memory_space;
+            crate::fork::shared_fault_test::command(arg2, arg3, _arg4, pid, root)
                 .map(|value| value as usize)
                 .map_err(|()| SyscallError::EINVAL)
         }

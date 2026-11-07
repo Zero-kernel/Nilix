@@ -297,6 +297,8 @@ pub extern "C" fn _start() -> ! {
         test_thread_group_children(&mut results);
     }
     test_cow_sibling_read(&mut results);
+    // ST-K2-P2(b): a page-table holder and a remote IF=0 shared fault.
+    test_shared_fault_remote_holder(&mut results);
 
     // GAP-5 G8: /proc lists group leaders; /proc/<pid>/task lists members.
     test_proc_thread_listing(&mut results);
@@ -5371,6 +5373,196 @@ fn test_cow_sibling_read(results: &mut TestResult) {
         results.pass("COW replacement keeps a sibling's cold read present and the fork child's frame private");
     } else {
         results.fail("COW sibling cold read during the paused PTE replacement");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ST-K2-P2: shared-anonymous fault races. Keep the prctl operations and states
+// in sync with `kernel/kernel_core/shared_fault_test.rs`.
+// ---------------------------------------------------------------------------
+
+const PR_SHARED_FAULT_TEST: u64 = 0x5a53_4654;
+const SFT_PAUSED: u64 = 3;
+const SFT_COMPLETE: u64 = 5;
+const SYS_UNAME: u64 = 63;
+
+unsafe fn shared_fault_test(op: u64, a: u64, b: u64) -> u64 {
+    syscall4(SYS_PRCTL, PR_SHARED_FAULT_TEST, op, a, b)
+}
+
+/// ST-K2-P2(b): the cold shared page the sibling copies out to, and how far it
+/// got: 1 pinned and polling, 2 copied, 0xe_ a failure.
+static REMOTE_HOLDER_COLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static REMOTE_HOLDER_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Repetitions of the remote-holder round, fixed at fixture build time
+/// (`NILIX_ST_K2_REMOTE_REPS=300` for the 8-vCPU acceptance run).
+fn remote_holder_reps() -> usize {
+    let reps = option_env!("NILIX_ST_K2_REMOTE_REPS")
+        .unwrap_or("1")
+        .parse::<usize>()
+        .expect("NILIX_ST_K2_REMOTE_REPS must be an integer");
+    assert!((1..=1000).contains(&reps));
+    reps
+}
+
+/// The sibling on CPU 1: once the holder is paused in munmap with PT_LOCK held,
+/// `uname` copies out to the cold shared page. Its guarded copy faults with
+/// IF=0 and gets Busy until the holder has its acknowledgement.
+extern "C" fn remote_holder_sibling() -> ! {
+    use core::sync::atomic::Ordering;
+    if !cow_test_pin(2) {
+        REMOTE_HOLDER_STAGE.store(0xe1, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    REMOTE_HOLDER_STAGE.store(1, Ordering::Release);
+    let cold = REMOTE_HOLDER_COLD.load(Ordering::Acquire);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if unsafe { shared_fault_test(2, 0, 0) } == SFT_PAUSED {
+            let copied = unsafe { syscall1(SYS_UNAME, cold) } == 0
+                && unsafe { core::slice::from_raw_parts(cold as *const u8, 8) } == b"Zero-OS\0";
+            REMOTE_HOLDER_STAGE.store(if copied { 2 } else { 0xe2 }, Ordering::Release);
+            unsafe { raw_exit(SYS_EXIT, 0) };
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    REMOTE_HOLDER_STAGE.store(0xe3, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// One round on CPU 0: arm, start the sibling, unmap a touched private page
+/// (the kernel pauses before its shootdown), then require that the sibling's
+/// copy completed and that at least one acknowledgement came from a #PF drain.
+/// Returns the round's (drain ACKs, Busy faults).
+fn remote_holder_round() -> Result<(u64, u64), u64> {
+    use core::sync::atomic::Ordering;
+    let unmap = unsafe { mmap_anon(PAGE, false) };
+    let cold = unsafe { mmap_anon(PAGE, true) };
+    if unmap < 0 || cold < 0 {
+        return Err(0xd1);
+    }
+    // A present leaf, so munmap reaches its range shootdown.
+    unsafe { core::ptr::write_volatile(unmap as *mut u64, 0x5354_4b32) };
+    if unsafe { shared_fault_test(1, unmap as u64, cold as u64) } != 0 {
+        return Err(0xd2);
+    }
+    REMOTE_HOLDER_COLD.store(cold as u64, Ordering::Release);
+    REMOTE_HOLDER_STAGE.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let sibling = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            remote_holder_sibling,
+        )
+    };
+    if is_error(sibling) || sibling == 0 {
+        return Err(0xd3);
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if REMOTE_HOLDER_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if REMOTE_HOLDER_STAGE.load(Ordering::Acquire) != 1 {
+        let _ = g8_join_thread();
+        return Err(0xd4);
+    }
+    let unmapped = unsafe { munmap(unmap as usize, PAGE) } == 0;
+    let joined = g8_join_thread();
+    let copied = REMOTE_HOLDER_STAGE.load(Ordering::Acquire) == 2;
+    let state = unsafe { shared_fault_test(2, 0, 0) };
+    let acks = unsafe { shared_fault_test(3, 0, 0) };
+    let busy = unsafe { shared_fault_test(4, 0, 0) };
+    let disarmed = unsafe { shared_fault_test(5, 0, 0) } == 0;
+    let released = unsafe { munmap(cold as usize, PAGE) } == 0;
+    if unmapped
+        && joined
+        && copied
+        && state == SFT_COMPLETE
+        && !is_error(acks)
+        && acks >= 1
+        && !is_error(busy)
+        && busy >= 1
+        && disarmed
+        && released
+    {
+        return Ok((acks, busy));
+    }
+    let (mut a, mut b, mut c, mut d) = ([0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20]);
+    println_parts(&[
+        "  remote holder: state=",
+        decimal(state as usize, &mut a),
+        " acks=",
+        decimal(acks as usize, &mut b),
+        " busy=",
+        decimal(busy as usize, &mut c),
+        if copied { " copied" } else { " not-copied" },
+    ]);
+    println_parts(&[
+        "  remote holder: stage=",
+        decimal(REMOTE_HOLDER_STAGE.load(Ordering::Acquire) as usize, &mut d),
+        if unmapped {
+            " unmapped"
+        } else {
+            " munmap-failed"
+        },
+        if joined { " joined" } else { " not-joined" },
+    ]);
+    Err(0xd5)
+}
+
+fn shared_fault_remote_holder_leg() -> u64 {
+    if !cow_test_pin(1) {
+        return 0xd0;
+    }
+    let (mut min_acks, mut min_busy) = (u64::MAX, u64::MAX);
+    for _ in 0..remote_holder_reps() {
+        match remote_holder_round() {
+            Ok((acks, busy)) => {
+                min_acks = min_acks.min(acks);
+                min_busy = min_busy.min(busy);
+            }
+            Err(code) => return code,
+        }
+    }
+    let (mut a, mut b) = ([0u8; 20], [0u8; 20]);
+    println_parts(&[
+        "ST-K2-REMOTE-HOLDER detail: min_drain_acks=",
+        decimal(min_acks as usize, &mut a),
+        " min_busy=",
+        decimal(min_busy as usize, &mut b),
+    ]);
+    GROUP_LEG_OK
+}
+
+/// ST-K2-P2(b): a page-table holder paused in munmap before its shootdown gets
+/// its acknowledgement from a sibling spinning on a Busy shared fault with
+/// IF=0, through that fault's mailbox drain. Needs CPUs 0 and 1.
+fn test_shared_fault_remote_holder(results: &mut TestResult) {
+    let cpus = unsafe { shared_fault_test(0, 0, 0) };
+    if is_error(cpus) || cpus & 3 != 3 {
+        println("[SKIP] shared-fault remote holder: requires CPUs 0 and 1");
+        return;
+    }
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, shared_fault_remote_holder_leg()) };
+    }
+    if !is_error(host) && reap_pid(host) == Some(GROUP_LEG_OK) {
+        let mut reps = [0u8; 20];
+        println_parts(&[
+            "ST-K2-REMOTE-HOLDER-ACK PASS reps=",
+            decimal(remote_holder_reps(), &mut reps),
+        ]);
+        results.pass("a page-table holder paused before its munmap shootdown is acknowledged by a sibling's IF=0 shared-fault Busy drain");
+    } else {
+        results.fail(
+            "shared-fault remote holder: munmap shootdown during a sibling's IF=0 Busy fault",
+        );
     }
 }
 

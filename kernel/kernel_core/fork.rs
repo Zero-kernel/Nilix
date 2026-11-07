@@ -1576,6 +1576,10 @@ pub enum CowFaultFailure {
 #[cfg(feature = "syscall_test")]
 #[path = "cow_test.rs"]
 pub(crate) mod cow_test;
+// ST-K2-P2 race oracles, likewise absent from production kernels.
+#[cfg(feature = "syscall_test")]
+#[path = "shared_fault_test.rs"]
+pub mod shared_fault_test;
 
 pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFaultResult {
     use mm::page_table::try_with_current_manager;

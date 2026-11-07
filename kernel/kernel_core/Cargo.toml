@@ -40,7 +40,7 @@ namespace_probe = []
 open_fault_probe = []
 shared_fault_reentry_probe = []
 # Guest-only syscall fixture hooks (shared-fault verification oracle).
-syscall_test = ["lsm/syscall_test"]
+syscall_test = ["lsm/syscall_test", "mm/syscall_test"]
 
 [dependencies]
 spin = "0.9"

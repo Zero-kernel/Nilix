@@ -140,6 +140,20 @@ if [ "${KERNEL_TEST_CPUS:-1}" -gt 1 ]; then
     if grep -Fq '[SKIP] COW sibling cold read:' "$serial"; then
         report_fail "shared-COW sibling read oracle skipped on SMP"
     fi
+    # ST-K2-P2(b): a page-table holder paused before its munmap shootdown got
+    # its acknowledgement from a sibling's IF=0 Busy shared fault, in every one
+    # of the fixture's NILIX_ST_K2_REMOTE_REPS rounds, reported once.
+    if ! grep -Fq "[PASS] a page-table holder paused before its munmap shootdown is acknowledged by a sibling's IF=0 shared-fault Busy drain" "$serial"; then
+        report_fail "missing ST-K2-P2 remote page-table holder oracle"
+    fi
+    if grep -Fq '[SKIP] shared-fault remote holder:' "$serial"; then
+        report_fail "ST-K2-P2 remote page-table holder oracle skipped on SMP"
+    fi
+    remote_reps="${NILIX_ST_K2_REMOTE_REPS:-1}"
+    if [ "$(grep -c 'ST-K2-REMOTE-HOLDER-ACK' "$serial" || true)" -ne 1 ] \
+        || [ "$(grep -cx "ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps" "$serial" || true)" -ne 1 ]; then
+        report_fail "expected exactly one 'ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps' marker"
+    fi
 fi
 if grep -Eq '^\[FAIL\]' "$serial"; then
     report_fail "the guest reported a failing leg"

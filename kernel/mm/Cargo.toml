@@ -16,6 +16,8 @@ path = "lib.rs"
 host_harness = ["cpu_local/host_harness"]
 # Actual page-table rollback probes, run only before KPTI/AP startup.
 mmio_probe = []
+# ST-K2-P2(b): count shootdown ACKs delivered by #PF Busy mailbox drains.
+syscall_test = []
 
 # fuzz_runner: enable KCOV instrumentation and raise boot heap budget to accommodate
 # the coverage infrastructure overhead. This feature is propagated from the kernel crate.
