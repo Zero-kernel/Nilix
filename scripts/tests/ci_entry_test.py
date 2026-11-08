@@ -108,7 +108,8 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
                                                     FAIL_GATE='smp-8-16', FAIL_ATTEMPTS='1',
                                                     FAIL_STATUS=failure)
                     self.assertEqual(status, 1)
-                    self.assertEqual(events, ['build', 'smp-8-16', *following, 'report'])
+                    self.assertEqual(events, ['build', 'smp-8-16', 'final-owner-build',
+                                              'final-owner-16', *following, 'report'])
 
     def test_32_vcpu_failure_is_reported_without_retry(self):
         for group, prefix in (('smp-32', []), ('extended-smp-32', ['build'])):
@@ -120,11 +121,12 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
 
     def test_extended_split_groups_keep_the_combined_gate_order(self):
         expected = {
-            'extended-smp': ['build', 'smp-8-16', 'report'],
+            'extended-smp': ['build', 'smp-8-16', 'final-owner-build', 'final-owner-16', 'report'],
             'smp-32': ['smp-32', 'report'],
             'extended-smp-32': ['build', 'smp-32', 'report'],
             'extended-ext3': ['build', 'ext3', 'report'],
-            'extended': ['build', 'smp-8-16', 'ext3', 'stress-build', 'stress', 'report'],
+            'extended': ['build', 'smp-8-16', 'final-owner-build', 'final-owner-16',
+                         'ext3', 'stress-build', 'stress', 'report'],
         }
         for group, gates in expected.items():
             with self.subTest(group=group):

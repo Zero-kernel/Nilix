@@ -27,9 +27,11 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
         # Budgets include build, guest windows, final analysis and upload.
         # The 32-vCPU window is 3600 seconds; other windows remain 900 seconds.
+        # The smp-8-16 lane also runs the 16-vCPU 200-round final-owner gate
+        # with the 2700-second completion ceiling, hence its 90-minute budget.
         # Block adds up to 12 bounded writer boots before its recovery soak.
         lane:
-          - {name: smp-8-16, group: extended-smp, timeout: 60}
+          - {name: smp-8-16, group: extended-smp, timeout: 90}
           - {name: smp-32, group: extended-smp-32, timeout: 120}
           - {name: ext3, group: extended-ext3, timeout: 40}
           - {name: iommu, group: iommu, timeout: 60}

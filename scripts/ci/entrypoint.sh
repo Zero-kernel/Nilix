@@ -83,9 +83,16 @@ check_guest() {
 }
 
 extended_smp() {
-    # Two full 900-second windows already use half the 60-minute job budget.
-    # Keep the first result and leave time for build, log analysis and upload.
+    # Two full 900-second windows plus the 16-vCPU 200-round final-owner gate
+    # fit the 90-minute job budget; keep every first result and leave time for
+    # build, log analysis and upload.
     check smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
+    # PR86-1 runs after the runtime lane so its focused rebuild cannot replace
+    # the normal image used above. Completion mode stops at the verdict.
+    gate final-owner-build -- env NILIX_ST_K2_FINAL_OWNER_FOCUSED=1 NILIX_ST_K2_FINAL_OWNER_ITERS=200 \
+        make build-syscall-test
+    check final-owner-16 --allow-qualified -- env KERNEL_TEST_CPUS=16 KERNEL_TEST_TIMEOUT=2700 \
+        NILIX_ST_K2_FINAL_OWNER_ITERS=200 bash scripts/gates/boot/shared_final_owner.sh esp
 }
 smp_32() {
     # Preserve the first 32-vCPU result; a stalled probe must not repeat a
