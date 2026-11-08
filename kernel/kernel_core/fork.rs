@@ -1580,6 +1580,9 @@ pub(crate) mod cow_test;
 #[cfg(feature = "syscall_test")]
 #[path = "shared_fault_test.rs"]
 pub mod shared_fault_test;
+#[cfg(feature = "syscall_test")]
+#[path = "shared_release_test.rs"]
+pub mod shared_release_test;
 
 pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFaultResult {
     use mm::page_table::try_with_current_manager;
@@ -2275,19 +2278,35 @@ impl Drop for SharedAnonRegion {
         // All PTE references must have been removed before this Arc reaches
         // zero.  Release the region pin and the first-toucher cgroup charge
         // for each materialized page; invalid metadata fails leak-safe.
+        #[cfg(feature = "syscall_test")]
+        let release_epoch = shared_release_test::begin(self as *const Self as usize);
+        #[cfg(feature = "syscall_test")]
+        let (mut released, mut freed) = (0usize, 0usize);
         let mut pages = self.pages.lock();
         let mut allocator = FrameAllocator::new();
         for slot in pages.iter_mut() {
             let Some(page) = slot.take() else { continue };
-            if PAGE_REF_COUNT
+            let did_free = PAGE_REF_COUNT
                 .release(page.phys_addr)
-                .should_free_unmapped()
-            {
+                .should_free_unmapped();
+            if did_free {
                 allocator.deallocate_frame(PhysFrame::containing_address(PhysAddr::new(
                     page.phys_addr as u64,
                 )));
             }
             crate::cgroup::uncharge_memory(page.owner, 0x1000);
+            #[cfg(feature = "syscall_test")]
+            if let Some(epoch) = release_epoch {
+                released += 1;
+                freed += usize::from(did_free);
+                if released == 1 {
+                    shared_release_test::midpoint(epoch, did_free);
+                }
+            }
+        }
+        #[cfg(feature = "syscall_test")]
+        if let Some(epoch) = release_epoch {
+            shared_release_test::complete(epoch, freed);
         }
     }
 }

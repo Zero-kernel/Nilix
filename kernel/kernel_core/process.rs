@@ -11553,6 +11553,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             lsm::syscall_test::clear_task(pid);
             crate::fork::cow_test::clear(pid);
             crate::fork::shared_fault_test::clear(pid);
+            crate::fork::shared_release_test::clear(pid, generation);
         }
 
         // GAP-5 slice 4 G2: a fatal outcome ends the whole thread group. Publish

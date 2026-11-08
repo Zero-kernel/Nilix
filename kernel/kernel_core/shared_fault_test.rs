@@ -75,10 +75,12 @@ fn active_root() -> usize {
 /// page); 2 = state; 3 = ACKs delivered by #PF mailbox drains since arming;
 /// 4 = Busy faults counted on the cold page; 5 = disarm; 6 = kernel-stack page
 /// tables built since boot; 7 = arm a population failure(pages, pause);
-/// 8 = population probe state; 9 = release a paused population.
+/// 8 = population probe state; 9 = release a paused population; 17 = current CPU.
+/// Operations 10..=16 belong to shared_release_test.
 pub fn command(op: u64, a: u64, b: u64, pid: usize, root: usize) -> Result<u64, ()> {
     match op {
         0 => Ok(cpu_local::online_cpu_mask()),
+        17 => Ok(cpu_local::current_cpu_id() as u64),
         6 => Ok(KERNEL_STACK_TABLES.load(Ordering::Acquire)),
         7 => {
             if root == 0 || a == 0 || a > POP_MAX_PAGES || b > 1 {

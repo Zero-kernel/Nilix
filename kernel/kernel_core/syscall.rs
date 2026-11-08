@@ -19403,8 +19403,24 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
         crate::fork::shared_fault_test::PR_SHARED_FAULT_TEST => {
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let root = process.lock().memory_space;
-            crate::fork::shared_fault_test::command(arg2, arg3, _arg4, pid, root)
+            let (root, generation) = {
+                let proc = process.lock();
+                (proc.memory_space, proc.generation)
+            };
+            let result = if arg2 == 10 {
+                let proc = process.lock();
+                let mm = proc.mm.lock();
+                let region = mm
+                    .shared_regions
+                    .get(&(arg3 as usize))
+                    .ok_or(SyscallError::EINVAL)?;
+                crate::fork::shared_release_test::arm(region, pid, generation, root)
+            } else if (11..=16).contains(&arg2) {
+                crate::fork::shared_release_test::command(arg2, arg3, _arg4, pid, generation, root)
+            } else {
+                crate::fork::shared_fault_test::command(arg2, arg3, _arg4, pid, root)
+            };
+            result
                 .map(|value| value as usize)
                 .map_err(|()| SyscallError::EINVAL)
         }

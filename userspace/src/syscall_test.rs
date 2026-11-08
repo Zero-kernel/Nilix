@@ -198,6 +198,15 @@ pub extern "C" fn _start() -> ! {
     println("");
 
     let mut results = TestResult::new();
+    if option_env!("NILIX_ST_K2_FINAL_OWNER_FOCUSED") == Some("1") {
+        test_shared_final_owner_race(&mut results);
+        println(if results.failed == 0 {
+            "  Results: 1 passed, 0 failed"
+        } else {
+            "  Results: 0 passed, 1 failed"
+        });
+        unsafe { userspace::syscall::sys_exit(if results.failed == 0 { 0 } else { 1 }) };
+    }
     // Optional focused guest for the audit's before/after oracle; normal gates
     // still run both legs as part of the complete suite below.
     if option_env!("NILIX_AUDIT_FOCUSED") == Some("1") {
@@ -5660,10 +5669,154 @@ unsafe fn settle_to(base: MemoryBaseline) -> Result<(), MemoryBaseline> {
     Err(last)
 }
 
-/// One process round: the parent first-touches a two-page shared region,
-/// forks a child (pinned to CPU 1 on SMP), and unmaps the region first. The
-/// child, now its last owner, checks and rewrites both pages and exits while
-/// the parent churns another shared region.
+static FINAL_REAPER_CHILD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FINAL_REAPER_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FINAL_REAPER_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FINAL_REAPER_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// sched_setaffinity requests migration; its return alone does not prove that
+// scheduling has moved the task. Observe the actual CPU before arming/registering.
+fn final_owner_pin(cpu: u64) -> bool {
+    if !cow_test_pin(1 << cpu) {
+        return false;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if unsafe { shared_fault_test(17, 0, 0) } == cpu {
+            return true;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    false
+}
+
+extern "C" fn final_owner_reaper() -> ! {
+    use core::sync::atomic::Ordering;
+    let epoch = FINAL_REAPER_EPOCH.load(Ordering::Acquire);
+    let ready = final_owner_pin(1) && unsafe { shared_fault_test(16, epoch, 0) == 0 };
+    FINAL_REAPER_STAGE.store(if ready { 1 } else { 3 }, Ordering::Release);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if FINAL_REAPER_GO.load(Ordering::Acquire) {
+            let reaped = reap_pid(FINAL_REAPER_CHILD.load(Ordering::Acquire)) == Some(GROUP_LEG_OK);
+            FINAL_REAPER_STAGE.store(if ready && reaped { 2 } else { 3 }, Ordering::Release);
+            unsafe { raw_exit(SYS_EXIT, 0) };
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    FINAL_REAPER_STAGE.store(3, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 1) }
+}
+
+/// The same brackets reject a churn-before-reap negative control: neither its
+/// beginning nor its end is allowed outside this epoch's real release window.
+unsafe fn final_owner_churn(epoch: Option<u64>) -> bool {
+    for _ in 0..FINAL_OWNER_CHURN {
+        if let Some(epoch) = epoch {
+            if shared_fault_test(12, epoch, 0) != 0 {
+                return false;
+            }
+        }
+        let churn = mmap_anon(PAGE, true);
+        if churn < 0 {
+            return false;
+        }
+        core::ptr::write_volatile(churn as *mut u64, 1);
+        if munmap(churn as usize, PAGE) != 0 {
+            return false;
+        }
+        if let Some(epoch) = epoch {
+            if shared_fault_test(12, epoch, 1) != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// On SMP, a CPU-1 sibling reaps the fork child, entering the actual last-Arc
+/// destructor. CPU 0 churns only while that destructor is paused after its
+/// first DATA-frame release. UP keeps the sequential ownership/accounting case.
+unsafe fn final_owner_reap_and_churn(child: u64, epoch: Option<u64>) -> bool {
+    use core::sync::atomic::Ordering;
+    let Some(epoch) = epoch else {
+        let churned = final_owner_churn(None);
+        return reap_pid(child) == Some(GROUP_LEG_OK) && churned;
+    };
+    FINAL_REAPER_CHILD.store(child, Ordering::Release);
+    FINAL_REAPER_EPOCH.store(epoch, Ordering::Release);
+    FINAL_REAPER_STAGE.store(0, Ordering::Release);
+    FINAL_REAPER_GO.store(false, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let thread = raw_clone(
+        THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+        group_stack_top(),
+        core::ptr::null_mut(),
+        GROUP_TID_WORD.as_ptr(),
+        final_owner_reaper,
+    );
+    if is_error(thread) || thread == 0 {
+        let _ = shared_fault_test(14, epoch, 0);
+        let _ = reap_pid(child);
+        let _ = shared_fault_test(15, epoch, 0);
+        return false;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if FINAL_REAPER_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        userspace::syscall::sys_yield();
+    }
+    let mut ok = FINAL_REAPER_STAGE.load(Ordering::Acquire) == 1;
+    let negative = option_env!("NILIX_ST_K2_FINAL_OWNER_NEGATIVE") == Some("1");
+    if negative {
+        ok &= final_owner_churn(Some(epoch));
+    }
+    FINAL_REAPER_GO.store(true, Ordering::Release);
+    if ok {
+        for _ in 0..THREAD_POLL_YIELDS {
+            let state = shared_fault_test(11, epoch, 0);
+            if state == 4 || state >= 6 {
+                break;
+            }
+            userspace::syscall::sys_yield();
+        }
+        ok = shared_fault_test(11, epoch, 0) == 4;
+        if ok && !negative {
+            ok = final_owner_churn(Some(epoch));
+        }
+        if ok {
+            ok = shared_fault_test(13, epoch, 0) == 0;
+        }
+    }
+    if !ok {
+        let (mut a, mut b) = ([0u8; 20], [0u8; 20]);
+        println_parts(&[
+            "  final owner: release window rejected state=",
+            decimal(shared_fault_test(11, epoch, 0) as usize, &mut a),
+            " reaper_stage=",
+            decimal(FINAL_REAPER_STAGE.load(Ordering::Acquire) as usize, &mut b),
+        ]);
+        let _ = shared_fault_test(14, epoch, 0);
+    }
+    let joined = g8_join_thread();
+    ok &= joined
+        && FINAL_REAPER_STAGE.load(Ordering::Acquire) == 2
+        && shared_fault_test(11, epoch, 0) == 6;
+    if !ok {
+        let (mut a, mut b) = ([0u8; 20], [0u8; 20]);
+        println_parts(&[
+            "  final owner: completion rejected state=",
+            decimal(shared_fault_test(11, epoch, 0) as usize, &mut a),
+            " reaper_stage=",
+            decimal(FINAL_REAPER_STAGE.load(Ordering::Acquire) as usize, &mut b),
+        ]);
+        let _ = shared_fault_test(14, epoch, 0);
+    }
+    ok &= shared_fault_test(15, epoch, 0) == 0;
+    ok
+}
+
+/// Parent-first unmap: the fork child checks the surviving shared pages, then
+/// a separate reaper provides the actual final-release window on SMP.
 unsafe fn final_owner_process_round(pinned: bool) -> Result<(), u64> {
     let region = mmap_anon(2 * PAGE, true);
     if region < 0 {
@@ -5684,9 +5837,9 @@ unsafe fn final_owner_process_round(pinned: bool) -> Result<(), u64> {
         let _ = sys_close(to_child[1] as u64);
         let _ = sys_close(to_parent[0] as u64);
         let mut byte = 0u8;
-        let code = if pinned && !cow_test_pin(2) {
-            0xf2
-        } else if syscall3(SYS_WRITE, to_parent[1] as u64, b"r".as_ptr() as u64, 1) != 1
+        // The DATA owner need not migrate. Only the actual reaper must run on
+        // CPU 1; migrating here could strand the parent's blocking pipe read.
+        let code = if syscall3(SYS_WRITE, to_parent[1] as u64, b"r".as_ptr() as u64, 1) != 1
             || sys_read(to_child[0] as u64, &mut byte, 1) != 1
         {
             0xf3
@@ -5712,18 +5865,22 @@ unsafe fn final_owner_process_round(pinned: bool) -> Result<(), u64> {
     let _ = sys_close(to_child[0] as u64);
     let mut byte = 0u8;
     let mut ok = !is_error(child) && sys_read(to_parent[0] as u64, &mut byte, 1) == 1;
+    let epoch = if pinned && ok {
+        let armed = shared_fault_test(10, region as u64, 0);
+        if is_error(armed) {
+            ok = false;
+            None
+        } else {
+            Some(armed)
+        }
+    } else {
+        None
+    };
     ok &= munmap(region, 2 * PAGE) == 0;
     ok &= syscall3(SYS_WRITE, to_child[1] as u64, b"u".as_ptr() as u64, 1) == 1;
-    for _ in 0..FINAL_OWNER_CHURN {
-        let churn = mmap_anon(PAGE, true);
-        if churn < 0 {
-            ok = false;
-            break;
-        }
-        core::ptr::write_volatile(churn as *mut u64, 1);
-        ok &= munmap(churn as usize, PAGE) == 0;
+    if !is_error(child) {
+        ok &= final_owner_reap_and_churn(child, epoch);
     }
-    ok &= !is_error(child) && reap_pid(child) == Some(GROUP_LEG_OK);
     let _ = sys_close(to_child[1] as u64);
     let _ = sys_close(to_parent[0] as u64);
     if ok {
@@ -5738,11 +5895,11 @@ static FINAL_OWNER_PINNED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static FINAL_OWNER_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// The CLONE_VM thread: first-touches both pages, says so, and exits at once,
-/// racing the parent's munmap of the region.
+/// Non-last CLONE_VM thread: first-touches both pages and may exit alongside
+/// munmap. The living parent retains MmState; this is not a last-owner witness.
 extern "C" fn final_owner_thread() -> ! {
     use core::sync::atomic::Ordering;
-    if FINAL_OWNER_PINNED.load(Ordering::Acquire) && !cow_test_pin(2) {
+    if FINAL_OWNER_PINNED.load(Ordering::Acquire) && !final_owner_pin(1) {
         FINAL_OWNER_STAGE.store(0xe1, Ordering::Release);
         unsafe { raw_exit(SYS_EXIT, 1) };
     }
@@ -5853,7 +6010,7 @@ unsafe fn final_owner_variant(
 }
 
 fn shared_final_owner_leg(pinned: bool) -> u64 {
-    if pinned && !cow_test_pin(1) {
+    if pinned && !final_owner_pin(0) {
         return 0xfb;
     }
     let iterations = final_owner_iterations();
@@ -5862,39 +6019,65 @@ fn shared_final_owner_leg(pinned: bool) -> u64 {
     if let Err(code) = process {
         return code;
     }
-    let thread =
-        unsafe { final_owner_variant("thread", iterations, final_owner_thread_round, pinned) };
+    let thread = unsafe {
+        final_owner_variant(
+            "nonlast-thread",
+            iterations,
+            final_owner_thread_round,
+            pinned,
+        )
+    };
     match thread {
         Ok(()) => GROUP_LEG_OK,
         Err(code) => code | 0x100,
     }
 }
 
-/// ST-K2-P2(c): the last owner of a shared region is a fork child that exits
-/// after its parent unmapped first, or a CLONE_VM thread that exits while the
-/// parent unmaps, with another shared region churning on the other CPU. Every
-/// round returns `memory.current` and the buddy's free pages to the baseline.
+/// ST-K2-P2(c): SMP requires churn inside the fork child's actual final-release
+/// window, driven by a separate reaper. The non-last-thread case is accounting
+/// coverage only. Every round restores memory.current and buddy pages exactly.
 fn test_shared_final_owner_race(results: &mut TestResult) {
     print("Testing shared-anon final owner and parent-first unmap... ");
     let cpus = unsafe { shared_fault_test(0, 0, 0) };
     let pinned = !is_error(cpus) && cpus & 3 == 3;
+    // Set the inherited mask before fork: the scheduler places a new task on
+    // an allowed CPU. The host therefore starts on CPU 0, without requiring a
+    // lone running task to migrate off a CPU with no replacement candidate.
+    let mut saved_mask = 0u64;
+    if pinned {
+        if unsafe { syscall3(204, 0, 8, &mut saved_mask as *mut u64 as u64) } != 8
+            || !cow_test_pin(1)
+        {
+            results.fail("shared-anon final owner affinity setup");
+            return;
+        }
+    }
     let host = unsafe { sys_fork() };
     if host == 0 {
         unsafe { raw_exit(SYS_EXIT_GROUP, shared_final_owner_leg(pinned)) };
     }
-    if !is_error(host) && reap_pid(host) == Some(GROUP_LEG_OK) {
+    let restored = !pinned || cow_test_pin(saved_mask);
+    let reaped = !is_error(host) && reap_pid(host) == Some(GROUP_LEG_OK);
+    if restored && reaped {
         let mut buf = [0u8; 20];
         let iterations = decimal(final_owner_iterations(), &mut buf);
         println("");
         println_parts(&[
             "ST-K2-FINAL-OWNER PASS variant=process iterations=",
             iterations,
+            if pinned {
+                " mode=release-window"
+            } else {
+                " mode=sequential"
+            },
         ]);
         println_parts(&[
-            "ST-K2-FINAL-OWNER PASS variant=thread iterations=",
+            "ST-K2-FINAL-OWNER PASS variant=nonlast-thread iterations=",
             iterations,
         ]);
-        results.pass("shared-anon final owner: a fork child or CLONE_VM thread outlives the parent's unmap; memory.current and buddy free pages return exactly every round");
+        results.pass(
+            "shared-anon final release and non-last-thread accounting return exactly every round",
+        );
     } else {
         results.fail("shared-anon final owner and parent-first unmap");
     }
