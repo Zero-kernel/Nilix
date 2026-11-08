@@ -14963,7 +14963,7 @@ pub fn mmap_flags_to_perms(flags: usize) -> [u8; 4] {
 /// exit — after every inner `mm_arc.lock()` scope has ended — so re-locking
 /// `MmState` here cannot self-deadlock.
 struct BrkReservation {
-    mm: Arc<spin::Mutex<crate::process::MmState>>,
+    mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
     armed: bool,
 }
 
@@ -14997,7 +14997,7 @@ impl Drop for BrkReservation {
 /// explicitly subtracted in the SAME arm (commit or rollback) with no early-return in
 /// between, exactly like `brk_pending_growth` — so the guard never needs to undo it.
 struct StackGrowReservation {
-    mm: Arc<spin::Mutex<crate::process::MmState>>,
+    mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
     armed: bool,
 }
 
@@ -16404,9 +16404,11 @@ impl EagerPopulator {
         if pages != 0 {
             let _ = pruned.try_reserve(populate_prune_reserve(pages));
         }
+        // ST-K2-P2(d) adds a re-armable failure of an exact smaller size.
         #[cfg(feature = "syscall_test")]
-        let fail_at = (pages == POPULATE_FAULT_PROBE_PAGES
+        let fail_at = ((pages == POPULATE_FAULT_PROBE_PAGES
             && POPULATE_FAULT_PROBE_ARMED.swap(false, AtomicOrdering::AcqRel))
+            || crate::fork::shared_fault_test::take_population_failure(pages))
         .then(|| pages - 1);
         Self {
             process: process.clone(),
@@ -16571,6 +16573,8 @@ impl crate::populate::PopulateBackend for EagerPopulator {
         #[cfg(feature = "syscall_test")]
         {
             if self.fail_at == Some(self.allocated) {
+                // ST-K2-P2(d): a re-armed failure may pause here first.
+                crate::fork::shared_fault_test::before_population_failure();
                 return None;
             }
             self.allocated += 1;
@@ -17326,7 +17330,8 @@ fn sys_mmap(
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
     let (base, end, update_next, cgroup_id, old_next_mmap_addr, mm_arc, shared_region) = {
         let mut proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -17803,7 +17808,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // D3-ARC-MM-SHARED: Phase 1 operates on shared MmState via mm Arc.
     let (recorded_length, committed_flags, mm_arc) = {
         let mut proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -17910,7 +17916,13 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             // even though a peer CPU still caches a removed leaf. Flush before
             // Phase 3 can drop that pin and reclaim the DATA frame.
             if removed_leaf {
+                // ST-K2-P2(b): the remote-holder oracle pauses here, holding
+                // PT_LOCK, until a sibling's IF=0 shared fault is spinning.
+                #[cfg(feature = "syscall_test")]
+                crate::fork::shared_fault_test::before_unmap_flush(pid, addr);
                 mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
+                #[cfg(feature = "syscall_test")]
+                crate::fork::shared_fault_test::after_unmap_flush(pid, addr);
             }
             for frame in frames_to_free {
                 frame_alloc.deallocate_frame(frame);
@@ -18188,7 +18200,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // D3-ARC-MM-SHARED: Phase 0 operates on shared MmState via mm Arc.
     let (prot_none_regions, real_regions, mm_arc) = {
         let proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         let mut mm = mm_arc.lock();
 
         if mm.fork_in_progress {
@@ -18783,7 +18796,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // new PTEs with old metadata. Claim every covered VMA before PT_LOCK and
     // retain the claim through the metadata commit.
     struct MprotectPteReservation {
-        mm: Arc<spin::Mutex<crate::process::MmState>>,
+        mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
         start: usize,
         end: usize,
         armed: bool,
@@ -19385,6 +19398,36 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
             crate::fork::cow_test::command(arg2, arg3, pid, root)
                 .map(|value| value as usize)
                 .map_err(|()| SyscallError::EINVAL)
+        }
+        #[cfg(feature = "syscall_test")]
+        crate::fork::shared_fault_test::PR_SHARED_FAULT_TEST => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let (root, generation) = {
+                let proc = process.lock();
+                (proc.memory_space, proc.generation)
+            };
+            let result = if arg2 == 10 {
+                let proc = process.lock();
+                let mm = proc.mm.lock();
+                let region = mm
+                    .shared_regions
+                    .get(&(arg3 as usize))
+                    .ok_or(SyscallError::EINVAL)?;
+                crate::fork::shared_release_test::arm(region, pid, generation, root)
+            } else if (11..=16).contains(&arg2) {
+                crate::fork::shared_release_test::command(arg2, arg3, _arg4, pid, generation, root)
+            } else {
+                crate::fork::shared_fault_test::command(arg2, arg3, _arg4, pid, root)
+            };
+            result
+                .map(|value| value as usize)
+                .map_err(|()| SyscallError::EINVAL)
+        }
+        // ST-K2-P2(a): the dedicated reentry probe image only.
+        #[cfg(feature = "shared_fault_reentry_probe")]
+        crate::shared_fault_reentry_probe::PR_SHARED_FAULT_REENTRY_PROBE => {
+            crate::shared_fault_reentry_probe::run(arg2, arg3)
         }
         // TD-LSM-1: the guest oracle marks its own pid for one LSM arm.
         #[cfg(feature = "syscall_test")]
@@ -26223,7 +26266,8 @@ fn sys_mremap(
     // destination under ONE Process → MmState critical section. ----
     let (tx_opt, mm_arc) = {
         let mut proc = process.lock();
-        let mm_arc: Arc<spin::Mutex<crate::process::MmState>> = Arc::clone(&proc.mm);
+        let mm_arc: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>> =
+            Arc::clone(&proc.mm);
         // A second handle for the post-Phase-1 lock-free window: `mm` below
         // borrows `mm_arc`, so this clone is what leaves the block.
         let mm_arc_out = Arc::clone(&mm_arc);

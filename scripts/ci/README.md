@@ -2,9 +2,10 @@
 
 Functional gates default to `QEMU_GATE_MODE=completion`. Boot/runtime,
 SMP, musl, Ring-3 and IOMMU activation use the same owned QEMU supervisor. Their
-existing timeout (normally 900 seconds) is a maximum deadline, not a mandatory
-sleep. The regular CI workflow selects this mode by default. Its manual dispatch
-input `qemu_gate_mode=window` runs the former full scope, including musl.
+existing timeout (normally 900 seconds, up to 2700 for the 16-vCPU final-owner
+gate) is a maximum deadline, not a mandatory sleep. The regular CI workflow
+selects this mode by default. Its manual dispatch input `qemu_gate_mode=window`
+runs the former full scope, including musl.
 
 Regular CI has an independent 32-vCPU SMP lane that reuses the normal build
 image. Its default and maximum guest timeout is 3600 seconds; the 8/16-vCPU
@@ -12,8 +13,9 @@ suite retains 900 seconds per topology. It requires all 32 CPUs online and exact
 a partial topology fails even when the general runtime result is QUALIFIED.
 Both the 8/16-vCPU suite and the 32-vCPU gate run once, without an automatic
 retry after a failure or stall. The 8/16-vCPU suite's two 900-second windows
-leave the rest of its 60-minute Extended job for build, analysis and upload;
-retrying both windows would consume that entire budget before this overhead.
+plus the 16-vCPU 200-round final-owner gate (2700-second completion ceiling)
+leave the rest of its 120-minute Extended job for build, analysis and upload;
+retrying those windows would consume that entire budget before this overhead.
 This single-attempt policy also applies in the combined local `extended` group.
 Extended has a separate 32-vCPU lane on each Ubuntu image with the full
 3600-second window. Regular and Extended 32-vCPU jobs allow 90 and 120 minutes,

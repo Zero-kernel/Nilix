@@ -1,0 +1,29 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "Negative control for (d): settle_failed_populate without its ledger debit",
+  "gates": [
+    {
+      "command": "git diff > /tmp/nilix-evidence/st-k2-p2/8f9d736/nd/negative-control.patch",
+      "status": 0,
+      "seconds": 0,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/nd/patch.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "patch": "/tmp/nilix-evidence/st-k2-p2/8f9d736/nd/negative-control.patch",
+      "sha256": "efd77d26db16b21c43fa27f8d96cd4f245de6de3b8b2a101384b59dfa81ccc4d"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

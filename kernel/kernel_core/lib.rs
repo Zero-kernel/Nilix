@@ -75,12 +75,15 @@ pub mod mount_namespace;
 #[cfg(feature = "namespace_probe")]
 pub mod namespace_probe;
 pub mod net_namespace;
+pub mod owner_lock;
 pub mod pid_namespace;
 pub mod poll;
 pub mod populate;
 pub mod process;
 pub mod rcu;
 pub mod scheduler_hook;
+#[cfg(feature = "shared_fault_reentry_probe")]
+pub mod shared_fault_reentry_probe;
 pub mod signal;
 pub mod signal_frame;
 pub mod syscall;

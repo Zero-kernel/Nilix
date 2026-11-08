@@ -1,0 +1,29 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 4,
+    "mem": "256M"
+  },
+  "scope": "Ring-3 MM oracle at 1 and 4 vCPUs and the 3 GiB lane",
+  "gates": [
+    {
+      "command": "env KERNEL_TEST_CPUS=4 make test-ring3-mm",
+      "status": 0,
+      "seconds": 244,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/r1/ring3-4.log",
+      "log_sha256": "7f4013dc8ec6bc85ee04a5de283f205e527be52442c8b2a08f20e259c4cdcc17"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/st-k2-p2/8f9d736/r1/ring3-4.tmp.Uu3u1ZO38P.serial",
+      "serial_sha256": "5275072942ebeb53a11ce8c4a2cf07c257709cdab8dc66a535566f9098eca8fd"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

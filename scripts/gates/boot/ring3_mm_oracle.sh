@@ -126,6 +126,8 @@ mremap relocation of the largest mapping that fits moves every page in one hold,
 KPTI: ring 3 uses mappings in fresh 512 GiB slots made by mmap, mprotect and a shared first touch; the kernel and a fork child see them
 heap quotas: oversized read refused, local isolation survives, fork shares the UID ceiling
 brk COW shrink flushes retained leaves before returning
+shared-anon final release and non-last-thread accounting return exactly every round
+private rollback beside a shared-fault page table: exact ENOMEM and memory.current
 console input belongs exclusively to the configured owner
 LEGS
 
@@ -140,7 +142,37 @@ if [ "${KERNEL_TEST_CPUS:-1}" -gt 1 ]; then
     if grep -Fq '[SKIP] COW sibling cold read:' "$serial"; then
         report_fail "shared-COW sibling read oracle skipped on SMP"
     fi
+    # ST-K2-P2(b): a page-table holder paused before its munmap shootdown got
+    # its acknowledgement from a sibling's IF=0 Busy shared fault, in every one
+    # of the fixture's NILIX_ST_K2_REMOTE_REPS rounds, reported once.
+    if ! grep -Fq "[PASS] a page-table holder paused before its munmap shootdown is acknowledged by a sibling's IF=0 shared-fault Busy drain" "$serial"; then
+        report_fail "missing ST-K2-P2 remote page-table holder oracle"
+    fi
+    if grep -Fq '[SKIP] shared-fault remote holder:' "$serial"; then
+        report_fail "ST-K2-P2 remote page-table holder oracle skipped on SMP"
+    fi
+    remote_reps="${NILIX_ST_K2_REMOTE_REPS:-1}"
+    if [ "$(grep -c 'ST-K2-REMOTE-HOLDER-ACK' "$serial" || true)" -ne 1 ] \
+        || [ "$(grep -cx "ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps" "$serial" || true)" -ne 1 ]; then
+        report_fail "expected exactly one 'ST-K2-REMOTE-HOLDER-ACK PASS reps=$remote_reps' marker"
+    fi
+    # ST-K2-P2(d): the rollback that prunes a shared-fault table while a sibling
+    # unmaps the shared page needs a second CPU.
+    if [ "$(grep -cx 'ST-K2-PRIVATE-ROLLBACK PASS site=mmap-concurrent cycles=3' "$serial" || true)" -ne 1 ]; then
+        report_fail "expected exactly one concurrent private-rollback marker on SMP"
+    fi
 fi
+# PR86-1: SMP must witness actual final release, not exit-before-waitid.
+if ! python3 "$ROOT/scripts/gates/boot/shared_final_owner_oracle.py" "$serial" \
+    --cpus "${KERNEL_TEST_CPUS:-1}" --iterations "${NILIX_ST_K2_FINAL_OWNER_ITERS:-200}"; then
+    report_fail "shared final-release/accounting oracle"
+fi
+# ST-K2-P2(d): exact ENOMEM and memory.current for both sequential sites.
+for site in mmap mremap; do
+    if [ "$(grep -cx "ST-K2-PRIVATE-ROLLBACK PASS site=$site cycles=3" "$serial" || true)" -ne 1 ]; then
+        report_fail "expected exactly one 'ST-K2-PRIVATE-ROLLBACK PASS site=$site cycles=3' marker"
+    fi
+done
 if grep -Eq '^\[FAIL\]' "$serial"; then
     report_fail "the guest reported a failing leg"
 fi

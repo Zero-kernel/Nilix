@@ -1,0 +1,25 @@
+{
+  "revision": "99267d94b6ed",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "L0/L1: formatting, clippy, lint, build, usercopy table, hosted debug/release, quality and license groups",
+  "gates": [
+    {
+      "command": "make build",
+      "status": 0,
+      "seconds": 197,
+      "log": "/tmp/nilix-evidence/st-k2-p2/99267d9/l1/build.log",
+      "log_sha256": "021bd07c455c43279dceeeb51d5a99f3bbf2d45e16a220835311e8d39b8560a1"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/99267d9; only their SHA-256 is recorded here"
+  ]
+}

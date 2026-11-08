@@ -1,0 +1,25 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "ST-K2-P2(a) same-CPU reentry probe image, one fresh guest per lock",
+  "gates": [
+    {
+      "command": "git ls-files -- kernel userspace/shared_fault_reentry_probe.c scripts/gates/qemu/shared_fault_reentry_probe.py scripts/ci/gate_log.py Cargo.lock rust-toolchain.toml | xargs sha256sum > /tmp/nilix-evidence/st-k2-p2/8f9d736/p/inputs.sha256",
+      "status": 0,
+      "seconds": 0,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/p/manifest.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

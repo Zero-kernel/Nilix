@@ -1,0 +1,25 @@
+{
+  "revision": "99267d94b6ed",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "L0/L1: formatting, clippy, lint, build, usercopy table, hosted debug/release, quality and license groups",
+  "gates": [
+    {
+      "command": "make clippy",
+      "status": 0,
+      "seconds": 145,
+      "log": "/tmp/nilix-evidence/st-k2-p2/99267d9/l1/clippy.log",
+      "log_sha256": "7da484941d84506e2e65320c2309aaab9770b4166cd2103084c0e8565f6f986c"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/99267d9; only their SHA-256 is recorded here"
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "revision": "cf032d42f0ed",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "Negative control for (a): the reentry fail-stop replaced by Busy; the probe must time out. The fail-stop code is unchanged between cf032d4 and fa4b588.",
+  "gates": [
+    {
+      "command": "NEG=1: sed SharedFaultResult::Reentry(which) -> SharedFaultResult::Busy in kernel/kernel_core/fork.rs; make build; python3 scripts/gates/qemu/shared_fault_reentry_probe.py --cases mm --timeout 300",
+      "status": 1,
+      "log": "/tmp/nilix-evidence/st-k2-p2/reentry-neg-cf032d4/probe.log",
+      "log_sha256": "6da8dc307adec4a88f0c9772c7bde02fa2394a4a770d8d36c13e3498e8bd88ce"
+    },
+    {
+      "negative_control_patch": "/tmp/nilix-evidence/st-k2-p2/reentry-neg-cf032d4/negative-control.patch",
+      "sha256": "d53e422881787bbebc49f66a7d17d9ffd15a9fa5af3ec48eeba5edcfe1dc9207"
+    },
+    {
+      "case_result": "/tmp/nilix-evidence/st-k2-p2/reentry-neg-cf032d4/artifacts/shared-reentry-o5_eyhki/mm/result.json",
+      "sha256": "0c64eddaa5b4f045e189afcb612954240fbfa05ec7f7455949b584b63888a2be",
+      "pass": false,
+      "qemu_status": "timeout"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host",
+    "logs stay on the dev host; only their SHA-256 is recorded here"
+  ]
+}

@@ -1357,3 +1357,30 @@ pub fn handle_shootdown_ipi() {
         mailbox.ack_gen.store(requested, Ordering::Release);
     }
 }
+
+/// ST-K2-P2(b): drains that delivered at least one acknowledgement from a #PF
+/// Busy return (guest oracle builds only).
+#[cfg(feature = "syscall_test")]
+static ACKS_FROM_FAULT_DRAIN: AtomicU64 = AtomicU64::new(0);
+
+/// Drain this CPU's mailbox from a page fault's Busy return.
+///
+/// Guarded usercopy retries its fault with the saved IF=0, so the shootdown IPI
+/// of a remote page-table holder cannot arrive while it spins; this drain is
+/// how that holder gets its acknowledgement. #PF has cleared AC and keeps IRQs
+/// disabled, which satisfies [`handle_shootdown_ipi`]'s single-consumer rule.
+pub fn drain_from_fault() {
+    #[cfg(feature = "syscall_test")]
+    let acked = current_cpu().tlb_mailbox().ack_gen.load(Ordering::Acquire);
+    handle_shootdown_ipi();
+    #[cfg(feature = "syscall_test")]
+    if current_cpu().tlb_mailbox().ack_gen.load(Ordering::Acquire) != acked {
+        ACKS_FROM_FAULT_DRAIN.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// ST-K2-P2(b): see [`drain_from_fault`].
+#[cfg(feature = "syscall_test")]
+pub fn acks_from_fault_drain() -> u64 {
+    ACKS_FROM_FAULT_DRAIN.load(Ordering::Acquire)
+}

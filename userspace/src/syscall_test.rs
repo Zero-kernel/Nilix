@@ -198,6 +198,15 @@ pub extern "C" fn _start() -> ! {
     println("");
 
     let mut results = TestResult::new();
+    if option_env!("NILIX_ST_K2_FINAL_OWNER_FOCUSED") == Some("1") {
+        test_shared_final_owner_race(&mut results);
+        println(if results.failed == 0 {
+            "  Results: 1 passed, 0 failed"
+        } else {
+            "  Results: 0 passed, 1 failed"
+        });
+        unsafe { userspace::syscall::sys_exit(if results.failed == 0 { 0 } else { 1 }) };
+    }
     // Optional focused guest for the audit's before/after oracle; normal gates
     // still run both legs as part of the complete suite below.
     if option_env!("NILIX_AUDIT_FOCUSED") == Some("1") {
@@ -297,6 +306,13 @@ pub extern "C" fn _start() -> ! {
         test_thread_group_children(&mut results);
     }
     test_cow_sibling_read(&mut results);
+    // ST-K2-P2(b): a page-table holder and a remote IF=0 shared fault.
+    test_shared_fault_remote_holder(&mut results);
+    // ST-K2-P2(c): the last owner of a shared region exits after, or while,
+    // its parent unmaps it.
+    test_shared_final_owner_race(&mut results);
+    // ST-K2-P2(d): private population rollback beside a shared-fault table.
+    test_private_rollback_reclaim(&mut results);
 
     // GAP-5 G8: /proc lists group leaders; /proc/<pid>/task lists members.
     test_proc_thread_listing(&mut results);
@@ -5372,6 +5388,935 @@ fn test_cow_sibling_read(results: &mut TestResult) {
     } else {
         results.fail("COW sibling cold read during the paused PTE replacement");
     }
+}
+
+// ---------------------------------------------------------------------------
+// ST-K2-P2: shared-anonymous fault races. Keep the prctl operations and states
+// in sync with `kernel/kernel_core/shared_fault_test.rs`.
+// ---------------------------------------------------------------------------
+
+const PR_SHARED_FAULT_TEST: u64 = 0x5a53_4654;
+const SFT_PAUSED: u64 = 3;
+const SFT_COMPLETE: u64 = 5;
+const SYS_UNAME: u64 = 63;
+
+unsafe fn shared_fault_test(op: u64, a: u64, b: u64) -> u64 {
+    syscall4(SYS_PRCTL, PR_SHARED_FAULT_TEST, op, a, b)
+}
+
+/// ST-K2-P2(b): the cold shared page the sibling copies out to, and how far it
+/// got: 1 pinned and polling, 2 copied, 0xe_ a failure.
+static REMOTE_HOLDER_COLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static REMOTE_HOLDER_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Repetitions of the remote-holder round, fixed at fixture build time
+/// (`NILIX_ST_K2_REMOTE_REPS=300` for the 8-vCPU acceptance run).
+fn remote_holder_reps() -> usize {
+    let reps = option_env!("NILIX_ST_K2_REMOTE_REPS")
+        .unwrap_or("1")
+        .parse::<usize>()
+        .expect("NILIX_ST_K2_REMOTE_REPS must be an integer");
+    assert!((1..=1000).contains(&reps));
+    reps
+}
+
+/// The sibling on CPU 1: once the holder is paused in munmap with PT_LOCK held,
+/// `uname` copies out to the cold shared page. Its guarded copy faults with
+/// IF=0 and gets Busy until the holder has its acknowledgement.
+extern "C" fn remote_holder_sibling() -> ! {
+    use core::sync::atomic::Ordering;
+    if !cow_test_pin(2) {
+        REMOTE_HOLDER_STAGE.store(0xe1, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    REMOTE_HOLDER_STAGE.store(1, Ordering::Release);
+    let cold = REMOTE_HOLDER_COLD.load(Ordering::Acquire);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if unsafe { shared_fault_test(2, 0, 0) } == SFT_PAUSED {
+            let copied = unsafe { syscall1(SYS_UNAME, cold) } == 0
+                && unsafe { core::slice::from_raw_parts(cold as *const u8, 8) } == b"Zero-OS\0";
+            REMOTE_HOLDER_STAGE.store(if copied { 2 } else { 0xe2 }, Ordering::Release);
+            unsafe { raw_exit(SYS_EXIT, 0) };
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    REMOTE_HOLDER_STAGE.store(0xe3, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// One round on CPU 0: arm, start the sibling, unmap a touched private page
+/// (the kernel pauses before its shootdown), then require that the sibling's
+/// copy completed and that at least one acknowledgement came from a #PF drain.
+/// Returns the round's (drain ACKs, Busy faults).
+fn remote_holder_round() -> Result<(u64, u64), u64> {
+    use core::sync::atomic::Ordering;
+    let unmap = unsafe { mmap_anon(PAGE, false) };
+    let cold = unsafe { mmap_anon(PAGE, true) };
+    if unmap < 0 || cold < 0 {
+        return Err(0xd1);
+    }
+    // A present leaf, so munmap reaches its range shootdown.
+    unsafe { core::ptr::write_volatile(unmap as *mut u64, 0x5354_4b32) };
+    if unsafe { shared_fault_test(1, unmap as u64, cold as u64) } != 0 {
+        return Err(0xd2);
+    }
+    REMOTE_HOLDER_COLD.store(cold as u64, Ordering::Release);
+    REMOTE_HOLDER_STAGE.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let sibling = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            remote_holder_sibling,
+        )
+    };
+    if is_error(sibling) || sibling == 0 {
+        return Err(0xd3);
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if REMOTE_HOLDER_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if REMOTE_HOLDER_STAGE.load(Ordering::Acquire) != 1 {
+        let _ = g8_join_thread();
+        return Err(0xd4);
+    }
+    let unmapped = unsafe { munmap(unmap as usize, PAGE) } == 0;
+    let joined = g8_join_thread();
+    let copied = REMOTE_HOLDER_STAGE.load(Ordering::Acquire) == 2;
+    let state = unsafe { shared_fault_test(2, 0, 0) };
+    let acks = unsafe { shared_fault_test(3, 0, 0) };
+    let busy = unsafe { shared_fault_test(4, 0, 0) };
+    let disarmed = unsafe { shared_fault_test(5, 0, 0) } == 0;
+    let released = unsafe { munmap(cold as usize, PAGE) } == 0;
+    if unmapped
+        && joined
+        && copied
+        && state == SFT_COMPLETE
+        && !is_error(acks)
+        && acks >= 1
+        && !is_error(busy)
+        && busy >= 1
+        && disarmed
+        && released
+    {
+        return Ok((acks, busy));
+    }
+    let (mut a, mut b, mut c, mut d) = ([0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20]);
+    println_parts(&[
+        "  remote holder: state=",
+        decimal(state as usize, &mut a),
+        " acks=",
+        decimal(acks as usize, &mut b),
+        " busy=",
+        decimal(busy as usize, &mut c),
+        if copied { " copied" } else { " not-copied" },
+    ]);
+    println_parts(&[
+        "  remote holder: stage=",
+        decimal(REMOTE_HOLDER_STAGE.load(Ordering::Acquire) as usize, &mut d),
+        if unmapped {
+            " unmapped"
+        } else {
+            " munmap-failed"
+        },
+        if joined { " joined" } else { " not-joined" },
+    ]);
+    Err(0xd5)
+}
+
+fn shared_fault_remote_holder_leg() -> u64 {
+    if !cow_test_pin(1) {
+        return 0xd0;
+    }
+    let (mut min_acks, mut min_busy) = (u64::MAX, u64::MAX);
+    for _ in 0..remote_holder_reps() {
+        match remote_holder_round() {
+            Ok((acks, busy)) => {
+                min_acks = min_acks.min(acks);
+                min_busy = min_busy.min(busy);
+            }
+            Err(code) => return code,
+        }
+    }
+    let (mut a, mut b) = ([0u8; 20], [0u8; 20]);
+    println_parts(&[
+        "ST-K2-REMOTE-HOLDER detail: min_drain_acks=",
+        decimal(min_acks as usize, &mut a),
+        " min_busy=",
+        decimal(min_busy as usize, &mut b),
+    ]);
+    GROUP_LEG_OK
+}
+
+/// ST-K2-P2(b): a page-table holder paused in munmap before its shootdown gets
+/// its acknowledgement from a sibling spinning on a Busy shared fault with
+/// IF=0, through that fault's mailbox drain. Needs CPUs 0 and 1.
+fn test_shared_fault_remote_holder(results: &mut TestResult) {
+    let cpus = unsafe { shared_fault_test(0, 0, 0) };
+    if is_error(cpus) || cpus & 3 != 3 {
+        println("[SKIP] shared-fault remote holder: requires CPUs 0 and 1");
+        return;
+    }
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, shared_fault_remote_holder_leg()) };
+    }
+    if !is_error(host) && reap_pid(host) == Some(GROUP_LEG_OK) {
+        let mut reps = [0u8; 20];
+        println_parts(&[
+            "ST-K2-REMOTE-HOLDER-ACK PASS reps=",
+            decimal(remote_holder_reps(), &mut reps),
+        ]);
+        results.pass("a page-table holder paused before its munmap shootdown is acknowledged by a sibling's IF=0 shared-fault Busy drain");
+    } else {
+        results.fail(
+            "shared-fault remote holder: munmap shootdown during a sibling's IF=0 Busy fault",
+        );
+    }
+}
+
+/// ST-K2-P2(c): iterations per variant, fixed at fixture build time.
+fn final_owner_iterations() -> usize {
+    let iterations = option_env!("NILIX_ST_K2_FINAL_OWNER_ITERS")
+        .unwrap_or("200")
+        .parse::<usize>()
+        .expect("NILIX_ST_K2_FINAL_OWNER_ITERS must be an integer");
+    assert!((1..=1000).contains(&iterations));
+    iterations
+}
+
+/// Shared mmap/touch/munmap rounds the parent runs while the other owner of
+/// the race region is checking it and exiting.
+const FINAL_OWNER_CHURN: usize = 4;
+const FINAL_OWNER_WORDS: [u64; 2] = [0x4649_4e41_4c30, 0x4649_4e41_4c31];
+
+/// Root-cgroup `MemFree` from /proc/meminfo, in kB: the buddy's free pages
+/// times four.
+unsafe fn read_mem_free_kb() -> Option<u64> {
+    let fd = sys_open(b"/proc/meminfo\0".as_ptr(), 0, 0);
+    if is_error(fd) {
+        return None;
+    }
+    let mut buf = [0u8; 512];
+    let read = sys_read(fd, buf.as_mut_ptr(), buf.len() as u64);
+    let _ = sys_close(fd);
+    if is_error(read) {
+        return None;
+    }
+    let text = &buf[..read as usize];
+    let key = b"MemFree:";
+    let start = text.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut value = 0u64;
+    let mut digits = 0;
+    for &byte in &text[start..] {
+        match byte {
+            b' ' if digits == 0 => {}
+            b'0'..=b'9' => {
+                value = value.checked_mul(10)?.checked_add((byte - b'0') as u64)?;
+                digits += 1;
+            }
+            _ => break,
+        }
+    }
+    (digits != 0).then_some(value)
+}
+
+/// What (c) restores exactly: the cgroup's `memory.current`, and buddy free
+/// pages plus every kernel-stack page table built so far (those tables are
+/// kept for recycled PIDs, so they are counted rather than tolerated).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MemoryBaseline {
+    charged: u64,
+    free_pages: u64,
+}
+
+unsafe fn memory_baseline() -> Option<MemoryBaseline> {
+    let charged = read_memory_current()?;
+    let free_kb = read_mem_free_kb()?;
+    let tables = shared_fault_test(6, 0, 0);
+    if is_error(tables) {
+        return None;
+    }
+    Some(MemoryBaseline {
+        charged,
+        free_pages: (free_kb / 4).checked_add(tables)?,
+    })
+}
+
+/// Wait (bounded) for deferred teardown, such as the RCU-delayed kernel-stack
+/// reclaim of a reaped task, to land on `base` exactly.
+unsafe fn settle_to(base: MemoryBaseline) -> Result<(), MemoryBaseline> {
+    let mut last = MemoryBaseline {
+        charged: u64::MAX,
+        free_pages: u64::MAX,
+    };
+    for _ in 0..2000 {
+        if let Some(now) = memory_baseline() {
+            if now == base {
+                return Ok(());
+            }
+            last = now;
+        }
+        for _ in 0..20 {
+            userspace::syscall::sys_yield();
+        }
+    }
+    Err(last)
+}
+
+static FINAL_REAPER_CHILD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FINAL_REAPER_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FINAL_REAPER_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FINAL_REAPER_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// sched_setaffinity requests migration; its return alone does not prove that
+// scheduling has moved the task. Observe the actual CPU before arming/registering.
+fn final_owner_pin(cpu: u64) -> bool {
+    if !cow_test_pin(1 << cpu) {
+        return false;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if unsafe { shared_fault_test(17, 0, 0) } == cpu {
+            return true;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    false
+}
+
+extern "C" fn final_owner_reaper() -> ! {
+    use core::sync::atomic::Ordering;
+    let epoch = FINAL_REAPER_EPOCH.load(Ordering::Acquire);
+    let ready = final_owner_pin(1) && unsafe { shared_fault_test(16, epoch, 0) == 0 };
+    FINAL_REAPER_STAGE.store(if ready { 1 } else { 3 }, Ordering::Release);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if FINAL_REAPER_GO.load(Ordering::Acquire) {
+            let reaped = reap_pid(FINAL_REAPER_CHILD.load(Ordering::Acquire)) == Some(GROUP_LEG_OK);
+            FINAL_REAPER_STAGE.store(if ready && reaped { 2 } else { 3 }, Ordering::Release);
+            unsafe { raw_exit(SYS_EXIT, 0) };
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    FINAL_REAPER_STAGE.store(3, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 1) }
+}
+
+/// The same brackets reject a churn-before-reap negative control: neither its
+/// beginning nor its end is allowed outside this epoch's real release window.
+unsafe fn final_owner_churn(epoch: Option<u64>) -> bool {
+    for _ in 0..FINAL_OWNER_CHURN {
+        if let Some(epoch) = epoch {
+            if shared_fault_test(12, epoch, 0) != 0 {
+                return false;
+            }
+        }
+        let churn = mmap_anon(PAGE, true);
+        if churn < 0 {
+            return false;
+        }
+        core::ptr::write_volatile(churn as *mut u64, 1);
+        if munmap(churn as usize, PAGE) != 0 {
+            return false;
+        }
+        if let Some(epoch) = epoch {
+            if shared_fault_test(12, epoch, 1) != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// On SMP, a CPU-1 sibling reaps the fork child, entering the actual last-Arc
+/// destructor. CPU 0 churns only while that destructor is paused after its
+/// first DATA-frame release. UP keeps the sequential ownership/accounting case.
+unsafe fn final_owner_reap_and_churn(child: u64, epoch: Option<u64>) -> bool {
+    use core::sync::atomic::Ordering;
+    let Some(epoch) = epoch else {
+        let churned = final_owner_churn(None);
+        return reap_pid(child) == Some(GROUP_LEG_OK) && churned;
+    };
+    FINAL_REAPER_CHILD.store(child, Ordering::Release);
+    FINAL_REAPER_EPOCH.store(epoch, Ordering::Release);
+    FINAL_REAPER_STAGE.store(0, Ordering::Release);
+    FINAL_REAPER_GO.store(false, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let thread = raw_clone(
+        THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+        group_stack_top(),
+        core::ptr::null_mut(),
+        GROUP_TID_WORD.as_ptr(),
+        final_owner_reaper,
+    );
+    if is_error(thread) || thread == 0 {
+        let _ = shared_fault_test(14, epoch, 0);
+        let _ = reap_pid(child);
+        let _ = shared_fault_test(15, epoch, 0);
+        return false;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if FINAL_REAPER_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        userspace::syscall::sys_yield();
+    }
+    let mut ok = FINAL_REAPER_STAGE.load(Ordering::Acquire) == 1;
+    let negative = option_env!("NILIX_ST_K2_FINAL_OWNER_NEGATIVE") == Some("1");
+    if negative {
+        ok &= final_owner_churn(Some(epoch));
+    }
+    FINAL_REAPER_GO.store(true, Ordering::Release);
+    if ok {
+        for _ in 0..THREAD_POLL_YIELDS {
+            let state = shared_fault_test(11, epoch, 0);
+            if state == 4 || state >= 6 {
+                break;
+            }
+            userspace::syscall::sys_yield();
+        }
+        ok = shared_fault_test(11, epoch, 0) == 4;
+        if ok && !negative {
+            ok = final_owner_churn(Some(epoch));
+        }
+        if ok {
+            ok = shared_fault_test(13, epoch, 0) == 0;
+        }
+    }
+    if !ok {
+        let (mut a, mut b) = ([0u8; 20], [0u8; 20]);
+        println_parts(&[
+            "  final owner: release window rejected state=",
+            decimal(shared_fault_test(11, epoch, 0) as usize, &mut a),
+            " reaper_stage=",
+            decimal(FINAL_REAPER_STAGE.load(Ordering::Acquire) as usize, &mut b),
+        ]);
+        let _ = shared_fault_test(14, epoch, 0);
+    }
+    let joined = g8_join_thread();
+    ok &= joined
+        && FINAL_REAPER_STAGE.load(Ordering::Acquire) == 2
+        && shared_fault_test(11, epoch, 0) == 6;
+    if !ok {
+        let (mut a, mut b) = ([0u8; 20], [0u8; 20]);
+        println_parts(&[
+            "  final owner: completion rejected state=",
+            decimal(shared_fault_test(11, epoch, 0) as usize, &mut a),
+            " reaper_stage=",
+            decimal(FINAL_REAPER_STAGE.load(Ordering::Acquire) as usize, &mut b),
+        ]);
+        let _ = shared_fault_test(14, epoch, 0);
+    }
+    ok &= shared_fault_test(15, epoch, 0) == 0;
+    ok
+}
+
+/// Parent-first unmap: the fork child checks the surviving shared pages, then
+/// a separate reaper provides the actual final-release window on SMP.
+unsafe fn final_owner_process_round(pinned: bool) -> Result<(), u64> {
+    let region = mmap_anon(2 * PAGE, true);
+    if region < 0 {
+        return Err(0xf0);
+    }
+    let region = region as usize;
+    for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+        core::ptr::write_volatile((region + page * PAGE) as *mut u64, *word);
+    }
+    let (mut to_child, mut to_parent) = ([-1i32; 2], [-1i32; 2]);
+    if syscall2(SYS_PIPE2, to_child.as_mut_ptr() as u64, 0) != 0
+        || syscall2(SYS_PIPE2, to_parent.as_mut_ptr() as u64, 0) != 0
+    {
+        return Err(0xf1);
+    }
+    let child = sys_fork();
+    if child == 0 {
+        let _ = sys_close(to_child[1] as u64);
+        let _ = sys_close(to_parent[0] as u64);
+        let mut byte = 0u8;
+        // The DATA owner need not migrate. Only the actual reaper must run on
+        // CPU 1; migrating here could strand the parent's blocking pipe read.
+        let code = if syscall3(SYS_WRITE, to_parent[1] as u64, b"r".as_ptr() as u64, 1) != 1
+            || sys_read(to_child[0] as u64, &mut byte, 1) != 1
+        {
+            0xf3
+        } else {
+            // The parent has unmapped: this task holds the region's last pin.
+            let mut intact = true;
+            for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+                let addr = (region + page * PAGE) as *mut u64;
+                intact &= core::ptr::read_volatile(addr) == *word;
+                core::ptr::write_volatile(addr, !*word);
+                intact &= core::ptr::read_volatile(addr) == !*word;
+            }
+            if intact {
+                GROUP_LEG_OK
+            } else {
+                0xf4
+            }
+        };
+        raw_exit(SYS_EXIT_GROUP, code);
+    }
+    // Only the child keeps these ends, so its early exit reads as EOF here.
+    let _ = sys_close(to_parent[1] as u64);
+    let _ = sys_close(to_child[0] as u64);
+    let mut byte = 0u8;
+    let mut ok = !is_error(child) && sys_read(to_parent[0] as u64, &mut byte, 1) == 1;
+    let epoch = if pinned && ok {
+        let armed = shared_fault_test(10, region as u64, 0);
+        if is_error(armed) {
+            ok = false;
+            None
+        } else {
+            Some(armed)
+        }
+    } else {
+        None
+    };
+    ok &= munmap(region, 2 * PAGE) == 0;
+    ok &= syscall3(SYS_WRITE, to_child[1] as u64, b"u".as_ptr() as u64, 1) == 1;
+    if !is_error(child) {
+        ok &= final_owner_reap_and_churn(child, epoch);
+    }
+    let _ = sys_close(to_child[1] as u64);
+    let _ = sys_close(to_parent[0] as u64);
+    if ok {
+        Ok(())
+    } else {
+        Err(0xf5)
+    }
+}
+
+static FINAL_OWNER_REGION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FINAL_OWNER_PINNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static FINAL_OWNER_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Non-last CLONE_VM thread: first-touches both pages and may exit alongside
+/// munmap. The living parent retains MmState; this is not a last-owner witness.
+extern "C" fn final_owner_thread() -> ! {
+    use core::sync::atomic::Ordering;
+    if FINAL_OWNER_PINNED.load(Ordering::Acquire) && !final_owner_pin(1) {
+        FINAL_OWNER_STAGE.store(0xe1, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    let region = FINAL_OWNER_REGION.load(Ordering::Acquire) as usize;
+    for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((region + page * PAGE) as *mut u64, *word) };
+    }
+    FINAL_OWNER_STAGE.store(1, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// One thread round: a CLONE_VM thread on CPU 1 faults the region in and
+/// exits while the parent checks the words, unmaps the region and churns.
+unsafe fn final_owner_thread_round(pinned: bool) -> Result<(), u64> {
+    use core::sync::atomic::Ordering;
+    let region = mmap_anon(2 * PAGE, true);
+    if region < 0 {
+        return Err(0xf6);
+    }
+    FINAL_OWNER_REGION.store(region as u64, Ordering::Release);
+    FINAL_OWNER_PINNED.store(pinned, Ordering::Release);
+    FINAL_OWNER_STAGE.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let thread = raw_clone(
+        THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+        group_stack_top(),
+        core::ptr::null_mut(),
+        GROUP_TID_WORD.as_ptr(),
+        final_owner_thread,
+    );
+    if is_error(thread) || thread == 0 {
+        return Err(0xf7);
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if FINAL_OWNER_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        userspace::syscall::sys_yield();
+    }
+    let mut ok = FINAL_OWNER_STAGE.load(Ordering::Acquire) == 1;
+    for (page, word) in FINAL_OWNER_WORDS.iter().enumerate() {
+        ok = ok && core::ptr::read_volatile((region as usize + page * PAGE) as *const u64) == *word;
+    }
+    ok &= munmap(region as usize, 2 * PAGE) == 0;
+    for _ in 0..FINAL_OWNER_CHURN {
+        let churn = mmap_anon(PAGE, true);
+        if churn < 0 {
+            ok = false;
+            break;
+        }
+        core::ptr::write_volatile(churn as *mut u64, 1);
+        ok &= munmap(churn as usize, PAGE) == 0;
+    }
+    ok &= g8_join_thread();
+    if ok {
+        Ok(())
+    } else {
+        Err(0xf8)
+    }
+}
+
+/// Runs `round` once to warm up, takes the baseline, then requires every one
+/// of `iterations` rounds to come back to it exactly.
+unsafe fn final_owner_variant(
+    name: &str,
+    iterations: usize,
+    round: unsafe fn(bool) -> Result<(), u64>,
+    pinned: bool,
+) -> Result<(), u64> {
+    round(pinned)?;
+    let mut base = None;
+    for _ in 0..2000 {
+        // Let the warm-up's deferred teardown finish before the baseline.
+        let first = memory_baseline();
+        for _ in 0..20 {
+            userspace::syscall::sys_yield();
+        }
+        if first.is_some() && memory_baseline() == first {
+            base = first;
+            break;
+        }
+    }
+    let base = base.ok_or(0xf9u64)?;
+    for iteration in 0..iterations {
+        round(pinned)?;
+        if let Err(now) = settle_to(base) {
+            let (mut a, mut b, mut c, mut d, mut e) =
+                ([0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20], [0u8; 20]);
+            println_parts(&[
+                "  final owner: ",
+                name,
+                " iteration ",
+                decimal(iteration, &mut a),
+                " charged ",
+                decimal(base.charged as usize, &mut b),
+                decimal(now.charged as usize, &mut c),
+            ]);
+            println_parts(&[
+                "  final owner: free pages+kstack tables ",
+                decimal(base.free_pages as usize, &mut d),
+                " -> ",
+                decimal(now.free_pages as usize, &mut e),
+            ]);
+            return Err(0xfa);
+        }
+    }
+    Ok(())
+}
+
+fn shared_final_owner_leg(pinned: bool) -> u64 {
+    if pinned && !final_owner_pin(0) {
+        return 0xfb;
+    }
+    let iterations = final_owner_iterations();
+    let process =
+        unsafe { final_owner_variant("process", iterations, final_owner_process_round, pinned) };
+    if let Err(code) = process {
+        return code;
+    }
+    let thread = unsafe {
+        final_owner_variant(
+            "nonlast-thread",
+            iterations,
+            final_owner_thread_round,
+            pinned,
+        )
+    };
+    match thread {
+        Ok(()) => GROUP_LEG_OK,
+        Err(code) => code | 0x100,
+    }
+}
+
+/// ST-K2-P2(c): SMP requires churn inside the fork child's actual final-release
+/// window, driven by a separate reaper. The non-last-thread case is accounting
+/// coverage only. Every round restores memory.current and buddy pages exactly.
+fn test_shared_final_owner_race(results: &mut TestResult) {
+    print("Testing shared-anon final owner and parent-first unmap... ");
+    let cpus = unsafe { shared_fault_test(0, 0, 0) };
+    let pinned = !is_error(cpus) && cpus & 3 == 3;
+    // Set the inherited mask before fork: the scheduler places a new task on
+    // an allowed CPU. The host therefore starts on CPU 0, without requiring a
+    // lone running task to migrate off a CPU with no replacement candidate.
+    let mut saved_mask = 0u64;
+    if pinned {
+        if unsafe { syscall3(204, 0, 8, &mut saved_mask as *mut u64 as u64) } != 8
+            || !cow_test_pin(1)
+        {
+            results.fail("shared-anon final owner affinity setup");
+            return;
+        }
+    }
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, shared_final_owner_leg(pinned)) };
+    }
+    let restored = !pinned || cow_test_pin(saved_mask);
+    let reaped = !is_error(host) && reap_pid(host) == Some(GROUP_LEG_OK);
+    if restored && reaped {
+        let mut buf = [0u8; 20];
+        let iterations = decimal(final_owner_iterations(), &mut buf);
+        println("");
+        println_parts(&[
+            "ST-K2-FINAL-OWNER PASS variant=process iterations=",
+            iterations,
+            if pinned {
+                " mode=release-window"
+            } else {
+                " mode=sequential"
+            },
+        ]);
+        println_parts(&[
+            "ST-K2-FINAL-OWNER PASS variant=nonlast-thread iterations=",
+            iterations,
+        ]);
+        results.pass(
+            "shared-anon final release and non-last-thread accounting return exactly every round",
+        );
+    } else {
+        results.fail("shared-anon final owner and parent-first unmap");
+    }
+}
+
+/// ST-K2-P2(d): a shared page at the start of an otherwise unused PD (160 GiB)
+/// and the private population beside it. 515 pages run from the next page into
+/// the following 2 MiB block, and stay below the R192-RES-2 report size.
+const ROLLBACK_BASE: usize = 0x28_0000_0000;
+const ROLLBACK_PAGES: usize = 515;
+const ROLLBACK_CYCLES: usize = 3;
+const ROLLBACK_SHARED_WORD: u64 = 0x5348_4152_4544;
+const POP_PAUSED: u64 = 3;
+const POP_DONE: u64 = 5;
+
+unsafe fn mmap_hint(addr: usize, len: usize, shared: bool) -> i64 {
+    let kind = if shared { MAP_SHARED } else { MAP_PRIVATE };
+    syscall6(
+        SYS_MMAP,
+        addr as u64,
+        len as u64,
+        PROT_READ | PROT_WRITE,
+        kind | MAP_ANONYMOUS,
+        u64::MAX,
+        0,
+    ) as i64
+}
+
+/// Map and first-touch the shared page: its page table (and the PD above it)
+/// go to the shared-fault ledger.
+unsafe fn rollback_shared_page() -> Result<(), &'static str> {
+    if mmap_hint(ROLLBACK_BASE, PAGE, true) != ROLLBACK_BASE as i64 {
+        return Err("shared page: address hint unavailable");
+    }
+    core::ptr::write_volatile(ROLLBACK_BASE as *mut u64, ROLLBACK_SHARED_WORD);
+    Ok(())
+}
+
+/// After the armed population failed: exactly ENOMEM, the probe fired, and
+/// the shared page kept its word.
+unsafe fn rollback_failed(result: i64) -> Result<(), &'static str> {
+    if err_of(result) != ENOMEM {
+        return Err("the injected population did not fail with exactly ENOMEM");
+    }
+    if shared_fault_test(8, 0, 0) != POP_DONE {
+        return Err("the armed population failure did not fire");
+    }
+    Ok(())
+}
+
+/// mmap: the private population beside the shared page fails; nothing it
+/// charged survives, and unmapping the shared page restores the baseline.
+unsafe fn rollback_mmap_cycle() -> Result<(), &'static str> {
+    let base = read_memory_current().ok_or("memory.current")?;
+    rollback_shared_page()?;
+    let with_shared = read_memory_current().ok_or("memory.current")?;
+    if shared_fault_test(7, ROLLBACK_PAGES as u64, 0) != 0 {
+        return Err("mmap: arming the population failure");
+    }
+    rollback_failed(mmap_hint(
+        ROLLBACK_BASE + PAGE,
+        ROLLBACK_PAGES * PAGE,
+        false,
+    ))?;
+    if read_memory_current() != Some(with_shared) {
+        return Err("mmap: the failed population changed memory.current");
+    }
+    if core::ptr::read_volatile(ROLLBACK_BASE as *const u64) != ROLLBACK_SHARED_WORD {
+        return Err("mmap: the shared page lost its word");
+    }
+    if munmap(ROLLBACK_BASE, PAGE) != 0 || read_memory_current() != Some(base) {
+        return Err("mmap: unmapping the shared page did not restore the baseline");
+    }
+    Ok(())
+}
+
+/// mremap: a private page beside the shared one grows in place; its tail
+/// population fails and the page keeps its contents and charge.
+unsafe fn rollback_mremap_cycle() -> Result<(), &'static str> {
+    const WORD: u64 = 0x4d52_454d_4150;
+    let base = read_memory_current().ok_or("memory.current")?;
+    rollback_shared_page()?;
+    let private = ROLLBACK_BASE + PAGE;
+    if mmap_hint(private, PAGE, false) != private as i64 {
+        return Err("mremap: private page hint unavailable");
+    }
+    core::ptr::write_volatile(private as *mut u64, WORD);
+    let with_private = read_memory_current().ok_or("memory.current")?;
+    if shared_fault_test(7, ROLLBACK_PAGES as u64, 0) != 0 {
+        return Err("mremap: arming the population failure");
+    }
+    rollback_failed(mremap(private, PAGE, (1 + ROLLBACK_PAGES) * PAGE, 0))?;
+    if read_memory_current() != Some(with_private)
+        || core::ptr::read_volatile(private as *const u64) != WORD
+    {
+        return Err("mremap: the failed tail changed memory.current or the page");
+    }
+    if munmap(private, PAGE) != 0
+        || munmap(ROLLBACK_BASE, PAGE) != 0
+        || read_memory_current() != Some(base)
+    {
+        return Err("mremap: unmapping both pages did not restore the baseline");
+    }
+    Ok(())
+}
+
+static ROLLBACK_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The sibling on CPU 1: once the population is paused before its failing
+/// allocation, unmap the shared page (its table still holds the population's
+/// leaves, so this munmap cannot prune it) and let the population fail.
+extern "C" fn rollback_unmapper() -> ! {
+    use core::sync::atomic::Ordering;
+    if !cow_test_pin(2) {
+        ROLLBACK_STAGE.store(0xe1, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    ROLLBACK_STAGE.store(1, Ordering::Release);
+    for _ in 0..THREAD_POLL_YIELDS {
+        if unsafe { shared_fault_test(8, 0, 0) } == POP_PAUSED {
+            let unmapped = unsafe { munmap(ROLLBACK_BASE, PAGE) } == 0;
+            let released = unsafe { shared_fault_test(9, 0, 0) } == 0;
+            ROLLBACK_STAGE.store(
+                if unmapped && released { 2 } else { 0xe2 },
+                Ordering::Release,
+            );
+            unsafe { raw_exit(SYS_EXIT, 0) };
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    ROLLBACK_STAGE.store(0xe3, Ordering::Release);
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+/// Concurrent prune: the rollback itself empties the shared fault's page
+/// table and prunes it, so only `settle_failed_populate` can release its
+/// ledgered charge. The baseline is checked once the sibling is reaped.
+unsafe fn rollback_concurrent_cycle() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    let base = read_memory_current().ok_or("memory.current")?;
+    rollback_shared_page()?;
+    if shared_fault_test(7, ROLLBACK_PAGES as u64, 1) != 0 {
+        return Err("concurrent: arming the paused population failure");
+    }
+    ROLLBACK_STAGE.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+    let sibling = raw_clone(
+        THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+        group_stack_top(),
+        core::ptr::null_mut(),
+        GROUP_TID_WORD.as_ptr(),
+        rollback_unmapper,
+    );
+    if is_error(sibling) || sibling == 0 {
+        return Err("concurrent: clone");
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if ROLLBACK_STAGE.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        userspace::syscall::sys_yield();
+    }
+    if ROLLBACK_STAGE.load(Ordering::Acquire) != 1 {
+        let _ = g8_join_thread();
+        return Err("concurrent: the sibling did not start on CPU 1");
+    }
+    let result = mmap_hint(ROLLBACK_BASE + PAGE, ROLLBACK_PAGES * PAGE, false);
+    let joined = g8_join_thread();
+    rollback_failed(result)?;
+    if !joined || ROLLBACK_STAGE.load(Ordering::Acquire) != 2 {
+        return Err("concurrent: the sibling did not unmap the shared page during the pause");
+    }
+    for _ in 0..2000 {
+        if read_memory_current() == Some(base) {
+            return Ok(());
+        }
+        for _ in 0..20 {
+            userspace::syscall::sys_yield();
+        }
+    }
+    Err("concurrent: the pruned shared-fault table stayed charged")
+}
+
+type RollbackCycle = unsafe fn() -> Result<(), &'static str>;
+
+fn private_rollback_leg(smp: bool) -> u64 {
+    let sites: [(RollbackCycle, bool); 3] = [
+        (rollback_mmap_cycle, true),
+        (rollback_mremap_cycle, true),
+        (rollback_concurrent_cycle, smp),
+    ];
+    if smp && !cow_test_pin(1) {
+        return 0xc0;
+    }
+    for (index, (cycle, run)) in sites.iter().enumerate() {
+        if !run {
+            continue;
+        }
+        for _ in 0..ROLLBACK_CYCLES {
+            if let Err(reason) = unsafe { cycle() } {
+                print("  private rollback: ");
+                println(reason);
+                return 0xc1 + index as u64;
+            }
+        }
+    }
+    GROUP_LEG_OK
+}
+
+/// ST-K2-P2(d): a private population beside a page table built by a shared
+/// fault fails by injection (mmap, mremap growth, and on SMP while a sibling
+/// unmaps the shared page); the errno and `memory.current` are exact.
+fn test_private_rollback_reclaim(results: &mut TestResult) {
+    print("Testing private rollback beside a shared-fault page table... ");
+    let cpus = unsafe { shared_fault_test(0, 0, 0) };
+    let smp = !is_error(cpus) && cpus & 3 == 3;
+    let host = unsafe { sys_fork() };
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, private_rollback_leg(smp)) };
+    }
+    if is_error(host) || reap_pid(host) != Some(GROUP_LEG_OK) {
+        results.fail("private rollback beside a shared-fault page table");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let cycles = decimal(ROLLBACK_CYCLES, &mut buf);
+    println("");
+    println_parts(&["ST-K2-PRIVATE-ROLLBACK PASS site=mmap cycles=", cycles]);
+    println_parts(&["ST-K2-PRIVATE-ROLLBACK PASS site=mremap cycles=", cycles]);
+    if smp {
+        println_parts(&[
+            "ST-K2-PRIVATE-ROLLBACK PASS site=mmap-concurrent cycles=",
+            cycles,
+        ]);
+    } else {
+        println("[SKIP] private rollback concurrent prune: requires CPUs 0 and 1");
+    }
+    results
+        .pass("private rollback beside a shared-fault page table: exact ENOMEM and memory.current");
 }
 
 // ---------------------------------------------------------------------------

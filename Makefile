@@ -538,6 +538,11 @@ test: build
 # (built by `build-syscall-test`) and checks the Ring-3 verdict for the
 # anonymous-resize and shared-anonymous legs. Separate from `test` because that
 # workload demand-faults by design, which `kernel_test.sh` bans outright.
+.PHONY: test-shared-final-owner
+test-shared-final-owner:
+	NILIX_ST_K2_FINAL_OWNER_FOCUSED=1 $(MAKE) build-syscall-test
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/shared_final_owner.sh esp
+
 test-ring3-mm: build-syscall-test
 	@echo "=== Running Ring-3 memory-management oracle ==="
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/ring3_mm_oracle.sh esp

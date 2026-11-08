@@ -1729,6 +1729,11 @@ fn panic(info: &PanicInfo) -> ! {
         // - Base64 encoding for serial transport
         // Only emits once per boot (atomic guard prevents duplicate dumps).
         trace::kdump::emit_encrypted_dump(crash_dump);
+
+        // ST-K2-P2(a): the reentry probe image ends QEMU here, so its gate can
+        // tell this fail-stop from a hang (isa-debug-exit 0x11: status 35).
+        #[cfg(feature = "shared_fault_reentry_probe")]
+        x86_64::instructions::port::Port::<u32>::new(0xf4).write(0x11);
     }
     loop {
         unsafe {

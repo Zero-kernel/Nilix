@@ -80,11 +80,13 @@ pub enum ForkError {
 /// through the parent-PTE COW commit.  Mutators observe `fork_in_progress`
 /// before arming their own transient state; Drop closes every error path.
 struct ForkMmReservation {
-    mm: Arc<Mutex<crate::process::MmState>>,
+    mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
 }
 
 impl ForkMmReservation {
-    fn acquire(mm: Arc<Mutex<crate::process::MmState>>) -> Result<Self, ForkError> {
+    fn acquire(
+        mm: Arc<crate::owner_lock::OwnerCpuMutex<crate::process::MmState>>,
+    ) -> Result<Self, ForkError> {
         {
             let mut state = mm.lock();
             if state.fork_in_progress
@@ -1062,8 +1064,8 @@ fn fork_inner(
         child_mm
             .reserve_shared_fault_pt(None)
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        child.mm =
-            Arc::try_new(Mutex::new(child_mm)).map_err(|_| ForkError::MemoryAllocationFailed)?;
+        child.mm = Arc::try_new(crate::owner_lock::OwnerCpuMutex::new(child_mm))
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
         charge_bytes
     };
 
@@ -1574,6 +1576,13 @@ pub enum CowFaultFailure {
 #[cfg(feature = "syscall_test")]
 #[path = "cow_test.rs"]
 pub(crate) mod cow_test;
+// ST-K2-P2 race oracles, likewise absent from production kernels.
+#[cfg(feature = "syscall_test")]
+#[path = "shared_fault_test.rs"]
+pub mod shared_fault_test;
+#[cfg(feature = "syscall_test")]
+#[path = "shared_release_test.rs"]
+pub mod shared_release_test;
 
 pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFaultResult {
     use mm::page_table::try_with_current_manager;
@@ -1795,6 +1804,41 @@ pub enum SharedFaultResult {
     Busy,
     NotShared,
     Fatal(CowFaultFailure),
+    /// ST-K2-P2(a): the named lock is held by the context this fault
+    /// interrupted on the same CPU. Retrying could never succeed.
+    Reentry(SharedFaultLock),
+}
+
+/// ST-K2-P2(a): the locks `handle_shared_page_fault` try-locks before
+/// `PT_LOCK`, each of which records its holding CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedFaultLock {
+    ProcessTable,
+    Pcb,
+    MmState,
+}
+
+impl SharedFaultLock {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ProcessTable => "PROCESS_TABLE",
+            Self::Pcb => "PCB",
+            Self::MmState => "MmState",
+        }
+    }
+}
+
+/// A failed fault-path try-lock is ordinary contention, unless this CPU is the
+/// holder: the interrupted context cannot release it before the fault returns.
+fn shared_fault_contended<T: ?Sized>(
+    lock: &crate::owner_lock::OwnerCpuMutex<T>,
+    which: SharedFaultLock,
+) -> SharedFaultResult {
+    if lock.held_by_current_cpu() {
+        SharedFaultResult::Reentry(which)
+    } else {
+        SharedFaultResult::Busy
+    }
 }
 
 /// Fixed-storage frame allocator for the shared #PF path.  Mapping one 4 KiB
@@ -1891,20 +1935,25 @@ unsafe impl x86_64::structures::paging::FrameAllocator<Size4KiB> for SharedFault
 /// Resolve one demand fault in a shared-anonymous region.  The Process and
 /// MmState guards remain held while the region slot and page table transaction
 /// complete; every lower lock is try-only so contention returns `Busy` and the
-/// faulting instruction is retried by the exception path.
+/// faulting instruction is retried by the exception path. A failed try-lock of
+/// `PROCESS_TABLE`, the PCB or `MmState` that this CPU itself holds returns
+/// `Reentry` instead (ST-K2-P2(a)).
 pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> SharedFaultResult {
     use crate::cgroup::{FaultChargeError, FaultMemoryCharge};
     use mm::page_table::try_with_current_manager;
     use x86_64::structures::paging::{Page, PageTableFlags};
 
     let Some(process_arc) = crate::process::try_get_process(pid) else {
-        return SharedFaultResult::Busy;
+        return shared_fault_contended(
+            &crate::process::PROCESS_TABLE,
+            SharedFaultLock::ProcessTable,
+        );
     };
     let Some(process_arc) = process_arc else {
         return SharedFaultResult::NotShared;
     };
     let Some(proc) = process_arc.try_lock() else {
-        return SharedFaultResult::Busy;
+        return shared_fault_contended(&process_arc, SharedFaultLock::Pcb);
     };
     if proc.pid != pid {
         return SharedFaultResult::NotShared;
@@ -1928,7 +1977,7 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
         return SharedFaultResult::NotShared;
     }
     let Some(mut mm_state) = proc.mm.try_lock() else {
-        return SharedFaultResult::Busy;
+        return shared_fault_contended(&proc.mm, SharedFaultLock::MmState);
     };
 
     let page_base = fault_addr & !0xfff;
@@ -2229,19 +2278,35 @@ impl Drop for SharedAnonRegion {
         // All PTE references must have been removed before this Arc reaches
         // zero.  Release the region pin and the first-toucher cgroup charge
         // for each materialized page; invalid metadata fails leak-safe.
+        #[cfg(feature = "syscall_test")]
+        let release_epoch = shared_release_test::begin(self as *const Self as usize);
+        #[cfg(feature = "syscall_test")]
+        let (mut released, mut freed) = (0usize, 0usize);
         let mut pages = self.pages.lock();
         let mut allocator = FrameAllocator::new();
         for slot in pages.iter_mut() {
             let Some(page) = slot.take() else { continue };
-            if PAGE_REF_COUNT
+            let did_free = PAGE_REF_COUNT
                 .release(page.phys_addr)
-                .should_free_unmapped()
-            {
+                .should_free_unmapped();
+            if did_free {
                 allocator.deallocate_frame(PhysFrame::containing_address(PhysAddr::new(
                     page.phys_addr as u64,
                 )));
             }
             crate::cgroup::uncharge_memory(page.owner, 0x1000);
+            #[cfg(feature = "syscall_test")]
+            if let Some(epoch) = release_epoch {
+                released += 1;
+                freed += usize::from(did_free);
+                if released == 1 {
+                    shared_release_test::midpoint(epoch, did_free);
+                }
+            }
+        }
+        #[cfg(feature = "syscall_test")]
+        if let Some(epoch) = release_epoch {
+            shared_release_test::complete(epoch, freed);
         }
     }
 }

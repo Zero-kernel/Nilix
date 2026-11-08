@@ -1,0 +1,34 @@
+{
+  "revision": "fa4b588c89f5",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "Diagnostic, not a gate verdict: ring3-mm at 16 vCPUs with only the known-hanging test_selective_wait_nested_zombie call removed (RING3-16-HANG)",
+  "gates": [
+    {
+      "command": "env KERNEL_TEST_CPUS=16 make test-ring3-mm",
+      "status": 2,
+      "seconds": 1140,
+      "log": "/tmp/nilix-evidence/st-k2-p2/fa4b588/r16/ring3-16-diag.log",
+      "log_sha256": "dc38cec2dc515ee779b1c14feae16ec38ba38b28371af6deca0ca51a11bbe4f3"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/st-k2-p2/fa4b588/r16/ring3-16-diag.tmp.YTVmDhKqZn.serial",
+      "serial_sha256": "a817f6db520d5f4760720e8a37bafbe9bf3eaf7e99c4d1ea4e01df131c6c0459"
+    },
+    {
+      "patch": "/tmp/nilix-evidence/st-k2-p2/fa4b588/r16/diagnostic.patch",
+      "sha256": "02b8d6c211e156617e18ccda4cf28b1b47611d24e8fe778d568b803d4a392ef6"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/fa4b588; only their SHA-256 is recorded here"
+  ],
+  "notes": "First version (LAPIC MMIO owner read): hung inside the final-owner leg after 2-3 rounds."
+}

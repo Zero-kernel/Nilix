@@ -6,6 +6,8 @@
 # KERNEL_TEST_CPUS=2|4|8|16 boots that many vCPUs (default: QEMU's single CPU).
 # KERNEL_TEST_MEM is the guest RAM as a QEMU size (default 256M; e.g. 3G for the
 # large-memory ring3-mm lane).
+# KERNEL_TEST_TIMEOUT may be raised to 2700 for the 16-vCPU 200-round final-owner
+# gate; the default remains 900.
 set -u
 
 # Resolve the repo root from this script's own location so it runs from any
@@ -20,8 +22,8 @@ source "$ROOT/scripts/ci/qemu_run.sh"
 ESP="${1:-$ROOT/esp}"
 case "$ESP" in /*) ;; *) ESP="$ROOT/$ESP" ;; esac
 TO="${KERNEL_TEST_TIMEOUT:-900}"
-if [[ ! "$TO" =~ ^([1-9]|[1-9][0-9]|[1-8][0-9][0-9]|900)$ ]]; then
-    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_TIMEOUT must be an integer from 1 to 900"
+if [[ ! "$TO" =~ ^[1-9][0-9]{0,3}$ ]] || (( TO > 2700 )); then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_TIMEOUT must be an integer from 1 to 2700"
     exit 2
 fi
 MEM="${KERNEL_TEST_MEM:-256M}"

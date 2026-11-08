@@ -1,0 +1,30 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "Ring-3 MM oracle at 8 and 16 vCPUs, and the remote-holder leg repeated 300 times at 8 vCPUs",
+  "gates": [
+    {
+      "command": "env KERNEL_TEST_CPUS=16 make test-ring3-mm",
+      "status": 2,
+      "seconds": 1074,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/r2/ring3-16.log",
+      "log_sha256": "5cd950b7ed6be605a94f94104bed1a26220e945c96e6f7be4c61de7649f1ecda"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/st-k2-p2/8f9d736/r2/ring3-16.tmp.k424dP2XNl.serial",
+      "serial_sha256": "5263b3dbf51ae32ba920eaf9c1d1073f27071735befb00306fa9ed2700c873ff"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ],
+  "notes": "Fails as on main @ f998237: the guest stops in test_selective_wait_nested_zombie (the 16-vCPU hang from the P0 baseline) before any ST-K2-P2 leg; 44 legs passed first, no panic. See 8f9d736-d16a/d16b for the new legs at 16 vCPUs."
+}

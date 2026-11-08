@@ -1,0 +1,34 @@
+{
+  "revision": "fa4b588c89f5",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "Diagnostic, not a gate verdict: the same 16-vCPU run with the owner-lock commit reverted, to tell whether the hang depends on this change",
+  "gates": [
+    {
+      "command": "env KERNEL_TEST_CPUS=16 make test-ring3-mm",
+      "status": 2,
+      "seconds": 1212,
+      "log": "/tmp/nilix-evidence/st-k2-p2/fa4b588/rv16/ring3-16-revert-diag.log",
+      "log_sha256": "1298efc26c94864b2b9107d06fb549654bbae0c2b06325c02e8b6d975ed12027"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/st-k2-p2/fa4b588/rv16/ring3-16-revert-diag.tmp.gTZV9OJOcj.serial",
+      "serial_sha256": "0c0e3143813136190141fe5ceeb27321a1191df5833c0875e54c2b1fabd0b46c"
+    },
+    {
+      "patch": "/tmp/nilix-evidence/st-k2-p2/fa4b588/rv16/revert-diag.patch",
+      "sha256": "e1da911c9e9c5e6110e404c9a529548bf62c9ea120fca5953134059fcfd7566e"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/fa4b588; only their SHA-256 is recorded here"
+  ],
+  "notes": "Owner-lock commit reverted: (b), (c) and (d) passed; the guest then hung in a futex PI leg."
+}

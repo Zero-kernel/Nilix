@@ -1,0 +1,25 @@
+{
+  "revision": "8f9d736526c2",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0",
+    "accel": "tcg",
+    "cpus": 1,
+    "mem": "256M"
+  },
+  "scope": "L2: CI build, runtime (boot, runtime, SMP-4) and musl (1/4 CPU) groups, CI_GUEST_RETRIES=0",
+  "gates": [
+    {
+      "command": "env CI_GUEST_RETRIES=0 bash scripts/ci/entrypoint.sh musl",
+      "status": 0,
+      "seconds": 236,
+      "log": "/tmp/nilix-evidence/st-k2-p2/8f9d736/l2/musl.log",
+      "log_sha256": "e2f8d68b4225f09c96b62a71d5abcdb7dd01d25405a2b61f0526652dfb3528cb"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to six lanes ran at once",
+    "QEMU interrupt logs are not kept; their last 2 MB are retained on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/st-k2-p2/8f9d736; only their SHA-256 is recorded here"
+  ]
+}

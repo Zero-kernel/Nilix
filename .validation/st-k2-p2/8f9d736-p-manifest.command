@@ -1,0 +1,1 @@
+git ls-files -- kernel userspace/shared_fault_reentry_probe.c scripts/gates/qemu/shared_fault_reentry_probe.py scripts/ci/gate_log.py Cargo.lock rust-toolchain.toml | xargs sha256sum > /tmp/nilix-evidence/st-k2-p2/8f9d736/p/inputs.sha256
