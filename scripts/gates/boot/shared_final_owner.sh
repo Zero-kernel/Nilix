@@ -9,8 +9,10 @@ BOOT_LOG="$(mktemp)" || exit 2
 trap 'rm -f -- "$BOOT_LOG"' EXIT
 # Always collect at completion: the Extended lane exports window mode for its
 # stability gates, but this focused release-window probe must not idle to the
-# deadline after it has already reached its verdict.
-KERNEL_TEST_COMPLETION_PROFILE=ring3 KERNEL_TEST_KEEP_LOGS=1 QEMU_GATE_MODE=completion \
+# deadline after it has already reached its verdict. Export it so the later
+# verify_gate_termination check uses the same completion contract.
+export QEMU_GATE_MODE=completion
+KERNEL_TEST_COMPLETION_PROFILE=ring3 KERNEL_TEST_KEEP_LOGS=1 \
     bash "$ROOT/scripts/gates/boot/kernel_test.sh" "$ESP" > "$BOOT_LOG" 2>&1
 boot_status=$?
 grep -E 'GATE-LOG|KERNEL-TEST' "$BOOT_LOG"
