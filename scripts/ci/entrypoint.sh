@@ -84,7 +84,7 @@ check_guest() {
 
 extended_smp() {
     # Two full 900-second windows plus the 16-vCPU 200-round final-owner gate
-    # fit the 90-minute job budget; keep every first result and leave time for
+    # fit the 120-minute job budget; keep every first result and leave time for
     # build, log analysis and upload.
     check smp-8-16 --allow-qualified -- bash scripts/gates/boot/extended_smp_test.sh esp
     # PR86-1 runs after the runtime lane so its focused rebuild cannot replace

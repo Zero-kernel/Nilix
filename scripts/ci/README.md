@@ -14,7 +14,7 @@ a partial topology fails even when the general runtime result is QUALIFIED.
 Both the 8/16-vCPU suite and the 32-vCPU gate run once, without an automatic
 retry after a failure or stall. The 8/16-vCPU suite's two 900-second windows
 plus the 16-vCPU 200-round final-owner gate (2700-second completion ceiling)
-leave the rest of its 90-minute Extended job for build, analysis and upload;
+leave the rest of its 120-minute Extended job for build, analysis and upload;
 retrying those windows would consume that entire budget before this overhead.
 This single-attempt policy also applies in the combined local `extended` group.
 Extended has a separate 32-vCPU lane on each Ubuntu image with the full
