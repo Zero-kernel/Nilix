@@ -59,6 +59,18 @@ class ExtendedLaneTests(unittest.TestCase):
         stress = [lane['profile'] for lane in workflow_lanes() if lane['group'] == 'extended-stress']
         self.assertEqual(stress, profiles)
 
+    def test_strict_job_is_diagnostic_and_outside_the_aggregate(self):
+        workflow = (ROOT / '.github/workflows/extended.yml').read_text(encoding='utf8')
+        strict = re.search(r'^  strict:\n(.*?)^  result:', workflow, re.M | re.S)
+        self.assertIsNotNone(strict)
+        self.assertRegex(strict[1], r'(?m)^    continue-on-error: true$')
+        self.assertRegex(strict[1], r'(?m)^      - run: bash scripts/ci/entrypoint\.sh strict$')
+        self.assertRegex(strict[1], r'(?m)^        os: \[ubuntu-22\.04, ubuntu-24\.04\]$')
+        self.assertRegex(workflow, r'(?m)^    needs: \[lane\]$')
+        self.assertNotIn('strict', [lane['name'] for lane in workflow_lanes()])
+        entry = (ROOT / 'scripts/ci/entrypoint.sh').read_text(encoding='utf8')
+        self.assertRegex(entry, r'(?m)^    strict\)$')
+
     def test_every_lane_names_a_group_and_a_budget(self):
         entry = (ROOT / 'scripts/ci/entrypoint.sh').read_text(encoding='utf8')
         lanes = workflow_lanes()
