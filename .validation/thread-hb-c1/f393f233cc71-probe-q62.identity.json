@@ -1,0 +1,25 @@
+{
+  "revision": "f393f233cc71",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0 (jammy apt)",
+    "accel": "tcg",
+    "cpus": 4,
+    "mem": "256M"
+  },
+  "scope": "THREAD-HB C1 negative controls: ud, gp, nx, triple after the switch; nx-boot before it",
+  "gates": [
+    {
+      "command": "python3 scripts/gates/qemu/trace_phase_probe.py --artifacts <dir>",
+      "status": 0,
+      "log": "/tmp/nilix-evidence/thread-hb-c1/probe-q62.log",
+      "log_sha256": "0c5e55d8655113acb5fb4fc8e21595b1a380ec6fbe31baf08ded24abcd778c3e"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to three lanes ran at once (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/thread-hb-c1; only their SHA-256 is recorded here"
+  ],
+  "notes": ""
+}

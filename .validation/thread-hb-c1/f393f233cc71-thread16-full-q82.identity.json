@@ -1,0 +1,52 @@
+{
+  "revision": "f393f233cc71",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18, rebuilt for jammy without root)",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "Pre-repair control on the same image: NILIX_QEMU_TRACE=full (today's main behaviour)",
+  "gates": [
+    {
+      "command": "source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; env NILIX_QEMU_TRACE=full STRESS_PROFILES=thread STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=16 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+      "status": 1,
+      "log": "/tmp/nilix-evidence/thread-hb-c1/thread16-full-q82/gate.log",
+      "log_sha256": "8165a5234506928b9d6b89be75413801df1fada7b966fe56cfd4bcb42692ebbd"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/thread-hb-c1/thread16-full-q82/serial.log",
+      "serial_sha256": "e7a0f0fa40c8020bca46c6a3f71d2a36ef423496306a1e722f5efe79ee2ba534"
+    },
+    {
+      "interrupt_log_bytes": 9374397565
+    },
+    {
+      "rounds": "/tmp/nilix-evidence/thread-hb-c1/thread16-full-q82/rounds.json",
+      "sha256": "241dccd2cb7770af8f13a6cb0e0f91ae036cbdc5c82ad412b3f800610651eca5",
+      "summary": {
+        "rounds": 5,
+        "heartbeats": 5,
+        "round_wall_ms": {
+          "min": 43649.0,
+          "median": 54250.0,
+          "max": 77718.0
+        },
+        "gap_ms": {
+          "min": 128881.4,
+          "median": 151942.7,
+          "max": 196639.9
+        },
+        "gaps_over_bound": 5,
+        "bound_ms": 15000
+      }
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to three lanes ran at once (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/thread-hb-c1; only their SHA-256 is recorded here"
+  ],
+  "notes": "started 2026-11-09T09:40:50Z load 9.31; finished 2026-11-09T10:03:03Z"
+}
