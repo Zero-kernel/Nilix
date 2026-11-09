@@ -25,7 +25,9 @@
  *
  * PASS, HEARTBEAT(N) and round N all carry the same checksum; heartbeat cycles
  * are exactly seq * rounds_per_heartbeat and both cycles and ops must strictly
- * increase. The run is host-terminated: we loop until QEMU is killed.
+ * increase. The run is host-terminated: we loop until QEMU is killed. A thread
+ * round is one joined wave (THREAD-HB C2): its child still runs churn_waves
+ * waves before exiting, so only the reporting granularity is finer.
  *
  * Each phase is independently bounded and fail-closed. Any deviation emits a
  * FAIL marker (which the validator treats as fatal) rather than continuing.
@@ -687,7 +689,8 @@ static void write_all_fd(int fd, const void *buffer, size_t length, const char *
     }
 }
 
-static void read_exact_fd(int fd, void *buffer, size_t length, const char *stage) {
+/* Reads until `length` bytes or EOF; returns the count. Only errors fail. */
+static size_t read_up_to_fd(int fd, void *buffer, size_t length, const char *stage) {
     uint8_t *bytes = (uint8_t *)buffer;
     size_t received = 0;
     while (received < length) {
@@ -699,9 +702,17 @@ static void read_exact_fd(int fd, void *buffer, size_t length, const char *stage
             fail(stage, errno, received);
         }
         if (count == 0) {
-            fail(stage, EPIPE, received);
+            break;
         }
         received += (size_t)count;
+    }
+    return received;
+}
+
+static void read_exact_fd(int fd, void *buffer, size_t length, const char *stage) {
+    const size_t received = read_up_to_fd(fd, buffer, length, stage);
+    if (received != length) {
+        fail(stage, EPIPE, received);
     }
 }
 
@@ -1376,13 +1387,18 @@ static CombinedRoundResult run_combined_round(void) {
 
 /*
  * GAP-5 thread lifecycle under pressure.
- * Each round forks a child that runs churn_waves waves of `workers` pthreads.
+ * Each group forks a child that runs churn_waves waves of `workers` pthreads.
  * Every thread takes one mutex contention_iterations times, then meets the
  * others at a condition-variable barrier whose broadcast is musl's requeue
  * chain, checks its __thread value and is joined. The child then exits with
  * one more thread parked in pthread_cond_wait, so the group ends with a live
- * member. The parent reaps the child once and reads its report only after the
- * whole group is gone: the pipe reaches EOF when the shared fd table closes.
+ * member.
+ *
+ * THREAD-HB C2: the child reports each joined wave, and the parent publishes
+ * every wave as one round with its own heartbeat. At 16 vCPUs a whole group
+ * outlasts the heartbeat bound while every wave stays well inside it. After
+ * the last wave the parent reaps the child once and requires EOF on the report
+ * pipe, which arrives only when the shared fd table closes with the group.
  */
 typedef struct {
     pthread_mutex_t lock;
@@ -1406,6 +1422,7 @@ typedef struct {
     uint64_t joined;
     uint64_t counter;
     uint64_t checksum;
+    uint64_t wall_ns; /* the wave's own duration, measured in the child */
 } ThreadRoundReport;
 
 #define THREAD_TLS_TAG 0x7448524400000000ull
@@ -1467,10 +1484,11 @@ static void thread_round_child(int report_fd, uint64_t seq) {
     static ThreadWave parked;
     pthread_t threads[MAX_WORKERS];
     ThreadWorkerArg args[MAX_WORKERS];
-    ThreadRoundReport report = {0, 0, 0, 0};
     uint64_t accumulator = checksum_mix(config.seed, seq);
 
     for (uint32_t wave_index = 0; wave_index < config.churn_waves; ++wave_index) {
+        const uint64_t started = monotonic_ns();
+        ThreadRoundReport report = {0, 0, 0, 0, 0};
         ThreadWave wave;
         thread_wave_init(&wave, config.workers);
         for (uint32_t index = 0; index < config.workers; ++index) {
@@ -1500,10 +1518,13 @@ static void thread_round_child(int report_fd, uint64_t seq) {
         if (wave.counter != (uint64_t)config.workers * config.contention_iterations) {
             fail("thread_wave_counter", 0, wave.counter);
         }
-        report.counter += wave.counter;
+        report.counter = wave.counter;
         accumulator = checksum_mix(accumulator, wave.counter);
         (void)pthread_cond_destroy(&wave.barrier);
         (void)pthread_mutex_destroy(&wave.lock);
+        report.checksum = checksum_finalize(accumulator);
+        report.wall_ns = monotonic_ns() - started;
+        write_all_fd(report_fd, &report, sizeof(report), "thread_report_write");
     }
 
     thread_wave_init(&parked, 1u);
@@ -1520,43 +1541,59 @@ static void thread_round_child(int report_fd, uint64_t seq) {
     if (pthread_mutex_lock(&parked.lock) != 0 || pthread_mutex_unlock(&parked.lock) != 0) {
         fail("thread_parked_sync", 0, 0);
     }
-    report.checksum = checksum_finalize(accumulator);
-    write_all_fd(report_fd, &report, sizeof(report), "thread_report_write");
     /* exit_group with the parked thread still alive. */
     _exit(0);
 }
 
-static ThreadRoundReport run_thread_round(uint64_t seq) {
-    int report_pipe[2] = {-1, -1};
-    if (pipe(report_pipe) != 0) {
-        fail("thread_report_pipe", errno, 0);
-    }
-    const pid_t child = fork();
-    if (child < 0) {
-        fail("thread_child_fork", errno, 0);
-    }
-    if (child == 0) {
-        (void)close(report_pipe[0]);
-        thread_round_child(report_pipe[1], seq);
-    }
-    (void)close(report_pipe[1]);
+/* The child of the current group, between its first and last wave. */
+static pid_t thread_group_child = -1;
+static int thread_group_fd = -1;
+static uint32_t thread_group_wave;
 
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) {
-            fail("thread_child_wait", errno, 0);
+/* Returns the report of round `seq`, which is wave *wave_index of its group. */
+static ThreadRoundReport run_thread_round(uint64_t seq, uint32_t *wave_index) {
+    if (thread_group_child < 0) {
+        int report_pipe[2] = {-1, -1};
+        if (pipe(report_pipe) != 0) {
+            fail("thread_report_pipe", errno, 0);
         }
-    }
-    /* A failing child emitted its own FAIL marker. */
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        _exit(1);
+        const pid_t child = fork();
+        if (child < 0) {
+            fail("thread_child_fork", errno, 0);
+        }
+        if (child == 0) {
+            (void)close(report_pipe[0]);
+            thread_round_child(report_pipe[1], seq);
+        }
+        (void)close(report_pipe[1]);
+        thread_group_child = child;
+        thread_group_fd = report_pipe[0];
+        thread_group_wave = 0;
     }
 
-    ThreadRoundReport report = {0, 0, 0, 0};
-    read_exact_fd(report_pipe[0], &report, sizeof(report), "thread_report_read");
-    assert_pipe_eof(report_pipe[0], "thread_report_oversized");
-    if (close(report_pipe[0]) != 0) {
-        fail("thread_report_close", errno, 0);
+    ThreadRoundReport report = {0, 0, 0, 0, 0};
+    const size_t got = read_up_to_fd(thread_group_fd, &report, sizeof(report), "thread_report_read");
+    *wave_index = thread_group_wave++;
+    if (got != sizeof(report) || thread_group_wave == config.churn_waves) {
+        int status = 0;
+        while (waitpid(thread_group_child, &status, 0) < 0) {
+            if (errno != EINTR) {
+                fail("thread_child_wait", errno, 0);
+            }
+        }
+        /* A failing child emitted its own FAIL marker. */
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            _exit(1);
+        }
+        if (got != sizeof(report)) {
+            fail("thread_report_short", 0, got);
+        }
+        assert_pipe_eof(thread_group_fd, "thread_report_oversized");
+        if (close(thread_group_fd) != 0) {
+            fail("thread_report_close", errno, 0);
+        }
+        thread_group_child = -1;
+        thread_group_fd = -1;
     }
     return report;
 }
@@ -1911,11 +1948,11 @@ static uint64_t run_round(uint64_t seq, uint64_t *cumulative_ops) {
         break;
     }
     case PROFILE_THREAD: {
-        const uint64_t started = monotonic_ns();
-        const ThreadRoundReport result = run_thread_round(seq);
-        const uint64_t wall_ns = monotonic_ns() - started;
+        uint32_t wave_index = 0;
+        const ThreadRoundReport result = run_thread_round(seq, &wave_index);
+        const uint64_t wall_ns = result.wall_ns;
 
-        const uint64_t threads = (uint64_t)config.workers * config.churn_waves;
+        const uint64_t threads = config.workers;
         const uint64_t expected = threads * config.contention_iterations;
         if (result.created != threads || result.joined != threads) {
             fail("thread_join_count", 0, result.joined);
@@ -1927,11 +1964,12 @@ static uint64_t run_round(uint64_t seq, uint64_t *cumulative_ops) {
         checksum = result.checksum;
 
         emit("NILIX_STRESS_V2_THREAD run=%016" PRIx64 " seq=%" PRIu64 " workers=%" PRIu32
-             " waves=%" PRIu32 " iterations=%" PRIu64 " created=%" PRIu64 " joined=%" PRIu64
-             " counter=%" PRIu64 " expected=%" PRIu64 " wall_ns=%" PRIu64 " checksum=%016" PRIx64,
-             config.run_id, seq, config.workers, config.churn_waves, config.contention_iterations,
-             result.created, result.joined, result.counter, expected, wall_ns != 0u ? wall_ns : 1u,
-             checksum);
+             " waves=%" PRIu32 " wave=%" PRIu32 " iterations=%" PRIu64 " created=%" PRIu64
+             " joined=%" PRIu64 " counter=%" PRIu64 " expected=%" PRIu64 " wall_ns=%" PRIu64
+             " checksum=%016" PRIx64,
+             config.run_id, seq, config.workers, config.churn_waves, wave_index,
+             config.contention_iterations, result.created, result.joined, result.counter, expected,
+             wall_ns != 0u ? wall_ns : 1u, checksum);
         break;
     }
     case PROFILE_BLOCK:

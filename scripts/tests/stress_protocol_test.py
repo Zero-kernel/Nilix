@@ -368,14 +368,16 @@ class MarkerStateMachineTests(unittest.TestCase):
 
 
 def thread_round(
-    config: protocol.StressConfig, sequence: int, checksum: str, *, counter: int | None = None
+    config: protocol.StressConfig, sequence: int, checksum: str, *, counter: int | None = None,
+    wave: int | None = None,
 ) -> str:
     knobs = config.knobs
-    threads = knobs.workers * knobs.churn_waves
+    threads = knobs.workers
     expected = threads * knobs.contention_iterations
+    wave = (sequence - 1) % knobs.churn_waves if wave is None else wave
     return (
         f"NILIX_STRESS_V2_THREAD run={config.run_hex} seq={sequence} "
-        f"workers={knobs.workers} waves={knobs.churn_waves} "
+        f"workers={knobs.workers} waves={knobs.churn_waves} wave={wave} "
         f"iterations={knobs.contention_iterations} created={threads} joined={threads} "
         f"counter={expected if counter is None else counter} expected={expected} "
         f"wall_ns=12345 checksum={checksum}"
@@ -396,18 +398,18 @@ class ThreadProfileTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def validate(self, round1: str) -> None:
-        # Each round joins 6 threads and counts 30 acquisitions.
-        hb1 = heartbeat(self.config, 1, 36, CHECKSUM_A)
-        hb2 = heartbeat(self.config, 2, 72, CHECKSUM_B)
+    def validate(self, round1: str, round2: str | None = None) -> None:
+        # Each round is one wave: it joins 2 threads and counts 10 acquisitions.
+        hb1 = heartbeat(self.config, 1, 12, CHECKSUM_A)
+        hb2 = heartbeat(self.config, 2, 24, CHECKSUM_B)
         ready_line = ready(self.config, "normal")
         lines = [
             begin(self.config),
             ready_line,
             round1,
-            common_pass(self.config, 36, CHECKSUM_A),
+            common_pass(self.config, 12, CHECKSUM_A),
             hb1,
-            thread_round(self.config, 2, CHECKSUM_B),
+            round2 or thread_round(self.config, 2, CHECKSUM_B),
             hb2,
         ]
         write_log(self.log, lines)
@@ -434,7 +436,23 @@ class ThreadProfileTests(unittest.TestCase):
         with self.assertRaises(protocol.StressProtocolError):
             self.validate(thread_round(self.config, 1, CHECKSUM_A, counter=29))
         with self.assertRaises(protocol.StressProtocolError):
-            self.validate(thread_round(self.config, 1, CHECKSUM_A).replace("joined=6", "joined=5"))
+            self.validate(thread_round(self.config, 1, CHECKSUM_A).replace("joined=2", "joined=1"))
+
+    def test_wave_index_must_follow_the_round_sequence(self) -> None:
+        # churn_waves=3: rounds 1..3 are waves 0..2 of one group, round 4 starts the next.
+        for sequence, wave in ((1, 0), (3, 2), (4, 0), (7, 0)):
+            self.assertIn(f"wave={wave} ", thread_round(self.config, sequence, CHECKSUM_A))
+        with self.assertRaises(protocol.StressProtocolError):
+            self.validate(thread_round(self.config, 1, CHECKSUM_A, wave=1))
+        with self.assertRaises(protocol.StressProtocolError):
+            self.validate(thread_round(self.config, 1, CHECKSUM_A),
+                          thread_round(self.config, 2, CHECKSUM_B, wave=0))
+
+    def test_a_whole_group_per_round_is_rejected(self) -> None:
+        # The pre-C2 shape (one marker for all waves) no longer matches the knobs.
+        group = thread_round(self.config, 1, CHECKSUM_A).replace("created=2 joined=2", "created=6 joined=6")
+        with self.assertRaises(protocol.StressProtocolError):
+            self.validate(group)
 
     def test_config_requires_two_threads_and_rejects_foreign_knobs(self) -> None:
         with self.assertRaises(protocol.StressProtocolError):

@@ -979,7 +979,7 @@ MARKER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     marker_pattern(
         "thread",
         rf"NILIX_STRESS_V2_THREAD run=(?P<run>{HEX16_RE}) seq=(?P<seq>{POS_UINT_RE}) "
-        rf"workers=(?P<workers>{POS_UINT_RE}) waves=(?P<waves>{POS_UINT_RE}) "
+        rf"workers=(?P<workers>{POS_UINT_RE}) waves=(?P<waves>{POS_UINT_RE}) wave=(?P<wave>{UINT_RE}) "
         rf"iterations=(?P<iterations>{POS_UINT_RE}) created=(?P<created>{POS_UINT_RE}) "
         rf"joined=(?P<joined>{POS_UINT_RE}) counter=(?P<counter>{UINT_RE}) "
         rf"expected=(?P<expected>{POS_UINT_RE}) wall_ns=(?P<wall_ns>{POS_UINT_RE}) "
@@ -1147,13 +1147,16 @@ def validate_profile_marker(marker: Marker, config: StressConfig) -> None:
         if total == 0:
             raise StressProtocolError("combined profile reported no subsystem operations")
     elif marker.kind == "thread":
-        threads = checked_mul_u64(knobs.workers, knobs.churn_waves, "thread count")
-        expected = checked_mul_u64(threads, knobs.contention_iterations, "thread expected")
+        # THREAD-HB C2: a round is one joined wave; each forked group runs
+        # churn_waves consecutive rounds, so the wave index follows seq.
+        expected = checked_mul_u64(knobs.workers, knobs.contention_iterations, "thread expected")
         if fields["workers"] != knobs.workers or fields["waves"] != knobs.churn_waves:
             raise StressProtocolError("thread marker does not match configured workers/waves")
+        if fields["wave"] != (fields["seq"] - 1) % knobs.churn_waves:
+            raise StressProtocolError("thread wave index does not follow its round sequence")
         if fields["iterations"] != knobs.contention_iterations:
             raise StressProtocolError("thread marker iteration count mismatch")
-        if fields["created"] != threads or fields["joined"] != threads:
+        if fields["created"] != knobs.workers or fields["joined"] != knobs.workers:
             raise StressProtocolError("thread round did not create and join the exact thread set")
         if fields["expected"] != expected or fields["counter"] != expected:
             raise StressProtocolError("thread mutex-protected counter/expected mismatch")
