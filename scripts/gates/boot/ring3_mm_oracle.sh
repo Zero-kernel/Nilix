@@ -37,7 +37,10 @@ trap 'rm -f -- "$BOOT_LOG"' EXIT
 # The boot gate's own status is NOT this gate's verdict: it will report failure
 # solely because of those `[PF ENTRY]` lines. Everything mechanical is
 # still reused, and its summary is printed for the record.
-KERNEL_TEST_COMPLETION_PROFILE=ring3 KERNEL_TEST_KEEP_LOGS=1 bash "$ROOT/scripts/gates/boot/kernel_test.sh" "$ESP" > "$BOOT_LOG" 2>&1
+# THREAD-HB C1: this verdict reads only serial evidence, so the harness reduces
+# QEMU's interrupt trace to `cpu_reset` after boot (scripts/ci/qemu_trace.py).
+KERNEL_TEST_TRACE_DEFAULT=phased KERNEL_TEST_COMPLETION_PROFILE=ring3 KERNEL_TEST_KEEP_LOGS=1 \
+    bash "$ROOT/scripts/gates/boot/kernel_test.sh" "$ESP" > "$BOOT_LOG" 2>&1
 boot_status=$?
 grep -E 'GATE-LOG|KERNEL-TEST' "$BOOT_LOG" | sed 's/^/  boot-harness: /'
 
@@ -62,6 +65,13 @@ timeoutlog="$(sed -n 's/.* timeoutlog=\([^ ]*\).*/\1/p' "$BOOT_LOG" | tail -1)"
 qemu_status="$(cat "$ser.qemu.status" 2>/dev/null || echo 125)"
 if ! verify_gate_termination; then
     report_fail "missing or invalid QEMU termination evidence"
+fi
+trace_policy="$(qemu_trace_policy phased)" || exit 2
+python3 "$ROOT/scripts/ci/qemu_trace.py" verify --policy "$trace_policy" --default phased \
+    --receipt "$ser.trace.json" --serial "$ser" | sed 's/^/  /'
+trace_status=${PIPESTATUS[0]}
+if [ "$trace_status" -eq 1 ]; then
+    report_fail "interrupt-trace receipt does not match the serial log"
 fi
 
 # 1. No terminal fault outcome anywhere in the serial.
@@ -275,6 +285,10 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
+if [ "$trace_status" -ne 0 ]; then
+    echo "RING3-MM BLOCKED: missing interrupt-trace receipt"
+    exit 2
+fi
 if grep -Fq '[SKIP] shared-anon migration: requires host-root fixture' "$serial"; then
     echo "RING3-MM QUALIFIED: executed memory legs passed; cgroup migration not executed"
     echo "RING3-MM ARTIFACTS: serial=$serial"
