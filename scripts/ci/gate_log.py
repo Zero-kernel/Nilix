@@ -13,8 +13,10 @@ import sys
 
 try:
     from qemu_run import termination_errors
+    from qemu_trace import POLICIES, load_receipt, verify as verify_trace
 except ModuleNotFoundError:
     from scripts.ci.qemu_run import termination_errors
+    from scripts.ci.qemu_trace import POLICIES, load_receipt, verify as verify_trace
 
 
 SUMMARY = re.compile(
@@ -290,6 +292,24 @@ def fatal_interrupt_lines(path: Path, limit: int = 64, chunk_size: int = 64 << 2
     return b"".join(matches).decode("utf-8", errors="replace")
 
 
+# Combine verdicts: failure, then incompleteness, then qualification, then pass.
+SEVERITY = {0: 0, 3: 1, 2: 2, 1: 3}
+
+
+def apply_trace(result: GateResult, policy: str, default: str, receipt: object,
+                serial: bytes, strict: bool) -> GateResult:
+    """Fold a THREAD-HB C1 interrupt-trace receipt into the gate verdict."""
+    trace_status, scope, reasons = verify_trace(policy, default, receipt, serial)
+    status = max(result.status, trace_status, key=SEVERITY.__getitem__)
+    reasons = [*result.reasons, *reasons]
+    if strict and status == 3:
+        status = 1
+        reasons.append("strict mode rejects a diagnostic interrupt-trace scope")
+    details = dict(result.details or {}, trace_policy=policy, trace_default=default, trace_scope=scope)
+    return GateResult(status, result.counts, result.warning_markers, result.skipped_markers,
+                      tuple(reasons), details)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", required=True, type=Path)
@@ -302,6 +322,9 @@ def main() -> int:
     parser.add_argument("--require-iommu", action="store_true")
     parser.add_argument("--strict", action="store_true", default=os.environ.get("ZERO_OS_STRICT_TESTS") == "1")
     parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--trace-policy", choices=POLICIES)
+    parser.add_argument("--trace-default", choices=POLICIES, default="full")
+    parser.add_argument("--trace-receipt", type=Path)
     arguments = parser.parse_args()
     contents = []
     missing = []
@@ -334,6 +357,13 @@ def main() -> int:
             (*result.reasons, *missing),
             result.details,
         )
+    if arguments.trace_policy is not None:
+        try:
+            serial_bytes = arguments.serial.read_bytes()
+        except OSError:
+            serial_bytes = b""
+        result = apply_trace(result, arguments.trace_policy, arguments.trace_default,
+                             load_receipt(arguments.trace_receipt), serial_bytes, arguments.strict)
     if arguments.json_output:
         payload = {"scope": "serial-and-process-policy; final caller status is recorded separately", **asdict(result)}
         arguments.json_output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

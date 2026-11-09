@@ -185,7 +185,8 @@ class ShellTests(unittest.TestCase):
         self.work = Path(self.directory.name)
         for name in ("scripts", "esp", "bin", "tmp"):
             (self.work / name).mkdir()
-        for relative in (Path("ci/gate_log.py"), Path("ci/gate_inputs.py"), Path("ci/qemu_run.py"), Path("ci/qemu_run.sh")):
+        for relative in (Path("ci/gate_log.py"), Path("ci/gate_inputs.py"), Path("ci/qemu_run.py"),
+                         Path("ci/qemu_run.sh"), Path("ci/qemu_trace.py")):
             destination = self.work / "scripts" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / "scripts" / relative, destination)

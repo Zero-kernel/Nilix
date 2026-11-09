@@ -16,6 +16,11 @@ import sys
 import tempfile
 import time
 
+try:
+    from qemu_trace import POLICIES, TracePhase
+except ModuleNotFoundError:
+    from scripts.ci.qemu_trace import POLICIES, TracePhase
+
 
 EXIT = re.compile(r"Process 1 (?:exited with code|terminated with exit code) (-?\d+)\s*$")
 CLEANUP = re.compile(r"CI-EXIT pid=1 code=(-?\d+) stage=teardown-complete\s*$")
@@ -146,6 +151,7 @@ def run(args: argparse.Namespace) -> int:
                   error=None, runner_status=2)
     started = time.monotonic()
     process = None
+    phase = None
     previous_handlers = {}
 
     def cancelled(signum, _frame):
@@ -158,6 +164,8 @@ def run(args: argparse.Namespace) -> int:
         # the Unix socket path limit. The socket is never network-accessible.
         with tempfile.TemporaryDirectory(prefix="nilix-qmp-", dir="/tmp") as control:
             endpoint = str(Path(control) / "qmp")
+            if args.trace_policy == "phased":
+                phase = TracePhase(endpoint, args.serial, args.intlog, args.trace_cpus)
             for path in (args.serial, args.qemu_stderr):
                 if path.exists() and path.stat().st_size:
                     raise ValueError(f"refusing stale diagnostic output: {path}")
@@ -177,6 +185,8 @@ def run(args: argparse.Namespace) -> int:
                     if now >= deadline:
                         record["reason"] = "deadline"
                         break
+                    if phase is not None:
+                        phase.poll()
                     serial = args.serial.read_text(encoding="utf-8", errors="replace")
                     diagnostics_text = args.qemu_stderr.read_text(encoding="utf-8", errors="replace")
                     if TERMINAL_FATAL.search(serial) or TERMINAL_FATAL.search(diagnostics_text):
@@ -192,6 +202,8 @@ def run(args: argparse.Namespace) -> int:
                         record["reason"] = "completed"
                         break
                     time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+                if record["reason"] == "deadline" and phase is not None:
+                    phase.tail(lambda: record["signal"] is not None or process.poll() is not None)
                 if process.poll() is None:
                     record["stop_requested_seconds"] = time.monotonic() - started
                     stop_deadline = time.monotonic() + STOP_SECONDS
@@ -229,6 +241,10 @@ def run(args: argparse.Namespace) -> int:
             serial = ""
             record["error"] = str(error)
         record["serial_text_sha256"] = hashlib.sha256(serial.encode("utf-8")).hexdigest()
+        if phase is not None:
+            outcome = ("aborted" if record["signal"] is not None
+                       else "qemu-exited" if record["reason"] == "unexpected-exit" else "marker-missing")
+            args.trace_receipt.write_text(json.dumps(phase.finish(outcome), indent=2) + "\n")
         record["runner_status"] = (0 if record["reason"] == "completed" and record["qemu_returncode"] == 0
                                    and not record["forced_kill"] and record["error"] is None else 1)
         args.receipt.write_text(json.dumps(record, indent=2) + "\n")
@@ -247,6 +263,11 @@ def main() -> int:
     parser.add_argument("--profile", choices=("runtime", "musl", "ring3"), default="runtime")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--verify-status", type=int)
+    # THREAD-HB C1: reduce the interrupt trace after the boot marker (qemu_trace.py).
+    parser.add_argument("--trace-policy", choices=POLICIES, default="full")
+    parser.add_argument("--intlog", type=Path)
+    parser.add_argument("--trace-cpus", type=int)
+    parser.add_argument("--trace-receipt", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.verify_status is not None:
@@ -260,6 +281,9 @@ def main() -> int:
         return int(bool(errors))
     if not 1 <= args.timeout <= MAX_TIMEOUT_SECONDS or args.qemu_stderr is None:
         parser.error(f"timeout must be 1..{MAX_TIMEOUT_SECONDS} and --qemu-stderr is required")
+    if args.trace_policy == "phased" and (args.intlog is None or args.trace_receipt is None
+                                          or args.trace_cpus is None or args.trace_cpus < 1):
+        parser.error("--trace-policy phased requires --intlog, --trace-receipt and a positive --trace-cpus")
     return run(args)
 
 
