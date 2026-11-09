@@ -454,6 +454,43 @@ class ThreadProfileTests(unittest.TestCase):
         with self.assertRaises(protocol.StressProtocolError):
             self.validate(group)
 
+    def validate_tail(self, tail: str, *, end_ns: int | None = 2_500_000_000, ledger: bool = True) -> None:
+        hb1 = heartbeat(self.config, 1, 12, CHECKSUM_A)
+        hb2 = heartbeat(self.config, 2, 24, CHECKSUM_B)
+        ready_line = ready(self.config, "normal")
+        write_log(self.log, [
+            begin(self.config), ready_line, thread_round(self.config, 1, CHECKSUM_A),
+            common_pass(self.config, 12, CHECKSUM_A), hb1, thread_round(self.config, 2, CHECKSUM_B), hb2, tail,
+        ])
+        write_events(self.events, [(1_000_000_000, ready_line), (1_500_000_000, hb1),
+                                   (2_000_000_000, hb2), (2_400_000_000, tail)])
+        protocol.validate_log(
+            config=self.config, serial_path=str(self.log), mode="normal", minimum_heartbeats=2,
+            events_path=str(self.events) if ledger else None, end_ns=end_ns if ledger else None,
+            heartbeat_grace_ms=0, qmp_before_path=None, qmp_after_path=None,
+        )
+
+    def test_host_cut_between_the_last_round_and_its_heartbeat_is_accepted(self) -> None:
+        self.validate_tail(thread_round(self.config, 3, CHECKSUM_A))
+
+    def test_host_cut_tail_needs_the_freshness_proof(self) -> None:
+        with self.assertRaisesRegex(protocol.StressProtocolError, "last profile round has no HEARTBEAT"):
+            self.validate_tail(thread_round(self.config, 3, CHECKSUM_A), ledger=False)
+        # The stop came more than heartbeat_max_ms after the last heartbeat.
+        with self.assertRaisesRegex(protocol.StressProtocolError, "stale by run end"):
+            self.validate_tail(thread_round(self.config, 3, CHECKSUM_A), end_ns=3_100_000_000)
+
+    def test_host_cut_tail_content_is_still_validated(self) -> None:
+        with self.assertRaises(protocol.StressProtocolError):
+            self.validate_tail(thread_round(self.config, 3, CHECKSUM_A, counter=9))
+        with self.assertRaises(protocol.StressProtocolError):
+            self.validate_tail(thread_round(self.config, 4, CHECKSUM_A))
+
+    def test_an_unpaired_round_before_the_tail_is_rejected(self) -> None:
+        with self.assertRaisesRegex(protocol.StressProtocolError, "another round before its heartbeat"):
+            self.validate_tail(thread_round(self.config, 3, CHECKSUM_A) + "\n"
+                               + thread_round(self.config, 4, CHECKSUM_B))
+
     def test_config_requires_two_threads_and_rejects_foreign_knobs(self) -> None:
         with self.assertRaises(protocol.StressProtocolError):
             make_config("thread", workers=1)

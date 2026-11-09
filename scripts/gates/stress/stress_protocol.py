@@ -1190,7 +1190,8 @@ def validate_header(markers: Sequence[Marker], config: StressConfig, mode: str) 
 
 
 def validate_normal_markers(
-    markers: Sequence[Marker], config: StressConfig, minimum_heartbeats: int, recovery: bool = False
+    markers: Sequence[Marker], config: StressConfig, minimum_heartbeats: int, recovery: bool = False,
+    host_cut_round: bool = False,
 ) -> list[Marker]:
     expected_kind = config.profile_name
     next_sequence = 1
@@ -1292,7 +1293,15 @@ def validate_normal_markers(
             continue
         raise StressProtocolError(f"unexpected {marker.kind} marker in {config.profile_name} run")
 
-    if pending_round is not None:
+    # The host stops a host-terminated run at an arbitrary instant, which can
+    # fall between the final round marker and its HEARTBEAT. That round's
+    # content was validated above; liveness up to the stop is proven by the
+    # caller's freshness check of the last heartbeat against end_ns, so the
+    # unpaired tail is dropped instead of failing (maintainer decision
+    # 2026-11-09, THREAD-HB C2). Every earlier round still needs its HEARTBEAT.
+    if pending_round is not None and not (
+        host_cut_round and config.flags & FLAG_HOST_TERMINATED and pass_marker is not None
+    ):
         raise StressProtocolError("last profile round has no HEARTBEAT")
     if first_round is None or pass_marker is None:
         raise StressProtocolError("stress run did not complete its first verified round and PASS")
@@ -1545,13 +1554,13 @@ def validate_log(
     if mode == "writer":
         commits = validate_writer_markers(markers, config)
         heartbeats: list[Marker] = []
-    elif mode == "normal":
+    elif mode in ("normal", "recovery"):
         commits = []
-        heartbeats = validate_normal_markers(markers, config, minimum_heartbeats)
-    elif mode == "recovery":
-        commits = []
+        # Only a run whose last heartbeat is checked against the host stop
+        # (event ledger + end_ns) may end on an unpaired round marker.
         heartbeats = validate_normal_markers(
-            markers, config, minimum_heartbeats, recovery=True
+            markers, config, minimum_heartbeats, recovery=mode == "recovery",
+            host_cut_round=events_path is not None and end_ns is not None,
         )
     else:
         raise StressProtocolError(f"unknown validation mode {mode}")
