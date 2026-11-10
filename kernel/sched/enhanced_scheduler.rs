@@ -806,6 +806,7 @@ static CURRENT_GENERATION: [AtomicU64; cpu_local::max_cpus()] =
 ///
 /// `cycle_start` survives across scheduling entries, allowing a 17/32/N-entry
 /// empty scan to prove completion after multiple bounded windows.
+#[derive(Clone, Copy)]
 struct SelectionCursorState {
     after: Option<(Priority, Pid)>,
     cycle_start: Option<(Priority, Pid)>,
@@ -1158,6 +1159,55 @@ impl Scheduler {
             visited,
             complete_cycle,
         }
+    }
+
+    /// Observe local work without consuming a candidate needed by the later
+    /// dispatch scan. Misses still advance the bounded cursor, so a runnable
+    /// tail beyond one visit budget is eventually observed.
+    fn probe_next_with_cursor(
+        queue: &ReadyQueues,
+        target_cpu: usize,
+        skip_pid: Option<Pid>,
+        cursor: &mut SelectionCursorState,
+        queue_epoch: u64,
+        visit_budget: usize,
+    ) -> SelectionResult {
+        let before = *cursor;
+        let result = Self::select_next_with_cursor(
+            queue,
+            target_cpu,
+            skip_pid,
+            cursor,
+            queue_epoch,
+            visit_budget,
+        );
+        if result.candidate.is_some() {
+            *cursor = before;
+        }
+        result
+    }
+
+    /// The caller holds the local ready-queue lock, which serializes its cursor.
+    fn probe_local_candidate_locked(
+        queue: &ReadyQueues,
+        local_cpu: usize,
+        skip_pid: Option<Pid>,
+    ) -> bool {
+        debug_assert!(local_cpu < max_cpus());
+        // SAFETY: the caller holds ready queue local_cpu's lock, as required
+        // for every access to its owner-selection continuation.
+        let cursor = unsafe { &mut *OWNER_SELECTION_CURSOR[local_cpu].0.get() };
+        let queue_epoch = QUEUE_MUTATION_EPOCH[local_cpu].load(Ordering::Acquire);
+        Self::probe_next_with_cursor(
+            queue,
+            local_cpu,
+            skip_pid,
+            cursor,
+            queue_epoch,
+            SELECT_VISIT_BUDGET,
+        )
+        .candidate
+        .is_some()
     }
 
     /// Select from queue `queue_cpu` for execution on `target_cpu`.
@@ -1903,10 +1953,15 @@ impl Scheduler {
             let Some(queue) = Self::lock_ready_queue_or_defer(local) else {
                 return false;
             };
-            Self::select_next_result_locked(&queue, local_cpu, local_cpu, current_pid)
-                .candidate
-                .is_some()
+            Self::probe_local_candidate_locked(&queue, local_cpu, current_pid)
         };
+        if Self::arm_idle_for_local_candidate(
+            local_has_candidate,
+            current_pid,
+            &current_cpu().need_resched,
+        ) {
+            process::note_idle_rearm();
+        }
         if local_has_candidate {
             return false;
         }
@@ -1943,6 +1998,31 @@ impl Scheduler {
             Self::arm_ready_cpu(source_cpu);
             false
         }
+    }
+
+    /// #92: arm an idle CPU whose own queue holds a runnable candidate.
+    ///
+    /// Publishing work arms its CPU once, and `reschedule_now` consumes that
+    /// edge before selecting. When the selection then skips the only candidate
+    /// for a transient reason (its PCB lock held elsewhere, `on_cpu` not yet
+    /// released, a cpuset snapshot miss), the scan reads as complete and nothing
+    /// armed the CPU again: every idle tick found the task here and halted.
+    /// Once a bounded probe observes a candidate, preserve that window for
+    /// dispatch and arm this CPU. A longer queue can take multiple idle passes
+    /// to reach the candidate; transient contention can defer it further.
+    /// A CPU running a task is never armed here, so syscall returns gain no
+    /// preemption. The dispatch path still revalidates the candidate.
+    ///
+    /// Returns whether the bit was clear, not whether dispatch has completed.
+    fn arm_idle_for_local_candidate(
+        has_candidate: bool,
+        current_pid: Option<Pid>,
+        need_resched: &AtomicBool,
+    ) -> bool {
+        if !has_candidate || current_pid.is_some() {
+            return false;
+        }
+        !need_resched.swap(true, Ordering::SeqCst)
     }
 
     /// Migrate a ready task from the busiest CPU to the idlest CPU
@@ -3425,6 +3505,175 @@ pub fn run_scheduler_admission_self_test() {
     assert_eq!(queue.bucket(120).capacity(), 0);
     drop(removed);
     drop(retired);
+}
+
+/// #92 executable probe: an idle pass arms its CPU for a runnable local
+/// candidate, waits out a transient skip without arming, and never arms a CPU
+/// that is running a task.
+pub fn run_idle_rearm_self_test() {
+    fn idle_pass(queue: &ReadyQueues, current: Option<Pid>, need_resched: &AtomicBool) -> bool {
+        let mut cursor = SelectionCursorState::new();
+        let has_candidate = Scheduler::probe_next_with_cursor(
+            queue,
+            current_cpu_id(),
+            current,
+            &mut cursor,
+            0,
+            SELECT_VISIT_BUDGET,
+        )
+        .candidate
+        .is_some();
+        Scheduler::arm_idle_for_local_candidate(has_candidate, current, need_resched)
+    }
+
+    let pcb = Process::try_new_pcb(
+        0x92_0001,
+        1,
+        ProcessNameSnapshot::from_parts("sched-stall-92", ""),
+        120,
+    )
+    .expect("#92 idle-rearm PCB fixture");
+    let pid = {
+        let mut proc = pcb.lock();
+        proc.state = ProcessState::Provisioning;
+        proc.publish_ready_at(kernel_core::get_ticks());
+        proc.pid
+    };
+    let mut queue = ReadyQueues::new();
+    let prepared = PreparedAdmittedMapCapacity::try_new(HeapClass::Scheduler, 1)
+        .expect("#92 idle-rearm queue reserve");
+    let retired = queue
+        .bucket_mut(120)
+        .install_prepared_deferred(prepared)
+        .expect("#92 idle-rearm queue install");
+    drop(retired);
+    let inserted = queue
+        .bucket_mut(120)
+        .insert_unique_reserved(pid, Arc::clone(&pcb));
+    assert!(inserted.is_ok(), "#92 idle-rearm insert");
+    let need_resched = AtomicBool::new(false);
+
+    // The edge was consumed, and the only candidate's PCB lock is held
+    // elsewhere: the pass must neither arm nor report a candidate (no spin).
+    {
+        let _held = pcb.lock();
+        assert!(!idle_pass(&queue, None, &need_resched));
+        assert!(!need_resched.load(Ordering::Acquire));
+    }
+    // The next idle tick finds the task and arms its CPU.
+    assert!(idle_pass(&queue, None, &need_resched));
+    assert!(need_resched.load(Ordering::Acquire));
+    // An already armed CPU stays armed and is not counted as a recovery.
+    assert!(!idle_pass(&queue, None, &need_resched));
+    assert!(need_resched.load(Ordering::Acquire));
+
+    // Same for an outgoing save that has not released `on_cpu` yet.
+    need_resched.store(false, Ordering::Release);
+    pcb.lock().on_cpu.store(true, Ordering::Release);
+    assert!(!idle_pass(&queue, None, &need_resched));
+    assert!(!need_resched.load(Ordering::Acquire));
+    pcb.lock().on_cpu.store(false, Ordering::Release);
+    assert!(idle_pass(&queue, None, &need_resched));
+
+    // A CPU running another task is never armed by this path.
+    need_resched.store(false, Ordering::Release);
+    assert!(!idle_pass(&queue, Some(pid + 1), &need_resched));
+    assert!(!need_resched.load(Ordering::Acquire));
+
+    let (removed, retired) = queue.remove_ordinary(120, &pid);
+    drop(removed);
+    drop(retired);
+}
+
+/// PR96-1: exercise the shared cursor through the production idle probe and
+/// dispatch selector. A probe hit must not consume the candidate's window;
+/// a probe miss must retain progress toward runnable entries beyond the budget.
+pub fn run_idle_probe_cursor_self_test() {
+    for count in [
+        2 * SELECT_VISIT_BUDGET,
+        2 * SELECT_VISIT_BUDGET + 1,
+        4 * SELECT_VISIT_BUDGET,
+    ] {
+        for ready_offset in [0, SELECT_VISIT_BUDGET, count - 1] {
+            let mut queue = ReadyQueues::new();
+            let backing = PreparedAdmittedMapCapacity::try_new(HeapClass::Scheduler, count)
+                .expect("PR96-1 cursor fixture reserve");
+            let retired = queue
+                .bucket_mut(120)
+                .install_prepared_deferred(backing)
+                .expect("PR96-1 cursor fixture install");
+            drop(retired);
+            let first_pid = 0x96_0000;
+            for offset in 0..count {
+                let pid = first_pid + offset;
+                let pcb = Process::try_new_pcb(
+                    pid,
+                    1,
+                    ProcessNameSnapshot::from_parts("idle-probe-cursor", ""),
+                    120,
+                )
+                .expect("PR96-1 cursor fixture PCB");
+                {
+                    let mut proc = pcb.lock();
+                    proc.state = ProcessState::Provisioning;
+                    if offset == ready_offset {
+                        proc.publish_ready_at(kernel_core::get_ticks());
+                    } else {
+                        proc.state = ProcessState::Blocked;
+                    }
+                }
+                assert!(queue
+                    .bucket_mut(120)
+                    .insert_unique_reserved(pid, pcb)
+                    .is_ok());
+            }
+            let mut cursor = SelectionCursorState::new();
+            let need_resched = AtomicBool::new(false);
+            let mut selected = None;
+            for _ in 0..(count / SELECT_VISIT_BUDGET + 2) {
+                let observed = Scheduler::probe_next_with_cursor(
+                    &queue,
+                    current_cpu_id(),
+                    None,
+                    &mut cursor,
+                    0,
+                    SELECT_VISIT_BUDGET,
+                );
+                assert!(observed.visited <= SELECT_VISIT_BUDGET);
+                Scheduler::arm_idle_for_local_candidate(
+                    observed.candidate.is_some(),
+                    None,
+                    &need_resched,
+                );
+                // Match reschedule_now's request consumption, then the second
+                // bounded selection in prepare_switch using the same cursor.
+                if !need_resched.swap(false, Ordering::SeqCst) {
+                    continue;
+                }
+                let dispatch = Scheduler::select_next_with_cursor(
+                    &queue,
+                    current_cpu_id(),
+                    None,
+                    &mut cursor,
+                    0,
+                    SELECT_VISIT_BUDGET,
+                );
+                assert!(dispatch.visited <= SELECT_VISIT_BUDGET);
+                if let Some((pid, _, _)) = dispatch.candidate {
+                    selected = Some(pid);
+                    break;
+                }
+                if !dispatch.complete_cycle {
+                    need_resched.store(true, Ordering::SeqCst);
+                }
+            }
+            assert_eq!(
+                selected,
+                Some(first_pid + ready_offset),
+                "PR96-1 idle probe must preserve a candidate for dispatch"
+            );
+        }
+    }
 }
 
 /// RF178-36 executable probe for identity-bound stopped/fatal resume.
