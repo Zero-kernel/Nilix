@@ -73,6 +73,7 @@ ACTIVE_MONITOR_PID=""
 ACTIVE_TRACE_PID=""
 TRACE_RECEIPT=""
 VM_STATUS=0
+VM_HOST_TERMINATED=0
 MONITOR_STATUS=0
 RUN_END_NS=0
 SUITE_TMP=""
@@ -146,23 +147,39 @@ wait_trace() {
 
 stop_vm() {
     local requested_signal="${1:-TERM}"
+    local was_live=0 signalled=0 forced_kill=0
     VM_STATUS=0
+    VM_HOST_TERMINATED=0
     if [ -n "${ACTIVE_PID:-}" ]; then
-        kill -"$requested_signal" -- "-$ACTIVE_PID" 2>/dev/null \
-            || kill -"$requested_signal" "$ACTIVE_PID" 2>/dev/null \
-            || true
+        if kill -0 "$ACTIVE_PID" 2>/dev/null; then
+            was_live=1
+        fi
+        # The timeout supervisor can die while QEMU still owns its process
+        # group. Keep cleaning that group even when it cannot prove liveness.
+        if kill -"$requested_signal" -- "-$ACTIVE_PID" 2>/dev/null \
+            || kill -"$requested_signal" "$ACTIVE_PID" 2>/dev/null; then
+            signalled=1
+        fi
         local remaining=$((STRESS_SHUTDOWN_GRACE * 10))
         while kill -0 "$ACTIVE_PID" 2>/dev/null && [ "$remaining" -gt 0 ]; do
             sleep 0.1
             remaining=$((remaining - 1))
         done
         if kill -0 "$ACTIVE_PID" 2>/dev/null; then
+            forced_kill=1
             kill -KILL -- "-$ACTIVE_PID" 2>/dev/null \
                 || kill -KILL "$ACTIVE_PID" 2>/dev/null \
                 || true
         fi
         wait "$ACTIVE_PID" 2>/dev/null || VM_STATUS=$?
         ACTIVE_PID=""
+    fi
+    # GNU timeout normally returns 143 for a forwarded TERM. Its PID-only
+    # fallback can return 0 when QEMU handles TERM and exits cleanly. A natural
+    # exit, expired guard, or KILL escalation is not a completed host window.
+    if [ "$requested_signal" = TERM ] && [ "$was_live" -eq 1 ] && [ "$signalled" -eq 1 ] \
+        && [ "$forced_kill" -eq 0 ] && { [ "$VM_STATUS" -eq 0 ] || [ "$VM_STATUS" -eq 143 ]; }; then
+        VM_HOST_TERMINATED=1
     fi
     stop_trace
     stop_monitor
@@ -525,12 +542,19 @@ validate_current_log() {
     if [ "$mode" != writer ]; then
         args+=(--events "$EVENT_LOG" --end-ns "$RUN_END_NS"
             --heartbeat-grace-ms "$STRESS_HEARTBEAT_GRACE_MS")
+        if [ "$VM_HOST_TERMINATED" -eq 1 ]; then
+            args+=(--host-terminated)
+        fi
     fi
     if [ "$qmp_required" = 1 ]; then
         args+=(--qmp-before "$QMP_BEFORE" --qmp-after "$QMP_AFTER")
     fi
     "$PYTHON" "${args[@]}"
     local status=$?
+    if [ "$mode" != writer ] && [ "$VM_HOST_TERMINATED" -ne 1 ]; then
+        echo "  FAIL: QEMU did not finish by host TERM (status=$VM_STATUS)"
+        status=$TEST_FAIL
+    fi
     # A phased run must prove its switch against this serial log; a missing or
     # inconsistent receipt fails the profile (there is no per-profile INCOMPLETE).
     if ! "$PYTHON" "$TRACE_TOOL" verify --policy "$TRACE_POLICY" --default phased \

@@ -979,7 +979,7 @@ MARKER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     marker_pattern(
         "thread",
         rf"NILIX_STRESS_V2_THREAD run=(?P<run>{HEX16_RE}) seq=(?P<seq>{POS_UINT_RE}) "
-        rf"workers=(?P<workers>{POS_UINT_RE}) waves=(?P<waves>{POS_UINT_RE}) "
+        rf"workers=(?P<workers>{POS_UINT_RE}) waves=(?P<waves>{POS_UINT_RE}) wave=(?P<wave>{UINT_RE}) "
         rf"iterations=(?P<iterations>{POS_UINT_RE}) created=(?P<created>{POS_UINT_RE}) "
         rf"joined=(?P<joined>{POS_UINT_RE}) counter=(?P<counter>{UINT_RE}) "
         rf"expected=(?P<expected>{POS_UINT_RE}) wall_ns=(?P<wall_ns>{POS_UINT_RE}) "
@@ -1147,13 +1147,16 @@ def validate_profile_marker(marker: Marker, config: StressConfig) -> None:
         if total == 0:
             raise StressProtocolError("combined profile reported no subsystem operations")
     elif marker.kind == "thread":
-        threads = checked_mul_u64(knobs.workers, knobs.churn_waves, "thread count")
-        expected = checked_mul_u64(threads, knobs.contention_iterations, "thread expected")
+        # THREAD-HB C2: a round is one joined wave; each forked group runs
+        # churn_waves consecutive rounds, so the wave index follows seq.
+        expected = checked_mul_u64(knobs.workers, knobs.contention_iterations, "thread expected")
         if fields["workers"] != knobs.workers or fields["waves"] != knobs.churn_waves:
             raise StressProtocolError("thread marker does not match configured workers/waves")
+        if fields["wave"] != (fields["seq"] - 1) % knobs.churn_waves:
+            raise StressProtocolError("thread wave index does not follow its round sequence")
         if fields["iterations"] != knobs.contention_iterations:
             raise StressProtocolError("thread marker iteration count mismatch")
-        if fields["created"] != threads or fields["joined"] != threads:
+        if fields["created"] != knobs.workers or fields["joined"] != knobs.workers:
             raise StressProtocolError("thread round did not create and join the exact thread set")
         if fields["expected"] != expected or fields["counter"] != expected:
             raise StressProtocolError("thread mutex-protected counter/expected mismatch")
@@ -1187,7 +1190,8 @@ def validate_header(markers: Sequence[Marker], config: StressConfig, mode: str) 
 
 
 def validate_normal_markers(
-    markers: Sequence[Marker], config: StressConfig, minimum_heartbeats: int, recovery: bool = False
+    markers: Sequence[Marker], config: StressConfig, minimum_heartbeats: int, recovery: bool = False,
+    host_cut_round: bool = False,
 ) -> list[Marker]:
     expected_kind = config.profile_name
     next_sequence = 1
@@ -1289,7 +1293,15 @@ def validate_normal_markers(
             continue
         raise StressProtocolError(f"unexpected {marker.kind} marker in {config.profile_name} run")
 
-    if pending_round is not None:
+    # The host stops a host-terminated run at an arbitrary instant, which can
+    # fall between the final round marker and its HEARTBEAT. That round's
+    # content was validated above; liveness up to the stop is proven by the
+    # caller's freshness check of the last heartbeat against end_ns, so the
+    # unpaired tail is dropped instead of failing (maintainer decision
+    # 2026-11-09, THREAD-HB C2). Every earlier round still needs its HEARTBEAT.
+    if pending_round is not None and not (
+        host_cut_round and config.flags & FLAG_HOST_TERMINATED and pass_marker is not None
+    ):
         raise StressProtocolError("last profile round has no HEARTBEAT")
     if first_round is None or pass_marker is None:
         raise StressProtocolError("stress run did not complete its first verified round and PASS")
@@ -1533,6 +1545,7 @@ def validate_log(
     qemu_stderr_path: str | None = None,
     qmp_before_path: str | None = None,
     qmp_after_path: str | None = None,
+    host_terminated: bool = False,
 ) -> dict[str, Any]:
     # A writer boot ends in SIGKILL, which can cut its last marker mid-line.
     markers = parse_protocol_log(serial_path, live=mode == "writer")
@@ -1542,13 +1555,13 @@ def validate_log(
     if mode == "writer":
         commits = validate_writer_markers(markers, config)
         heartbeats: list[Marker] = []
-    elif mode == "normal":
+    elif mode in ("normal", "recovery"):
         commits = []
-        heartbeats = validate_normal_markers(markers, config, minimum_heartbeats)
-    elif mode == "recovery":
-        commits = []
+        # The caller must have successfully stopped the live VM by TERM, and
+        # the last heartbeat must still be fresh at that proven host stop.
         heartbeats = validate_normal_markers(
-            markers, config, minimum_heartbeats, recovery=True
+            markers, config, minimum_heartbeats, recovery=mode == "recovery",
+            host_cut_round=host_terminated and events_path is not None and end_ns is not None,
         )
     else:
         raise StressProtocolError(f"unknown validation mode {mode}")
@@ -1598,6 +1611,7 @@ def command_validate_log(args: argparse.Namespace) -> int:
         qemu_stderr_path=args.qemu_stderr,
         qmp_before_path=args.qmp_before,
         qmp_after_path=args.qmp_after,
+        host_terminated=args.host_terminated,
     )
     print(json.dumps(result, sort_keys=True))
     return 3 if result["runtime"]["status"] == "qualified" else 0
@@ -1760,6 +1774,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     validate.add_argument("--minimum-heartbeats", type=parse_uint, default=1)
     validate.add_argument("--events")
     validate.add_argument("--end-ns", type=parse_uint)
+    validate.add_argument("--host-terminated", action="store_true",
+                          help="caller proved a live VM stopped by host TERM without forced KILL")
     validate.add_argument("--heartbeat-grace-ms", type=parse_uint, default=0)
     validate.add_argument("--interrupt-log")
     validate.add_argument("--qemu-stderr")

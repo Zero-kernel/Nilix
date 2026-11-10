@@ -1,0 +1,27 @@
+{
+  "revision": "7159522ae4e6",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "python": "uv venv /home/dev/.venvs/nilix-ci"
+  },
+  "scope": "L1 host tests on the C2 tree",
+  "gates": [
+    {
+      "command": "python3 -m pytest scripts/tests -q -p no:cacheprovider",
+      "status": 1,
+      "log": "/tmp/nilix-evidence/thread-hb-c2-final/pytest.log",
+      "log_sha256": "3111511262abc018ad0ef9683fb888f603659ac70ae34b1145d66687a639aaa0",
+      "result": "275 passed, 9 errors"
+    },
+    {
+      "command": "make stress-test-selftest",
+      "status": 0,
+      "log": "/tmp/nilix-evidence/thread-hb-c2-final/selftest.log",
+      "log_sha256": "81cb6142bdbb2721cabd6f1a3f096e3d0676085c1e9280fdd4dfc27738358dc1"
+    }
+  ],
+  "limitations": [
+    "the 9 errors are all private_fuzz_evidence_test: `age` is not installed on the dev host; same as the P0 baseline"
+  ],
+  "notes": ""
+}

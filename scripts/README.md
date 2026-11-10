@@ -28,3 +28,13 @@ raw evidence. Python tests also publish JUnit and coverage files through the
 `quality` group. Guest groups retry one exit-1 or exit-2 attempt by default;
 set `CI_GUEST_RETRIES=0` for a single attempt. Retry decisions are recorded in
 the group's `retry.log` and both gate receipts are retained.
+
+Stress-v2 normal and recovery windows must finish by a successful host TERM
+of the live VM, with no KILL escalation and QEMU/timeout status 0 or 143.
+Spontaneous exits and guard timeouts fail even when the last heartbeat is
+fresh. The host passes `validate-log --host-terminated` only after this check;
+only that proof, together with the event ledger and end timestamp, permits
+one fully validated final round whose heartbeat was cut by the stop. Writer
+boots retain their intentional crash path. The thread profile reports each
+wave and emits a parent FAIL if its child exits abnormally, including when
+earlier waves have already made progress.
