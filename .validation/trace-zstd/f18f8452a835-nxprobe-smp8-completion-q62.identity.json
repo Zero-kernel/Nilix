@@ -1,0 +1,70 @@
+{
+  "revision": "f18f8452a835",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.27)",
+    "zstd": "1.4.8",
+    "accel": "tcg",
+    "cpus": 8,
+    "mem": "512M",
+    "kernel_sha256": "12ca1223939631d9ec32b74a65f573d1ecdd5ff5fd1b022bdb7e735430dccd76"
+  },
+  "scope": "negative control: trace_phase_probe nx-boot kernel, fault before the AP marker",
+  "gates": [
+    {
+      "command": "PATH=/home/dev/opt/zstd-jammy/usr/bin:$PATH; env TMPDIR=/tmp/nilix-evidence/trace-zstd/nxprobe-smp8-completion-q62/tmp EXTENDED_SMP_KEEP_LOGS=1 EXTENDED_SMP_CPUS=8 QEMU_GATE_MODE=completion bash /tmp/nilix-f18f8452a835/scripts/gates/boot/extended_smp_test.sh /tmp/nilix-f18f8452a835/esp-nxprobe",
+      "status": 1,
+      "log": "/tmp/nilix-evidence/trace-zstd/nxprobe-smp8-completion-q62/gate.log",
+      "log_sha256": "2bea56c70b80777f460bb1135c8026f3d13f4a1fe6ed028dc7dcb798d559747c"
+    },
+    {
+      "gate_log": {
+        "status": 1,
+        "counts": [
+          37,
+          37,
+          0
+        ],
+        "reasons": [
+          "fatal serial/QEMU marker (including markers after completion)",
+          "NX, reset or fatal kernel/AP-trampoline exception in interrupt log",
+          "QEMU did not complete the controlled exit protocol",
+          "missing exit-cleanup witness",
+          "invalid completion/observation timing in receipt",
+          "expected exactly one 'Process 1 exited with code 0' completion"
+        ]
+      }
+    },
+    {
+      "termination": {
+        "mode": "completion",
+        "qemu_status": 1,
+        "reason": "fatal-output",
+        "completion_seconds": null,
+        "elapsed_seconds": 51.533450186252594
+      }
+    },
+    {
+      "trace": {
+        "intlog": "/tmp/nilix-evidence/trace-zstd/nxprobe-smp8-completion-q62/tmp/tmp.mJBEqBnjtg.zst",
+        "format": "zstd",
+        "stored_bytes": "2436618",
+        "raw_bytes": "281345375",
+        "raw_lines": "4334898",
+        "interrupt_records": "206393",
+        "cpu_reset_lines": "23",
+        "nx_e0011": "1",
+        "triple_fault": "0",
+        "last_byte_is_newline": "yes",
+        "decompress_status": "0"
+      },
+      "stored_sha256": "ded2b9462d96062e5fc6af3995c81ef616d8b33aa808b11c80ca0876a9f7968f"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; concurrent runs shared it (see each run's load)",
+    "logs and compressed traces stay on the dev host under /tmp/nilix-evidence; only their SHA-256 is recorded here",
+    "the raw control trace (7.2 GB) was deleted after its statistics were taken"
+  ],
+  "notes": "started 2026-11-10T03:40:18Z; finished 2026-11-10T03:41:15Z"
+}

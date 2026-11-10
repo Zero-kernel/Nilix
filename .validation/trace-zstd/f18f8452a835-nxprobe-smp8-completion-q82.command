@@ -1,0 +1,1 @@
+PATH=/home/dev/opt/zstd-jammy/usr/bin:$PATH; source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; env TMPDIR=/tmp/nilix-evidence/trace-zstd/nxprobe-smp8-completion-q82/tmp EXTENDED_SMP_KEEP_LOGS=1 EXTENDED_SMP_CPUS=8 QEMU_GATE_MODE=completion bash /tmp/nilix-f18f8452a835/scripts/gates/boot/extended_smp_test.sh /tmp/nilix-f18f8452a835/esp-nxprobe

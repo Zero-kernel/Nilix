@@ -1,0 +1,21 @@
+{
+  "revision": "6ba753f8637c",
+  "environment": {
+    "host": "maintainer laptop (Fedora, x86_64)",
+    "python": "uv-managed CPython 3.12.15, pytest 9.2.0"
+  },
+  "scope": "L1 host tests on the trace-compression tree, including the maintainer's damaged-header and -D repairs",
+  "gates": [
+    {
+      "command": "uv run --no-project --with pytest python -m pytest scripts/tests -q -p no:cacheprovider",
+      "status": 0,
+      "log": "scratchpad pytest-6ba753f.log (not retained in the repository)",
+      "log_sha256": "221af36f0e7bf5da087151d58724243fadf170f8772071da2c168486d9165fa5",
+      "result": "302 passed, 3 skipped, 426 subtests passed"
+    }
+  ],
+  "limitations": [
+    "the dev-host gate records in this directory ran at f18f8452a835; 6ba753f only rejects a damaged .zst header and counts every -D option, so the accepted paths those runs exercised are unchanged"
+  ],
+  "notes": "f18f8452a835 alone: 299 passed, 3 skipped"
+}
