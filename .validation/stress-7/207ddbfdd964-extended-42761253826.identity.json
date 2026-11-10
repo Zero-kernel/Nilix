@@ -1,0 +1,180 @@
+{
+  "revision": "207ddbfdd964",
+  "environment": {
+    "host": "GitHub-hosted runners (ubuntu-22.04: QEMU 6.2, ubuntu-24.04: QEMU 8.2)",
+    "accel": "tcg",
+    "run": "https://github.com/Zero-kernel/Nilix/actions/runs/42761253826",
+    "event": "workflow_dispatch",
+    "created": "2026-11-10T05:17:58Z",
+    "updated": "2026-11-10T07:24:43Z"
+  },
+  "scope": "STRESS-7 Extended dispatch on the matrix source identity",
+  "gates": [
+    {
+      "command": "gh workflow run extended.yml -R Zero-kernel/Nilix --ref main",
+      "status": 1,
+      "conclusion": "failure",
+      "lanes": [
+        {
+          "job": "Extended / ubuntu-22.04 / ext3",
+          "job_id": 129647205370,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / iommu",
+          "job_id": 129647205250,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / smp-32",
+          "job_id": 129647205083,
+          "conclusion": "cancelled",
+          "reason": "the run step hung in `apt-get update` (setup-kernel) after fetching security InRelease; the guest never started"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / smp-8-16",
+          "job_id": 129647205303,
+          "conclusion": "cancelled",
+          "reason": "the run step hung in `apt-get update` (setup-kernel) after fetching security InRelease; the guest never started"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / stress-block",
+          "job_id": 129647205332,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / stress-combined",
+          "job_id": 129647205350,
+          "conclusion": "failure",
+          "verdict": "STRESS-TEST UNSTABLE: 1 profile(s) failed"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / stress-cpu",
+          "job_id": 129647205352,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / stress-memory",
+          "job_id": 129647205202,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / stress-process",
+          "job_id": 129647205434,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / stress-smp",
+          "job_id": 129647205293,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / stress-thread",
+          "job_id": 129647205253,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-22.04 / strict (diagnostic)",
+          "job_id": 129647204920,
+          "conclusion": "failure",
+          "reason": "diagnostic job: every current deferral fails a strict gate; not part of the aggregate"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / ext3",
+          "job_id": 129647204932,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / iommu",
+          "job_id": 129647204844,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / smp-32",
+          "job_id": 129647204880,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / smp-8-16",
+          "job_id": 129647205234,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / stress-block",
+          "job_id": 129647204877,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / stress-combined",
+          "job_id": 129647204972,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / stress-cpu",
+          "job_id": 129647204886,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / stress-memory",
+          "job_id": 129647204843,
+          "conclusion": "cancelled",
+          "reason": "the run step hung in `apt-get update` (setup-kernel) after fetching security InRelease; the guest never started"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / stress-process",
+          "job_id": 129647204891,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / stress-smp",
+          "job_id": 129647204793,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / stress-thread",
+          "job_id": 129647204872,
+          "conclusion": "success",
+          "verdict": "GATE-QUALIFIED: accepted for diagnostic CI; strict qualification remains open"
+        },
+        {
+          "job": "Extended / ubuntu-24.04 / strict (diagnostic)",
+          "job_id": 129647204617,
+          "conclusion": "failure",
+          "reason": "diagnostic job: every current deferral fails a strict gate; not part of the aggregate"
+        }
+      ]
+    },
+    {
+      "failure": "Extended / ubuntu-22.04 / stress-combined",
+      "gate_log_sha256": "cb26f1f3acde7763528ed06967a8f1b9db09aa9b8666d23b4e1d03ccb21c7b47",
+      "gate_status": 1,
+      "reason": "last heartbeat was stale by run end (412623 ms); bound 30000 ms; last round 3192",
+      "serial_sha256": "636b5d8ba2a9df96f7d02df8154ac40fcab9fa3de1f6f9add8e795b6befcaa47",
+      "events_sha256": "f2e40f756a0db8e3d5774049ea8fcc5eaf0ccd0df5e32fc1da3be2ee8af569f8",
+      "tracking": "#92"
+    }
+  ],
+  "limitations": [
+    "three lanes were cancelled before any guest ran, so 24.04 stress-memory, 22.04 smp-32 and 22.04 smp-8-16 have no result on this source",
+    "the strict jobs are diagnostic and were expected to fail",
+    "artifacts stay in the workflow run; only SHA-256 values of the failure's logs are recorded here"
+  ],
+  "notes": "18 lanes GATE-QUALIFIED; ubuntu-22.04 stress-combined FAILED on a scheduler stall (Ready pid 75 pinned to idle CPU 3 never ran)."
+}
