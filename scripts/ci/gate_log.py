@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 try:
@@ -256,12 +258,54 @@ INTERRUPT_FATAL_BYTES = re.compile(
 INTERRUPT_FATAL_NEEDLES = (b"v=06 ", b"v=08 ", b"v=0d ", b"v=0e ", b"cpu_reset", b"triple fault")
 
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+class _Drain:
+    """Read a decompressor's output and remember whether it reached EOF."""
+
+    def __init__(self, stream):
+        self.stream, self.eof = stream, False
+
+    def read(self, size: int) -> bytes:
+        data = self.stream.read(size)
+        self.eof = self.eof or not data
+        return data
+
+
+@contextmanager
+def open_trace(path: Path):
+    """Open an interrupt trace, decompressing a QEMU_TRACE_COMPRESS=zstd stream.
+
+    A stream read to its end must decompress cleanly, so a truncated or corrupt
+    trace is unreadable (OSError) rather than silently short. A reader that
+    stops early already has what it needs, and the decompressor is stopped.
+    """
+    with path.open("rb") as raw:
+        if raw.read(len(ZSTD_MAGIC)) != ZSTD_MAGIC:
+            raw.seek(0)
+            yield raw
+            return
+    process = subprocess.Popen(["zstd", "-dcq", "--", str(path)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    stream = _Drain(process.stdout)
+    try:
+        yield stream
+    finally:
+        if not stream.eof:
+            process.kill()
+        process.stdout.close()
+        status = process.wait()
+    if stream.eof and status != 0:
+        raise OSError(f"zstd could not decompress {path} (status {status})")
+
+
 def fatal_interrupt_lines(path: Path, limit: int = 64, chunk_size: int = 64 << 20) -> str:
     # Scan whole line-aligned chunks with the C regex engine; a per-line
     # Python loop takes many minutes on multi-GiB logs.
     matches: list[bytes] = []
     carry = b""
-    with path.open("rb") as stream:
+    with open_trace(path) as stream:
         while len(matches) < limit:
             block = stream.read(chunk_size)
             if not block:

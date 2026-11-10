@@ -109,3 +109,12 @@ deadline and do not count toward the post-witness observation interval.
 `trace_phase_probe.py` checks fault evidence in bounded log blocks and retains
 only a bounded interrupt-log tail. Its test-only kernel feature is disabled in
 normal images. The probe changes no workload, heartbeat bound or gate verdict.
+
+The extended SMP gates (8, 16 and 32 vCPUs) keep the full trace but store it
+compressed (`QEMU_TRACE_COMPRESS=zstd`, #63): QEMU logs into a FIFO, and one
+`zstd -1` stream at the `-D` path holds the complete content. A full 3600-second
+32-vCPU window previously filled the runner disk. `gate_log.py` recognizes the
+zstd magic and decompresses as it scans. A truncated or corrupt stream, or a
+compressor that failed (its output is kept as `*.partial`), leaves the gate
+unable to read its trace, so it reports INCOMPLETE rather than passing. Read a
+retained trace with `zstd -dc tmp.XXXXXX.zst`.

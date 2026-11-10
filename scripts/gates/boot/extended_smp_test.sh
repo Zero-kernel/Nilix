@@ -54,6 +54,10 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo "EXTENDED-SMP-TEST BLOCKED: python3 is required for gate-log validation"
     exit 2
 fi
+if ! command -v zstd >/dev/null 2>&1; then
+    echo "EXTENDED-SMP-TEST BLOCKED: zstd is required for the compressed interrupt trace"
+    exit 2
+fi
 
 # OVMF firmware autodetect
 if [ -n "${OVMF_PATH:-}" ] && [ -f "${OVMF_PATH:-}" ]; then
@@ -97,8 +101,11 @@ run_smp_test() {
     echo ""
 
     local ser intlog qemuerr timeoutlog
+    # A full 32-vCPU window trace filled the runner disk (#63): keep it as zstd.
+    local QEMU_TRACE_COMPRESS=zstd QEMU_TRACE_INTLOG
     ser="$(mktemp)"
-    intlog="$(mktemp)"
+    intlog="$(mktemp --suffix=.zst)"
+    QEMU_TRACE_INTLOG="$intlog"
     qemuerr="$(mktemp)"
     timeoutlog="$(mktemp)"
 
@@ -120,9 +127,9 @@ run_smp_test() {
 
     # Analyze results
     local nx cpu_resets supervisor_faults
-    nx=$(grep -c 'e=0011' "$intlog" 2>/dev/null)
+    nx=$(qemu_trace_cat "$intlog" 2>/dev/null | grep -c 'e=0011')
     nx=${nx:-0}
-    cpu_resets=$(grep -c 'cpu_reset' "$intlog" 2>/dev/null)
+    cpu_resets=$(qemu_trace_cat "$intlog" 2>/dev/null | grep -c 'cpu_reset')
     cpu_resets=${cpu_resets:-0}
     supervisor_faults=$(grep -cE '\[PF ENTRY\]|\[PAGE FAULT\]|\[DOUBLE FAULT\]|triple fault|Triple fault|KERNEL PANIC' "$ser" 2>/dev/null)
     supervisor_faults=${supervisor_faults:-0}
@@ -253,7 +260,7 @@ run_smp_test() {
         echo "EXTENDED-SMP ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status termination=$ser.run.json qemu_status=$ser.qemu.status"
     else
         rm -rf -- "$ser.inputs"
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status"
+        rm -f "$ser" "$intlog" "$intlog.partial" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status"
     fi
     echo "End time: $(date)"
     echo ""
