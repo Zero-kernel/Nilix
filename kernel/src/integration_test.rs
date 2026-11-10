@@ -83,6 +83,8 @@ pub fn test_scheduler() {
     sched::enhanced_scheduler::run_identity_resume_self_test();
     sched::enhanced_scheduler::run_scheduler_admission_self_test();
     sched::enhanced_scheduler::run_idle_rearm_self_test();
+    sched::enhanced_scheduler::run_idle_probe_cursor_self_test();
+    klog_always!("    [PASS] PR96-1 idle probe preserves bounded dispatch progress");
     kernel_core::process::run_fd_charge_migration_self_test();
     klog_always!(
         "    [PASS] RF178-33 selector/aging/identity-cleanup + RF178-35 fatal wake + RF178-36 identity resume"
