@@ -1,0 +1,45 @@
+{
+  "revision": "207ddbfdd964",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18, rebuilt for jammy without root)",
+    "accel": "tcg",
+    "cpus": 4,
+    "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+    "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d"
+  },
+  "scope": "STRESS-7 seven-profile matrix: process, 900 s, the Extended stress lane's parameters",
+  "gates": [
+    {
+      "command": "source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; env STRESS_PROFILES=process STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+      "status": 3,
+      "log": "/tmp/nilix-evidence/stress7-207ddbf/process-q82/gate.log",
+      "log_sha256": "804798d4bcf21dfb28801bcb82ec52ec7176037e59aa34f62f0c8012dfbfaa68",
+      "verdict": [
+        "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+      ]
+    },
+    {
+      "heartbeat_ledgers": [
+        {
+          "stage": "process/run",
+          "sha256": "f8096c810a72449cfbfe57dc781981a0b7b0ffc2f2a4bfb811824ec31c6558b5",
+          "heartbeats": 1190,
+          "gap_ms": {
+            "min": 702.5,
+            "median": 756.9,
+            "max": 919.8
+          },
+          "gaps_over_bound": 0,
+          "bound_ms": 15000
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; all seven profiles ran concurrently (20 vCPUs in total)",
+    "QEMU 8.2 only; the Extended workflow covers QEMU 6.2 (ubuntu-22.04) and 8.2 (ubuntu-24.04)",
+    "logs, serial ledgers and disks stay on the dev host under /tmp/nilix-evidence; only SHA-256 values are recorded"
+  ],
+  "notes": "started 2026-11-10T05:22:33Z; finished 2026-11-10T05:38:14Z; wall 940 s"
+}

@@ -1,0 +1,1 @@
+source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; env STRESS_PROFILES=block STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
