@@ -1,0 +1,77 @@
+{
+  "revision": "f393f233cc71",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18, rebuilt for jammy without root)",
+    "accel": "tcg",
+    "cpus": 8,
+    "mem": "256M"
+  },
+  "scope": "Diagnostic, not a verdict: thread profile with NILIX_STRESS_V2_DIAG_WAVE markers after every joined wave and /proc/schedstat every round (patch never committed; the extra marker fails the protocol by design), 300 s after READY",
+  "gates": [
+    {
+      "command": "cd /tmp/nilix-c1-diag (f393f233cc71 + diag_patch.py on userspace/stress_runner.c); make build-stress; source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; env NILIX_QEMU_TRACE=phased STRESS_PROFILES=thread STRESS_PROFILE_LIMIT=1 STRESS_DURATION=300 STRESS_CPUS=8 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+      "status": 1,
+      "log": "/tmp/nilix-evidence/thread-hb-c1/diag-thread8-q82/gate.log",
+      "log_sha256": "826097a03c768df29c9c5f175fd4e5b463994b60c652758ecc3302c51148b5a7"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/thread-hb-c1/diag-thread8-q82/serial.log",
+      "serial_sha256": "985b6a27dd9f35142e270c0c7af7195ba65d9366c06d2a6c496273d7fcec72a3"
+    },
+    {
+      "trace_receipt": "/tmp/nilix-evidence/thread-hb-c1/diag-thread8-q82/trace.json",
+      "sha256": "95ddee35eb43876cd3f3aa2d507d8b269ad794af2937d9a1c2f78d93ddd203ab",
+      "outcome": "switched",
+      "switched_seconds": 62.468,
+      "intlog_bytes_at_switch": 268055055,
+      "intlog_bytes_final": 268055055
+    },
+    {
+      "interrupt_log_bytes": 268055055
+    },
+    {
+      "rounds": "/tmp/nilix-evidence/thread-hb-c1/diag-thread8-q82/rounds.json",
+      "sha256": "b497c80e16fd710631d1fbe85bb486a85e0644d0eb7523ded06bff4d6c3bdc82",
+      "summary": {
+        "rounds": 56,
+        "heartbeats": 56,
+        "round_wall_ms": {
+          "min": 2556.0,
+          "median": 3172.0,
+          "max": 4411.0
+        },
+        "gap_ms": {
+          "min": 4347.2,
+          "median": 4760.7,
+          "max": 7013.7
+        },
+        "gaps_over_bound": 0,
+        "bound_ms": 15000
+      }
+    },
+    {
+      "waves": "/tmp/nilix-evidence/thread-hb-c1/diag-thread8-q82/waves.json",
+      "sha256": "2085b72499faf29ee8e85e33d01b94347d09fa8e041cc872c7c80b2a431739d4",
+      "summary": {
+        "waves": 452,
+        "host_ms": {
+          "median": 602.5,
+          "max": 1308.4
+        },
+        "host_ms_excluding_wave0": {
+          "median": 560.0,
+          "max": 1007.7
+        },
+        "over_bound": 0,
+        "bound_ms": 15000
+      }
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to three lanes ran at once (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/thread-hb-c1; only their SHA-256 is recorded here"
+  ],
+  "notes": "started 2026-11-09T10:29:08Z load 4.07; finished 2026-11-09T10:35:12Z"
+}

@@ -8,6 +8,9 @@
 # large-memory ring3-mm lane).
 # KERNEL_TEST_TIMEOUT may be raised to 2700 for the 16-vCPU 200-round final-owner
 # gate; the default remains 900.
+# KERNEL_TEST_TRACE_DEFAULT=full|phased is the caller's interrupt-trace default
+# (full; the serial-only Ring-3 oracle selects phased). NILIX_QEMU_TRACE
+# overrides it; a phased run of this gate's own verdict is diagnostic only.
 set -u
 
 # Resolve the repo root from this script's own location so it runs from any
@@ -38,6 +41,12 @@ if [[ ! "$CPUS" =~ ^(1|2|4|8|16)$ ]]; then
 fi
 smp_args=()
 [ "$CPUS" = 1 ] || smp_args=(-smp "$CPUS")
+TRACE_DEFAULT="${KERNEL_TEST_TRACE_DEFAULT:-full}"
+if [[ ! "$TRACE_DEFAULT" =~ ^(full|phased)$ ]]; then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_TRACE_DEFAULT must be full or phased"
+    exit 2
+fi
+QEMU_TRACE_POLICY="$(qemu_trace_policy "$TRACE_DEFAULT")" || exit 2
 for tool in "$QEMU" timeout python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "KERNEL-TEST BLOCKED: $tool not found in PATH"
@@ -68,12 +77,14 @@ ser="$(mktemp)" || exit 2
 intlog="$(mktemp)" || exit 2
 qemuerr="$(mktemp)" || exit 2
 timeoutlog="$(mktemp)" || exit 2
+QEMU_TRACE_INTLOG="$intlog"
+QEMU_TRACE_CPUS="$CPUS"
 cleanup() {
     if [ "${KERNEL_TEST_KEEP_LOGS:-0}" = 1 ]; then
-        echo "KERNEL-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status termination=$ser.run.json qemu_status=$ser.qemu.status"
+        echo "KERNEL-TEST ARTIFACTS: serial=$ser intlog=$intlog qemuerr=$qemuerr timeoutlog=$timeoutlog counts=$ser.counts.json gate_status=$ser.gate.status termination=$ser.run.json qemu_status=$ser.qemu.status trace=$ser.trace.json"
     else
         rm -rf -- "$ser.inputs"
-        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status"
+        rm -f "$ser" "$intlog" "$qemuerr" "$timeoutlog" "$ser.counts.json" "$ser.gate.status" "$ser.run.json" "$ser.qemu.status" "$ser.trace.json"
     fi
 }
 trap cleanup EXIT
@@ -115,7 +126,8 @@ qemu_status=$?
 printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 
 python3 "$ROOT/scripts/ci/gate_log.py" --serial "$ser" --intlog "$intlog" \
-    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json"
+    --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json" \
+    --trace-policy "$QEMU_TRACE_POLICY" --trace-default full --trace-receipt "$ser.trace.json"
 rc=$?
 python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || rc=1
 if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Fq 'R180-6 production JBD2 write path passed' "$ser"; then

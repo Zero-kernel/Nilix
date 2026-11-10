@@ -6,11 +6,18 @@
 #   1 - at least one selected profile failed
 #   2 - a required host prerequisite or suite setting is invalid
 #   3 - workloads completed with runtime/security qualifications
+#
+# NILIX_QEMU_TRACE=full|phased selects QEMU's interrupt trace (default phased:
+# `-d int,cpu_reset` through boot, then `cpu_reset` only; THREAD-HB C1,
+# scripts/ci/qemu_trace.py). The verdict reads only triple faults and the NX
+# signature from that log; after boot an NX fetch panics with serial evidence.
 
 set -uo pipefail
 
 ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")")")")"
 PROTOCOL="$ROOT/scripts/gates/stress/stress_protocol.py"
+TRACE_TOOL="$ROOT/scripts/ci/qemu_trace.py"
+TRACE_POLICY="${NILIX_QEMU_TRACE:-phased}"
 QEMU="${QEMU:-qemu-system-x86_64}"
 PYTHON="${PYTHON:-python3}"
 ESP="${1:-$ROOT/esp-stress}"
@@ -63,6 +70,8 @@ TEST_FAIL=1
 TEST_QUALIFIED=3
 ACTIVE_PID=""
 ACTIVE_MONITOR_PID=""
+ACTIVE_TRACE_PID=""
+TRACE_RECEIPT=""
 VM_STATUS=0
 MONITOR_STATUS=0
 RUN_END_NS=0
@@ -115,6 +124,26 @@ stop_monitor() {
     fi
 }
 
+# Ends the trace sidecar: it writes its receipt (switched, or why not) on exit.
+stop_trace() {
+    if [ -n "${ACTIVE_TRACE_PID:-}" ]; then
+        kill -TERM "$ACTIVE_TRACE_PID" 2>/dev/null || true
+        wait "$ACTIVE_TRACE_PID" 2>/dev/null || true
+        ACTIVE_TRACE_PID=""
+    fi
+}
+
+# QMP serves one client at a time; let the sidecar finish its switch first.
+wait_trace() {
+    local remaining=300
+    while [ -n "${ACTIVE_TRACE_PID:-}" ] && kill -0 "$ACTIVE_TRACE_PID" 2>/dev/null \
+        && [ "$remaining" -gt 0 ]; do
+        sleep 0.1
+        remaining=$((remaining - 1))
+    done
+    stop_trace
+}
+
 stop_vm() {
     local requested_signal="${1:-TERM}"
     VM_STATUS=0
@@ -135,6 +164,7 @@ stop_vm() {
         wait "$ACTIVE_PID" 2>/dev/null || VM_STATUS=$?
         ACTIVE_PID=""
     fi
+    stop_trace
     stop_monitor
 }
 
@@ -173,6 +203,7 @@ for numeric in \
     require_positive "$numeric" "${!numeric}"
 done
 require_nonnegative STRESS_HEARTBEAT_GRACE_MS "$STRESS_HEARTBEAT_GRACE_MS"
+case "$TRACE_POLICY" in full|phased) ;; *) blocked "NILIX_QEMU_TRACE must be full or phased" ;; esac
 [[ "$STRESS_MEM" =~ ^[1-9][0-9]*[KMG]?$ ]] \
     || blocked "STRESS_MEM must be a QEMU memory size such as 256M"
 [[ "$STRESS_CONSTRAINED_MEM" =~ ^[1-9][0-9]*[KMG]?$ ]] \
@@ -261,6 +292,7 @@ echo "OVMF:      $OVMF"
 echo "Profiles:  ${SELECTED_PROFILES[*]}"
 echo "Duration:  ${STRESS_DURATION}s after READY"
 echo "vCPUs:     $STRESS_CPUS"
+echo "Trace:     $TRACE_POLICY interrupt trace"
 echo "Artifacts: $SUITE_TMP"
 
 random_hex64() {
@@ -393,13 +425,14 @@ start_vm() {
     INTERRUPT_LOG="$workdir/interrupt.log"
     QEMU_STDERR="$workdir/qemu.stderr"
     EVENT_LOG="$workdir/events.jsonl"
+    TRACE_RECEIPT="$workdir/trace.json"
     QMP_BEFORE="$workdir/qmp-before.json"
     QMP_AFTER="$workdir/qmp-after.json"
     : > "$SERIAL_LOG"
     : > "$INTERRUPT_LOG"
     : > "$QEMU_STDERR"
     : > "$EVENT_LOG"
-    rm -f -- "$QMP_SOCKET"
+    rm -f -- "$QMP_SOCKET" "$TRACE_RECEIPT"
 
     # QEMU's virtual FAT is writable (`fat:rw:`) and OVMF stores NvVars on it, so
     # pointing it straight at $ESP lets the firmware write back into the source
@@ -430,6 +463,12 @@ start_vm() {
     "$PYTHON" "$PROTOCOL" monitor --serial "$SERIAL_LOG" --events "$EVENT_LOG" \
         --poll-ms 50 >/dev/null 2>"$workdir/monitor.stderr" &
     ACTIVE_MONITOR_PID=$!
+    if [ "$TRACE_POLICY" = phased ]; then
+        "$PYTHON" "$TRACE_TOOL" switch --qmp "$QMP_SOCKET" --serial "$SERIAL_LOG" \
+            --intlog "$INTERRUPT_LOG" --cpus "$vcpus" --receipt "$TRACE_RECEIPT" \
+            --timeout "$guard_seconds" --pid "$ACTIVE_PID" >/dev/null 2>"$workdir/trace.stderr" &
+        ACTIVE_TRACE_PID=$!
+    fi
     return 0
 }
 
@@ -457,6 +496,7 @@ wait_soak_window() {
 
 capture_qmp() {
     local output="$1"
+    wait_trace
     "$PYTHON" "$PROTOCOL" qmp-snapshot --socket "$QMP_SOCKET" --output "$output" \
         --timeout "$STRESS_BOOT_TIMEOUT" >/dev/null
 }
@@ -490,6 +530,15 @@ validate_current_log() {
         args+=(--qmp-before "$QMP_BEFORE" --qmp-after "$QMP_AFTER")
     fi
     "$PYTHON" "${args[@]}"
+    local status=$?
+    # A phased run must prove its switch against this serial log; a missing or
+    # inconsistent receipt fails the profile (there is no per-profile INCOMPLETE).
+    if ! "$PYTHON" "$TRACE_TOOL" verify --policy "$TRACE_POLICY" --default phased \
+        --receipt "$TRACE_RECEIPT" --serial "$SERIAL_LOG"; then
+        echo "  FAIL: interrupt-trace receipt"
+        status=$TEST_FAIL
+    fi
+    return "$status"
 }
 
 run_normal_profile() {

@@ -1,0 +1,32 @@
+{
+  "revision": "f393f233cc71",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18, rebuilt for jammy without root)",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "THREAD-HB C1 acceptance: phased interrupt trace (default)",
+  "gates": [
+    {
+      "command": "source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; env NILIX_QEMU_TRACE=phased KERNEL_TEST_CPUS=16 bash scripts/gates/boot/ring3_mm_oracle.sh esp",
+      "status": 0,
+      "log": "/tmp/nilix-evidence/thread-hb-c1/ring3-16-phased-q82-3/gate.log",
+      "log_sha256": "107cee8381fd12c418c1e6de94a09652008efe0a9d57464770614775696b9e18"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/thread-hb-c1/ring3-16-phased-q82-3/serial.log",
+      "serial_sha256": "08d7f3fa53001b3a74b4688811e28c0e23030249913017692736d6cf4cd9ed6c"
+    },
+    {
+      "interrupt_log_bytes": 2380938915
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to three lanes ran at once (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/thread-hb-c1; only their SHA-256 is recorded here"
+  ],
+  "notes": "started 2026-11-09T09:57:06Z load 8.31; finished 2026-11-09T10:07:43Z; status 0 restored from the lane log (RING3-MM OK printed in the gate log): the run script first copied the boot harness's own gate.status over the oracle status (fixed before run 4)"
+}

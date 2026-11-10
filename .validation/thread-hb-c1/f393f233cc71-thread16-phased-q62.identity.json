@@ -1,0 +1,60 @@
+{
+  "revision": "f393f233cc71",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.27)",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "THREAD-HB C1 acceptance: phased interrupt trace (default)",
+  "gates": [
+    {
+      "command": "env NILIX_QEMU_TRACE=phased STRESS_PROFILES=thread STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=16 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+      "status": 1,
+      "log": "/tmp/nilix-evidence/thread-hb-c1/thread16-phased-q62/gate.log",
+      "log_sha256": "8687597b75b8823c94972172102fd5df3b4b98381a3b79b9d7ae99c3fd61d717"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/thread-hb-c1/thread16-phased-q62/serial.log",
+      "serial_sha256": "f5e330fd009545fd5de4201045c5dc9717ee94c64c672ab5f4b3dc0a1fc2e14e"
+    },
+    {
+      "trace_receipt": "/tmp/nilix-evidence/thread-hb-c1/thread16-phased-q62/trace.json",
+      "sha256": "e194aa4d65bfe4f5a79a4b98795d74698b1a15c8dc24ccc973e497164ff970be",
+      "outcome": "switched",
+      "switched_seconds": 182.667,
+      "intlog_bytes_at_switch": 1140274234,
+      "intlog_bytes_final": 1140274234
+    },
+    {
+      "interrupt_log_bytes": 1140274234
+    },
+    {
+      "rounds": "/tmp/nilix-evidence/thread-hb-c1/thread16-phased-q62/rounds.json",
+      "sha256": "c2d9623a42242b4a0b37c852e0026bcefcf389b7d2a0393d8607a3294d6c7f47",
+      "summary": {
+        "rounds": 47,
+        "heartbeats": 47,
+        "round_wall_ms": {
+          "min": 8774.0,
+          "median": 10092.0,
+          "max": 11933.0
+        },
+        "gap_ms": {
+          "min": 15946.4,
+          "median": 17750.6,
+          "max": 25737.5
+        },
+        "gaps_over_bound": 47,
+        "bound_ms": 15000
+      }
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to three lanes ran at once (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/thread-hb-c1; only their SHA-256 is recorded here"
+  ],
+  "notes": "started 2026-11-09T09:22:15Z load 14.60; finished 2026-11-09T09:40:49Z"
+}

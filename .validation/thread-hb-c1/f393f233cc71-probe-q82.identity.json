@@ -1,0 +1,25 @@
+{
+  "revision": "f393f233cc71",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18, rebuilt for jammy without root)",
+    "accel": "tcg",
+    "cpus": 4,
+    "mem": "256M"
+  },
+  "scope": "THREAD-HB C1 negative controls: ud, gp, nx, triple after the switch; nx-boot before it",
+  "gates": [
+    {
+      "command": "source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; python3 scripts/gates/qemu/trace_phase_probe.py --artifacts <dir>",
+      "status": 0,
+      "log": "/tmp/nilix-evidence/thread-hb-c1/probe-q82.log",
+      "log_sha256": "2e4c56d2a4a3c76b078a7d43041ea6f5e257aaca95a438ae2992493adaafa7b5"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; up to three lanes ran at once (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence/thread-hb-c1; only their SHA-256 is recorded here"
+  ],
+  "notes": ""
+}

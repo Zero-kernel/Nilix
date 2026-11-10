@@ -108,6 +108,8 @@ mod shell;
 mod stack_guard;
 mod syscall_demo;
 mod test_framework;
+#[cfg(feature = "trace_phase_probe")]
+mod trace_phase_probe;
 mod usermode_test;
 
 // 串口端口
@@ -1521,7 +1523,12 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
     // RF180-54 FIX: do not expose runnable Ring-3 work until every online AP has
     // completed one full post-publication deferred drain. The bounded BSP wait
     // runs with interrupts enabled and fails closed on a missing/invalid ACK.
+    #[cfg(feature = "trace_phase_probe")]
+    trace_phase_probe::before_marker();
     arch::smp::wait_for_process_deferred_acknowledgements();
+    // THREAD-HB C1: the probe image faults after the trace-switch marker above.
+    #[cfg(feature = "trace_phase_probe")]
+    trace_phase_probe::after_marker();
 
     // Measure with IRQs enabled and before any user task becomes runnable.
     // The mitigation image requires an independent clock-rate witness as well

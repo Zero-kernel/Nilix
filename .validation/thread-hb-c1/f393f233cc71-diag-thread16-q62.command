@@ -1,0 +1,1 @@
+cd /tmp/nilix-c1-diag (f393f233cc71 + diag_patch.py on userspace/stress_runner.c); make build-stress; env NILIX_QEMU_TRACE=phased STRESS_PROFILES=thread STRESS_PROFILE_LIMIT=1 STRESS_DURATION=300 STRESS_CPUS=16 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
