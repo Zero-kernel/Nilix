@@ -1907,6 +1907,13 @@ impl Scheduler {
                 .candidate
                 .is_some()
         };
+        if Self::arm_idle_for_local_candidate(
+            local_has_candidate,
+            current_pid,
+            &current_cpu().need_resched,
+        ) {
+            process::note_idle_rearm();
+        }
         if local_has_candidate {
             return false;
         }
@@ -1943,6 +1950,30 @@ impl Scheduler {
             Self::arm_ready_cpu(source_cpu);
             false
         }
+    }
+
+    /// #92: arm an idle CPU whose own queue holds a runnable candidate.
+    ///
+    /// Publishing work arms its CPU once, and `reschedule_now` consumes that
+    /// edge before selecting. When the selection then skips the only candidate
+    /// for a transient reason (its PCB lock held elsewhere, `on_cpu` not yet
+    /// released, a cpuset snapshot miss), the scan reads as complete and nothing
+    /// armed the CPU again: every idle tick found the task here and halted.
+    /// Arming on what this pass observes recovers any lost edge within one tick.
+    /// It cannot spin, because the same selector does not report a candidate
+    /// while the skip persists. A CPU running a task is never armed here, so
+    /// syscall returns gain no preemption.
+    ///
+    /// Returns whether the bit was clear, i.e. whether a lost wakeup was recovered.
+    fn arm_idle_for_local_candidate(
+        has_candidate: bool,
+        current_pid: Option<Pid>,
+        need_resched: &AtomicBool,
+    ) -> bool {
+        if !has_candidate || current_pid.is_some() {
+            return false;
+        }
+        !need_resched.swap(true, Ordering::SeqCst)
     }
 
     /// Migrate a ready task from the busiest CPU to the idlest CPU
@@ -3423,6 +3454,84 @@ pub fn run_scheduler_admission_self_test() {
     assert!(removed.is_some());
     let retired = retired.expect("final scheduler backing must detach");
     assert_eq!(queue.bucket(120).capacity(), 0);
+    drop(removed);
+    drop(retired);
+}
+
+/// #92 executable probe: an idle pass arms its CPU for a runnable local
+/// candidate, waits out a transient skip without arming, and never arms a CPU
+/// that is running a task.
+pub fn run_idle_rearm_self_test() {
+    fn idle_pass(queue: &ReadyQueues, current: Option<Pid>, need_resched: &AtomicBool) -> bool {
+        let mut cursor = SelectionCursorState::new();
+        let has_candidate = Scheduler::select_next_with_cursor(
+            queue,
+            current_cpu_id(),
+            current,
+            &mut cursor,
+            0,
+            SELECT_VISIT_BUDGET,
+        )
+        .candidate
+        .is_some();
+        Scheduler::arm_idle_for_local_candidate(has_candidate, current, need_resched)
+    }
+
+    let pcb = Process::try_new_pcb(
+        0x92_0001,
+        1,
+        ProcessNameSnapshot::from_parts("sched-stall-92", ""),
+        120,
+    )
+    .expect("#92 idle-rearm PCB fixture");
+    let pid = {
+        let mut proc = pcb.lock();
+        proc.state = ProcessState::Provisioning;
+        proc.publish_ready_at(kernel_core::get_ticks());
+        proc.pid
+    };
+    let mut queue = ReadyQueues::new();
+    let prepared = PreparedAdmittedMapCapacity::try_new(HeapClass::Scheduler, 1)
+        .expect("#92 idle-rearm queue reserve");
+    let retired = queue
+        .bucket_mut(120)
+        .install_prepared_deferred(prepared)
+        .expect("#92 idle-rearm queue install");
+    drop(retired);
+    let inserted = queue
+        .bucket_mut(120)
+        .insert_unique_reserved(pid, Arc::clone(&pcb));
+    assert!(inserted.is_ok(), "#92 idle-rearm insert");
+    let need_resched = AtomicBool::new(false);
+
+    // The edge was consumed, and the only candidate's PCB lock is held
+    // elsewhere: the pass must neither arm nor report a candidate (no spin).
+    {
+        let _held = pcb.lock();
+        assert!(!idle_pass(&queue, None, &need_resched));
+        assert!(!need_resched.load(Ordering::Acquire));
+    }
+    // The next idle tick finds the task and arms its CPU.
+    assert!(idle_pass(&queue, None, &need_resched));
+    assert!(need_resched.load(Ordering::Acquire));
+    // An already armed CPU stays armed and is not counted as a recovery.
+    assert!(!idle_pass(&queue, None, &need_resched));
+    assert!(need_resched.load(Ordering::Acquire));
+
+    // Same for an outgoing save that has not released `on_cpu` yet.
+    need_resched.store(false, Ordering::Release);
+    pcb.lock().on_cpu.store(true, Ordering::Release);
+    assert!(!idle_pass(&queue, None, &need_resched));
+    assert!(!need_resched.load(Ordering::Acquire));
+    pcb.lock().on_cpu.store(false, Ordering::Release);
+    assert!(idle_pass(&queue, None, &need_resched));
+
+    // A CPU running another task is never armed by this path.
+    need_resched.store(false, Ordering::Release);
+    assert!(!idle_pass(&queue, Some(pid + 1), &need_resched));
+    assert!(!need_resched.load(Ordering::Acquire));
+
+    let (removed, retired) = queue.remove_ordinary(120, &pid);
     drop(removed);
     drop(retired);
 }

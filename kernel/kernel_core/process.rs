@@ -6727,6 +6727,21 @@ pub fn wait_over_wake_count() -> u64 {
     WAIT_OVER_WAKES.load(Ordering::Relaxed)
 }
 
+/// #92: idle passes that found a runnable task in their own queue with no
+/// reschedule pending, and armed their CPU. Each one is a recovered lost wakeup.
+static IDLE_REARMS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one idle CPU that armed itself for a local candidate (#92).
+pub fn note_idle_rearm() {
+    // Diagnostic counter only; wrap is harmless. lint-fetch-add: allow
+    IDLE_REARMS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Idle self-arms since boot (#92).
+pub fn idle_rearm_count() -> u64 {
+    IDLE_REARMS.load(Ordering::Relaxed)
+}
+
 /// GAP-6 F11 diagnostic (stress builds only): tick of the last console write.
 /// The stress runner writes a marker every round, so a long silence means the
 /// guest stopped making progress.
