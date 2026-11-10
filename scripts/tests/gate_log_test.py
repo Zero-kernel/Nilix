@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.ci import gate_log
 
@@ -160,6 +161,69 @@ class CommandTests(unittest.TestCase):
             result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=10)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("cannot read", result.stdout)
+
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed traces")
+    def test_compressed_trace_keeps_the_interrupt_verdict(self):
+        fault = "  12: v=0e e=0011 i=0 cpl=0 IP=0008:ffffffff80001000\n"
+        with tempfile.TemporaryDirectory(prefix="gate-zstd-") as directory:
+            work = Path(directory)
+            paths = [work / name for name in ("serial", "interrupts.zst", "qemu.stderr", "timeout.stderr")]
+            for path, text in zip(paths, (CLEAN, "", "", TERM)):
+                path.write_text(text, encoding="utf-8")
+            command = [sys.executable, str(ROOT / "scripts" / "ci" / "gate_log.py"), "--qemu-status", "124"]
+            for option, path in zip(("--serial", "--intlog", "--qemu-stderr", "--timeout-stderr"), paths):
+                command.extend([option, str(path)])
+
+            def compress(text: str) -> bytes:
+                return subprocess.run(["zstd", "-q", "-1", "-c"], input=text.encode(), capture_output=True,
+                                      check=True).stdout
+
+            noise = "".join(f"{n}: v=ef e=0000 i=0 cpl=0 IP=0008:ffffffff80001000\n" for n in range(50000))
+            # A late fault, more faults than the scan keeps, and a truncated stream.
+            for trace, expected in ((compress(noise), 0), (compress(noise + fault), 1),
+                                    (compress(fault * 100 + noise), 1), (compress(noise + fault)[:-64], 2)):
+                with self.subTest(size=len(trace), expected=expected):
+                    paths[1].write_bytes(trace)
+                    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=30)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if expected == 2:
+                        self.assertIn("zstd could not decompress", result.stdout)
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed traces")
+    def test_declared_compressed_trace_never_falls_back_to_raw(self):
+        compressed = subprocess.run(["zstd", "-q", "-1", "-c"], input=b"ordinary trace\n",
+                                    capture_output=True, check=True).stdout
+        with tempfile.TemporaryDirectory(prefix="gate-zstd-header-") as directory:
+            work = Path(directory)
+            serial, trace, stderr, timeout = [work / name for name in
+                                             ("serial", "trace.zst", "stderr", "timeout")]
+            serial.write_text(CLEAN)
+            stderr.write_text("")
+            timeout.write_text(TERM)
+            command = [sys.executable, str(ROOT / "scripts/ci/gate_log.py"),
+                       "--serial", str(serial), "--intlog", str(trace),
+                       "--qemu-stderr", str(stderr), "--timeout-stderr", str(timeout),
+                       "--qemu-status", "124"]
+            cases = [compressed[:length] for length in range(4)]
+            cases.extend((b"\x00" + compressed[1:], b"ordinary text is not a zstd frame\n"))
+            for content in cases:
+                with self.subTest(content=content[:4]):
+                    trace.write_bytes(content)
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("cannot read", result.stdout)
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed traces")
+    def test_compressed_magic_without_extension_and_raw_trace_remain_supported(self):
+        fault = b"  12: v=0e e=0011 i=0 cpl=0 IP=0008:ffffffff80001000\n"
+        with tempfile.TemporaryDirectory(prefix="gate-zstd-detect-") as directory:
+            path = Path(directory) / "interrupts"
+            path.write_bytes(subprocess.run(["zstd", "-q", "-1", "-c"], input=fault,
+                                            capture_output=True, check=True).stdout)
+            self.assertEqual(gate_log.fatal_interrupt_lines(path), fault.decode())
+            path.write_bytes(fault)
+            self.assertEqual(gate_log.fatal_interrupt_lines(path), fault.decode())
 
 
 @unittest.skipUnless(shutil.which("bash"), "bash is required for shell caller tests")
@@ -412,6 +476,32 @@ exit 0
                        CLEAN + acknowledgement + '\n'):
             with self.subTest(serial=serial):
                 self.assert_gate(self.run_gate("extended_smp_test.sh", serial, extended_cpus="32"), 1)
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed traces")
+    def test_extended_smp_streams_its_full_trace_through_zstd(self):
+        fault = "  12: v=0e e=0011 i=0 cpl=0 IP=0008:ffffffff80001000\n"
+        with mock.patch.dict(os.environ, {"EXTENDED_SMP_KEEP_LOGS": "1"}):
+            result = self.run_gate("extended_smp_test.sh", interrupts=fault, extended_cpus="8")
+        self.assert_gate(result, 1)
+        self.assertIn("FAIL: 1 NX-violation #PF detected", result.stdout)
+        arguments = (self.work / "qemu.arguments").read_text().splitlines()
+        self.assertEqual(arguments[arguments.index("-d") + 1], "int,cpu_reset")
+        retained = Path(next(field[len("intlog="):] for field in result.stdout.split()
+                             if field.startswith("intlog=")))
+        self.assertTrue(retained.name.endswith(".zst"))
+        self.assertNotEqual(Path(arguments[arguments.index("-D") + 1]), retained)
+        self.assertEqual(retained.read_bytes()[:4], gate_log.ZSTD_MAGIC)
+        decompressed = subprocess.run(["zstd", "-dcq", "--", str(retained)], capture_output=True, text=True,
+                                      check=True).stdout
+        self.assertEqual(decompressed, fault)
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed traces")
+    def test_extended_smp_without_a_complete_trace_is_not_accepted(self):
+        self.write_tool("zstd", '#!/bin/bash\n[ "$1" != -q ] || cat >/dev/null\nexit 1\n')
+        result = self.run_gate("extended_smp_test.sh", extended_cpus="8")
+        self.assert_gate(result, 2)
+        self.assertIn("QEMU-RUN TRACE-COMPRESS FAILED", result.stdout)
+        self.assertIn("cannot read", result.stdout)
 
     def test_invalid_extended_topology_is_blocked_before_qemu_launch(self):
         for cpus in ('0', '33', '64', '32 32', '8 16 32', '32\n8'):

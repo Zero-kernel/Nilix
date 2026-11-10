@@ -1,0 +1,65 @@
+{
+  "revision": "f18f8452a835",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.27)",
+    "zstd": "1.4.8",
+    "accel": "tcg",
+    "cpus": 32,
+    "mem": "512M",
+    "kernel_sha256": "081df7869ec6d2f7f19cc3db5a2765050373fac1f87fa825c7bdbcfcb7e555bc"
+  },
+  "scope": "smp-32 completion with the compressed trace on the Extended 22.04 QEMU",
+  "gates": [
+    {
+      "command": "PATH=/home/dev/opt/zstd-jammy/usr/bin:$PATH; env TMPDIR=/tmp/nilix-evidence/trace-zstd/zstd-smp32-completion-q62/tmp EXTENDED_SMP_KEEP_LOGS=1 EXTENDED_SMP_CPUS=32 QEMU_GATE_MODE=completion bash /tmp/nilix-f18f8452a835/scripts/gates/boot/extended_smp_test.sh /tmp/nilix-f18f8452a835/esp",
+      "status": 3,
+      "log": "/tmp/nilix-evidence/trace-zstd/zstd-smp32-completion-q62/gate.log",
+      "log_sha256": "7afa2ea2bdca264c2b3e97f535992309256232b9b7b0e6ffc157ebc79f303bd6"
+    },
+    {
+      "gate_log": {
+        "status": 3,
+        "counts": [
+          37,
+          37,
+          0
+        ],
+        "reasons": [
+          "warnings/deferred/skipped checks remain; no strict qualification"
+        ]
+      }
+    },
+    {
+      "termination": {
+        "mode": "completion",
+        "qemu_status": 0,
+        "reason": "completed",
+        "completion_seconds": 257.6659735040739,
+        "elapsed_seconds": 259.7469499814324
+      }
+    },
+    {
+      "trace": {
+        "intlog": "/tmp/nilix-evidence/trace-zstd/zstd-smp32-completion-q62/tmp/tmp.LtATKySnTQ.zst",
+        "format": "zstd",
+        "stored_bytes": "26412348",
+        "raw_bytes": "2332476100",
+        "raw_lines": "35928474",
+        "interrupt_records": "1710753",
+        "cpu_reset_lines": "95",
+        "nx_e0011": "0",
+        "triple_fault": "0",
+        "last_byte_is_newline": "yes",
+        "decompress_status": "0"
+      },
+      "stored_sha256": "4b47a02012949fa9fa4eecc5719c318223ae32967fb38f52032b109d0d038aa5"
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; concurrent runs shared it (see each run's load)",
+    "logs and compressed traces stay on the dev host under /tmp/nilix-evidence; only their SHA-256 is recorded here",
+    "the raw control trace (7.2 GB) was deleted after its statistics were taken"
+  ],
+  "notes": "started 2026-11-10T03:50:38Z; finished 2026-11-10T03:55:32Z"
+}
