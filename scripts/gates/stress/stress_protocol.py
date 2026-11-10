@@ -1075,8 +1075,13 @@ def protocol_lines(
     tail_start = raw.rfind(b"\n") + 1
     if live:
         raw = raw[:tail_start]
-    elif host_cut and HOST_CUT_FRAGMENT_RE.match(raw[tail_start:].decode("utf-8", errors="replace")):
-        raw = raw[:tail_start]
+    elif host_cut:
+        tail = raw[tail_start:].decode("utf-8", errors="replace")
+        # The parser below recognizes more line boundaries than LF. Never
+        # discard a complete logical line or another marker interleaved with it.
+        if (HOST_CUT_FRAGMENT_RE.match(tail) and tail.splitlines() == [tail]
+                and tail.count("NILIX_STRESS_V2_") == 1):
+            raw = raw[:tail_start]
     text = raw.decode("utf-8", errors="replace")
     lines = []
     for line in text.splitlines():
