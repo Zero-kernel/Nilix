@@ -1,0 +1,57 @@
+{
+  "revision": "cf79ba03539f",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.27)",
+    "accel": "tcg",
+    "cpus": 4,
+    "mem": "256M"
+  },
+  "scope": "THREAD-HB C2 first build, before the host-cut tail rule: per-wave thread heartbeats, phased trace",
+  "gates": [
+    {
+      "command": "env NILIX_QEMU_TRACE=phased STRESS_PROFILES=thread STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+      "status": 3,
+      "log": "/tmp/nilix-evidence/thread-hb-c2/c2-thread4-q62/gate.log",
+      "log_sha256": "cd4242af9bdd8e6a6de2be8dcddef8b303154dc16866d2b203c6b3a0d5c71db2"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/thread-hb-c2/c2-thread4-q62/serial.log",
+      "serial_sha256": "41d157a678ba17c34a775a5b070c510c07e993f41199b81444f9223ae760110a"
+    },
+    {
+      "trace_receipt": "/tmp/nilix-evidence/thread-hb-c2/c2-thread4-q62/trace.json",
+      "sha256": "ca85401265ee006c74dbb347b59531f26cb5f293f840dd2d7e0f0b62458e524a",
+      "outcome": "switched",
+      "switched_seconds": 30.571,
+      "intlog_bytes_at_switch": 37549505,
+      "intlog_bytes_final": 37549505
+    },
+    {
+      "rounds": "/tmp/nilix-evidence/thread-hb-c2/c2-thread4-q62/rounds.json",
+      "sha256": "d3c87a31d6b31a06c47fcee4f32361aa7c6bcc1835918015892b9c4d96675436",
+      "summary": {
+        "rounds": 8337,
+        "heartbeats": 8337,
+        "round_wall_ms": {
+          "min": 23.0,
+          "median": 62.0,
+          "max": 159.0
+        },
+        "gap_ms": {
+          "min": 50.2,
+          "median": 100.6,
+          "max": 351.3
+        },
+        "gaps_over_bound": 0,
+        "bound_ms": 15000
+      }
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; a 16-vCPU and a 4-vCPU run shared it (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence; only their SHA-256 is recorded here"
+  ],
+  "notes": "started 2026-11-09T11:23:44Z load 11.01; finished 2026-11-09T11:39:19Z"
+}

@@ -1,0 +1,57 @@
+{
+  "revision": "cf79ba03539f",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "qemu": "8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18, rebuilt for jammy without root)",
+    "accel": "tcg",
+    "cpus": 16,
+    "mem": "256M"
+  },
+  "scope": "THREAD-HB C2 first build, before the host-cut tail rule: per-wave thread heartbeats, phased trace",
+  "gates": [
+    {
+      "command": "source /home/dev/opt/qemu-noble-8.2.2-0ubuntu1.18/env.sh; env NILIX_QEMU_TRACE=phased STRESS_PROFILES=thread STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=16 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+      "status": 1,
+      "log": "/tmp/nilix-evidence/thread-hb-c2/c2-thread16-q82/gate.log",
+      "log_sha256": "0f8f045a51298df833bcc4fcda0a3ed28c6ad02dac79508720125195534cf3ff"
+    },
+    {
+      "serial": "/tmp/nilix-evidence/thread-hb-c2/c2-thread16-q82/serial.log",
+      "serial_sha256": "9f5d560ee52b52f2e69e0df4c783d01ed40efe40383d5451117f89ee357082c3"
+    },
+    {
+      "trace_receipt": "/tmp/nilix-evidence/thread-hb-c2/c2-thread16-q82/trace.json",
+      "sha256": "a61b720ccc1cce611164d69db1735868be2d445dd6c99016109f247905fcc4c4",
+      "outcome": "switched",
+      "switched_seconds": 235.229,
+      "intlog_bytes_at_switch": 2581333589,
+      "intlog_bytes_final": 2581333589
+    },
+    {
+      "rounds": "/tmp/nilix-evidence/thread-hb-c2/c2-thread16-q82/rounds.json",
+      "sha256": "ce0f9bd83e4ab75e4db35b412ba07191afca548e60d6111f1a5431307692f471",
+      "summary": {
+        "rounds": 260,
+        "heartbeats": 259,
+        "round_wall_ms": {
+          "min": 1524.0,
+          "median": 1938.5,
+          "max": 3062.0
+        },
+        "gap_ms": {
+          "min": 2770.1,
+          "median": 3425.2,
+          "max": 5300.9
+        },
+        "gaps_over_bound": 0,
+        "bound_ms": 15000
+      }
+    }
+  ],
+  "limitations": [
+    "TCG (no KVM) on a shared 40-core dev host; a 16-vCPU and a 4-vCPU run shared it (see each run's load)",
+    "QEMU interrupt logs are not kept; their size and last 256 KiB stay on the host next to the logs",
+    "logs stay on the dev host under /tmp/nilix-evidence; only their SHA-256 is recorded here"
+  ],
+  "notes": "started 2026-11-09T11:03:37Z load 4.39; finished 2026-11-09T11:23:41Z"
+}
