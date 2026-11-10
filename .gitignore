@@ -38,6 +38,7 @@ userspace/clippy-userspace-target
 *.md
 *.txt
 !LICENSES/*.txt
+!scripts/ci/strict_scope.txt
 *.log
 !scripts/fixtures/iommu_device_probe/serial.log
 *.skill

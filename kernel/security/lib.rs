@@ -532,7 +532,7 @@ pub fn init(
         } else if test_report.ok() {
             klog_always!("      All {} tests passed", test_report.passed);
         } else {
-            klog_always!("      Security tests: {} passed, {} warnings, {} deferred, {} skipped; qualification pending", test_report.passed, test_report.warnings, test_report.deferred, test_report.skipped);
+            klog_always!("      Security tests: {} passed, {} warnings, {} deferred, {} skipped, {} not applicable, {} out of scope, {} covered; qualification pending", test_report.passed, test_report.warnings, test_report.deferred, test_report.skipped, test_report.not_applicable, test_report.out_of_scope, test_report.covered);
         }
         test_report.emit_evidence("SECURITY-BOOT");
 

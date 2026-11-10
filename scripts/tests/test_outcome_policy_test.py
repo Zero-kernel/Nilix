@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from scripts.ci import gate_log
 from scripts.tests.gate_log_test import CLEAN, SUMMARY, PID1, check
 
 
@@ -22,6 +23,24 @@ def serial(status="pass", security_warning=0):
     totals = "RUNTIME-COUNTS " + " ".join(f"{key}={value}" for key, value in counts.items())
     security_cases = [f'SECURITY-CASE name=security_{number} status={"warning" if number < security_warning else "pass"} owner=security::Test reason={json.dumps("CPU fixture unavailable" if number < security_warning else "")}' for number in range(9)]
     security = "\n".join([*security_cases, f"SECURITY-COUNTS passed={9-security_warning} warning={security_warning} deferred=0 skipped=0 failed=0"])
+    return CLEAN.replace(SUMMARY, "\n".join([security, *cases, legacy, totals]))
+
+
+
+def scoped_serial(status, scope):
+    """Five passes plus one STRICT-Q declared-scope case (`test_5`)."""
+    counts = dict(passed=5, warning=0, deferred=0, skipped=0, failed=0, not_applicable=0, out_of_scope=0, covered=0)
+    counts[status] += 1
+    cases = [f'RUNTIME-CASE name=test_{number} status=pass scope=in_scope owner=kernel::fixture::Test reason=""'
+             for number in range(5)]
+    cases.append(f'RUNTIME-CASE name=test_5 status={status} scope={scope} owner=kernel::fixture::Test '
+                 'reason="needs 2 online CPUs; 1 online"')
+    legacy = "=== Test Summary: 5 passed, 0 deferred (see per-test reasons), 0 failed ==="
+    totals = "RUNTIME-COUNTS " + " ".join(f"{key}={value}" for key, value in counts.items())
+    security_cases = [f'SECURITY-CASE name=security_{number} status=pass scope=in_scope owner=security::Test reason=""'
+                      for number in range(9)]
+    security = "\n".join([*security_cases, "SECURITY-COUNTS passed=9 warning=0 deferred=0 skipped=0 failed=0 "
+                                            "not_applicable=0 out_of_scope=0 covered=0"])
     return CLEAN.replace(SUMMARY, "\n".join([security, *cases, legacy, totals]))
 
 
@@ -104,6 +123,68 @@ class OutcomePolicyTests(unittest.TestCase):
             with self.assertRaises(StressProtocolError):
                 validate_runtime_evidence(path)
 
+
+    def test_declared_scope_is_qualified_unless_strict_lists_it(self):
+        entry = ("RUNTIME", "test_5", "not_applicable", "needs_cpus:2")
+        text = scoped_serial("not_applicable", "needs_cpus:2")
+        result = check(text)
+        self.assertEqual(result.status, 3, result.reasons)
+        self.assertEqual(result.details["suites"]["RUNTIME"]["not_applicable"], 1)
+        listed = check(text, strict=True, strict_scope=frozenset({entry}))
+        self.assertEqual(listed.status, 0, listed.reasons)
+        self.assertIn("STRICT PASS", listed.render())
+        unlisted = check(text, strict=True, strict_scope=frozenset())
+        self.assertEqual(unlisted.status, 1)
+        self.assertIn("undeclared scope RUNTIME test_5 not_applicable needs_cpus:2", " ".join(unlisted.reasons))
+        # Every field of the tuple is binding.
+        for other in (("RUNTIME", "test_5", "not_applicable", "needs_cpus:4"),
+                      ("SECURITY", "test_5", "not_applicable", "needs_cpus:2"),
+                      ("RUNTIME", "test_4", "not_applicable", "needs_cpus:2")):
+            with self.subTest(other=other):
+                self.assertEqual(check(text, strict=True, strict_scope=frozenset({other})).status, 1)
+
+    def test_listed_scope_never_excuses_other_qualifications(self):
+        entry = ("RUNTIME", "test_5", "out_of_scope", "out_of_scope:N6")
+        text = scoped_serial("out_of_scope", "out_of_scope:N6") + "[WARN] unavailable\n"
+        self.assertEqual(check(text, strict=True, strict_scope=frozenset({entry})).status, 1)
+
+    def test_declared_scope_status_needs_its_own_scope(self):
+        for status, scope in (("not_applicable", "out_of_scope:N6"), ("out_of_scope", "needs_cpus:2"),
+                              ("covered", "in_scope")):
+            with self.subTest(status=status, scope=scope):
+                self.assertEqual(check(scoped_serial(status, scope)).status, 2)
+        missing = scoped_serial("out_of_scope", "out_of_scope:N6").replace(" scope=out_of_scope:N6", "")
+        self.assertEqual(check(missing).status, 2)
+
+    def test_declared_scope_counts_reconcile(self):
+        text = scoped_serial("covered", "covered_by:ring3-mm")
+        self.assertEqual(check(text).status, 3)
+        self.assertEqual(check(text.replace("covered=1", "covered=0")).status, 2)
+        self.assertEqual(check(text.replace(" not_applicable=0 out_of_scope=0 covered=1", "")).status, 2)
+
+    def test_strict_scope_list_is_well_formed(self):
+        entries = gate_log.load_strict_scope()
+        self.assertTrue(entries)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scope.txt"
+            for bad in ("RUNTIME smp_online deferred needs_cpus:2", "RUNTIME smp_online not_applicable out_of_scope:N6",
+                        "BOOT smp_online not_applicable needs_cpus:2", "RUNTIME smp_online not_applicable",
+                        "RUNTIME a not_applicable needs_cpus:2\nRUNTIME a not_applicable needs_cpus:2"):
+                with self.subTest(bad=bad):
+                    path.write_text(bad + "\n", encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        gate_log.load_strict_scope(path)
+
+    def test_stress_runtime_evidence_applies_the_strict_scope(self):
+        from scripts.gates.stress.stress_protocol import StressProtocolError, validate_runtime_evidence
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serial.log"
+            path.write_text(scoped_serial("not_applicable", "needs_cpus:2"), encoding="utf-8")
+            with patch.dict(os.environ, {"ZERO_OS_STRICT_TESTS": "0"}):
+                self.assertEqual(validate_runtime_evidence(path)["status"], "qualified")
+            with patch.dict(os.environ, {"ZERO_OS_STRICT_TESTS": "1"}):
+                with self.assertRaisesRegex(StressProtocolError, "undeclared scope"):
+                    validate_runtime_evidence(path)
 
 if __name__ == "__main__":
     unittest.main()

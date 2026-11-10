@@ -646,6 +646,15 @@ impl Shell {
                 crate::runtime_tests::TestResult::Fail(msg) => {
                     klog_always!("  [FAIL] {}: {}", test_name, msg);
                 }
+                crate::runtime_tests::TestResult::NotApplicable(msg) => {
+                    klog_always!("  [NOT APPLICABLE] {}: {}", test_name, msg);
+                }
+                crate::runtime_tests::TestResult::OutOfScope(msg) => {
+                    klog_always!("  [OUT OF SCOPE] {}: {}", test_name, msg);
+                }
+                crate::runtime_tests::TestResult::Covered(msg) => {
+                    klog_always!("  [COVERED] {}: {}", test_name, msg);
+                }
             }
         } else {
             klog_always!("test: {} not found", test_name);
