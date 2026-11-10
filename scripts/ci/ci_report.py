@@ -10,6 +10,11 @@ import re
 import xml.etree.ElementTree as ET
 
 
+# gate_log.py case statuses, in table order; the last three are STRICT-Q
+# declared scope (scripts/ci/strict_scope.txt).
+CASE_STATUSES = ('pass', 'warning', 'deferred', 'skipped', 'failed', 'not_applicable', 'out_of_scope', 'covered')
+
+
 def cell(value):
     return html.escape(str(value)).replace('|', '&#124;').replace('\n', '<br>')
 
@@ -43,15 +48,15 @@ def report(root):
             if not cases:
                 continue
             details.extend(['', f'### {cell(name)}: executed and deferred cases', '',
-                          '| Suite | Pass | Warning | Deferred | Skipped | Fail |',
-                          '| --- | ---: | ---: | ---: | ---: | ---: |'])
+                          '| Suite | Pass | Warning | Deferred | Skipped | Fail | Not applicable | Out of scope | Covered |',
+                          '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |'])
             for suite_name in sorted({row['suite'] for row in cases}):
                 totals = Counter(row['status'] for row in cases if row['suite'] == suite_name)
                 details.append('| ' + cell(suite_name) + ' | ' + ' | '.join(
-                    str(totals[key]) for key in ('pass', 'warning', 'deferred', 'skipped', 'fail')) + ' |')
+                    str(totals[key]) for key in CASE_STATUSES) + ' |')
             for row in cases:
                 item = ET.SubElement(suite, 'testcase', name=row['name'], classname=row['owner'])
-                if row['status'] == 'fail':
+                if row['status'] == 'failed':
                     ET.SubElement(item, 'failure', message=row['reason'])
                 elif row['status'] != 'pass':
                     ET.SubElement(item, 'skipped', message=f'{row["status"]}: {row["reason"]}')
