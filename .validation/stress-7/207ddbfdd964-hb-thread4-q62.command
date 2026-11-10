@@ -1,1 +1,0 @@
-env NILIX_QEMU_TRACE=phased STRESS_PROFILES=thread STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
