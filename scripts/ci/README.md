@@ -56,6 +56,14 @@ Completion-mode results do **not** claim the old 900-second post-completion
 observation coverage. Old images without the cleanup witness must use window
 mode; they cannot silently qualify completion mode.
 
+The `strict` group runs boot, runtime at 1 and 4 vCPUs and SMP-4 with
+`ZERO_OS_STRICT_TESTS=1`, where any warning, deferred test or skip fails the
+gate (STRICT-Q, #64). It never accepts exit 3 and never retries. Until the
+declared strict scope lands, every current deferral fails it, so Extended runs
+it as a separate diagnostic job in completion mode: the job is not a lane, the
+aggregate result does not depend on it, and its failure does not fail the run.
+`make test-strict` and `make test-strict-smp4` run the strict runtime gate locally.
+
 Examples:
 
 ```sh
