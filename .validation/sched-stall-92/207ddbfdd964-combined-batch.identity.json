@@ -1,0 +1,178 @@
+{
+  "revision": "207ddbfdd964",
+  "environment": {
+    "host": "dev@172.30.0.2",
+    "accel": "tcg",
+    "cpus": 4,
+    "concurrent_runs": 8,
+    "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+    "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d"
+  },
+  "scope": "#92 stress baseline: eight concurrent 900-second combined runs",
+  "gates": [
+    {
+      "runs": [
+        {
+          "label": "fast-q62-1",
+          "qemu": "6.2.0",
+          "command": "env STRESS_COMBINED_CPU_ITERATIONS=1000 STRESS_COMBINED_CONTENTION_ITERATIONS=50 STRESS_COMBINED_IO_WRITES_PER_ROUND=1 STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 3,
+          "rounds": 1292,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+          ],
+          "gate_log_sha256": "64e172bb79b11451d55592cfda96d66a4bc99415607ac4283c0160f52043ec11",
+          "serial_sha256": "9770e7136a4e3f40b31f27000060cfb7916cef3a93b002f4e421a224c2101123",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:52Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        },
+        {
+          "label": "fast-q62-2",
+          "qemu": "6.2.0",
+          "command": "env STRESS_COMBINED_CPU_ITERATIONS=1000 STRESS_COMBINED_CONTENTION_ITERATIONS=50 STRESS_COMBINED_IO_WRITES_PER_ROUND=1 STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 1,
+          "rounds": 1293,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "stress_protocol: malformed or unknown stress-v2 marker: 'NILIX_STRESS_V2_COMBINED run=f1d90da6a621c075 seq=1294 memory_ops=2 cpu_ops=4000 smp_ops=200 process_ops=1 io_ops=1 che'",
+            "STRESS-TEST UNSTABLE: 1 profile(s) failed"
+          ],
+          "gate_log_sha256": "69fd1061b9f693bd2cffbbe463139dc4eb1b564e84f086fb1e61e17cf662ee51",
+          "serial_sha256": "6739bbb74ebde4d3cf33427266c653af3983e9d564979d5400cbc9f7104e9128",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:49Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        },
+        {
+          "label": "fast-q62-3",
+          "qemu": "6.2.0",
+          "command": "env STRESS_COMBINED_CPU_ITERATIONS=1000 STRESS_COMBINED_CONTENTION_ITERATIONS=50 STRESS_COMBINED_IO_WRITES_PER_ROUND=1 STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 3,
+          "rounds": 1296,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+          ],
+          "gate_log_sha256": "ef0d6f49e1ee49fa8e5fef4af07a5394ab8ce5611909acabefbd386c972a33f0",
+          "serial_sha256": "2d0c3a77a1c6b25a6b0fe574d5d9b14bc9a84bcd3c0f49410c49ea07b7a9ae3c",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:51Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        },
+        {
+          "label": "fast-q62-4",
+          "qemu": "6.2.0",
+          "command": "env STRESS_COMBINED_CPU_ITERATIONS=1000 STRESS_COMBINED_CONTENTION_ITERATIONS=50 STRESS_COMBINED_IO_WRITES_PER_ROUND=1 STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 3,
+          "rounds": 1285,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+          ],
+          "gate_log_sha256": "952bc135edd96b502e66fb76b0072a2c53e2583cbbe518d33997572d4d197cf2",
+          "serial_sha256": "823504a41d9f1b4c69dba26459eeacb21756e0423d945945331a472cca46d746",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:52Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        },
+        {
+          "label": "fast-q82-1",
+          "qemu": "8.2.2",
+          "command": "env STRESS_COMBINED_CPU_ITERATIONS=1000 STRESS_COMBINED_CONTENTION_ITERATIONS=50 STRESS_COMBINED_IO_WRITES_PER_ROUND=1 STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 3,
+          "rounds": 1102,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+          ],
+          "gate_log_sha256": "a502d3ad3710b7abe965a558c0a99f026d8501a0ae38ae718d5c5c49625314d2",
+          "serial_sha256": "8cd28eb2d796f3c4be9a7dbd42c929ea201e90366e3bf717a274c643084c9ff5",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:56Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        },
+        {
+          "label": "fast-q82-2",
+          "qemu": "8.2.2",
+          "command": "env STRESS_COMBINED_CPU_ITERATIONS=1000 STRESS_COMBINED_CONTENTION_ITERATIONS=50 STRESS_COMBINED_IO_WRITES_PER_ROUND=1 STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 3,
+          "rounds": 1086,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+          ],
+          "gate_log_sha256": "cc51807bb54c0e79475abbde07fb4e0a5642e905e45eece96c8e49d497149cfb",
+          "serial_sha256": "0b205589e324b9d4e412717de08657c7b2eb6c0e6b6f903e3da94d410b872641",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:56Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        },
+        {
+          "label": "stock-q62-1",
+          "qemu": "6.2.0",
+          "command": "env  STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 3,
+          "rounds": 301,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+          ],
+          "gate_log_sha256": "0be3ccb2aaaff104d99a676715f0f3f1fc4e70e5cf647ee34c7661c627736d8a",
+          "serial_sha256": "6e809e8408b360b711a4af957033eaed2463e9b41d09bcd6cb4bdd055c20838e",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:51Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        },
+        {
+          "label": "stock-q62-2",
+          "qemu": "6.2.0",
+          "command": "env  STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 STRESS_DURATION=900 STRESS_CPUS=4 STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress",
+          "status": 3,
+          "rounds": 301,
+          "stall_dumps": 0,
+          "idle_rearms_last_sample": null,
+          "verdict": [
+            "STRESS-TEST QUALIFIED: 1 profile(s) completed with runtime qualifications"
+          ],
+          "gate_log_sha256": "01cd45a5bb8e2c3c8cb89eaa5fbd355eca910ed61f280cf9b16151d945c82684",
+          "serial_sha256": "9259de8b8b59d8495a634be2a0c9bd311fa9a46abc378871d5432397fcd7a83f",
+          "started": "2026-11-10T07:44:07Z",
+          "finished": "2026-11-10T07:59:53Z",
+          "kernel_sha256": "fce89ab070e7d79be6913fbfe3853b3abf2add63095b96df2373bfa35d9c4e65",
+          "disk_sha256": "da32e65f3e5c1794d6e1290effdc8411bf359162b47cb25f3852a7e8dc74a53d",
+          "revision": "207ddbfdd964a65770d7c4c203b2bd42ee71a419"
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "TCG on a shared 40-core host, 32 vCPUs in total (load about 20)",
+    "accelerated runs set STRESS_COMBINED_CPU_ITERATIONS=1000 STRESS_COMBINED_CONTENTION_ITERATIONS=50 STRESS_COMBINED_IO_WRITES_PER_ROUND=1",
+    "logs stay on the dev host; only SHA-256 values are recorded",
+    "fast-q62-2 FAILED on the host-cut marker fragment fixed separately in #94/#95, not on a stall"
+  ],
+  "notes": "7956 rounds, 0 stall dumps"
+}
