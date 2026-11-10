@@ -59,6 +59,36 @@ jobs:
           path: target/ci/
           if-no-files-found: error
 
+  # STRICT-Q (#64): boot, runtime at 1 and 4 vCPUs and SMP-4 under
+  # ZERO_OS_STRICT_TESTS=1. Every current deferral fails a strict gate, so this
+  # job is diagnostic: it is not a lane, the aggregate does not need it and its
+  # failure does not fail the run. The strict verdict is reached at completion,
+  # so it uses completion mode; the window lanes keep the stability coverage.
+  strict:
+    name: Extended / ${{ matrix.os }} / strict (diagnostic)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      QEMU_GATE_MODE: completion
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-kernel
+        with:
+          qemu: 'true'
+          cache-key: extended-${{ matrix.os }}-strict
+      - run: bash scripts/ci/entrypoint.sh strict
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: extended-${{ matrix.os }}-strict
+          path: target/ci/
+          if-no-files-found: error
+
   result:
     name: Extended result
     needs: [lane]

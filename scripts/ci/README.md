@@ -56,6 +56,14 @@ Completion-mode results do **not** claim the old 900-second post-completion
 observation coverage. Old images without the cleanup witness must use window
 mode; they cannot silently qualify completion mode.
 
+The `strict` group runs boot, runtime at 1 and 4 vCPUs and SMP-4 with
+`ZERO_OS_STRICT_TESTS=1`, where any warning, deferred test or skip fails the
+gate (STRICT-Q, #64). It never accepts exit 3 and never retries. Until the
+declared strict scope lands, every current deferral fails it, so Extended runs
+it as a separate diagnostic job in completion mode: the job is not a lane, the
+aggregate result does not depend on it, and its failure does not fail the run.
+`make test-strict` and `make test-strict-smp4` run the strict runtime gate locally.
+
 Examples:
 
 ```sh
@@ -79,3 +87,38 @@ EXTENDED_SMP_CPUS=32 bash scripts/gates/boot/extended_smp_test.sh esp
 returns. Actions' existing `if: always()` upload steps collect it after either
 success or failure, provided the runner is still available. A lost/forcibly
 stopped runner cannot guarantee an upload.
+
+## Interrupt trace policy
+
+Stress profiles and the Ring-3 oracle default to phased tracing: QEMU starts
+with `int,cpu_reset` and switches to `cpu_reset` only after the expected AP
+acknowledgement marker. Boot interrupt evidence and triple-fault logging remain
+available. All `gate_log.py` verdicts require full tracing for acceptance; their
+phased runs are diagnostic (QUALIFIED, or FAIL in strict mode). The Ring-3
+oracle uses its own serial verdict, even when its shared runtime harness reports
+a diagnostic result. `NILIX_QEMU_TRACE=full` restores full tracing for diagnosis.
+
+The trace receipt binds the switch to the final serial prefix. Missing receipts
+block acceptance and mismatches fail. A connection/negotiation failure before
+the command, or a confirmed QEMU rejection, retains full scope. If command
+delivery was attempted but its reply is lost, malformed or late, the receipt
+records `switch-unknown` and every phased consumer fails: a timeout does not
+prove QEMU kept tracing interrupts. QMP waits are bounded by the completion
+deadline and do not count toward the post-witness observation interval.
+
+`trace_phase_probe.py` checks fault evidence in bounded log blocks and retains
+only a bounded interrupt-log tail. Its test-only kernel feature is disabled in
+normal images. The probe changes no workload, heartbeat bound or gate verdict.
+
+The extended SMP gates (8, 16 and 32 vCPUs) keep the full trace but store it
+compressed (`QEMU_TRACE_COMPRESS=zstd`, #63): QEMU logs into a FIFO, and one
+`zstd -1` stream at the `-D` path holds the complete content. A full 3600-second
+32-vCPU window previously filled the runner disk. `gate_log.py` recognizes the
+zstd magic and decompresses as it scans. A `.zst` path always requires valid
+zstd data, including a complete header; damaged magic cannot fall back to raw
+text. The wrapper requires exactly one `-D` option matching the retained trace,
+so a later log destination cannot divert evidence away from the compressor.
+A truncated or corrupt stream, or a
+compressor that failed (its output is kept as `*.partial`), leaves the gate
+unable to read its trace, so it reports INCOMPLETE rather than passing. Read a
+retained trace with `zstd -dc tmp.XXXXXX.zst`.

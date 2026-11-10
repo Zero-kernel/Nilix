@@ -22,4 +22,4 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs
+        sudo apt-get install -y qemu-system-x86 ovmf musl-tools e2fsprogs zstd

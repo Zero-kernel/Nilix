@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm boot-check musl-check test-smp test-smp-4core test-smp-extended test-smp-32core stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm test-strict test-strict-smp4 boot-check musl-check test-smp test-smp-4core test-smp-extended test-smp-32core stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -547,6 +547,18 @@ test-ring3-mm: build-syscall-test
 	@echo "=== Running Ring-3 memory-management oracle ==="
 	@OVMF_PATH="$(OVMF_PATH)" bash scripts/gates/boot/ring3_mm_oracle.sh esp
 
+# STRICT-Q strict runtime gates. ZERO_OS_STRICT_TESTS=1 makes gate_log.py
+# turn a qualified result (warnings, deferred tests or skips) into a failure,
+# so these exit 0 only on STRICT PASS. They are diagnostic until the declared
+# strict scope lands (#64); `make test` keeps the qualified verdict.
+test-strict: build
+	@echo "=== Running strict runtime gate (1 CPU) ==="
+	@OVMF_PATH="$(OVMF_PATH)" ZERO_OS_STRICT_TESTS=1 bash scripts/gates/boot/kernel_test.sh esp
+
+test-strict-smp4: build
+	@echo "=== Running strict runtime gate (4 CPUs) ==="
+	@OVMF_PATH="$(OVMF_PATH)" ZERO_OS_STRICT_TESTS=1 KERNEL_TEST_CPUS=4 bash scripts/gates/boot/kernel_test.sh esp
+
 # R180-6 production filesystem gate: attach the reproducibly journaled image
 # so the mounted-image probe exercises real JBD2 transactions.
 test-ext3: build ensure-ext3-image
@@ -1014,6 +1026,8 @@ help:
 	@echo "  make run-both     - 图形+串口组合模式"
 	@echo "  make debug        - GDB调试模式（等待GDB连接）"
 	@echo "  make test         - 运行时套件门禁（Test Summary + panic/NX；exit 0/1/2）"
+	@echo "  make test-strict  - 严格运行时门禁（ZERO_OS_STRICT_TESTS=1，QUALIFIED 记为失败）"
+	@echo "  make test-strict-smp4 - 同上，4 个 vCPU（KERNEL_TEST_CPUS=4）"
 	@echo "  make test-hosted-subcrates - 主机侧内核子 crate 测试（638 tests + 3 compile checks，默认并行，精确计数门禁）"
 	@echo ""
 	@echo "SMP多核模式:"

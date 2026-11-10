@@ -5,8 +5,8 @@ Guests boot with `-d int,cpu_reset`. Once the serial log shows the kernel's AP
 acknowledgement marker, `log cpu_reset` over QMP stops the per-interrupt
 register dumps that dominate TCG guests at 16 vCPUs, while QEMU keeps logging
 `Triple fault` under the `cpu_reset` item. The receipt binds the switch to the
-serial prefix that triggered it. A missing marker or a failed switch leaves full
-tracing on, so a run is never traced less than its receipt says.
+serial prefix that triggered it. A missing marker or a confirmed rejection leaves
+full tracing on. An unacknowledged command has unknown scope and fails the gate.
 
 Gate defaults (private design thread-hb-trace-phase-design.md §3.2): `phased`
 only where the verdict reads no interrupt-log class that the kernel cannot also
@@ -36,7 +36,7 @@ STEADY_ITEMS = "cpu_reset"
 # Printed once by wait_for_process_deferred_acknowledgements after AP bring-up,
 # the trampoline NX change and the in-kernel tests, before any user task runs.
 MARKER = re.compile(rb"\[SMP\] process-deferred gate complete: ([0-9]+)/([0-9]+) APs acknowledged\r?\n")
-OUTCOMES = ("switched", "switch-failed", "marker-missing", "qemu-exited", "aborted")
+OUTCOMES = ("switched", "switch-failed", "switch-unknown", "marker-missing", "qemu-exited", "aborted")
 QMP_SECONDS = 5.0
 POLL_SECONDS = 0.05
 # Diagnostic tail after a missed completion deadline: the verdict is already a
@@ -64,6 +64,10 @@ def find_marker(serial: bytes, cpus: int) -> tuple[int, int] | None:
     return match.start(), match.end()
 
 
+class HmpOutcomeUnknown(ValueError):
+    """The command may have taken effect, but no valid reply proves its outcome."""
+
+
 def hmp(path: str, command_line: str, timeout: float = QMP_SECONDS) -> dict:
     """Run one HMP command in a fresh QMP session and return QEMU's reply."""
     deadline = time.monotonic() + timeout
@@ -73,7 +77,10 @@ def hmp(path: str, command_line: str, timeout: float = QMP_SECONDS) -> dict:
         with client.makefile("rb") as stream:
             def receive(identifier: str | None) -> dict:
                 while True:
-                    client.settimeout(max(0.01, deadline - time.monotonic()))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("QMP reply deadline expired")
+                    client.settimeout(remaining)
                     line = stream.readline(1 << 20)
                     if not line:
                         raise ConnectionError("QMP closed the session")
@@ -89,8 +96,17 @@ def hmp(path: str, command_line: str, timeout: float = QMP_SECONDS) -> dict:
             if "return" not in receive("capabilities"):
                 raise ValueError("QMP capability negotiation failed")
             request = {"execute": "human-monitor-command", "arguments": {"command-line": command_line}, "id": "hmp"}
-            client.sendall(json.dumps(request).encode() + b"\r\n")
-            return receive("hmp")
+            try:
+                # Even a sendall error can follow delivery of the full request.
+                # Once delivery is attempted, transport errors cannot prove that
+                # QEMU kept the previous trace mask.
+                client.sendall(json.dumps(request).encode() + b"\r\n")
+                reply = receive("hmp")
+                if not (isinstance(reply.get("return"), str) or isinstance(reply.get("error"), dict)):
+                    raise ValueError("invalid HMP reply")
+                return reply
+            except (OSError, ValueError) as error:
+                raise HmpOutcomeUnknown(str(error)) from error
 
 
 class TracePhase:
@@ -109,7 +125,7 @@ class TracePhase:
     def pending(self) -> bool:
         return self.receipt["outcome"] is None
 
-    def poll(self) -> bool:
+    def poll(self, timeout: float = QMP_SECONDS) -> bool:
         """Switch once the marker has arrived; True after the one attempt."""
         if not self.pending:
             return True
@@ -120,7 +136,10 @@ class TracePhase:
         self.receipt.update(marker_offset=found[0], marker_end=found[1],
                             serial_prefix_sha256=digest(serial[:found[1]]))
         try:
-            reply = hmp(self.qmp, "log " + STEADY_ITEMS)
+            reply = hmp(self.qmp, "log " + STEADY_ITEMS, timeout=min(QMP_SECONDS, timeout))
+        except HmpOutcomeUnknown as error:
+            self.receipt.update(outcome="switch-unknown", error=str(error))
+            return True
         except (OSError, ValueError) as error:
             self.receipt.update(outcome="switch-failed", error=str(error))
             return True
@@ -168,6 +187,8 @@ def verify(policy: str, default: str, receipt: object, serial: bytes) -> tuple[i
             or receipt.get("outcome") not in OUTCOMES or not isinstance(receipt.get("cpus"), int)
             or isinstance(receipt.get("cpus"), bool)):
         return 1, "unknown", ["malformed interrupt-trace receipt"]
+    if receipt["outcome"] == "switch-unknown":
+        return 1, "unknown", ["interrupt-trace switch was not acknowledged; trace scope is unknown"]
     if receipt["outcome"] != "switched":
         return 0, "full", [f"interrupt trace stayed full ({receipt['outcome']})"]
     found = find_marker(serial, receipt["cpus"])

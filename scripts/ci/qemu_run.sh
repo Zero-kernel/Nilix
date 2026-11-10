@@ -11,9 +11,73 @@ qemu_trace_policy() {
     esac
 }
 
+# Print an interrupt trace written by run_gate_qemu, decompressing a zstd one.
+qemu_trace_cat() {
+    if [ "${QEMU_TRACE_COMPRESS:-none}" = zstd ]; then zstd -dcq -- "$1"; else cat -- "$1"; fi
+}
+
 # A phased caller sets QEMU_TRACE_POLICY=phased, QEMU_TRACE_INTLOG and
 # QEMU_TRACE_CPUS; the switch receipt is written to $ser.trace.json.
+#
+# QEMU_TRACE_COMPRESS=zstd (full policy only) streams the caller's
+# `-D "$QEMU_TRACE_INTLOG"` through a FIFO into one zstd stream at that path: the
+# full trace of a 32-vCPU window filled the runner disk (#63). Its content and
+# every verdict are unchanged; qemu_trace_cat and gate_log.py decompress it. A
+# failed compressor leaves only "$QEMU_TRACE_INTLOG.partial", which no gate reads.
 run_gate_qemu() {
+    case "${QEMU_TRACE_COMPRESS:-none}" in
+        none) run_gate_qemu_traced "$@"; return ;;
+        zstd) ;;
+        *) echo "QEMU-RUN BLOCKED: QEMU_TRACE_COMPRESS must be none or zstd"; return 2 ;;
+    esac
+    if [ "${QEMU_TRACE_POLICY:-full}" != full ]; then
+        echo "QEMU-RUN BLOCKED: a compressed interrupt trace needs the full trace policy"
+        return 2
+    fi
+    if ! command -v zstd >/dev/null 2>&1; then
+        echo "QEMU-RUN BLOCKED: zstd is required for QEMU_TRACE_COMPRESS=zstd"
+        return 2
+    fi
+    local args=("$@") index target=0 found=0 control writer reader compressor status compressed
+    for ((index = 2; index < ${#args[@]}; index++)); do
+        if [ "${args[index]}" = -D ]; then
+            found=$((found + 1))
+            if (( index + 1 < ${#args[@]} )) && \
+                [ "${args[index + 1]}" = "${QEMU_TRACE_INTLOG:-}" ]; then
+                target=$((index + 1))
+            fi
+        fi
+    done
+    if [ "$found" -ne 1 ] || [ "$target" -eq 0 ]; then
+        echo 'QEMU-RUN BLOCKED: QEMU_TRACE_COMPRESS needs exactly one -D "$QEMU_TRACE_INTLOG"'
+        return 2
+    fi
+    control="$(mktemp -d /tmp/nilix-trace-XXXXXX)" || return 2
+    if ! mkfifo "$control/intlog"; then rm -rf -- "$control"; return 2; fi
+    # Open both ends here so neither zstd nor QEMU can block in open(2). The
+    # read-write end is the writer zstd waits on until QEMU has exited, and no
+    # child inherits it.
+    exec {writer}<>"$control/intlog"
+    exec {reader}<"$control/intlog"
+    zstd -q -1 -c <&"$reader" >"$QEMU_TRACE_INTLOG" {reader}<&- {writer}>&- &
+    compressor=$!
+    exec {reader}<&-
+    args[target]="$control/intlog"
+    run_gate_qemu_traced "${args[@]}" {writer}>&-
+    status=$?
+    # Both supervisors reap QEMU before returning, so zstd now reaches EOF.
+    exec {writer}>&-
+    wait "$compressor"
+    compressed=$?
+    rm -rf -- "$control"
+    if [ "$compressed" -ne 0 ]; then
+        echo "QEMU-RUN TRACE-COMPRESS FAILED: zstd status $compressed; partial trace at $QEMU_TRACE_INTLOG.partial"
+        mv -f -- "$QEMU_TRACE_INTLOG" "$QEMU_TRACE_INTLOG.partial" 2>/dev/null || rm -f -- "$QEMU_TRACE_INTLOG"
+    fi
+    return "$status"
+}
+
+run_gate_qemu_traced() {
     local window="$1" profile="$2"
     shift 2
     local phased=0

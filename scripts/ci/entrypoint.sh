@@ -2,7 +2,7 @@
 # Shared local/Actions entrypoint. Each group owns a single artifact directory.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|smp-32|musl|iommu|mitigation|qemu-fuzz|extended|extended-smp|extended-smp-32|extended-ext3|extended-stress}"
+group="${1:?usage: bash scripts/ci/entrypoint.sh quality|license|hosted|tools|build|runtime|strict|smp-32|musl|iommu|mitigation|qemu-fuzz|extended|extended-smp|extended-smp-32|extended-ext3|extended-stress}"
 out_root="${CI_ARTIFACTS:-target/ci/$group}"
 mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
@@ -159,6 +159,18 @@ case "$group" in
         check_guest boot --allow-qualified -- bash scripts/gates/boot/boot_check.sh esp
         check_guest runtime --allow-qualified -- bash scripts/gates/boot/kernel_test.sh esp
         check_guest smp --allow-qualified -- bash scripts/gates/boot/smp_test_4core.sh esp
+        ;;
+    strict)
+        # STRICT-Q: boot, runtime at 1 and 4 vCPUs and SMP-4 under
+        # ZERO_OS_STRICT_TESTS=1, where a warning, deferral or skip fails the
+        # gate. Diagnostic until the declared strict scope lands (#64): exit 3
+        # is not accepted, and each first result is kept without a retry.
+        export ZERO_OS_STRICT_TESTS=1
+        gate build -- make build
+        check strict-boot -- bash scripts/gates/boot/boot_check.sh esp
+        check strict-runtime -- bash scripts/gates/boot/kernel_test.sh esp
+        check strict-runtime-4 -- env KERNEL_TEST_CPUS=4 bash scripts/gates/boot/kernel_test.sh esp
+        check strict-smp-4 -- bash scripts/gates/boot/smp_test_4core.sh esp
         ;;
     smp-32)
         # Like runtime, consume the normal ESP from the build job.

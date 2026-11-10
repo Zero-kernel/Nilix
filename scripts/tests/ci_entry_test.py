@@ -28,6 +28,11 @@ name = sys.argv[sys.argv.index('--name') + 1]
 events = Path(os.environ['EVENTS'])
 with events.open('a') as stream:
     stream.write(json.dumps(name) + '\\n')
+if 'INVOCATIONS' in os.environ:
+    with open(os.environ['INVOCATIONS'], 'a') as stream:
+        stream.write(json.dumps({'name': name, 'argv': sys.argv[1:],
+                                 'strict': os.environ.get('ZERO_OS_STRICT_TESTS'),
+                                 'mode': os.environ.get('QEMU_GATE_MODE')}) + '\\n')
 base = name.split(' (retry', 1)[0]
 attempt = sum(1 for line in events.read_text().splitlines()
               if json.loads(line).split(' (retry', 1)[0] == base)
@@ -48,7 +53,8 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
         # The caller's own CI settings must not leak into the group under test:
         # an exported CI_GUEST_RETRIES=0 would disable the retry these tests pin.
         inherited = {key: value for key, value in os.environ.items()
-                     if key not in ('CI_GUEST_RETRIES', 'CI_STRESS_PROFILE')}
+                     if key not in ('CI_GUEST_RETRIES', 'CI_STRESS_PROFILE', 'QEMU_GATE_MODE',
+                                    'ZERO_OS_STRICT_TESTS')}
         result = subprocess.run(['bash', str(self.root / 'scripts/ci/entrypoint.sh'), group],
                                 cwd=self.root, env={**inherited, 'EVENTS': str(events), **environment},
                                 capture_output=True, text=True, timeout=15)
@@ -119,6 +125,30 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
                 status, events = self.run_group(group, FAIL_GATE='smp-32', FAIL_ATTEMPTS='1', FAIL_STATUS='1')
                 self.assertEqual(status, 1)
                 self.assertEqual(events, prefix + ['smp-32', 'report'])
+
+    def test_strict_failure_is_reported_without_retry_or_skipping_gates(self):
+        status, events = self.run_group('strict', CI_GUEST_RETRIES='1', FAIL_GATE='strict-boot',
+                                        FAIL_ATTEMPTS='1', FAIL_STATUS='1')
+        self.assertEqual(status, 1)
+        self.assertEqual(events, ['build', 'strict-boot', 'strict-runtime', 'strict-runtime-4',
+                                  'strict-smp-4', 'report'])
+
+    def test_strict_gates_run_in_strict_completion_mode_without_accepting_qualified(self):
+        invocations = self.root / 'invocations.jsonl'
+        status, events = self.run_group('strict', INVOCATIONS=str(invocations))
+        self.assertEqual(status, 0)
+        self.assertEqual(events, ['build', 'strict-boot', 'strict-runtime', 'strict-runtime-4',
+                                  'strict-smp-4', 'report'])
+        gates = {record['name']: record for record in map(json.loads, invocations.read_text().splitlines())}
+        for name in ('strict-boot', 'strict-runtime', 'strict-runtime-4', 'strict-smp-4'):
+            with self.subTest(gate=name):
+                self.assertEqual(gates[name]['strict'], '1')
+                self.assertEqual(gates[name]['mode'], 'completion')
+                self.assertNotIn('--allow-qualified', gates[name]['argv'])
+        command = gates['strict-runtime-4']['argv']
+        self.assertEqual(command[command.index('--') + 1:],
+                         ['env', 'KERNEL_TEST_CPUS=4', 'bash', 'scripts/gates/boot/kernel_test.sh', 'esp'])
+        self.assertNotIn('KERNEL_TEST_CPUS=4', gates['strict-runtime']['argv'])
 
     def test_extended_split_groups_keep_the_combined_gate_order(self):
         expected = {

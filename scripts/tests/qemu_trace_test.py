@@ -48,10 +48,26 @@ def serve():
                 elif request['execute'] == 'human-monitor-command':
                     with commands.open('a') as out:
                         out.write(request['arguments']['command-line'] + '\n')
+                    mode = os.environ.get('FAKE_HMP_MODE', '')
+                    if mode == 'delayed':
+                        time.sleep(3)
+                    if mode == 'close':
+                        break
+                    if mode == 'timeout':
+                        time.sleep(6)
+                        break
+                    if mode == 'malformed':
+                        client.sendall(b'not json\r\n')
+                        break
+                    if mode == 'unexpected':
+                        client.sendall(b'{"id":"hmp","return":null}\r\n')
+                        continue
                     client.sendall(json.dumps({'return': reply, 'id': request['id']}).encode() + b'\r\n')
                 elif request['execute'] == 'quit':
                     with commands.open('a') as out:
                         out.write('quit\n')
+                    with commands.with_suffix('.times').open('a') as out:
+                        out.write('quit ' + str(time.monotonic()) + '\n')
                     os._exit(0)
 
 threading.Thread(target=serve, daemon=True).start()
@@ -59,6 +75,9 @@ for delay, chunk in json.loads(os.environ['FAKE_SCRIPT']):
     time.sleep(delay)
     with serial.open('a') as out:
         out.write(chunk)
+    if 'CI-EXIT' in chunk:
+        with commands.with_suffix('.times').open('a') as out:
+            out.write('witness ' + str(time.monotonic()) + '\n')
 while True:
     time.sleep(1)
 '''
@@ -141,20 +160,20 @@ class SupervisorTests(unittest.TestCase):
         self.commands = self.root / "commands.log"
         self.commands.touch()
 
-    def environment(self, script, reply=""):
+    def environment(self, script, reply="", mode=""):
         return dict(os.environ, FAKE_COMMANDS=str(self.commands), FAKE_SCRIPT=json.dumps(script),
-                    FAKE_HMP_REPLY=reply)
+                    FAKE_HMP_REPLY=reply, FAKE_HMP_MODE=mode)
 
     def qemu(self):
         return [sys.executable, str(self.fake), "-serial", f"file:{self.serial}", "-D", str(self.intlog)]
 
-    def supervise(self, script, timeout=30, reply=""):
+    def supervise(self, script, timeout=30, reply="", mode=""):
         receipt, trace = self.root / "run.json", self.root / "trace.json"
         command = [sys.executable, str(ROOT / "scripts/ci/qemu_run.py"), "--serial", str(self.serial),
                    "--qemu-stderr", str(self.root / "qemu.stderr"), "--receipt", str(receipt),
                    "--timeout", str(timeout), "--trace-policy", "phased", "--intlog", str(self.intlog),
                    "--trace-cpus", "4", "--trace-receipt", str(trace), "--", *self.qemu()]
-        subprocess.run(command, env=self.environment(script, reply), capture_output=True, timeout=120, check=False)
+        subprocess.run(command, env=self.environment(script, reply, mode), capture_output=True, timeout=120, check=False)
         return json.loads(receipt.read_text()), json.loads(trace.read_text())
 
     def test_completion_switches_after_the_marker_then_quits(self):
@@ -173,6 +192,43 @@ class SupervisorTests(unittest.TestCase):
         _, trace = self.supervise([[0.1, CLEAN], [0.1, WITNESS]], reply="Invalid log option\r\n")
         self.assertEqual(trace["outcome"], "switch-failed")
         self.assertEqual(qemu_trace.verify("phased", "phased", trace, self.serial.read_bytes())[:2], (0, "full"))
+
+    def assert_unknown_switch(self, mode):
+        _, trace = self.supervise([[0.1, CLEAN], [0.3, WITNESS]], mode=mode)
+        self.assertIn("log cpu_reset", self.commands.read_text().splitlines())
+        self.assertEqual(trace["outcome"], "switch-unknown")
+        serial = self.serial.read_bytes()
+        for default in ("full", "phased"):
+            self.assertEqual(qemu_trace.verify("phased", default, trace, serial)[:2], (1, "unknown"))
+            clean = gate_log.GateResult(0, (1, 0, 0), 0, 0, (), {})
+            result = gate_log.apply_trace(clean, "phased", default, trace, serial, False)
+            self.assertEqual((result.status, result.details["trace_scope"]), (1, "unknown"))
+
+    def test_lost_switch_reply_fails_closed(self):
+        self.assert_unknown_switch("close")
+
+    def test_switch_reply_timeout_fails_closed(self):
+        self.assert_unknown_switch("timeout")
+
+    def test_malformed_switch_reply_fails_closed(self):
+        self.assert_unknown_switch("malformed")
+
+    def test_unexpected_switch_reply_fails_closed(self):
+        self.assert_unknown_switch("unexpected")
+
+    def test_delayed_switch_reply_preserves_post_witness_observation(self):
+        run, trace = self.supervise([[0.1, CLEAN], [2.5, WITNESS]], mode="delayed")
+        times = dict(line.split() for line in self.commands.with_suffix('.times').read_text().splitlines())
+        self.assertEqual(run["reason"], "completed")
+        self.assertEqual(trace["outcome"], "switched")
+        self.assertGreaterEqual(float(times["quit"]) - float(times["witness"]), qemu_run.SETTLE_SECONDS)
+        self.assertEqual(qemu_run.termination_errors(self.serial.read_text(), "completion", run, 0), [])
+
+    def test_delayed_switch_cannot_complete_after_deadline(self):
+        run, trace = self.supervise([[0.1, CLEAN], [0.1, WITNESS]], timeout=2, mode="delayed")
+        self.assertNotEqual(run["reason"], "completed")
+        self.assertEqual(trace["outcome"], "switch-unknown")
+        self.assertEqual(run["runner_status"], 1)
 
     def test_no_marker_before_completion_is_recorded(self):
         _, trace = self.supervise([[0.1, CLEAN.replace(MARKER, "")], [0.1, WITNESS]])

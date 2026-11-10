@@ -44,13 +44,40 @@ NX_SIGNATURE = b"v=0e e=0011"
 # vCPU threads may finish an interrupt record already in flight when QEMU applies
 # the switch; one record is about 1.5 KiB, so 16 vCPUs fit well inside this.
 SWITCH_GRACE_BYTES = 65536
+SCAN_CHUNK_BYTES = 1 << 20
+MAX_TRACE_LINE_BYTES = 65536
+INTERRUPT_RECORD = re.compile(rb"^\s*[0-9]+: v=", re.MULTILINE)
 
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def phase_failures(case: str, serial: bytes, intlog: bytes, receipt: dict | None) -> list[str]:
+def trace_contains(path: Path, pattern: re.Pattern, start: int = 0) -> bool:
+    """Scan bounded, line-aligned blocks, including matches at block boundaries."""
+    carry = b""
+    with path.open("rb") as stream:
+        stream.seek(start)
+        while True:
+            block = stream.read(SCAN_CHUNK_BYTES)
+            data = carry + block
+            if not block:
+                return pattern.search(data) is not None
+            cut = data.rfind(b"\n") + 1
+            carry = data[cut:]
+            if len(carry) > MAX_TRACE_LINE_BYTES:
+                raise ValueError("interrupt log contains an overlong line")
+            if pattern.search(data[:cut]):
+                return True
+
+
+def retain_interrupt_tail(source: Path, target: Path) -> None:
+    with source.open("rb") as stream:
+        stream.seek(max(0, source.stat().st_size - 262144))
+        target.write_bytes(stream.read(262144))
+
+
+def phase_failures(case: str, serial: bytes, intlog: Path, receipt: dict | None) -> list[str]:
     """Every reason the run did not fault in the intended trace phase."""
     failures = []
     text = serial.decode("utf-8", errors="replace")
@@ -68,21 +95,27 @@ def phase_failures(case: str, serial: bytes, intlog: bytes, receipt: dict | None
     if case == "nx-boot":
         if receipt.get("outcome") != "marker-missing":
             failures.append(f"boot-phase fault ran with trace outcome {receipt.get('outcome')!r}")
-        if NX_SIGNATURE not in intlog:
-            failures.append("full boot trace lacks the NX signature")
+        try:
+            if not trace_contains(intlog, re.compile(re.escape(NX_SIGNATURE))):
+                failures.append("full boot trace lacks the NX signature")
+        except (OSError, ValueError) as error:
+            failures.append(f"cannot scan interrupt log: {error}")
         return failures
     if receipt.get("outcome") != "switched":
         return failures + [f"trace outcome {receipt.get('outcome')!r}, expected switched"]
     status, _, reasons = qemu_trace.verify("phased", "phased", receipt, serial)
     if status:
-        failures.extend(reasons)
+        return failures + reasons
     if armed_offset < receipt.get("serial_bytes_at_switch", len(serial) + 1):
         failures.append("ARMED was written before QEMU confirmed the switch")
-    steady = intlog[receipt["intlog_bytes_at_switch"]:]
-    if case == "triple" and b"Triple fault" not in steady:
-        failures.append("the steady-phase log lacks QEMU's Triple fault")
-    if re.search(rb"^\s*[0-9]+: v=", steady[SWITCH_GRACE_BYTES:], re.MULTILINE):
-        failures.append("interrupts were still traced after the switch")
+    start = receipt["intlog_bytes_at_switch"]
+    try:
+        if case == "triple" and not trace_contains(intlog, re.compile(b"Triple fault"), start):
+            failures.append("the steady-phase log lacks QEMU's Triple fault")
+        if trace_contains(intlog, INTERRUPT_RECORD, start + SWITCH_GRACE_BYTES):
+            failures.append("interrupts were still traced after the switch")
+    except (OSError, ValueError) as error:
+        failures.append(f"cannot scan interrupt log: {error}")
     return failures
 
 
@@ -162,17 +195,17 @@ def main() -> int:
             with (case_dir / "supervisor.log").open("wb") as log:
                 result["supervisor_status"] = subprocess.run(supervisor, stdout=log, stderr=subprocess.STDOUT).returncode
             serial_bytes = serial.read_bytes() if serial.exists() else b""
-            intlog_bytes = intlog.read_bytes() if intlog.exists() else b""
+            intlog_size = intlog.stat().st_size if intlog.exists() else 0
             run = qemu_trace.load_receipt(receipt_path) or {}
             trace = qemu_trace.load_receipt(trace_path)
             result.update(run_reason=run.get("reason"), trace=trace,
-                          serial_sha256=hashlib.sha256(serial_bytes).hexdigest(), intlog_bytes=len(intlog_bytes),
-                          phase_failures=phase_failures(case, serial_bytes, intlog_bytes, trace),
+                          serial_sha256=hashlib.sha256(serial_bytes).hexdigest(), intlog_bytes=intlog_size,
+                          phase_failures=phase_failures(case, serial_bytes, intlog, trace),
                           detections=verdict_detections(serial, intlog, stderr, run))
             result["pass"] = not result["phase_failures"] and all(result["detections"].values())
             # Keep the decision-relevant log tail; the full boot trace can reach GBs.
-            if intlog_bytes:
-                (case_dir / "interrupts.tail.log").write_bytes(intlog_bytes[-262144:])
+            if intlog_size:
+                retain_interrupt_tail(intlog, case_dir / "interrupts.tail.log")
                 intlog.unlink()
         results.append(result)
         (case_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")

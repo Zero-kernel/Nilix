@@ -127,7 +127,7 @@ printf '%s\n' "$qemu_status" > "$ser.qemu.status"
 
 python3 "$ROOT/scripts/ci/gate_log.py" --serial "$ser" --intlog "$intlog" \
     --qemu-stderr "$qemuerr" --timeout-stderr "$timeoutlog" --qemu-status "$qemu_status" --termination-mode "${QEMU_GATE_MODE:-completion}" --termination-receipt "$ser.run.json" --json-output "$ser.counts.json" \
-    --trace-policy "$QEMU_TRACE_POLICY" --trace-default "$TRACE_DEFAULT" --trace-receipt "$ser.trace.json"
+    --trace-policy "$QEMU_TRACE_POLICY" --trace-default full --trace-receipt "$ser.trace.json"
 rc=$?
 python3 "$ROOT/scripts/ci/gate_inputs.py" verify --output "$ser.inputs" || rc=1
 if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Fq 'R180-6 production JBD2 write path passed' "$ser"; then
