@@ -1043,12 +1043,27 @@ def parse_marker(line: str) -> Marker:
 SHELL_PROMPT_PREFIX = "/ nilix# "
 
 
-def protocol_lines(path: str | os.PathLike[str], *, live: bool = False) -> list[str]:
+# A host stop at the end of a window can catch the guest mid-line while it
+# writes a steady-state round or heartbeat marker. Only a fragment whose kind is
+# complete and is one of those is dropped. An unterminated BEGIN, READY, PASS or
+# FAIL, or a kind cut short, is kept and fails to parse, so a terminal report
+# that was cut off never disappears.
+HOST_CUT_FRAGMENT_RE = re.compile(
+    r"NILIX_STRESS_V2_(?:HEARTBEAT|MEMORY|CPU|SMP|PROCESS|BLOCK|COMBINED|THREAD) "
+)
+
+
+def protocol_lines(
+    path: str | os.PathLike[str], *, live: bool = False, host_cut: bool = False
+) -> list[str]:
     """Marker lines of a serial log.
 
     `live` is for a log the guest may still be writing: the serial port emits a
     line byte by byte, so an unterminated final line can be a marker caught
     mid-write and is left for the next poll instead of failing to parse.
+
+    `host_cut` is for a log whose VM the host stopped by TERM: an unterminated
+    final line is dropped only if it matches `HOST_CUT_FRAGMENT_RE`.
 
     The interactive shell prints its prompt without a trailing newline. A Ring-3
     workload can start on another CPU while that prompt is being emitted, so the
@@ -1057,8 +1072,11 @@ def protocol_lines(path: str | os.PathLike[str], *, live: bool = False) -> list[
     therefore cannot fabricate a valid protocol line.
     """
     raw = Path(path).read_bytes()
+    tail_start = raw.rfind(b"\n") + 1
     if live:
-        raw = raw[: raw.rfind(b"\n") + 1]
+        raw = raw[:tail_start]
+    elif host_cut and HOST_CUT_FRAGMENT_RE.match(raw[tail_start:].decode("utf-8", errors="replace")):
+        raw = raw[:tail_start]
     text = raw.decode("utf-8", errors="replace")
     lines = []
     for line in text.splitlines():
@@ -1070,8 +1088,10 @@ def protocol_lines(path: str | os.PathLike[str], *, live: bool = False) -> list[
     return lines
 
 
-def parse_protocol_log(path: str | os.PathLike[str], live: bool = False) -> list[Marker]:
-    return [parse_marker(line) for line in protocol_lines(path, live=live)]
+def parse_protocol_log(
+    path: str | os.PathLike[str], live: bool = False, host_cut: bool = False
+) -> list[Marker]:
+    return [parse_marker(line) for line in protocol_lines(path, live=live, host_cut=host_cut)]
 
 
 def require_marker_identity(marker: Marker, config: StressConfig) -> None:
@@ -1547,8 +1567,13 @@ def validate_log(
     qmp_after_path: str | None = None,
     host_terminated: bool = False,
 ) -> dict[str, Any]:
-    # A writer boot ends in SIGKILL, which can cut its last marker mid-line.
-    markers = parse_protocol_log(serial_path, live=mode == "writer")
+    # A writer boot ends in SIGKILL, which can cut its last marker mid-line. A
+    # window that the host proved it stopped by TERM can cut a round or heartbeat
+    # mid-line; the freshness proof below still covers the last complete heartbeat.
+    host_cut_round = host_terminated and events_path is not None and end_ns is not None
+    markers = parse_protocol_log(
+        serial_path, live=mode == "writer", host_cut=mode != "writer" and host_cut_round
+    )
     validate_header(markers, config, mode)
     runtime = validate_runtime_evidence(serial_path)
     validate_diagnostics(serial_path, interrupt_path, qemu_stderr_path)
@@ -1561,7 +1586,7 @@ def validate_log(
         # the last heartbeat must still be fresh at that proven host stop.
         heartbeats = validate_normal_markers(
             markers, config, minimum_heartbeats, recovery=mode == "recovery",
-            host_cut_round=host_terminated and events_path is not None and end_ns is not None,
+            host_cut_round=host_cut_round,
         )
     else:
         raise StressProtocolError(f"unknown validation mode {mode}")

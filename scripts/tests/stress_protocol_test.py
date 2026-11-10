@@ -495,6 +495,55 @@ class ThreadProfileTests(unittest.TestCase):
             self.validate_tail(thread_round(self.config, 3, CHECKSUM_A) + "\n"
                                + thread_round(self.config, 4, CHECKSUM_B))
 
+    def validate_cut(self, fragment: str, *, round3: bool = False, host_terminated: bool = True,
+                     ledger: bool = True) -> None:
+        # The host stop lands while the guest writes `fragment`, which never gets its newline.
+        hb1 = heartbeat(self.config, 1, 12, CHECKSUM_A)
+        hb2 = heartbeat(self.config, 2, 24, CHECKSUM_B)
+        ready_line = ready(self.config, "normal")
+        lines = [begin(self.config), ready_line, thread_round(self.config, 1, CHECKSUM_A),
+                 common_pass(self.config, 12, CHECKSUM_A), hb1, thread_round(self.config, 2, CHECKSUM_B), hb2]
+        events = [(1_000_000_000, ready_line), (1_500_000_000, hb1), (2_000_000_000, hb2)]
+        if round3:
+            lines.append(thread_round(self.config, 3, CHECKSUM_A))
+            events.append((2_400_000_000, lines[-1]))
+        write_log(self.log, lines)
+        with self.log.open("a", encoding="utf-8") as stream:
+            stream.write(fragment)
+        write_events(self.events, events)
+        protocol.validate_log(
+            config=self.config, serial_path=str(self.log), mode="normal", minimum_heartbeats=2,
+            events_path=str(self.events) if ledger else None, end_ns=2_500_000_000 if ledger else None,
+            heartbeat_grace_ms=0, qmp_before_path=None, qmp_after_path=None,
+            host_terminated=host_terminated,
+        )
+
+    def test_host_cut_mid_round_or_heartbeat_is_dropped(self) -> None:
+        self.validate_cut(thread_round(self.config, 3, CHECKSUM_A)[:60])
+        self.validate_cut(heartbeat(self.config, 3, 36, CHECKSUM_A)[:40], round3=True)
+        # Cut after the last byte of the marker but before its newline.
+        self.validate_cut(heartbeat(self.config, 3, 36, CHECKSUM_A), round3=True)
+
+    def test_mid_line_cut_needs_the_proven_host_stop(self) -> None:
+        fragment = thread_round(self.config, 3, CHECKSUM_A)[:60]
+        with self.assertRaisesRegex(protocol.StressProtocolError, "malformed or unknown"):
+            self.validate_cut(fragment, host_terminated=False)
+        with self.assertRaisesRegex(protocol.StressProtocolError, "malformed or unknown"):
+            self.validate_cut(fragment, ledger=False)
+
+    def test_a_cut_terminal_or_unidentified_marker_still_fails(self) -> None:
+        for fragment in (f"NILIX_STRESS_V2_FAIL run={self.config.run_hex} st",
+                         f"NILIX_STRESS_V2_PASS run={self.config.run_hex}",
+                         "NILIX_STRESS_V2_HEART",
+                         "NILIX_STRESS_V2_THREAD"):
+            with self.subTest(fragment=fragment):
+                with self.assertRaisesRegex(protocol.StressProtocolError, "malformed or unknown"):
+                    self.validate_cut(fragment)
+
+    def test_a_complete_malformed_marker_still_fails_after_a_host_stop(self) -> None:
+        with self.assertRaisesRegex(protocol.StressProtocolError, "malformed or unknown"):
+            self.validate_cut(thread_round(self.config, 3, CHECKSUM_A)[:60] + "\n")
+
     def test_config_requires_two_threads_and_rejects_foreign_knobs(self) -> None:
         with self.assertRaises(protocol.StressProtocolError):
             make_config("thread", workers=1)
