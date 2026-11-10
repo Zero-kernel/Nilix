@@ -39,13 +39,16 @@ run_gate_qemu() {
         return 2
     fi
     local args=("$@") index target=0 found=0 control writer reader compressor status compressed
-    for ((index = 2; index + 1 < ${#args[@]}; index++)); do
-        if [ "${args[index]}" = -D ] && [ "${args[index + 1]}" = "${QEMU_TRACE_INTLOG:-}" ]; then
+    for ((index = 2; index < ${#args[@]}; index++)); do
+        if [ "${args[index]}" = -D ]; then
             found=$((found + 1))
-            target=$((index + 1))
+            if (( index + 1 < ${#args[@]} )) && \
+                [ "${args[index + 1]}" = "${QEMU_TRACE_INTLOG:-}" ]; then
+                target=$((index + 1))
+            fi
         fi
     done
-    if [ "$found" -ne 1 ]; then
+    if [ "$found" -ne 1 ] || [ "$target" -eq 0 ]; then
         echo 'QEMU-RUN BLOCKED: QEMU_TRACE_COMPRESS needs exactly one -D "$QEMU_TRACE_INTLOG"'
         return 2
     fi

@@ -282,7 +282,7 @@ def open_trace(path: Path):
     stops early already has what it needs, and the decompressor is stopped.
     """
     with path.open("rb") as raw:
-        if raw.read(len(ZSTD_MAGIC)) != ZSTD_MAGIC:
+        if raw.read(len(ZSTD_MAGIC)) != ZSTD_MAGIC and path.suffix != ".zst":
             raw.seek(0)
             yield raw
             return

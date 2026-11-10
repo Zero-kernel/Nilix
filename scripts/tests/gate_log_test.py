@@ -190,6 +190,41 @@ class CommandTests(unittest.TestCase):
                     if expected == 2:
                         self.assertIn("zstd could not decompress", result.stdout)
 
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed traces")
+    def test_declared_compressed_trace_never_falls_back_to_raw(self):
+        compressed = subprocess.run(["zstd", "-q", "-1", "-c"], input=b"ordinary trace\n",
+                                    capture_output=True, check=True).stdout
+        with tempfile.TemporaryDirectory(prefix="gate-zstd-header-") as directory:
+            work = Path(directory)
+            serial, trace, stderr, timeout = [work / name for name in
+                                             ("serial", "trace.zst", "stderr", "timeout")]
+            serial.write_text(CLEAN)
+            stderr.write_text("")
+            timeout.write_text(TERM)
+            command = [sys.executable, str(ROOT / "scripts/ci/gate_log.py"),
+                       "--serial", str(serial), "--intlog", str(trace),
+                       "--qemu-stderr", str(stderr), "--timeout-stderr", str(timeout),
+                       "--qemu-status", "124"]
+            cases = [compressed[:length] for length in range(4)]
+            cases.extend((b"\x00" + compressed[1:], b"ordinary text is not a zstd frame\n"))
+            for content in cases:
+                with self.subTest(content=content[:4]):
+                    trace.write_bytes(content)
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("cannot read", result.stdout)
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed traces")
+    def test_compressed_magic_without_extension_and_raw_trace_remain_supported(self):
+        fault = b"  12: v=0e e=0011 i=0 cpl=0 IP=0008:ffffffff80001000\n"
+        with tempfile.TemporaryDirectory(prefix="gate-zstd-detect-") as directory:
+            path = Path(directory) / "interrupts"
+            path.write_bytes(subprocess.run(["zstd", "-q", "-1", "-c"], input=fault,
+                                            capture_output=True, check=True).stdout)
+            self.assertEqual(gate_log.fatal_interrupt_lines(path), fault.decode())
+            path.write_bytes(fault)
+            self.assertEqual(gate_log.fatal_interrupt_lines(path), fault.decode())
+
 
 @unittest.skipUnless(shutil.which("bash"), "bash is required for shell caller tests")
 class ShellTests(unittest.TestCase):

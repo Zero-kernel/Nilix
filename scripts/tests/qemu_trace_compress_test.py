@@ -112,6 +112,15 @@ class TraceCompressionTests(unittest.TestCase):
         self.assertIn("STATUS=2", duplicate.stdout)
         self.assertFalse((self.root / "log.path").exists())
 
+    def test_another_log_destination_cannot_bypass_the_compressed_trace(self):
+        other = self.root / "other.log"
+        for destinations in ((str(self.intlog), str(other)), (str(other), str(self.intlog))):
+            with self.subTest(destinations=destinations):
+                result = self.run_gate(str(self.fake), "-D", destinations[0], "-D", destinations[1])
+                self.assertIn("STATUS=2", result.stdout, result.stdout + result.stderr)
+                self.assertFalse((self.root / "log.path").exists())
+                self.assertFalse(other.exists())
+
     def test_uncompressed_runs_pass_the_log_path_through(self):
         result = self.run_gate(compress="none")
         self.assertIn("STATUS=0", result.stdout, result.stdout + result.stderr)
