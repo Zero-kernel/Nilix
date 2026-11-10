@@ -1,0 +1,26 @@
+{
+  "revision": "1c65dfe19b35",
+  "environment": {
+    "host": "maintainer laptop (Fedora)",
+    "python": "3.15.0"
+  },
+  "scope": "#94 parser change: stress_protocol_test.py, including four new host-cut fragment cases",
+  "gates": [
+    {
+      "command": "python3 -m unittest scripts.tests.stress_protocol_test",
+      "status": 0,
+      "result": "Ran 41 tests, OK",
+      "log_sha256": "b37bf0873097e3d261b24c9f130f274d1dec8e01b891fb6ce6658e67602c1335"
+    },
+    {
+      "negative_control": "the same tests with scripts/gates/stress/stress_protocol.py from 207ddbf",
+      "status": 1,
+      "result": "Ran 41 tests, FAILED (errors=1): test_host_cut_mid_round_or_heartbeat_is_dropped raises 'malformed or unknown stress-v2 marker'; the three fail-closed cases pass on both"
+    }
+  ],
+  "limitations": [
+    "run with unittest; CI runs the whole scripts/tests suite with pytest",
+    "a local `unittest discover` of all 315 script tests reports one unrelated import error (iommu_device_probe_test cannot import iommu_failure_probe outside pytest's path setup)"
+  ],
+  "notes": "The new cases cover: a round fragment and a heartbeat fragment dropped after a proven TERM stop; a complete marker without its newline; no drop without --host-terminated or without the event ledger; cut FAIL, PASS and short-kind fragments still fail; a complete malformed line still fails."
+}
