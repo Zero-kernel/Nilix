@@ -454,7 +454,8 @@ class ThreadProfileTests(unittest.TestCase):
         with self.assertRaises(protocol.StressProtocolError):
             self.validate(group)
 
-    def validate_tail(self, tail: str, *, end_ns: int | None = 2_500_000_000, ledger: bool = True) -> None:
+    def validate_tail(self, tail: str, *, end_ns: int | None = 2_500_000_000,
+                      ledger: bool = True, host_terminated: bool = True) -> None:
         hb1 = heartbeat(self.config, 1, 12, CHECKSUM_A)
         hb2 = heartbeat(self.config, 2, 24, CHECKSUM_B)
         ready_line = ready(self.config, "normal")
@@ -468,12 +469,15 @@ class ThreadProfileTests(unittest.TestCase):
             config=self.config, serial_path=str(self.log), mode="normal", minimum_heartbeats=2,
             events_path=str(self.events) if ledger else None, end_ns=end_ns if ledger else None,
             heartbeat_grace_ms=0, qmp_before_path=None, qmp_after_path=None,
+            host_terminated=host_terminated,
         )
 
     def test_host_cut_between_the_last_round_and_its_heartbeat_is_accepted(self) -> None:
         self.validate_tail(thread_round(self.config, 3, CHECKSUM_A))
 
     def test_host_cut_tail_needs_the_freshness_proof(self) -> None:
+        with self.assertRaisesRegex(protocol.StressProtocolError, "last profile round has no HEARTBEAT"):
+            self.validate_tail(thread_round(self.config, 3, CHECKSUM_A), host_terminated=False)
         with self.assertRaisesRegex(protocol.StressProtocolError, "last profile round has no HEARTBEAT"):
             self.validate_tail(thread_round(self.config, 3, CHECKSUM_A), ledger=False)
         # The stop came more than heartbeat_max_ms after the last heartbeat.

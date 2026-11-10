@@ -1581,9 +1581,9 @@ static ThreadRoundReport run_thread_round(uint64_t seq, uint32_t *wave_index) {
                 fail("thread_child_wait", errno, 0);
             }
         }
-        /* A failing child emitted its own FAIL marker. */
+        /* A signal or direct exit need not have emitted a child FAIL marker. */
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            _exit(1);
+            fail("thread_child_exit", 0, (uint64_t)status);
         }
         if (got != sizeof(report)) {
             fail("thread_report_short", 0, got);

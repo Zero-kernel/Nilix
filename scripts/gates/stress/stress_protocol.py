@@ -1545,6 +1545,7 @@ def validate_log(
     qemu_stderr_path: str | None = None,
     qmp_before_path: str | None = None,
     qmp_after_path: str | None = None,
+    host_terminated: bool = False,
 ) -> dict[str, Any]:
     # A writer boot ends in SIGKILL, which can cut its last marker mid-line.
     markers = parse_protocol_log(serial_path, live=mode == "writer")
@@ -1556,11 +1557,11 @@ def validate_log(
         heartbeats: list[Marker] = []
     elif mode in ("normal", "recovery"):
         commits = []
-        # Only a run whose last heartbeat is checked against the host stop
-        # (event ledger + end_ns) may end on an unpaired round marker.
+        # The caller must have successfully stopped the live VM by TERM, and
+        # the last heartbeat must still be fresh at that proven host stop.
         heartbeats = validate_normal_markers(
             markers, config, minimum_heartbeats, recovery=mode == "recovery",
-            host_cut_round=events_path is not None and end_ns is not None,
+            host_cut_round=host_terminated and events_path is not None and end_ns is not None,
         )
     else:
         raise StressProtocolError(f"unknown validation mode {mode}")
@@ -1610,6 +1611,7 @@ def command_validate_log(args: argparse.Namespace) -> int:
         qemu_stderr_path=args.qemu_stderr,
         qmp_before_path=args.qmp_before,
         qmp_after_path=args.qmp_after,
+        host_terminated=args.host_terminated,
     )
     print(json.dumps(result, sort_keys=True))
     return 3 if result["runtime"]["status"] == "qualified" else 0
@@ -1772,6 +1774,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     validate.add_argument("--minimum-heartbeats", type=parse_uint, default=1)
     validate.add_argument("--events")
     validate.add_argument("--end-ns", type=parse_uint)
+    validate.add_argument("--host-terminated", action="store_true",
+                          help="caller proved a live VM stopped by host TERM without forced KILL")
     validate.add_argument("--heartbeat-grace-ms", type=parse_uint, default=0)
     validate.add_argument("--interrupt-log")
     validate.add_argument("--qemu-stderr")
