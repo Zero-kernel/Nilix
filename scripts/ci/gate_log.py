@@ -57,32 +57,83 @@ TERM_EVENT = "timeout: sending signal TERM to command"
 KILL_EVENT = "timeout: sending signal KILL to command"
 LABELS = {0: "PASS (diagnostic)", 1: "FAIL", 2: "INCOMPLETE", 3: "QUALIFIED (not a strict pass)"}
 OUTCOME_KEYS = ("passed", "warning", "deferred", "skipped", "failed")
-COUNTS = re.compile(r"(RUNTIME|SECURITY|SECURITY-BOOT)-COUNTS " + " ".join(rf"{key}=([0-9]+)" for key in OUTCOME_KEYS))
-CASE = re.compile(r'(RUNTIME|SECURITY|SECURITY-BOOT)-CASE name=(\S+) status=(pass|warning|deferred|skipped|failed) owner=(\S+) reason=(".*")')
+# STRICT-Q (#64) declared-scope outcomes (kernel `TestScope`). Each status must
+# carry a scope of its own kind. Non-strict mode keeps them QUALIFIED; strict
+# mode accepts exactly the (suite, name, status, scope) tuples in STRICT_SCOPE.
+SCOPE_KEYS = ("not_applicable", "out_of_scope", "covered")
+SCOPE_PREFIX = {"not_applicable": "needs_cpus:", "out_of_scope": "out_of_scope:", "covered": "covered_by:"}
+QUALIFIED_KEYS = ("warning", "deferred", "skipped")
+STRICT_SCOPE = Path(__file__).with_name("strict_scope.txt")
+COUNTS = re.compile(
+    r"(RUNTIME|SECURITY|SECURITY-BOOT)-COUNTS " + " ".join(rf"{key}=([0-9]+)" for key in OUTCOME_KEYS)
+    + "(?: " + " ".join(rf"{key}=([0-9]+)" for key in SCOPE_KEYS) + ")?"
+)
+CASE = re.compile(
+    r"(RUNTIME|SECURITY|SECURITY-BOOT)-CASE name=(\S+) "
+    r"status=(pass|warning|deferred|skipped|failed|not_applicable|out_of_scope|covered)"
+    r'(?: scope=(\S+))? owner=(\S+) reason=(".*")'
+)
 
 
-def outcome_evidence(lines, legacy_counts, strict):
+def valid_declared_scope(status: str, scope: str | None) -> bool:
+    """Match a nonempty scope token, including the kernel's positive u8 CPU bound."""
+    prefix = SCOPE_PREFIX.get(status)
+    if not prefix or not scope or not scope.startswith(prefix):
+        return False
+    value = scope[len(prefix):]
+    if status == "not_applicable":
+        return bool(re.fullmatch(r"[1-9][0-9]{0,2}", value)) and int(value) <= 255
+    return bool(value)
+
+
+def load_strict_scope(path: Path = STRICT_SCOPE) -> frozenset[tuple[str, str, str, str]]:
+    """Read the declared strict scope: one `suite name status scope` per line."""
+    entries = set()
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        fields = raw.split("#", 1)[0].split()
+        if not fields:
+            continue
+        if (len(fields) != 4 or fields[0] not in ("RUNTIME", "SECURITY", "SECURITY-BOOT")
+                or not valid_declared_scope(fields[2], fields[3])
+                or tuple(fields) in entries):
+            raise ValueError(f"{path.name}:{number}: malformed or duplicate strict-scope entry")
+        entries.add(tuple(fields))
+    return frozenset(entries)
+
+
+def qualifying_keys(strict: bool) -> tuple[str, ...]:
+    """Outcome counters that qualify a result; declared scope counts only outside strict mode."""
+    return QUALIFIED_KEYS if strict else QUALIFIED_KEYS + SCOPE_KEYS
+
+
+def outcome_evidence(lines, legacy_counts, strict, strict_scope=None):
     """Reconcile final counters with unique, owned per-test observations."""
     errors, cases, suites = [], [], {}
     for position, line in enumerate(lines):
-        if line.startswith(("RUNTIME-COUNTS", "SECURITY-COUNTS", "SECURITY-BOOT-COUNTS")):
+        # A leading space must not hide a malformed structured result. Detect
+        # the candidate after whitespace, but validate the original exact line.
+        candidate = line.lstrip()
+        if candidate.startswith(("RUNTIME-COUNTS", "SECURITY-COUNTS", "SECURITY-BOOT-COUNTS")):
             match = COUNTS.fullmatch(line)
             if not match or match[1] in suites:
                 errors.append("malformed or duplicate structured suite counts")
                 continue
-            counts = dict(zip(OUTCOME_KEYS, map(int, match.groups()[1:])))
+            counts = dict(zip(OUTCOME_KEYS + SCOPE_KEYS, (int(value or 0) for value in match.groups()[1:])))
             suites[match[1]] = (position, counts)
             if not sum(counts.values()):
                 errors.append("structured suite has no tests")
-        elif line.startswith(("RUNTIME-CASE", "SECURITY-CASE", "SECURITY-BOOT-CASE")):
+        elif candidate.startswith(("RUNTIME-CASE", "SECURITY-CASE", "SECURITY-BOOT-CASE")):
             match = CASE.fullmatch(line)
             try:
                 if not match:
                     raise ValueError("bad case fields")
-                reason = json.loads(match[5])
+                reason = json.loads(match[6])
                 if not isinstance(reason, str) or (match[3] != "pass" and not reason.strip()):
                     raise ValueError("missing reason")
-                cases.append(dict(position=position, suite=match[1], name=match[2], status=match[3], owner=match[4], reason=reason))
+                if match[3] in SCOPE_KEYS and not valid_declared_scope(match[3], match[4]):
+                    raise ValueError("declared-scope status without its scope")
+                cases.append(dict(position=position, suite=match[1], name=match[2], status=match[3],
+                                  scope=match[4], owner=match[5], reason=reason))
             except (ValueError, TypeError):
                 errors.append("malformed test case or missing reason/owner")
     completion = next((pos for pos, line in enumerate(lines) if PID1_EXIT.fullmatch(line)), len(lines))
@@ -92,7 +143,7 @@ def outcome_evidence(lines, legacy_counts, strict):
             errors.append("structured counts must precede PID 1 completion")
         if suite == "RUNTIME" and position <= summary:
             errors.append("runtime counts must follow the legacy summary")
-        observed = dict.fromkeys(OUTCOME_KEYS, 0)
+        observed = dict.fromkeys(OUTCOME_KEYS + SCOPE_KEYS, 0)
         names = set()
         for case in (case for case in cases if case["suite"] == suite):
             if case["name"] in names or case["position"] >= min(position, summary):
@@ -109,7 +160,17 @@ def outcome_evidence(lines, legacy_counts, strict):
         errors.append("missing structured runtime counts")
     if strict and "SECURITY" not in suites:
         errors.append("strict mode requires structured security-suite evidence")
-    details = {"strict_requested": strict, "suites": {name: counts for name, (_, counts) in suites.items()}, "cases": cases}
+    scoped = [(case["suite"], case["name"], case["status"], case["scope"]) for case in cases if case["status"] in SCOPE_KEYS]
+    violations = []
+    if strict and scoped:
+        try:
+            allowed = load_strict_scope() if strict_scope is None else strict_scope
+        except (OSError, ValueError) as error:
+            allowed = frozenset()
+            errors.append(f"strict scope list unavailable: {error}")
+        violations = [" ".join(entry) for entry in scoped if entry not in allowed]
+    details = {"strict_requested": strict, "suites": {name: counts for name, (_, counts) in suites.items()},
+               "cases": cases, "scope_violations": violations}
     return details, errors
 
 
@@ -147,6 +208,7 @@ def evaluate(
     strict: bool = False,
     termination_mode: str = "window",
     termination_receipt: dict | None = None,
+    strict_scope: frozenset | None = None,
 ) -> GateResult:
     failures = []
     incomplete = []
@@ -219,8 +281,9 @@ def evaluate(
         elif active[0] >= enabled[0] or (counts is not None and enabled[0] >= summaries[0][0]):
             failures.append("IOMMU activation and enabled state must precede runtime completion")
 
-    details, evidence_errors = outcome_evidence(lines, counts, strict)
+    details, evidence_errors = outcome_evidence(lines, counts, strict, strict_scope)
     incomplete.extend(evidence_errors)
+    failures.extend(f"strict mode: undeclared scope {entry}" for entry in details["scope_violations"])
     runtime_counts = details["suites"].get("RUNTIME")
     if counts is not None and not sum(runtime_counts.values() if runtime_counts else counts):
         incomplete.append("runtime Test Summary contains no tests")
@@ -228,7 +291,7 @@ def evaluate(
         failures.append("structured suite reports failed tests")
     qualified_counts = any(
         suite[key] for suite in details["suites"].values()
-        for key in ("warning", "deferred", "skipped")
+        for key in qualifying_keys(strict)
     )
 
     if failures:

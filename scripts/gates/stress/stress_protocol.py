@@ -1450,7 +1450,7 @@ def validate_runtime_evidence(serial_path: str | os.PathLike[str]) -> dict[str, 
     ci_dir = str(Path(__file__).resolve().parents[2] / "ci")
     if ci_dir not in sys.path:
         sys.path.insert(0, ci_dir)
-    from gate_log import SUMMARY, FAILED_TEST, WARNING, SKIPPED, outcome_evidence
+    from gate_log import SUMMARY, FAILED_TEST, WARNING, SKIPPED, outcome_evidence, qualifying_keys
 
     text = Path(serial_path).read_bytes().decode("utf-8", errors="replace")
     lines = text.splitlines()
@@ -1471,8 +1471,10 @@ def validate_runtime_evidence(serial_path: str | os.PathLike[str]) -> dict[str, 
         raise StressProtocolError("kernel runtime summary contains no tests")
     if any(suite["failed"] for suite in details["suites"].values()):
         raise StressProtocolError("structured runtime/security suite reports failure")
+    if details["scope_violations"]:
+        raise StressProtocolError("strict mode: undeclared scope " + "; ".join(details["scope_violations"]))
     diagnostics = [line for line in lines if not line.startswith(("RUNTIME-", "SECURITY-"))]
-    qualified = bool(deferred) or any(WARNING.search(line) or SKIPPED.search(line) for line in diagnostics) or any(suite[key] for suite in details["suites"].values() for key in ("warning", "deferred", "skipped"))
+    qualified = bool(deferred) or any(WARNING.search(line) or SKIPPED.search(line) for line in diagnostics) or any(suite[key] for suite in details["suites"].values() for key in qualifying_keys(strict))
     if strict and qualified:
         raise StressProtocolError("strict mode rejects qualified runtime/security results")
     return {"legacy_counts": summaries[0], "status": "qualified" if qualified else "complete", **details}

@@ -58,10 +58,28 @@ mode; they cannot silently qualify completion mode.
 
 The `strict` group runs boot, runtime at 1 and 4 vCPUs and SMP-4 with
 `ZERO_OS_STRICT_TESTS=1`, where any warning, deferred test or skip fails the
-gate (STRICT-Q, #64). It never accepts exit 3 and never retries. Until the
-declared strict scope lands, every current deferral fails it, so Extended runs
-it as a separate diagnostic job in completion mode: the job is not a lane, the
-aggregate result does not depend on it, and its failure does not fail the run.
+gate (STRICT-Q, #64). It never accepts exit 3 and never retries.
+
+Declared strict scope. A runtime or security test can declare a `TestScope`:
+- `NeedsCpus(n)` reports `not_applicable` below `n` online CPUs.
+- `OutOfScope { milestone, .. }` reports `out_of_scope`, and `CoveredBy { gate, .. }`
+  reports `covered`. Both apply only when the body defers; a pass or failure stands.
+
+Case records carry a matching `scope=` token, and the suite counts add
+`not_applicable=`, `out_of_scope=` and `covered=`. Outside strict mode these
+results are QUALIFIED. In strict mode, `gate_log.py` accepts one only when its
+`suite name status scope` tuple is listed in `scripts/ci/strict_scope.txt`, and
+fails the gate otherwise. `scripts/tests/strict_scope_test.py` requires that list
+to equal the kernel's declarations. The source check accepts literal declarations
+in its registered modules and rejects unrecognized explicit scope methods or new
+declaration locations; it is a conservative inventory check, not a Rust macro
+expander. CPU requirements must be positive u8 values (1–255), and milestone/gate
+tokens must have a nonempty suffix. Whitespace-prefixed structured records are
+malformed and cannot silently disappear from either gate or stress validation.
+
+The remaining deferrals still fail the strict gates, so Extended runs them as a
+separate diagnostic job in completion mode: the job is not a lane, the aggregate
+result does not depend on it, and its failure does not fail the run.
 `make test-strict` and `make test-strict-smp4` run the strict runtime gate locally.
 
 Examples:

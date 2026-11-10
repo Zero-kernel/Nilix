@@ -35,6 +35,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::sync::atomic::Ordering;
+pub use security::tests::{ScopeToken, TestScope};
 
 // ============================================================================
 // Test Result Types
@@ -53,6 +54,12 @@ pub enum TestResult {
     Skipped(String),
     /// Test failed
     Fail(String),
+    /// STRICT-Q: the test needs more online CPUs than this boot has.
+    NotApplicable(String),
+    /// STRICT-Q: deferred, and declared outside strict scope until a milestone.
+    OutOfScope(String),
+    /// STRICT-Q: deferred, and declared covered by another gate's oracle.
+    Covered(String),
 }
 
 impl TestResult {
@@ -71,6 +78,9 @@ impl TestResult {
             Self::Deferred(reason) => ("deferred", reason),
             Self::Skipped(reason) => ("skipped", reason),
             Self::Fail(reason) => ("failed", reason),
+            Self::NotApplicable(reason) => ("not_applicable", reason),
+            Self::OutOfScope(reason) => ("out_of_scope", reason),
+            Self::Covered(reason) => ("covered", reason),
         }
     }
 }
@@ -90,6 +100,10 @@ pub struct TestReport {
     pub warnings: usize,
     pub deferred: usize,
     pub skipped: usize,
+    /// STRICT-Q declared-scope outcomes, counted apart from deferrals
+    pub not_applicable: usize,
+    pub out_of_scope: usize,
+    pub covered: usize,
     pub outcomes: Vec<TestOutcome>,
 }
 
@@ -101,6 +115,9 @@ impl TestReport {
             warnings: 0,
             deferred: 0,
             skipped: 0,
+            not_applicable: 0,
+            out_of_scope: 0,
+            covered: 0,
             outcomes: Vec::new(),
         }
     }
@@ -111,6 +128,9 @@ impl TestReport {
             && self.warnings == 0
             && self.deferred == 0
             && self.skipped == 0
+            && self.not_applicable == 0
+            && self.out_of_scope == 0
+            && self.covered == 0
     }
 }
 
@@ -124,6 +144,34 @@ pub trait RuntimeTest {
     fn run(&self) -> TestResult;
     fn description(&self) -> &'static str {
         "Runtime validation test"
+    }
+    /// STRICT-Q declared scope; see `TestScope`.
+    fn scope(&self) -> TestScope {
+        TestScope::InScope
+    }
+}
+
+/// Run one test under its declared scope (STRICT-Q, see `TestScope`).
+fn run_scoped(test: &dyn RuntimeTest) -> TestResult {
+    let scope = test.scope();
+    if let TestScope::NeedsCpus(cpus) = scope {
+        let online = arch::num_online_cpus();
+        if online < usize::from(cpus) {
+            return TestResult::NotApplicable(alloc::format!(
+                "needs {} online CPUs; {} online",
+                cpus,
+                online
+            ));
+        }
+    }
+    match (scope, test.run()) {
+        (TestScope::OutOfScope { milestone, reason }, TestResult::Deferred(why)) => {
+            TestResult::OutOfScope(alloc::format!("{}: {} ({})", milestone, reason, why))
+        }
+        (TestScope::CoveredBy { gate, marker }, TestResult::Deferred(why)) => {
+            TestResult::Covered(alloc::format!("{}: {:?} ({})", gate, marker, why))
+        }
+        (_, result) => result,
     }
 }
 
@@ -1623,6 +1671,9 @@ impl RuntimeTest for SecuritySubsystemTest {
             ));
         }
 
+        // STRICT-Q: not-applicable, out-of-scope and covered children are
+        // counted and allowlisted in their own SECURITY-CASE records, so they
+        // do not qualify this rollup.
         TestResult::Pass
     }
 }
@@ -1637,6 +1688,11 @@ struct SmpOnlineTest;
 impl RuntimeTest for SmpOnlineTest {
     fn name(&self) -> &'static str {
         "smp_online"
+    }
+
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
     }
 
     fn description(&self) -> &'static str {
@@ -1661,6 +1717,11 @@ struct IpiPingPongTest;
 impl RuntimeTest for IpiPingPongTest {
     fn name(&self) -> &'static str {
         "ipi_ping_pong"
+    }
+
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
     }
 
     fn description(&self) -> &'static str {
@@ -1753,6 +1814,11 @@ struct TlbShootdownCoherencyTest;
 impl RuntimeTest for TlbShootdownCoherencyTest {
     fn name(&self) -> &'static str {
         "tlb_shootdown_coherency"
+    }
+
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
     }
 
     fn description(&self) -> &'static str {
@@ -2049,6 +2115,11 @@ impl RuntimeTest for SchedulerAffinityTest {
         "scheduler_affinity"
     }
 
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
     fn description(&self) -> &'static str {
         "Check that scheduler honors CPU affinity masks"
     }
@@ -2122,6 +2193,11 @@ impl RuntimeTest for R175TlbShootdownStressTest {
         "r175_d0_cross_2_tlb_fence"
     }
 
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
     fn description(&self) -> &'static str {
         "R175 D0-CROSS-2: TLB shootdown Release fence present"
     }
@@ -2152,6 +2228,11 @@ impl RuntimeTest for R175SignalFramePointerTest {
         "r175_d0_cross_1_frame_ptr"
     }
 
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
     fn description(&self) -> &'static str {
         "R175 D0-CROSS-1: Frame pointer task-bound (PCB storage)"
     }
@@ -2179,6 +2260,11 @@ struct R175SchedulerAtomicityTest;
 impl RuntimeTest for R175SchedulerAtomicityTest {
     fn name(&self) -> &'static str {
         "r175_d0_cross_3_sched_atomic"
+    }
+
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
     }
 
     fn description(&self) -> &'static str {
@@ -2211,6 +2297,11 @@ struct Rf17833SchedulerSmpGateTest;
 impl RuntimeTest for Rf17833SchedulerSmpGateTest {
     fn name(&self) -> &'static str {
         "rf178_33_sched_smp_gate"
+    }
+
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
     }
 
     fn description(&self) -> &'static str {
@@ -2358,6 +2449,9 @@ pub fn run_all_runtime_tests() -> TestReport {
     let mut warnings = 0usize;
     let mut deferred = 0usize;
     let mut skipped = 0usize;
+    let mut not_applicable = 0usize;
+    let mut out_of_scope = 0usize;
+    let mut covered = 0usize;
 
     klog_always!();
     klog_always!("=== Runtime Functional Tests ===");
@@ -2366,7 +2460,7 @@ pub fn run_all_runtime_tests() -> TestReport {
     for test in tests {
         print!("  [TEST] {}... ", test.name());
 
-        let result = test.run();
+        let result = run_scoped(test);
 
         match &result {
             TestResult::Pass => {
@@ -2389,13 +2483,26 @@ pub fn run_all_runtime_tests() -> TestReport {
                 klog_always!("FAIL: {}", msg);
                 failed += 1;
             }
+            TestResult::NotApplicable(msg) => {
+                klog_always!("NOT APPLICABLE: {}", msg);
+                not_applicable += 1;
+            }
+            TestResult::OutOfScope(msg) => {
+                klog_always!("OUT OF SCOPE: {}", msg);
+                out_of_scope += 1;
+            }
+            TestResult::Covered(msg) => {
+                klog_always!("COVERED BY {}", msg);
+                covered += 1;
+            }
         }
 
         let (status, reason) = result.record();
         klog_always!(
-            "RUNTIME-CASE name={} status={} owner={} reason={:?}",
+            "RUNTIME-CASE name={} status={} scope={} owner={} reason={:?}",
             test.name(),
             status,
+            ScopeToken(test.scope()),
             test.owner(),
             reason
         );
@@ -2414,12 +2521,15 @@ pub fn run_all_runtime_tests() -> TestReport {
     );
 
     klog_always!(
-        "RUNTIME-COUNTS passed={} warning={} deferred={} skipped={} failed={}",
+        "RUNTIME-COUNTS passed={} warning={} deferred={} skipped={} failed={} not_applicable={} out_of_scope={} covered={}",
         passed,
         warnings,
         deferred,
         skipped,
-        failed
+        failed,
+        not_applicable,
+        out_of_scope,
+        covered
     );
 
     klog_always!();
@@ -2430,6 +2540,9 @@ pub fn run_all_runtime_tests() -> TestReport {
         warnings,
         deferred,
         skipped,
+        not_applicable,
+        out_of_scope,
+        covered,
         outcomes,
     }
 }
@@ -2445,7 +2558,7 @@ pub fn run_test(name: &str) -> Option<TestOutcome> {
         .find(|test| test.name() == name)
         .map(|test| TestOutcome {
             name: test.name(),
-            result: test.run(),
+            result: run_scoped(test),
         })
 }
 
@@ -2745,6 +2858,11 @@ struct TlbShootdownPcidTest;
 impl RuntimeTest for TlbShootdownPcidTest {
     fn name(&self) -> &'static str {
         "tlb_shootdown_pcid"
+    }
+
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
     }
 
     fn description(&self) -> &'static str {

@@ -30,12 +30,29 @@ class ReportTests(unittest.TestCase):
         ]}}))
         text = report(self.root)
         self.assertIn('| runtime | QUALIFIED | 3 |', text)
-        self.assertIn('| RUNTIME | 1 | 0 | 1 | 0 | 0 |', text)
+        self.assertIn('| RUNTIME | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |', text)
         self.assertIn('requires &lt;device&gt; &#124; unavailable', text)
         cases = ET.parse(self.root / 'gates.junit.xml').findall('.//testcase')
         self.assertEqual(len(cases), 3)
         self.assertIsNotNone(cases[0].find('skipped'))
         self.assertIsNotNone(cases[2].find('skipped'))
+
+    def test_failed_and_declared_scope_cases_are_counted(self):
+        path = self.receipt('strict-runtime', 1)
+        (path / 'guest.counts.json').write_text(json.dumps({'details': {'cases': [
+            {'suite': 'RUNTIME', 'name': 'broken', 'status': 'failed', 'owner': 'test::Broken', 'reason': 'bad'},
+            {'suite': 'RUNTIME', 'name': 'smp', 'status': 'not_applicable', 'scope': 'needs_cpus:2',
+             'owner': 'test::Smp', 'reason': 'needs 2 online CPUs; 1 online'},
+            {'suite': 'SECURITY', 'name': 'spectre', 'status': 'out_of_scope', 'scope': 'out_of_scope:N6',
+             'owner': 'test::Spectre', 'reason': 'N6'},
+        ]}}))
+        text = report(self.root)
+        self.assertIn('| RUNTIME | 0 | 0 | 0 | 0 | 1 | 1 | 0 | 0 |', text)
+        self.assertIn('| SECURITY | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 |', text)
+        cases = {case.get('name'): case for case in ET.parse(self.root / 'gates.junit.xml').findall('.//testcase')}
+        self.assertIsNotNone(cases['broken'].find('failure'))
+        self.assertIsNotNone(cases['smp'].find('skipped'))
+        self.assertIsNotNone(cases['spectre'].find('skipped'))
 
     def test_process_failure_overrides_successful_test_records(self):
         self.receipt('runtime', 1)

@@ -1,0 +1,27 @@
+# STRICT-Q (#64) declared strict scope.
+#
+# Strict mode (ZERO_OS_STRICT_TESTS=1) accepts a not_applicable, out_of_scope
+# or covered case only when its exact `suite name status scope` tuple is
+# listed here. scripts/tests/strict_scope_test.py requires this list to equal
+# the kernel's `TestScope` declarations. Runtime declarations apply to RUNTIME;
+# security declarations apply to SECURITY and SECURITY-BOOT.
+#
+# Decisions D1 and D3 of the STRICT-Q deferral inventory, approved 2026-11-10.
+
+# D1: SMP checks are not applicable below two online CPUs. They must pass at
+# runtime 4 vCPUs and SMP-4 in the same acceptance run.
+RUNTIME smp_online not_applicable needs_cpus:2
+RUNTIME ipi_ping_pong not_applicable needs_cpus:2
+RUNTIME tlb_shootdown_coherency not_applicable needs_cpus:2
+RUNTIME scheduler_affinity not_applicable needs_cpus:2
+RUNTIME r175_d0_cross_2_tlb_fence not_applicable needs_cpus:2
+RUNTIME r175_d0_cross_1_frame_ptr not_applicable needs_cpus:2
+RUNTIME r175_d0_cross_3_sched_atomic not_applicable needs_cpus:2
+RUNTIME rf178_33_sched_smp_gate not_applicable needs_cpus:2
+RUNTIME tlb_shootdown_pcid not_applicable needs_cpus:2
+
+# D3: Spectre hardware mitigations and retpoline are N6.
+SECURITY spectre_mitigation_status out_of_scope out_of_scope:N6
+SECURITY spectre_v2_retpoline out_of_scope out_of_scope:N6
+SECURITY-BOOT spectre_mitigation_status out_of_scope out_of_scope:N6
+SECURITY-BOOT spectre_v2_retpoline out_of_scope out_of_scope:N6

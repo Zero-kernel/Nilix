@@ -41,6 +41,12 @@ pub enum TestResult {
     Skipped(&'static str),
     /// Test failed (security issue detected)
     Fail(&'static str),
+    /// STRICT-Q: the test needs more online CPUs than this boot has.
+    NotApplicable(&'static str),
+    /// STRICT-Q: deferred, and declared outside strict scope until a milestone.
+    OutOfScope(&'static str),
+    /// STRICT-Q: deferred, and declared covered by another gate's oracle.
+    Covered(&'static str),
 }
 
 impl TestResult {
@@ -53,6 +59,72 @@ impl TestResult {
     pub fn is_fail(&self) -> bool {
         matches!(self, TestResult::Fail(_))
     }
+
+    /// The status and reason written to the suite's case record.
+    pub fn record(&self) -> (&'static str, &'static str) {
+        match self {
+            TestResult::Pass => ("pass", ""),
+            TestResult::Warning(reason) => ("warning", reason),
+            TestResult::Deferred(reason) => ("deferred", reason),
+            TestResult::Skipped(reason) => ("skipped", reason),
+            TestResult::Fail(reason) => ("failed", reason),
+            TestResult::NotApplicable(reason) => ("not_applicable", reason),
+            TestResult::OutOfScope(reason) => ("out_of_scope", reason),
+            TestResult::Covered(reason) => ("covered", reason),
+        }
+    }
+}
+
+/// STRICT-Q (#64): a test's declared strict scope.
+///
+/// The runner applies it; the test body is unchanged. A test below its CPU
+/// requirement is not run. An out-of-scope or covered test still runs, and
+/// only a `Deferred` result is reported under its declaration, so a pass or a
+/// failure on capable hardware stands. `gate_log.py` accepts the three
+/// resulting statuses in strict mode only when `scripts/ci/strict_scope.txt`
+/// lists them, and that list must equal these declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestScope {
+    /// Part of the strict scope (the default).
+    InScope,
+    /// Needs at least this many online CPUs; below that it is not applicable.
+    NeedsCpus(u8),
+    /// Outside the strict scope until `milestone`.
+    OutOfScope {
+        milestone: &'static str,
+        reason: &'static str,
+    },
+    /// Covered by `gate`, whose oracle prints `marker`.
+    CoveredBy {
+        gate: &'static str,
+        marker: &'static str,
+    },
+}
+
+impl TestScope {
+    /// The `scope=` token of a case record, for example `needs_cpus:2`.
+    pub fn write_token(&self, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        match self {
+            TestScope::InScope => out.write_str("in_scope"),
+            TestScope::NeedsCpus(cpus) => write!(out, "needs_cpus:{}", cpus),
+            TestScope::OutOfScope { milestone, .. } => write!(out, "out_of_scope:{}", milestone),
+            TestScope::CoveredBy { gate, .. } => write!(out, "covered_by:{}", gate),
+        }
+    }
+
+    /// Whether this boot has fewer online CPUs than the test needs.
+    pub fn lacks_cpus(&self, online: usize) -> bool {
+        matches!(self, TestScope::NeedsCpus(cpus) if online < usize::from(*cpus))
+    }
+}
+
+/// Display adapter for `TestScope::write_token`.
+pub struct ScopeToken(pub TestScope);
+
+impl core::fmt::Display for ScopeToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.write_token(f)
+    }
 }
 
 /// Outcome of a single test execution.
@@ -61,6 +133,8 @@ pub struct TestOutcome {
     /// Name of the test
     pub name: &'static str,
     pub owner: &'static str,
+    /// Declared strict scope (STRICT-Q)
+    pub scope: TestScope,
     /// Result of the test
     pub result: TestResult,
 }
@@ -76,6 +150,10 @@ pub struct TestReport {
     pub warnings: usize,
     pub deferred: usize,
     pub skipped: usize,
+    /// STRICT-Q declared-scope outcomes, counted apart from deferrals
+    pub not_applicable: usize,
+    pub out_of_scope: usize,
+    pub covered: usize,
     /// Individual test outcomes
     pub outcomes: Vec<TestOutcome>,
 }
@@ -89,6 +167,9 @@ impl TestReport {
             warnings: 0,
             deferred: 0,
             skipped: 0,
+            not_applicable: 0,
+            out_of_scope: 0,
+            covered: 0,
             outcomes: Vec::new(),
         }
     }
@@ -114,30 +195,28 @@ impl TestReport {
     /// Emit owned cases and counters for the caller's boot or runtime suite.
     pub fn emit_evidence(&self, suite: &str) {
         for outcome in &self.outcomes {
-            let (status, reason) = match &outcome.result {
-                TestResult::Pass => ("pass", ""),
-                TestResult::Warning(reason) => ("warning", *reason),
-                TestResult::Deferred(reason) => ("deferred", *reason),
-                TestResult::Skipped(reason) => ("skipped", *reason),
-                TestResult::Fail(reason) => ("failed", *reason),
-            };
+            let (status, reason) = outcome.result.record();
             klog::klog_always!(
-                "{}-CASE name={} status={} owner={} reason={:?}",
+                "{}-CASE name={} status={} scope={} owner={} reason={:?}",
                 suite,
                 outcome.name,
                 status,
+                ScopeToken(outcome.scope),
                 outcome.owner,
                 reason
             );
         }
         klog::klog_always!(
-            "{}-COUNTS passed={} warning={} deferred={} skipped={} failed={}",
+            "{}-COUNTS passed={} warning={} deferred={} skipped={} failed={} not_applicable={} out_of_scope={} covered={}",
             suite,
             self.passed,
             self.warnings,
             self.deferred,
             self.skipped,
-            self.failed
+            self.failed,
+            self.not_applicable,
+            self.out_of_scope,
+            self.covered
         );
     }
 }
@@ -153,6 +232,11 @@ pub trait SecurityTest {
 
     /// Run the test and return the result.
     fn run(&self, ctx: &TestContext) -> TestResult;
+
+    /// STRICT-Q declared scope; see `TestScope`.
+    fn scope(&self) -> TestScope {
+        TestScope::InScope
+    }
 
     /// Description of what this test validates.
     fn description(&self) -> &'static str {
@@ -199,9 +283,12 @@ pub fn run_security_tests(ctx: &TestContext) -> TestReport {
     let mut warnings = 0usize;
     let mut deferred = 0usize;
     let mut skipped = 0usize;
+    let mut not_applicable = 0usize;
+    let mut out_of_scope = 0usize;
+    let mut covered = 0usize;
 
     for test in tests {
-        let result = test.run(ctx);
+        let result = run_scoped(test, ctx);
 
         match &result {
             TestResult::Pass => {
@@ -215,11 +302,15 @@ pub fn run_security_tests(ctx: &TestContext) -> TestReport {
             TestResult::Fail(_) => {
                 failed += 1;
             }
+            TestResult::NotApplicable(_) => not_applicable += 1,
+            TestResult::OutOfScope(_) => out_of_scope += 1,
+            TestResult::Covered(_) => covered += 1,
         }
 
         outcomes.push(TestOutcome {
             name: test.name(),
             owner: test.owner(),
+            scope: test.scope(),
             result,
         });
     }
@@ -230,7 +321,27 @@ pub fn run_security_tests(ctx: &TestContext) -> TestReport {
         warnings,
         deferred,
         skipped,
+        not_applicable,
+        out_of_scope,
+        covered,
         outcomes,
+    }
+}
+
+/// Run one test under its declared scope (STRICT-Q).
+fn run_scoped(test: &dyn SecurityTest, ctx: &TestContext) -> TestResult {
+    let scope = test.scope();
+    if scope.lacks_cpus(cpu_local::online_cpu_mask().count_ones() as usize) {
+        return TestResult::NotApplicable("fewer online CPUs than the test needs");
+    }
+    match (scope, test.run(ctx)) {
+        (TestScope::OutOfScope { reason, .. }, TestResult::Deferred(_)) => {
+            TestResult::OutOfScope(reason)
+        }
+        (TestScope::CoveredBy { marker, .. }, TestResult::Deferred(_)) => {
+            TestResult::Covered(marker)
+        }
+        (_, result) => result,
     }
 }
 
@@ -253,7 +364,8 @@ pub fn run_test(name: &str, ctx: &TestContext) -> Option<TestOutcome> {
             return Some(TestOutcome {
                 name: test.name(),
                 owner: test.owner(),
-                result: test.run(ctx),
+                scope: test.scope(),
+                result: run_scoped(test, ctx),
             });
         }
     }
@@ -427,6 +539,15 @@ impl SecurityTest for SpectreStatusTest {
         "Check Spectre/Meltdown mitigation effectiveness"
     }
 
+    // STRICT-Q D3: TCG `qemu64` exposes no IBRS/STIBP/SSBD. Capable
+    // hardware still runs the check and reports its pass or failure.
+    fn scope(&self) -> TestScope {
+        TestScope::OutOfScope {
+            milestone: "N6",
+            reason: "no hardware Spectre mitigation on the emulated CPU; mitigation hardware is N6",
+        }
+    }
+
     fn run(&self, _ctx: &TestContext) -> TestResult {
         let status = spectre::current_cpu_status();
 
@@ -501,6 +622,14 @@ impl SecurityTest for SpectreV2RetpolineTest {
 
     fn description(&self) -> &'static str {
         "Verify retpoline mitigation for indirect calls"
+    }
+
+    // STRICT-Q D3: retpoline and CET belong to N6.
+    fn scope(&self) -> TestScope {
+        TestScope::OutOfScope {
+            milestone: "N6",
+            reason: "compiler retpoline and its final-ELF proof are N6",
+        }
     }
 
     fn run(&self, _ctx: &TestContext) -> TestResult {

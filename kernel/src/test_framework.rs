@@ -224,6 +224,8 @@ pub struct TestStats {
     pub skipped: usize,
     pub implemented: usize,
     pub placeholders: usize,
+    /// STRICT-Q: not applicable, out of scope or covered elsewhere
+    pub declared_scope: usize,
 }
 
 impl TestStats {
@@ -233,7 +235,13 @@ impl TestStats {
 
     pub fn add_outcome(&mut self, result: &TestResult) {
         self.total += 1;
-        if !matches!(result, TestResult::Deferred(_) | TestResult::Skipped(_)) {
+        if !matches!(
+            result,
+            TestResult::Deferred(_)
+                | TestResult::Skipped(_)
+                | TestResult::OutOfScope(_)
+                | TestResult::Covered(_)
+        ) {
             self.implemented += 1;
         }
 
@@ -247,6 +255,9 @@ impl TestStats {
             }
             TestResult::Skipped(_) => self.skipped += 1,
             TestResult::Fail(_) => self.failed += 1,
+            TestResult::NotApplicable(_) | TestResult::OutOfScope(_) | TestResult::Covered(_) => {
+                self.declared_scope += 1
+            }
         }
     }
 
@@ -392,6 +403,18 @@ pub fn run_tests_by_category(category: TestCategory) -> TestReport {
         skipped: filtered_outcomes
             .iter()
             .filter(|o| matches!(o.result, TestResult::Skipped(_)))
+            .count(),
+        not_applicable: filtered_outcomes
+            .iter()
+            .filter(|o| matches!(o.result, TestResult::NotApplicable(_)))
+            .count(),
+        out_of_scope: filtered_outcomes
+            .iter()
+            .filter(|o| matches!(o.result, TestResult::OutOfScope(_)))
+            .count(),
+        covered: filtered_outcomes
+            .iter()
+            .filter(|o| matches!(o.result, TestResult::Covered(_)))
             .count(),
         outcomes: filtered_outcomes,
     };
