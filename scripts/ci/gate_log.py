@@ -75,6 +75,17 @@ CASE = re.compile(
 )
 
 
+def valid_declared_scope(status: str, scope: str | None) -> bool:
+    """Match a nonempty scope token, including the kernel's positive u8 CPU bound."""
+    prefix = SCOPE_PREFIX.get(status)
+    if not prefix or not scope or not scope.startswith(prefix):
+        return False
+    value = scope[len(prefix):]
+    if status == "not_applicable":
+        return bool(re.fullmatch(r"[1-9][0-9]{0,2}", value)) and int(value) <= 255
+    return bool(value)
+
+
 def load_strict_scope(path: Path = STRICT_SCOPE) -> frozenset[tuple[str, str, str, str]]:
     """Read the declared strict scope: one `suite name status scope` per line."""
     entries = set()
@@ -83,7 +94,7 @@ def load_strict_scope(path: Path = STRICT_SCOPE) -> frozenset[tuple[str, str, st
         if not fields:
             continue
         if (len(fields) != 4 or fields[0] not in ("RUNTIME", "SECURITY", "SECURITY-BOOT")
-                or fields[2] not in SCOPE_KEYS or not fields[3].startswith(SCOPE_PREFIX[fields[2]])
+                or not valid_declared_scope(fields[2], fields[3])
                 or tuple(fields) in entries):
             raise ValueError(f"{path.name}:{number}: malformed or duplicate strict-scope entry")
         entries.add(tuple(fields))
@@ -99,7 +110,10 @@ def outcome_evidence(lines, legacy_counts, strict, strict_scope=None):
     """Reconcile final counters with unique, owned per-test observations."""
     errors, cases, suites = [], [], {}
     for position, line in enumerate(lines):
-        if line.startswith(("RUNTIME-COUNTS", "SECURITY-COUNTS", "SECURITY-BOOT-COUNTS")):
+        # A leading space must not hide a malformed structured result. Detect
+        # the candidate after whitespace, but validate the original exact line.
+        candidate = line.lstrip()
+        if candidate.startswith(("RUNTIME-COUNTS", "SECURITY-COUNTS", "SECURITY-BOOT-COUNTS")):
             match = COUNTS.fullmatch(line)
             if not match or match[1] in suites:
                 errors.append("malformed or duplicate structured suite counts")
@@ -108,7 +122,7 @@ def outcome_evidence(lines, legacy_counts, strict, strict_scope=None):
             suites[match[1]] = (position, counts)
             if not sum(counts.values()):
                 errors.append("structured suite has no tests")
-        elif line.startswith(("RUNTIME-CASE", "SECURITY-CASE", "SECURITY-BOOT-CASE")):
+        elif candidate.startswith(("RUNTIME-CASE", "SECURITY-CASE", "SECURITY-BOOT-CASE")):
             match = CASE.fullmatch(line)
             try:
                 if not match:
@@ -116,7 +130,7 @@ def outcome_evidence(lines, legacy_counts, strict, strict_scope=None):
                 reason = json.loads(match[6])
                 if not isinstance(reason, str) or (match[3] != "pass" and not reason.strip()):
                     raise ValueError("missing reason")
-                if match[3] in SCOPE_KEYS and not (match[4] or "").startswith(SCOPE_PREFIX[match[3]]):
+                if match[3] in SCOPE_KEYS and not valid_declared_scope(match[3], match[4]):
                     raise ValueError("declared-scope status without its scope")
                 cases.append(dict(position=position, suite=match[1], name=match[2], status=match[3],
                                   scope=match[4], owner=match[5], reason=reason))

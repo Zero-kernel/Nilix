@@ -6368,15 +6368,13 @@ pub fn record_kcov_edge_for_current(edge_id: u32) {
 mod kcov_task_tests {
     use super::*;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn class_snapshots() -> [mm::HeapAdmissionSnapshot; mm::HEAP_CLASS_COUNT] {
         core::array::from_fn(|index| mm::heap_class_snapshot(HeapClass::ALL[index]))
     }
 
     #[test]
     fn task_kcov_is_accounted_nonblocking_task_local_and_noninherited() {
-        let _serial = TEST_LOCK.lock();
+        let _serial = crate::HOSTED_CPU_CONTEXT_TEST_LOCK.lock();
         mm::publish_heap_budgets();
         publish_current_kcov_token(0);
 
@@ -6725,6 +6723,22 @@ pub fn note_wait_over_wake() {
 /// Total over-wakes observed since boot (W-3 rubric counter).
 pub fn wait_over_wake_count() -> u64 {
     WAIT_OVER_WAKES.load(Ordering::Relaxed)
+}
+
+/// #92: idle passes that found a runnable task in their own queue with no
+/// reschedule pending, and armed their CPU. This counts false-to-true requests;
+/// the dispatch selector still revalidates whether the candidate can run.
+static IDLE_REARMS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one idle CPU that armed itself for a local candidate (#92).
+pub fn note_idle_rearm() {
+    // Diagnostic counter only; wrap is harmless. lint-fetch-add: allow
+    IDLE_REARMS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Idle self-arms since boot (#92).
+pub fn idle_rearm_count() -> u64 {
+    IDLE_REARMS.load(Ordering::Relaxed)
 }
 
 /// GAP-6 F11 diagnostic (stress builds only): tick of the last console write.
@@ -9951,6 +9965,7 @@ mod thread_group_tests {
 
     #[test]
     fn process_construction_inherits_host_uid_without_resetting_aggregate_usage() {
+        let _cpu_context = crate::HOSTED_CPU_CONTEXT_TEST_LOCK.lock();
         let parent = mm::heap_admission::HeapOwner::try_new_for_uid(52001).unwrap();
         mm::heap_admission::set_current_owner(Some(parent.clone()));
         let first = pcb(52001, 1);

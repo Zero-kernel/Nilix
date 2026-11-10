@@ -128,6 +128,9 @@ impl TestReport {
             && self.warnings == 0
             && self.deferred == 0
             && self.skipped == 0
+            && self.not_applicable == 0
+            && self.out_of_scope == 0
+            && self.covered == 0
     }
 }
 

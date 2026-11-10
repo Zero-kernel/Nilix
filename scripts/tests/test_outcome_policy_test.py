@@ -186,5 +186,74 @@ class OutcomePolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(StressProtocolError, "undeclared scope"):
                     validate_runtime_evidence(path)
 
+    def test_invalid_scope_values_are_rejected_in_lists_and_records(self):
+        invalid = (
+            ("not_applicable", "needs_cpus:"), ("not_applicable", "needs_cpus:0"),
+            ("not_applicable", "needs_cpus:256"), ("not_applicable", "needs_cpus:abc"),
+            ("not_applicable", "needs_cpus:02"), ("out_of_scope", "out_of_scope:"),
+            ("covered", "covered_by:"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scope.txt"
+            for status, scope in invalid:
+                with self.subTest(status=status, scope=scope):
+                    path.write_text(f"RUNTIME test_5 {status} {scope}\n", encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        gate_log.load_strict_scope(path)
+                    entry = ("RUNTIME", "test_5", status, scope)
+                    self.assertEqual(check(scoped_serial(status, scope), strict=True,
+                                           strict_scope=frozenset({entry})).status, 2)
+            for status, scope in (("not_applicable", "needs_cpus:1"), ("not_applicable", "needs_cpus:255"),
+                                  ("out_of_scope", "out_of_scope:N6"), ("covered", "covered_by:ring3-mm")):
+                with self.subTest(status=status, scope=scope):
+                    path.write_text(f"RUNTIME test_5 {status} {scope}\n", encoding="utf-8")
+                    allowed = gate_log.load_strict_scope(path)
+                    self.assertEqual(check(scoped_serial(status, scope), strict=True, strict_scope=allowed).status, 0)
+
+    def test_leading_whitespace_cannot_hide_structured_outcomes(self):
+        from scripts.gates.stress.stress_protocol import StressProtocolError, validate_runtime_evidence
+        text = scoped_serial("not_applicable", "needs_cpus:2").replace("name=test_5 ", "name=smp_online ")
+        self.assertEqual(check(text, strict=True).status, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serial.log"
+            for suite in ("RUNTIME", "SECURITY", "SECURITY-BOOT"):
+                records = [f'{suite}-CASE name=extra status={status} owner=test::Extra reason="unexpected"'
+                           for status in ("failed", "warning", "deferred", "skipped", "unknown")]
+                records.append(f"{suite}-COUNTS passed=1 warning=0 deferred=0 skipped=0 failed=0")
+                for prefix in (" ", "\t", " \t"):
+                    for record in records:
+                        with self.subTest(prefix=prefix, record=record):
+                            malformed = text + prefix + record + "\n"
+                            self.assertEqual(check(malformed, strict=True).status, 2)
+                            path.write_text(malformed, encoding="utf-8")
+                            with patch.dict(os.environ, {"ZERO_OS_STRICT_TESTS": "1"}):
+                                with self.assertRaises(StressProtocolError):
+                                    validate_runtime_evidence(path)
+
+    def test_listed_scope_never_excuses_structured_nonpasses(self):
+        from scripts.gates.stress.stress_protocol import StressProtocolError, validate_runtime_evidence
+        text = scoped_serial("not_applicable", "needs_cpus:2").replace("name=test_5 ", "name=smp_online ")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serial.log"
+            for status in ("failed", "warning", "deferred", "skipped"):
+                lines = text.splitlines()
+                for index, line in enumerate(lines):
+                    if line.startswith("RUNTIME-CASE name=test_0 "):
+                        lines[index] = line.replace("status=pass", f"status={status}").replace('reason=""', 'reason="other check unsuccessful"')
+                    elif line.startswith("RUNTIME-COUNTS "):
+                        counts = dict(field.split("=", 1) for field in line.split()[1:])
+                        counts["passed"], counts[status] = "4", "1"
+                        lines[index] = "RUNTIME-COUNTS " + " ".join(f"{key}={value}" for key, value in counts.items())
+                    elif "Test Summary" in line:
+                        lines[index] = f"=== Test Summary: 4 passed, {int(status == 'deferred')} deferred, {int(status == 'failed')} failed ==="
+                observed = "\n".join(lines) + "\n"
+                with self.subTest(status=status):
+                    result = check(observed, strict=True)
+                    self.assertEqual(result.status, 1, result.reasons)
+                    path.write_text(observed, encoding="utf-8")
+                    with patch.dict(os.environ, {"ZERO_OS_STRICT_TESTS": "1"}):
+                        with self.assertRaises(StressProtocolError):
+                            validate_runtime_evidence(path)
+
 if __name__ == "__main__":
     unittest.main()

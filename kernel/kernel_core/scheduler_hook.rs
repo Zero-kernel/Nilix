@@ -499,6 +499,7 @@ mod tests {
 
     #[test]
     fn rf187_soft_progress_guard_spans_callback_and_rejects_nested_drain() {
+        let _cpu_context = crate::HOSTED_CPU_CONTEXT_TEST_LOCK.lock();
         // RF187-5 FIX: drive the public production drain with its real
         // readiness and pending bits, then execute an actual callback from
         // the copied callback snapshot.  Registration is performed directly

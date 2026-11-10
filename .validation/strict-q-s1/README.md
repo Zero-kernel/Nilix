@@ -4,7 +4,7 @@ Source: mechanism `f16eb5451eca95c2c970e836785c09a33108e8c4`, job-summary fix `7
 
 Detailed commands, environment identities and artifact hashes are archived in the private documentation repository:
 
-[Immutable receipt archive](https://github.com/Zero-kernel/Nilix-docs-private/tree/51c0ce847d0ccd6af368d6819cc2b9fcb49f384b/validation/strict-q-s1) · [Archive PR](https://github.com/Zero-kernel/Nilix-docs-private/pull/10)
+[Immutable receipt archive](https://github.com/Zero-kernel/Nilix-docs-private/tree/9edcb7ea32c3ff8a0ea722ea7e06367c2b43ce6c/validation/strict-q-s1) · [Archive PR](https://github.com/Zero-kernel/Nilix-docs-private/pull/10)
 
 ## Recorded results and limits
 
@@ -17,3 +17,5 @@ Detailed commands, environment identities and artifact hashes are archived in th
 - This boot configuration emits no `SECURITY-BOOT` suite, so those list entries are not exercised by a guest run yet. The job-summary fix is covered by unit tests only.
 
 STRICT-Q (#64) still needs S2–S8 before a strict pass. Ordinary builds and public CI do not require the private archive.
+
+The local-checks aggregate receipt is status 1 because its recorded unittest command failed with an import error; individual statuses and log hashes are preserved. Merge-audit repairs and fresh CI results are recorded separately in the PR and private audit v5.

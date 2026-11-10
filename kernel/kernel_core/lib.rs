@@ -43,6 +43,12 @@
 #![feature(allocator_api)]
 extern crate alloc;
 
+// Hosted tests all observe the same simulated CPU 0. Tests that mutate its
+// IRQ/soft-progress state and tests that require ordinary task attribution
+// must share this lock; the heap-owner slot itself is thread-local.
+#[cfg(test)]
+pub(crate) static HOSTED_CPU_CONTEXT_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 // 导入 drivers crate，这会自动导入其导出的宏
 #[macro_use]
 extern crate drivers;

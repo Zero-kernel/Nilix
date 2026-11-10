@@ -2079,8 +2079,8 @@ impl Inode for ProcSchedstatInode {
 }
 
 /// One line per online CPU (`cpuN switches=S migrations_in=M`), then the RCU
-/// callback backlog and the W-3 wait over-wake count. Every value is read
-/// lock-free.
+/// callback backlog, the W-3 wait over-wake count and the #92 idle self-arm
+/// count. Every value is read lock-free.
 fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let mut content = AdmittedString::new(HeapClass::Procfs);
     let online = process::sched_online_cpu_mask();
@@ -2101,9 +2101,10 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
     }
     content
         .write_fmt(format_args!(
-            "rcu_backlog {}\nwait_over_wakes {}\n",
+            "rcu_backlog {}\nwait_over_wakes {}\nidle_rearms {}\n",
             kernel_core::rcu::callback_backlog(),
-            process::wait_over_wake_count()
+            process::wait_over_wake_count(),
+            process::idle_rearm_count()
         ))
         .map_err(|_| FsError::NoSpace)?;
     Ok(content)
