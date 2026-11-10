@@ -70,7 +70,12 @@ Case records carry a matching `scope=` token, and the suite counts add
 results are QUALIFIED. In strict mode, `gate_log.py` accepts one only when its
 `suite name status scope` tuple is listed in `scripts/ci/strict_scope.txt`, and
 fails the gate otherwise. `scripts/tests/strict_scope_test.py` requires that list
-to equal the kernel's declarations.
+to equal the kernel's declarations. The source check accepts literal declarations
+in its registered modules and rejects unrecognized explicit scope methods or new
+declaration locations; it is a conservative inventory check, not a Rust macro
+expander. CPU requirements must be positive u8 values (1–255), and milestone/gate
+tokens must have a nonempty suffix. Whitespace-prefixed structured records are
+malformed and cannot silently disappear from either gate or stress validation.
 
 The remaining deferrals still fail the strict gates, so Extended runs them as a
 separate diagnostic job in completion mode: the job is not a lane, the aggregate
