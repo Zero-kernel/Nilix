@@ -186,7 +186,13 @@ def run(args: argparse.Namespace) -> int:
                         record["reason"] = "deadline"
                         break
                     if phase is not None:
-                        phase.poll()
+                        phase.poll(timeout=max(0.01, deadline - time.monotonic()))
+                        # QMP may have waited for a reply while the guest made
+                        # progress. Date the witness observation after that wait,
+                        # and never accept completion using a pre-switch clock.
+                        now = time.monotonic()
+                        if record["signal"] is not None or process.poll() is not None or now >= deadline:
+                            continue
                     serial = args.serial.read_text(encoding="utf-8", errors="replace")
                     diagnostics_text = args.qemu_stderr.read_text(encoding="utf-8", errors="replace")
                     if TERMINAL_FATAL.search(serial) or TERMINAL_FATAL.search(diagnostics_text):
