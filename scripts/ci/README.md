@@ -52,6 +52,15 @@ only the supervisor's own live child process group and reaps that child.
 observation, status 124, one TERM and no KILL. The Extended workflow explicitly
 selects this mode, preserving its SMP/ext3/IOMMU stability coverage. The stress
 profiles keep their own complete 900-second window after READY in either mode.
+The Extended stress matrix retains all seven profiles with `CI_STRESS_CPUS=4`
+and adds CPU, SMP, thread and combined lanes with `CI_STRESS_CPUS=16` on both
+Ubuntu images. Memory/process always use one guest vCPU and block uses two, so
+their existing lanes cover those fixed topologies. Every 16-vCPU stress lane
+is required by the aggregate, runs once without retry, retains its artifact,
+and uses the existing workload and heartbeat bounds. These are guest vCPUs
+sharing the Actions runner's host CPUs, not a physical-core throughput benchmark.
+The local `extended` and single-profile `extended-stress` groups accept
+`CI_STRESS_CPUS=4` (default) or `16`; invalid settings fail before a build starts.
 Completion-mode results do **not** claim the old 900-second post-completion
 observation coverage. Old images without the cleanup witness must use window
 mode; they cannot silently qualify completion mode.

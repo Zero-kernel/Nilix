@@ -53,7 +53,8 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
         # The caller's own CI settings must not leak into the group under test:
         # an exported CI_GUEST_RETRIES=0 would disable the retry these tests pin.
         inherited = {key: value for key, value in os.environ.items()
-                     if key not in ('CI_GUEST_RETRIES', 'CI_STRESS_PROFILE', 'QEMU_GATE_MODE',
+                     if key not in ('CI_GUEST_RETRIES', 'CI_STRESS_PROFILE', 'CI_STRESS_CPUS',
+                                    'CI_STRESS_SECONDS', 'QEMU_GATE_MODE',
                                     'ZERO_OS_STRICT_TESTS')}
         result = subprocess.run(['bash', str(self.root / 'scripts/ci/entrypoint.sh'), group],
                                 cwd=self.root, env={**inherited, 'EVENTS': str(events), **environment},
@@ -101,10 +102,45 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
                 self.assertEqual(events, ['report'])
 
     def test_extended_stress_failure_is_reported_without_retry(self):
-        status, events = self.run_group('extended-stress', CI_STRESS_PROFILE='thread',
-                                        FAIL_GATE='stress-thread', FAIL_ATTEMPTS='1', FAIL_STATUS='1')
-        self.assertEqual(status, 1)
-        self.assertEqual(events, ['stress-build', 'stress-thread', 'report'])
+        for cpus in ('4', '16'):
+            for failure in ('1', '2'):
+                with self.subTest(cpus=cpus, failure=failure):
+                    (self.root / 'events.jsonl').unlink(missing_ok=True)
+                    status, events = self.run_group('extended-stress', CI_STRESS_PROFILE='thread',
+                                                    CI_STRESS_CPUS=cpus, CI_GUEST_RETRIES='1',
+                                                    FAIL_GATE='stress-thread', FAIL_ATTEMPTS='1',
+                                                    FAIL_STATUS=failure)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(events, ['stress-build', 'stress-thread', 'report'])
+
+    def test_extended_stress_cpu_selection_reaches_the_guest_command(self):
+        for environment, cpus in (({}, '4'), ({'CI_STRESS_CPUS': '4'}, '4'),
+                                  ({'CI_STRESS_CPUS': '16'}, '16')):
+            with self.subTest(cpus=cpus, environment=environment):
+                (self.root / 'events.jsonl').unlink(missing_ok=True)
+                invocations = self.root / 'invocations.jsonl'
+                invocations.unlink(missing_ok=True)
+                status, events = self.run_group('extended-stress', CI_STRESS_PROFILE='thread',
+                                                INVOCATIONS=str(invocations), **environment)
+                self.assertEqual(status, 0)
+                records = [json.loads(line) for line in invocations.read_text().splitlines()]
+                guest = next(record for record in records if record['name'] == 'stress-thread')
+                command = guest['argv'][guest['argv'].index('--') + 1:]
+                self.assertEqual(command, ['env', 'STRESS_PROFILES=thread', 'STRESS_PROFILE_LIMIT=1',
+                                           'STRESS_DURATION=900', 'STRESS_CPUS=' + cpus,
+                                           'STRESS_KEEP_ARTIFACTS=1', 'bash',
+                                           'scripts/gates/stress/stress_test.sh', 'esp-stress'])
+                self.assertEqual(guest['mode'], 'window')
+                self.assertIn('--allow-qualified', guest['argv'])
+
+    def test_invalid_stress_cpu_selection_blocks_before_building(self):
+        for group in ('extended', 'extended-stress'):
+            for cpus in ('0', '1', '8', '32', '04', '016', '-16', '16 ', 'bogus'):
+                with self.subTest(group=group, cpus=cpus):
+                    (self.root / 'events.jsonl').unlink(missing_ok=True)
+                    status, events = self.run_group(group, CI_STRESS_PROFILE='thread', CI_STRESS_CPUS=cpus)
+                    self.assertEqual(status, 2)
+                    self.assertEqual(events, ['report'])
 
     def test_extended_smp_failure_is_reported_without_retry(self):
         for group, following in (('extended-smp', []), ('extended', ['ext3', 'stress-build', 'stress'])):

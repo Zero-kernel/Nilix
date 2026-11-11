@@ -8,6 +8,7 @@ mkdir -p "$out_root"
 out="$(mktemp -d "$out_root/run.XXXXXX")"
 failed=0
 guest_retries="${CI_GUEST_RETRIES:-1}"
+stress_cpus="${CI_STRESS_CPUS:-4}"
 case "$group" in
     extended|extended-*) export QEMU_GATE_MODE="${QEMU_GATE_MODE:-window}" ;;
     *) export QEMU_GATE_MODE="${QEMU_GATE_MODE:-completion}" ;;
@@ -31,6 +32,14 @@ if [[ "$QEMU_GATE_MODE" != completion && "$QEMU_GATE_MODE" != window ]]; then
     echo "QEMU_GATE_MODE must be completion or window" >&2
     exit 2
 fi
+case "$group" in
+    extended|extended-stress)
+        if [[ ! "$stress_cpus" =~ ^(4|16)$ ]]; then
+            echo "CI_STRESS_CPUS must be 4 or 16" >&2
+            exit 2
+        fi
+        ;;
+esac
 
 gate() {
     local name="$1"
@@ -118,7 +127,7 @@ extended_stress() {
     # Extra `NAME=value` arguments narrow the profile set for one job.
     local name="$1"
     shift
-    check_guest "$name" --allow-qualified -- env "$@" STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS=4 \
+    check_guest "$name" --allow-qualified -- env "$@" STRESS_DURATION="${CI_STRESS_SECONDS:-900}" STRESS_CPUS="$stress_cpus" \
         STRESS_KEEP_ARTIFACTS=1 bash scripts/gates/stress/stress_test.sh esp-stress
 }
 

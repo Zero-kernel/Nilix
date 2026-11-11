@@ -35,13 +35,20 @@ jobs:
           - {name: smp-32, group: extended-smp-32, timeout: 120}
           - {name: ext3, group: extended-ext3, timeout: 40}
           - {name: iommu, group: iommu, timeout: 60}
-          - {name: stress-memory, group: extended-stress, profile: memory, timeout: 70}
-          - {name: stress-cpu, group: extended-stress, profile: cpu, timeout: 70}
-          - {name: stress-smp, group: extended-stress, profile: smp, timeout: 70}
-          - {name: stress-thread, group: extended-stress, profile: thread, timeout: 70}
-          - {name: stress-process, group: extended-stress, profile: process, timeout: 70}
-          - {name: stress-block, group: extended-stress, profile: block, timeout: 120}
-          - {name: stress-combined, group: extended-stress, profile: combined, timeout: 70}
+          - {name: stress-memory, group: extended-stress, profile: memory, cpus: 4, timeout: 70}
+          - {name: stress-cpu, group: extended-stress, profile: cpu, cpus: 4, timeout: 70}
+          - {name: stress-smp, group: extended-stress, profile: smp, cpus: 4, timeout: 70}
+          - {name: stress-thread, group: extended-stress, profile: thread, cpus: 4, timeout: 70}
+          - {name: stress-process, group: extended-stress, profile: process, cpus: 4, timeout: 70}
+          - {name: stress-block, group: extended-stress, profile: block, cpus: 4, timeout: 120}
+          - {name: stress-combined, group: extended-stress, profile: combined, cpus: 4, timeout: 70}
+          # STRESS-7 also requires the scalable profiles at 16 guest vCPUs.
+          # Memory/process remain 1 vCPU and block 2, so their existing lanes
+          # already cover the fixed-topology part of the seven-profile matrix.
+          - {name: stress-cpu-16, group: extended-stress, profile: cpu, cpus: 16, timeout: 70}
+          - {name: stress-smp-16, group: extended-stress, profile: smp, cpus: 16, timeout: 70}
+          - {name: stress-thread-16, group: extended-stress, profile: thread, cpus: 16, timeout: 70}
+          - {name: stress-combined-16, group: extended-stress, profile: combined, cpus: 16, timeout: 70}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-kernel
@@ -52,6 +59,7 @@ jobs:
         env:
           CI_GROUP: ${{ matrix.lane.group }}
           CI_STRESS_PROFILE: ${{ matrix.lane.profile }}
+          CI_STRESS_CPUS: ${{ matrix.lane.cpus }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:

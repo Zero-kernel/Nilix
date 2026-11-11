@@ -1,4 +1,4 @@
-"""EXT-CI: the Extended workflow must keep one lane per stress profile."""
+"""EXT-CI: preserve every profile and the required stress CPU topologies."""
 from pathlib import Path
 import re
 import unittest
@@ -52,12 +52,25 @@ class ExtendedLaneTests(unittest.TestCase):
         stress = (ROOT / 'scripts/gates/stress/stress_test.sh').read_text(encoding='utf8')
         self.assertIn('STRESS_DURATION="${STRESS_DURATION:-900}"', stress)
 
-    def test_every_stress_profile_has_exactly_one_lane(self):
+    def test_every_stress_profile_keeps_its_original_lane(self):
         profiles = default_profiles()
         self.assertEqual(len(profiles), 7)
         self.assertEqual(entrypoint_profiles(), profiles)
-        stress = [lane['profile'] for lane in workflow_lanes() if lane['group'] == 'extended-stress']
+        stress = [lane['profile'] for lane in workflow_lanes()
+                  if lane['group'] == 'extended-stress' and lane.get('cpus') == '4']
         self.assertEqual(stress, profiles)
+
+    def test_scalable_stress_profiles_also_run_at_16_vcpus(self):
+        stress = [lane for lane in workflow_lanes() if lane['group'] == 'extended-stress']
+        self.assertEqual({lane.get('cpus', '4') for lane in stress}, {'4', '16'})
+        self.assertEqual([lane['profile'] for lane in stress if lane['cpus'] == '16'],
+                         ['cpu', 'smp', 'thread', 'combined'])
+        workflow = (ROOT / '.github/workflows/extended.yml').read_text(encoding='utf8')
+        lane_job = re.search(r'^  lane:\n(.*?)^  strict:', workflow, re.M | re.S)[1]
+        self.assertIn('CI_STRESS_CPUS: ${{ matrix.lane.cpus }}', lane_job)
+        self.assertRegex(lane_job, r'(?m)^        os: \[ubuntu-22\.04, ubuntu-24\.04\]$')
+        self.assertNotIn('continue-on-error', lane_job)
+        self.assertRegex(workflow, r'(?m)^    needs: \[lane\]$')
 
     def test_strict_job_is_diagnostic_and_outside_the_aggregate(self):
         workflow = (ROOT / '.github/workflows/extended.yml').read_text(encoding='utf8')
