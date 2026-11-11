@@ -22,7 +22,7 @@ Detailed commands, environment identities and artifact hashes are archived in th
 - **Extended CI, run 42978556364 on this source.**
   - Aggregate success, with every lane green. smp-8-16 and smp-32 are GATE-QUALIFIED on Ubuntu 22.04 and 24.04.
   - The strict diagnostic lanes FAIL as on main, with strict SMP-4 at 45/29 on both images.
-  - The retained `counts.json` show the seven network cases passing at 8, 16 and 32 vCPUs on both images, with passed=45 deferred=29 at each size. On main they are deferred, at 38/36.
+  - The retained `counts.json` show the seven network cases passing at 8, 16 and 32 vCPUs on both images, with passed=45 deferred=29 at each size. In main's 24.04 smp-8-16 artifact they are deferred, at 38/36.
 - **Budget.** Compared with main's Extended run 42950345865 on `297d7d5`:
   - smp-32 gate time: 4030.6 s → 4025.9 s (22.04) and 4251.6 s → 4223.9 s (24.04).
   - smp-8-16 gate time: 1945.9 s → 1963.2 s and 1926.4 s → 1961.9 s.
