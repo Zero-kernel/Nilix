@@ -2135,6 +2135,14 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let tlb = mm::tlb_shootdown::get_stats();
     let pt = mm::page_table::pt_lock_stats();
     let causes = mm::tlb_shootdown::diag_broadcast_causes();
+    let (passes, stacks, stack_max, hist, gaps) = kernel_core::rcu::diag_stack_drain_stats();
+    content
+        .write_fmt(format_args!(
+            "kstack_drain passes={} callbacks={} max={} h1={} h2={} h4={} h8={} h16={} g100us={} g1ms={} g10ms={} g100ms={} gmore={}\n",
+            passes, stacks, stack_max, hist[0], hist[1], hist[2], hist[3], hist[4],
+            gaps[0], gaps[1], gaps[2], gaps[3], gaps[4]
+        ))
+        .map_err(|_| FsError::NoSpace)?;
     content
         .write_fmt(format_args!(
             "tlb_shootdowns targeted={} broadcast={} ipis={} cr3_zero={} kstack={}\n\

@@ -1019,8 +1019,66 @@ fn drain_callbacks(done_epoch: u64, max_callbacks: usize) -> usize {
 /// observes the busy owner and drains nothing. A callback must not call
 /// `synchronize_rcu()`, which would spin forever trying to reacquire its own
 /// drain ownership; this matches the usual kernel RCU callback constraint.
+// C3 E2c diagnostic: kernel-stack callbacks per drain pass and the gaps
+// between consecutive kernel-stack callbacks, to size a batched flush.
+static DIAG_STACK_PASSES: AtomicU64 = AtomicU64::new(0);
+static DIAG_STACK_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static DIAG_STACK_MAX: AtomicU64 = AtomicU64::new(0);
+// Passes with 1, 2-3, 4-7, 8-15 and 16+ stack callbacks.
+static DIAG_STACK_HIST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+// Gaps (TSC) < 2.5e5, < 2.5e6, < 2.5e7, < 2.5e8 and the rest
+// (0.1/1/10/100 ms at 2.5 GHz).
+static DIAG_STACK_GAPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static DIAG_STACK_LAST_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// C3 E2c diagnostic: (passes, callbacks, max, pass histogram, gap histogram).
+pub fn diag_stack_drain_stats() -> (u64, u64, u64, [u64; 5], [u64; 5]) {
+    let load = |a: &[AtomicU64; 5]| core::array::from_fn(|i| a[i].load(Ordering::Relaxed));
+    (
+        DIAG_STACK_PASSES.load(Ordering::Relaxed),
+        DIAG_STACK_CALLBACKS.load(Ordering::Relaxed),
+        DIAG_STACK_MAX.load(Ordering::Relaxed),
+        load(&DIAG_STACK_HIST),
+        load(&DIAG_STACK_GAPS),
+    )
+}
+
+fn diag_note_stack_callback() {
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let last = DIAG_STACK_LAST_TSC.swap(now, Ordering::Relaxed);
+    if last != 0 {
+        let gap = now.saturating_sub(last);
+        let bucket = match gap {
+            0..250_000 => 0,
+            250_000..2_500_000 => 1,
+            2_500_000..25_000_000 => 2,
+            25_000_000..250_000_000 => 3,
+            _ => 4,
+        };
+        DIAG_STACK_GAPS[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn diag_note_stack_pass(stack: u64) {
+    if stack == 0 {
+        return;
+    }
+    DIAG_STACK_PASSES.fetch_add(1, Ordering::Relaxed);
+    DIAG_STACK_CALLBACKS.fetch_add(stack, Ordering::Relaxed);
+    DIAG_STACK_MAX.fetch_max(stack, Ordering::Relaxed);
+    let bucket = match stack {
+        1 => 0,
+        2..=3 => 1,
+        4..=7 => 2,
+        8..=15 => 3,
+        _ => 4,
+    };
+    DIAG_STACK_HIST[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
 fn drain_callbacks_inner(done_epoch: u64, max_callbacks: usize) -> usize {
     let mut count = 0;
+    let mut stack = 0u64;
 
     while count < max_callbacks {
         // Queued -> Running under the pool lock, then execute outside it. A
@@ -1030,6 +1088,10 @@ fn drain_callbacks_inner(done_epoch: u64, max_callbacks: usize) -> usize {
             break;
         };
 
+        if ready.slot_index < RCU_STACK_CALLBACK_CAPACITY {
+            stack += 1;
+            diag_note_stack_callback();
+        }
         (ready.callback)(ready.args);
 
         CALLBACKS.lock().finish_running(ready.slot_index);
@@ -1038,6 +1100,7 @@ fn drain_callbacks_inner(done_epoch: u64, max_callbacks: usize) -> usize {
         count += 1;
     }
 
+    diag_note_stack_pass(stack);
     count
 }
 
