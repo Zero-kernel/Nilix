@@ -59,6 +59,8 @@ STRESS_COMBINED_IO_WRITES_PER_ROUND="${STRESS_COMBINED_IO_WRITES_PER_ROUND:-16}"
 # thread: pthread waves per round and mutex acquisitions per thread.
 STRESS_THREAD_WAVES="${STRESS_THREAD_WAVES:-8}"
 STRESS_THREAD_ITERATIONS="${STRESS_THREAD_ITERATIONS:-2000}"
+# C3 E2 (#90), diagnostic branch only: thread workers fixed independently of vCPUs.
+STRESS_THREAD_WORKERS="${STRESS_THREAD_WORKERS:-}"
 
 STRESS_BLOCK_CRASH_ATTEMPTS="${STRESS_BLOCK_CRASH_ATTEMPTS:-12}"
 STRESS_BLOCK_KILL_OFFSETS_MS="${STRESS_BLOCK_KILL_OFFSETS_MS:-0,1,2,3,4,6,8,12,16,24,32,48}"
@@ -219,6 +221,7 @@ for numeric in \
     STRESS_BLOCK_ACTIVE_WAIT_MS STRESS_BLOCK_ACTIVE_POLL_US; do
     require_positive "$numeric" "${!numeric}"
 done
+[ -z "$STRESS_THREAD_WORKERS" ] || require_positive STRESS_THREAD_WORKERS "$STRESS_THREAD_WORKERS"
 require_nonnegative STRESS_HEARTBEAT_GRACE_MS "$STRESS_HEARTBEAT_GRACE_MS"
 case "$TRACE_POLICY" in full|phased) ;; *) blocked "NILIX_QEMU_TRACE must be full or phased" ;; esac
 [[ "$STRESS_MEM" =~ ^[1-9][0-9]*[KMG]?$ ]] \
@@ -324,7 +327,9 @@ profile_workers() {
     case "$1" in
         memory|process|block) echo 1 ;;
         # A thread wave needs two threads even on one vCPU.
-        thread) if [ "$STRESS_CPUS" -lt 2 ]; then echo 2; else echo "$STRESS_CPUS"; fi ;;
+        thread)
+            if [ -n "$STRESS_THREAD_WORKERS" ]; then echo "$STRESS_THREAD_WORKERS"
+            elif [ "$STRESS_CPUS" -lt 2 ]; then echo 2; else echo "$STRESS_CPUS"; fi ;;
         *) echo "$STRESS_CPUS" ;;
     esac
 }
