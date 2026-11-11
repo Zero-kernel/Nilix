@@ -13428,6 +13428,7 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
             // Kernel-stack mappings are shared through many distinct CR3 roots.
             // Broadcast before any physical reuse, even on a partial failure.
             if cleared != 0 {
+                mm::tlb_shootdown::diag_note_kstack_flush();
                 mm::flush_all_address_spaces();
             }
             exact && matched == KSTACK_PAGES

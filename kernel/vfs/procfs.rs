@@ -2134,13 +2134,16 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
     }
     let tlb = mm::tlb_shootdown::get_stats();
     let pt = mm::page_table::pt_lock_stats();
+    let causes = mm::tlb_shootdown::diag_broadcast_causes();
     content
         .write_fmt(format_args!(
-            "tlb_shootdowns targeted={} broadcast={} ipis={}\n\
+            "tlb_shootdowns targeted={} broadcast={} ipis={} cr3_zero={} kstack={}\n\
              pt_lock acquired={} contended={} busy={} wait_tsc={} wait_tsc_max={} hold_tsc={} hold_tsc_max={}\n",
             tlb.targeted_shootdowns,
             tlb.broadcast_fallbacks,
             tlb.shootdown_ipis,
+            causes.0,
+            causes.1,
             pt.acquired,
             pt.contended,
             pt.busy,

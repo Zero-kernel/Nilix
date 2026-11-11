@@ -109,6 +109,22 @@ static STATS_BROADCAST_FALLBACK: AtomicU64 = AtomicU64::new(0);
 /// C3 E1 (#90): shootdown IPIs sent; divided by the two counters above, the
 /// mean fanout of a remote dispatch.
 static STATS_SHOOTDOWN_IPIS: AtomicU64 = AtomicU64::new(0);
+// C3 E2 diagnostic: broadcast fallbacks by cause.
+static STATS_BROADCAST_CR3_ZERO: AtomicU64 = AtomicU64::new(0);
+static STATS_KSTACK_FLUSHES: AtomicU64 = AtomicU64::new(0);
+
+/// C3 E2 diagnostic: (CR3-0 broadcasts, kernel-stack teardown flushes).
+pub fn diag_broadcast_causes() -> (u64, u64) {
+    (
+        STATS_BROADCAST_CR3_ZERO.load(Ordering::Relaxed),
+        STATS_KSTACK_FLUSHES.load(Ordering::Relaxed),
+    )
+}
+
+/// C3 E2 diagnostic: count one kernel-stack teardown flush.
+pub fn diag_note_kstack_flush() {
+    STATS_KSTACK_FLUSHES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Registered function used to send the TLB shootdown IPI
 /// Stored as usize to avoid function pointer in static
@@ -581,6 +597,9 @@ fn collect_target_cpus(target_cr3: u64) -> CpuMask {
     // Fallback: broadcast to all online CPUs except self
     // This handles: CR3=0, CR3 not tracked, or empty tracked mask
     STATS_BROADCAST_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    if target_cr3 == 0 {
+        STATS_BROADCAST_CR3_ZERO.fetch_add(1, Ordering::Relaxed);
+    }
 
     for cpu in 0..max_cpus() {
         if cpu == self_id {
