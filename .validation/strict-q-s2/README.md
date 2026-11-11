@@ -4,7 +4,7 @@ Source: `45924d60c7a3581526e7c5f6d103bec00cc3fa39` on `2e09191` (main after #99)
 
 Detailed commands, environment identities and artifact hashes are archived in the private documentation repository:
 
-[Immutable receipt archive](https://github.com/Zero-kernel/Nilix-docs-private/tree/d58fdb1c04d3da567680a5d908c79cedd49ad1ab/validation/strict-q-s2) · [Archive PR](https://github.com/Zero-kernel/Nilix-docs-private/pull/14)
+[Immutable receipt archive](https://github.com/Zero-kernel/Nilix-docs-private/tree/8b1854057a907bd0c112aea50173d7d26ef14950/validation/strict-q-s2) · [Archive PR](https://github.com/Zero-kernel/Nilix-docs-private/pull/14)
 
 ## Recorded results and limits
 
@@ -18,7 +18,10 @@ Detailed commands, environment identities and artifact hashes are archived in th
   - SMP-2 is QUALIFIED with the same change (38/36 to 45/29).
   - The runtime group is GATE-QUALIFIED on both sides.
   - Times to verdict are unchanged within a second (parent vs S2): SMP-4 30.6 s vs 30.1 s, SMP-2 27.9 s vs 27.3 s.
-  - The 8/16-vCPU harness is BLOCKED on this host before QEMU starts, because `zstd` is not installed. CI covers it.
+  - The 8/16/32-vCPU extended harness was then run in completion mode, against the parent. The first batch's BLOCKED rows came from leaving the host's `zstd` off PATH.
+    - All runs are QUALIFIED, 38/36 on the parent and 45/29 on S2.
+    - Times to verdict (S2 vs parent): 37.7 s vs 36.1 s at 8 vCPUs, 286.6 s vs 297.0 s at 16, and 699.5 s vs 740.9 s at 32.
+    - The NIC adds no measurable time.
 - **Extended CI, run 42978556364 on this source.**
   - Aggregate success, with every lane green. smp-8-16 and smp-32 are GATE-QUALIFIED on Ubuntu 22.04 and 24.04.
   - The strict diagnostic lanes FAIL as on main, with strict SMP-4 at 45/29 on both images.
@@ -26,9 +29,11 @@ Detailed commands, environment identities and artifact hashes are archived in th
 - **Budget.** Compared with main's Extended run 42950345865 on `297d7d5`:
   - smp-32 gate time: 4030.6 s → 4025.9 s (22.04) and 4251.6 s → 4223.9 s (24.04).
   - smp-8-16 gate time: 1945.9 s → 1963.2 s and 1926.4 s → 1961.9 s.
-  - These are window-mode gates, and QUALIFIED means the suite completed inside each window: 900 s at 8 and 16 vCPUs, 3600 s at 32. The completion offset inside a window is not recorded, so the 32-vCPU margin itself is not measured.
+  - These are window-mode gates, and QUALIFIED means the suite completed inside each window: 900 s at 8 and 16 vCPUs, 3600 s at 32.
+  - CI does not record when the suite completed inside a window, so the CI margin at 32 vCPUs is not measured.
+  - The dev-host completion times above bound the NIC's relative cost: none is measurable. They do not give the CI margin, because CI runners are smaller.
   - The 22.04 smp-8-16 job grew from 40 to 46 minutes. The growth is in its `final-owner-16` gate (243.6 s → 539.5 s), whose harness this change does not touch.
 
 None of these results is a strict pass. Ordinary builds and public CI do not require the private archive.
 
-The local-checks and gates receipts have aggregate status 1, from the unrelated unittest import error and from the remaining strict deferrals plus the blocked dev-host extended runs respectively. Individual statuses and log hashes are preserved.
+The local-checks and gates receipts have aggregate status 1, from the unrelated unittest import error and from the remaining strict deferrals respectively. The extended receipt has status 3: all QUALIFIED. Individual statuses and log hashes are preserved.
