@@ -2053,7 +2053,8 @@ int main(void) {
         emit("NILIX_STRESS_V2_HEARTBEAT run=%016" PRIx64 " profile=%s seq=%" PRIu64 " cycles=%" PRIu64
              " ops=%" PRIu64 " checksum=%016" PRIx64,
              config.run_id, profile_name(), seq, cycles, cumulative_ops, checksum);
-        if (seq % SCHEDSTAT_SAMPLE_ROUNDS == 1u) {
+        /* C3 E2 (#90), diagnostic branch only: sample every round. */
+        if (seq != 0u) {
             emit_schedstat(seq);
         }
         if (config.profile == PROFILE_BLOCK) {
