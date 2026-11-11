@@ -6808,6 +6808,41 @@ pub fn note_task_migration(cpu: usize) {
     }
 }
 
+/// C3 E1 (#90): reschedule and TLB-shootdown IPIs sent to each CPU, and the
+/// handler runs on it. Counting by target needs no LAPIC read on the sending
+/// side; sent minus handled is what the LAPIC coalesced or is still pending.
+/// Statistics only: Relaxed, wrap is harmless.
+static CPU_IPIS_SENT: [AtomicU64; cpu_local::max_cpus()] =
+    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
+static CPU_IPIS_HANDLED: [AtomicU64; cpu_local::max_cpus()] =
+    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
+
+/// Record one reschedule or TLB-shootdown IPI sent to `cpu` (IRQ-safe, lock-free).
+pub fn note_ipi_sent(cpu: usize) {
+    if let Some(counter) = CPU_IPIS_SENT.get(cpu) {
+        // lint-fetch-add: allow (statistics counter)
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record one reschedule or TLB-shootdown IPI handler run on `cpu`.
+pub fn note_ipi_handled(cpu: usize) {
+    if let Some(counter) = CPU_IPIS_HANDLED.get(cpu) {
+        // lint-fetch-add: allow (statistics counter)
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(IPIs sent to, IPIs handled on)` `cpu` since boot.
+pub fn cpu_ipi_counters(cpu: usize) -> (u64, u64) {
+    let load = |counters: &[AtomicU64]| {
+        counters
+            .get(cpu)
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    };
+    (load(&CPU_IPIS_SENT), load(&CPU_IPIS_HANDLED))
+}
+
 /// The CPUs currently online, as a bit mask (for `/proc/schedstat`).
 pub fn sched_online_cpu_mask() -> u64 {
     cpu_local::online_cpu_mask()

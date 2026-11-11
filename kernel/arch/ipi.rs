@@ -239,6 +239,10 @@ pub fn send_ipi(target_cpu: usize, ipi_type: IpiType) {
             apic::send_ipi_raw(dest_lapic, ipi_type.vector(), apic::icr_delivery::FIXED);
         }
         bump_stat(ipi_type, 1);
+        // C3 E1 (#90): per-target counts for /proc/schedstat.
+        if matches!(ipi_type, IpiType::Reschedule | IpiType::TlbShootdown) {
+            kernel_core::process::note_ipi_sent(target_cpu);
+        }
     }
 }
 

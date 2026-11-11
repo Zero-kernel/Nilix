@@ -1808,6 +1808,91 @@ impl RuntimeTest for IpiPingPongTest {
     }
 }
 
+/// C3 E1 (#90): the `/proc/schedstat` IPI, shootdown and `PT_LOCK` counters
+/// advance when their events happen.
+struct SchedstatEventCountersTest;
+
+impl RuntimeTest for SchedstatEventCountersTest {
+    fn name(&self) -> &'static str {
+        "schedstat_event_counters"
+    }
+
+    // An IPI check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
+    fn description(&self) -> &'static str {
+        "IPI, TLB shootdown and PT_LOCK counters advance on their events"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::ipi::{send_ipi, IpiType};
+        use arch::{current_cpu_id, max_cpus, num_online_cpus};
+        use kernel_core::process::cpu_ipi_counters;
+        use mm::page_table::{pt_lock_stats, with_pt_lock};
+        use mm::tlb_shootdown::{flush_all_address_spaces, get_stats, is_cpu_online};
+
+        let online = num_online_cpus();
+        let self_cpu = current_cpu_id();
+        let Some(target) = (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) else {
+            return TestResult::Fail(String::from("No online AP found"));
+        };
+
+        let (sent_before, handled_before) = cpu_ipi_counters(target);
+        send_ipi(target, IpiType::Reschedule);
+        let mut handled = handled_before;
+        for _ in 0..5_000_000usize {
+            handled = cpu_ipi_counters(target).1;
+            if handled > handled_before {
+                break;
+            }
+            spin_loop();
+        }
+        let sent = cpu_ipi_counters(target).0;
+        if sent <= sent_before || handled <= handled_before {
+            return TestResult::Fail(alloc::format!(
+                "CPU {} IPI counters did not advance: sent {}->{}, handled {}->{}",
+                target,
+                sent_before,
+                sent,
+                handled_before,
+                handled
+            ));
+        }
+
+        // A CR3-0 request always falls back to every other online CPU and
+        // waits for each to acknowledge.
+        let tlb_before = get_stats();
+        flush_all_address_spaces();
+        let tlb = get_stats();
+        let ipis = tlb.shootdown_ipis - tlb_before.shootdown_ipis;
+        if tlb.broadcast_fallbacks <= tlb_before.broadcast_fallbacks || ipis < (online - 1) as u64 {
+            return TestResult::Fail(alloc::format!(
+                "broadcast shootdown not counted: fallbacks {}->{}, {} IPIs for {} online CPUs",
+                tlb_before.broadcast_fallbacks,
+                tlb.broadcast_fallbacks,
+                ipis,
+                online
+            ));
+        }
+
+        let pt_before = pt_lock_stats();
+        with_pt_lock(spin_loop);
+        let pt = pt_lock_stats();
+        if pt.acquired <= pt_before.acquired || pt.hold_tsc <= pt_before.hold_tsc {
+            return TestResult::Fail(alloc::format!(
+                "PT_LOCK use not counted: acquired {}->{}, hold_tsc {}->{}",
+                pt_before.acquired,
+                pt.acquired,
+                pt_before.hold_tsc,
+                pt.hold_tsc
+            ));
+        }
+        TestResult::Pass
+    }
+}
+
 /// Ensure TLB shootdown reaches remote CPUs and is acknowledged
 struct TlbShootdownCoherencyTest;
 
@@ -2370,6 +2455,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &NetworkLoopbackTest,
         &SmpOnlineTest,
         &IpiPingPongTest,
+        &SchedstatEventCountersTest,
         &TlbShootdownCoherencyTest,
         &CpusetIsolationTest,
         &SchedulerAffinityTest,

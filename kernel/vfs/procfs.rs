@@ -2081,6 +2081,15 @@ impl Inode for ProcSchedstatInode {
 /// One line per online CPU (`cpuN switches=S migrations_in=M`), then the RCU
 /// callback backlog, the W-3 wait over-wake count and the #92 idle self-arm
 /// count. Every value is read lock-free.
+///
+/// C3 E1 (#90) appends four lines:
+/// - `ipis_sent` and `ipis_handled`: reschedule and TLB-shootdown IPIs sent to
+///   each online CPU and handled on it, one value per CPU in the order of the
+///   `cpuN` lines (compact, so the 2 KiB `syscall_test` reader keeps room);
+/// - `tlb_shootdowns targeted= broadcast= ipis=`: remote target scans by
+///   outcome, and the shootdown IPIs sent, resends included;
+/// - `pt_lock acquired= contended= busy= wait_tsc= wait_tsc_max= hold_tsc=
+///   hold_tsc_max=`: global page-table lock use, in TSC cycles.
 fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let mut content = AdmittedString::new(HeapClass::Procfs);
     let online = process::sched_online_cpu_mask();
@@ -2105,6 +2114,40 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
             kernel_core::rcu::callback_backlog(),
             process::wait_over_wake_count(),
             process::idle_rearm_count()
+        ))
+        .map_err(|_| FsError::NoSpace)?;
+    let ipi_lines: [(&str, fn((u64, u64)) -> u64); 2] = [
+        ("ipis_sent", |(sent, _)| sent),
+        ("ipis_handled", |(_, handled)| handled),
+    ];
+    for (label, pick) in ipi_lines {
+        content.try_push_str(label).map_err(|_| FsError::NoSpace)?;
+        let mut remaining = online;
+        while remaining != 0 {
+            let cpu = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            content
+                .write_fmt(format_args!(" {}", pick(process::cpu_ipi_counters(cpu))))
+                .map_err(|_| FsError::NoSpace)?;
+        }
+        content.try_push_str("\n").map_err(|_| FsError::NoSpace)?;
+    }
+    let tlb = mm::tlb_shootdown::get_stats();
+    let pt = mm::page_table::pt_lock_stats();
+    content
+        .write_fmt(format_args!(
+            "tlb_shootdowns targeted={} broadcast={} ipis={}\n\
+             pt_lock acquired={} contended={} busy={} wait_tsc={} wait_tsc_max={} hold_tsc={} hold_tsc_max={}\n",
+            tlb.targeted_shootdowns,
+            tlb.broadcast_fallbacks,
+            tlb.shootdown_ipis,
+            pt.acquired,
+            pt.contended,
+            pt.busy,
+            pt.wait_tsc,
+            pt.wait_tsc_max,
+            pt.hold_tsc,
+            pt.hold_tsc_max
         ))
         .map_err(|_| FsError::NoSpace)?;
     Ok(content)
