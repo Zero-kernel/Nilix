@@ -2090,6 +2090,12 @@ impl Inode for ProcSchedstatInode {
 ///   outcome, and the shootdown IPIs sent, resends included;
 /// - `pt_lock acquired= contended= busy= wait_tsc= wait_tsc_max= hold_tsc=
 ///   hold_tsc_max=`: global page-table lock use, in TSC cycles.
+///
+/// These are independent cumulative samples, not a coherent snapshot. IPI
+/// delivery can precede send accounting, and events can occur between reads,
+/// so `ipis_handled` may exceed `ipis_sent`. LAPIC coalescing also means their
+/// difference cannot measure pending or dropped requests. Compare same-boot
+/// interval deltas for each CPU's counter separately, allowing for u64 wrap.
 fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let mut content = AdmittedString::new(HeapClass::Procfs);
     let online = process::sched_online_cpu_mask();

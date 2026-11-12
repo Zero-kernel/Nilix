@@ -6810,8 +6810,11 @@ pub fn note_task_migration(cpu: usize) {
 
 /// C3 E1 (#90): reschedule and TLB-shootdown IPIs sent to each CPU, and the
 /// handler runs on it. Counting by target needs no LAPIC read on the sending
-/// side; sent minus handled is what the LAPIC coalesced or is still pending.
-/// Statistics only: Relaxed, wrap is harmless.
+/// side. These cumulative counts are sampled independently: handled may
+/// temporarily exceed sent because send accounting follows the ICR write or
+/// events occur between reads. The LAPIC can also coalesce sends, so their
+/// difference is not a pending- or dropped-IPI count.
+/// Statistics only: Relaxed, wrapping modulo 2^64.
 static CPU_IPIS_SENT: [AtomicU64; cpu_local::max_cpus()] =
     [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
 static CPU_IPIS_HANDLED: [AtomicU64; cpu_local::max_cpus()] =
@@ -6834,6 +6837,10 @@ pub fn note_ipi_handled(cpu: usize) {
 }
 
 /// `(IPIs sent to, IPIs handled on)` `cpu` since boot.
+///
+/// The two loads are not a coherent snapshot. For samples from the same boot,
+/// compare each counter's wrapping interval delta separately; subtracting the
+/// two fields does not measure outstanding or lost IPIs.
 pub fn cpu_ipi_counters(cpu: usize) -> (u64, u64) {
     let load = |counters: &[AtomicU64]| {
         counters

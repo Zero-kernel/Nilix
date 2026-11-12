@@ -28,3 +28,11 @@ Detailed commands, environment identities and artifact hashes are archived in th
 None of these results is a strict pass. E2–E4 (#90) do the measurements. Ordinary builds and public CI do not require the private archive.
 
 The local-checks, gates and paired-run receipts have aggregate status 1, from the unrelated unittest import error, the remaining strict deferrals, and the 16-vCPU deadlines respectively. Individual statuses and log hashes are preserved.
+
+## Interpreting IPI samples
+
+`ipis_sent` and `ipis_handled` are independent cumulative event counts for each CPU, not a coherent snapshot. A target can handle an IPI before the sender records its ICR write, and events can occur between procfs reads. A sample with `sent=10` and `handled=11` is therefore valid. LAPIC coalescing also prevents the difference from measuring pending or dropped IPIs, even after send accounting catches up.
+
+E2–E4 analysis should compare each CPU's send and handler counts over an interval separately, using unsigned 64-bit wrapping deltas for samples from the same boot and resetting the baseline after a reboot. Neither a single sample's difference nor the difference of the two interval deltas is an exact backlog or loss metric. Readers must accept `handled > sent` without unsigned underflow, a fabricated backlog, or a delivery-failure verdict.
+
+Existing readers retain the raw counters and do not subtract them. This clarification changes only documentation and Rust doc comments; the recorded runtime results above remain bound to their original sources.
