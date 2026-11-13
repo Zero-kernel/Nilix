@@ -133,6 +133,11 @@ enum CallbackState {
     /// cannot alias a mapping or physical block whose reclamation was not
     /// proven safe.
     Quarantined,
+    /// C3 (#90): a stack callback cleared its leaves and left the TLB flush
+    /// to the kernel-stack flush batch (`kstack_flush`). The PID slot stays
+    /// occupied, so the PID and its virtual stack slot cannot be handed out
+    /// again before that flush; the batch then frees the slot or quarantines it.
+    FlushPending,
 }
 
 #[derive(Clone, Copy)]
@@ -317,6 +322,11 @@ impl<const CAPACITY: usize> CallbackPool<CAPACITY> {
             // live.  `stack_slots` deliberately remains charged.
             return;
         }
+        if self.slots[index].state == CallbackState::FlushPending {
+            // C3: the flush batch owns the slot until its flush; it stays
+            // occupied and charged until `release_flush_pending_stack`.
+            return;
+        }
         assert_eq!(
             self.slots[index].state,
             CallbackState::Running,
@@ -344,6 +354,47 @@ impl<const CAPACITY: usize> CallbackPool<CAPACITY> {
         slot.target_epoch = 0;
         slot.callback = None;
         slot.args = [0; 2];
+        true
+    }
+
+    /// C3: hand a dequeued kernel-stack callback slot to the flush batch.
+    /// Only `Running -> FlushPending` is accepted.
+    fn defer_running_stack_release(&mut self, index: usize) -> bool {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if slot.state != CallbackState::Running || slot.class != CallbackClass::KernelStack {
+            return false;
+        }
+        slot.state = CallbackState::FlushPending;
+        true
+    }
+
+    /// C3: free a slot whose stack the flush batch has flushed and returned.
+    /// Only `FlushPending -> Free` is accepted.
+    fn release_flush_pending_stack(&mut self, index: usize) -> bool {
+        let Some(slot) = self.slots.get(index) else {
+            return false;
+        };
+        if slot.state != CallbackState::FlushPending || slot.class != CallbackClass::KernelStack {
+            return false;
+        }
+        self.slots[index] = CallbackSlot::EMPTY;
+        assert!(self.stack_slots > 0, "RCU: stack slot count underflow");
+        self.stack_slots -= 1;
+        true
+    }
+
+    /// C3: permanently pin a slot whose block the buddy allocator rejected
+    /// after the batch flush. Only `FlushPending -> Quarantined` is accepted.
+    fn quarantine_flush_pending_stack(&mut self, index: usize) -> bool {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if slot.state != CallbackState::FlushPending || slot.class != CallbackClass::KernelStack {
+            return false;
+        }
+        slot.state = CallbackState::Quarantined;
         true
     }
 
@@ -837,6 +888,64 @@ pub(crate) fn quarantine_running_stack_callback(pid: usize) {
     );
 }
 
+fn stack_slot_index(pid: usize) -> usize {
+    pid.checked_sub(1)
+        .filter(|index| *index < RCU_STACK_CALLBACK_CAPACITY)
+        .unwrap_or_else(|| panic!("RCU: invalid PID for a kernel-stack slot"))
+}
+
+/// C3 (#90): keep the currently running stack callback's PID slot occupied
+/// after the callback returns, until the kernel-stack flush batch has flushed
+/// the TLB for the leaves the callback cleared.
+///
+/// Called by the callback itself. A failed transition is fatal: returning
+/// would free the slot and reopen PID/virtual-address reuse before the flush.
+pub(crate) fn defer_running_stack_release(pid: usize) {
+    let deferred = CALLBACKS
+        .lock()
+        .defer_running_stack_release(stack_slot_index(pid));
+    assert!(
+        deferred,
+        "RCU: failed to defer the running kernel-stack callback's release"
+    );
+}
+
+/// C3: free the PID slot of a stack that the flush batch has flushed and
+/// returned to the buddy allocator. Fatal on any other slot state.
+///
+/// The caller holds drain ownership, so this cannot run between a callback's
+/// `defer_running_stack_release` and the drainer's `finish_running`.
+pub(crate) fn release_flush_pending_stack(pid: usize) {
+    let released = CALLBACKS
+        .lock()
+        .release_flush_pending_stack(stack_slot_index(pid));
+    assert!(
+        released,
+        "RCU: kernel-stack slot was not awaiting its batched flush"
+    );
+}
+
+/// C3: permanently pin the PID slot of a flushed stack whose block the buddy
+/// allocator rejected. Fatal on any other slot state.
+pub(crate) fn quarantine_flush_pending_stack(pid: usize) {
+    let quarantined = CALLBACKS
+        .lock()
+        .quarantine_flush_pending_stack(stack_slot_index(pid));
+    assert!(
+        quarantined,
+        "RCU: failed to quarantine a kernel-stack slot awaiting its batched flush"
+    );
+}
+
+/// C3: run `f` with exclusive drain ownership, spinning for it as
+/// `synchronize_rcu()` does. No callback runs and no drain epilogue starts
+/// while `f` runs. Must not be called from a callback, which would spin
+/// forever on its own drainer's ownership.
+pub(crate) fn with_drain_ownership<R>(f: impl FnOnce() -> R) -> R {
+    let _drain_owner = DrainOwnerGuard::acquire_spin();
+    f()
+}
+
 fn call_rcu_class(
     mut permit: RcuCallbackPermit,
     expected_class: CallbackClass,
@@ -1038,6 +1147,11 @@ fn drain_callbacks_inner(done_epoch: u64, max_callbacks: usize) -> usize {
         count += 1;
     }
 
+    // C3 (#90): every stack callback above has had its `finish_running`, and
+    // drain ownership is still held, so the kernel-stack flush batch may
+    // complete here if it is full or old enough.
+    crate::kstack_flush::drain_epilogue();
+
     count
 }
 
@@ -1063,7 +1177,8 @@ fn rcu_callback_self_test_noop(_args: [usize; 2]) {}
 /// start and does not place the 1.4 MiB production arena on the 16 KiB kernel
 /// stack. Covers class capacity exhaustion, Reserved cancellation (the same
 /// primitive used by permit `Drop`), double-release refusal, physical ring
-/// wrap, epoch readiness, FIFO, and Queued -> Running -> Free balance.
+/// wrap, epoch readiness, FIFO, Queued -> Running -> Free balance, the
+/// quarantine pin, and the C3 Running -> FlushPending -> Free hand-off.
 pub fn run_rcu_callback_pool_self_test() {
     const TEST_CAPACITY: usize = 6;
     const TEST_STACK_END: usize = 2;
@@ -1159,6 +1274,34 @@ pub fn run_rcu_callback_pool_self_test() {
         "RCU self-test recycled a quarantined PID slot"
     );
 
+    // C3: a stack callback that leaves its TLB flush to the flush batch keeps
+    // its PID slot occupied across `finish_running`, until the batch releases it.
+    assert!(pool.reserve_exact(CallbackClass::KernelStack, 1));
+    pool.enqueue_reserved(1, 21, rcu_callback_self_test_noop, [2, 0]);
+    let deferred = pool
+        .pop_ready(21)
+        .expect("RCU self-test deferred callback ready");
+    assert!(
+        !pool.release_flush_pending_stack(deferred.slot_index),
+        "RCU self-test released a Running slot as flush-pending"
+    );
+    assert!(pool.defer_running_stack_release(deferred.slot_index));
+    pool.finish_running(deferred.slot_index);
+    assert_eq!(pool.slots[1].state, CallbackState::FlushPending);
+    assert_eq!(pool.stack_slots, 2);
+    assert!(
+        !pool.reserve_exact(CallbackClass::KernelStack, 1),
+        "RCU self-test recycled a PID slot before its batched flush"
+    );
+    assert!(pool.release_flush_pending_stack(1));
+    assert!(
+        !pool.release_flush_pending_stack(1),
+        "RCU double flush-pending release accepted"
+    );
+    assert_eq!(pool.stack_slots, 1);
+    assert!(pool.reserve_exact(CallbackClass::KernelStack, 1));
+    assert!(pool.release_reserved(1));
+
     // Epoch exhaustion must never mutate through u64::MAX.  Exercise a local
     // atomic so the production epoch remains untouched.
     let epoch = AtomicU64::new(u64::MAX - 1);
@@ -1169,6 +1312,97 @@ pub fn run_rcu_callback_pool_self_test() {
         u64::MAX,
         "RCU epoch allocator wrapped or mutated on exhaustion"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CAPACITY: usize = 4;
+
+    /// Reserve, queue and dequeue slot `index`, leaving it Running.
+    fn run_slot(pool: &mut CallbackPool<CAPACITY>, class: CallbackClass, index: usize, epoch: u64) {
+        assert!(pool.reserve_exact(class, index));
+        pool.enqueue_reserved(index, epoch, rcu_callback_self_test_noop, [index, 0]);
+        let ready = pool.pop_ready(epoch).expect("queued callback is ready");
+        assert_eq!(ready.slot_index, index);
+    }
+
+    #[test]
+    fn rcu_callback_pool_self_test_passes_hosted() {
+        run_rcu_callback_pool_self_test();
+    }
+
+    #[test]
+    fn c3_flush_pending_slot_stays_occupied_until_the_batch_releases_it() {
+        let mut pool = CallbackPool::<CAPACITY>::new();
+        run_slot(&mut pool, CallbackClass::KernelStack, 0, 5);
+        assert!(pool.defer_running_stack_release(0));
+        assert_eq!(pool.slots[0].state, CallbackState::FlushPending);
+
+        // The drainer's epilogue for the callback leaves the slot to the batch.
+        pool.finish_running(0);
+        assert_eq!(pool.slots[0].state, CallbackState::FlushPending);
+        assert_eq!(pool.stack_slots, 1);
+        assert!(!pool.reserve_exact(CallbackClass::KernelStack, 0));
+        assert!(!pool.release_reserved(0));
+        assert!(!pool.is_pristine());
+
+        assert!(pool.release_flush_pending_stack(0));
+        assert_eq!(pool.stack_slots, 0);
+        assert!(pool.is_pristine());
+        assert!(pool.reserve_exact(CallbackClass::KernelStack, 0));
+    }
+
+    #[test]
+    fn c3_flush_pending_slot_can_only_be_released_or_quarantined() {
+        let mut pool = CallbackPool::<CAPACITY>::new();
+        run_slot(&mut pool, CallbackClass::KernelStack, 0, 5);
+        assert!(pool.defer_running_stack_release(0));
+        assert!(!pool.defer_running_stack_release(0));
+        assert!(!pool.quarantine_running_stack(0));
+        pool.finish_running(0);
+
+        assert!(pool.quarantine_flush_pending_stack(0));
+        assert_eq!(pool.slots[0].state, CallbackState::Quarantined);
+        assert_eq!(pool.stack_slots, 1, "a quarantined slot stays charged");
+        assert!(!pool.release_flush_pending_stack(0));
+        assert!(!pool.quarantine_flush_pending_stack(0));
+        assert!(!pool.reserve_exact(CallbackClass::KernelStack, 0));
+    }
+
+    #[test]
+    fn c3_flush_pending_transitions_refuse_every_other_state() {
+        let mut pool = CallbackPool::<CAPACITY>::new();
+        // 0 stays Free, 1 is Reserved, 2 is Queued, and 3 is a Running
+        // callback of the general class.
+        assert!(pool.reserve_exact(CallbackClass::KernelStack, 1));
+        assert!(pool.reserve_exact(CallbackClass::KernelStack, 2));
+        pool.enqueue_reserved(2, 9, rcu_callback_self_test_noop, [2, 0]);
+        let mut general = CallbackPool::<CAPACITY>::new();
+        run_slot(&mut general, CallbackClass::General, 3, 5);
+
+        for index in 0..=CAPACITY {
+            assert!(!pool.defer_running_stack_release(index), "slot {index}");
+            assert!(!pool.release_flush_pending_stack(index), "slot {index}");
+            assert!(!pool.quarantine_flush_pending_stack(index), "slot {index}");
+        }
+        assert!(!general.defer_running_stack_release(3));
+        assert!(!general.release_flush_pending_stack(3));
+        assert!(!general.quarantine_flush_pending_stack(3));
+
+        // A quarantined slot is never handed to the batch.
+        let mut quarantined = CallbackPool::<CAPACITY>::new();
+        run_slot(&mut quarantined, CallbackClass::KernelStack, 0, 5);
+        assert!(quarantined.quarantine_running_stack(0));
+        assert!(!quarantined.defer_running_stack_release(0));
+        assert!(!quarantined.release_flush_pending_stack(0));
+
+        assert_eq!(pool.stack_slots, 2);
+        assert_eq!(pool.slots[1].state, CallbackState::Reserved);
+        assert_eq!(pool.slots[2].state, CallbackState::Queued);
+        assert_eq!(general.slots[3].state, CallbackState::Running);
+    }
 }
 
 // ============================================================================
