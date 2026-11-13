@@ -116,6 +116,8 @@ run_smp_test() {
 
     run_gate_qemu "$timeout_val" "runtime" "$QEMU" -bios "$OVMF" \
         -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
+        -netdev user,id=net0,restrict=on,ipv6=off \
+        -device virtio-net-pci,netdev=net0,romfile= \
         -smp "$cpu_count" \
         -m 512M -vga std -no-reboot -no-shutdown \
         -cpu qemu64,+smep,+smap,+umip,+rdrand \

@@ -92,6 +92,8 @@ python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser
 
 run_gate_qemu "$TO" "runtime" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
+    -netdev user,id=net0,restrict=on,ipv6=off \
+    -device virtio-net-pci,netdev=net0,romfile= \
     -smp 2 \
     -m 512M -vga std -no-reboot -no-shutdown \
     -cpu qemu64,+smep,+smap,+umip,+rdrand \

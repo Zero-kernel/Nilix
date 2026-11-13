@@ -439,6 +439,16 @@ exit 0
         self.assertIn("-machine\nq35\n", arguments)
         self.assertIn("-device\nintel-iommu,intremap=on\n", arguments)
 
+    def test_runtime_harnesses_attach_the_restricted_user_network(self):
+        # STRICT-Q D2(a): kernel_test.sh and the three SMP harnesses give the guest a
+        # virtio-net eth0; extending boot_check.sh is a separate, undecided proposal.
+        netdev = "-netdev\nuser,id=net0,restrict=on,ipv6=off\n-device\nvirtio-net-pci,netdev=net0,romfile=\n"
+        for name, attached in (("kernel_test.sh", True), ("smp_test.sh", True), ("smp_test_4core.sh", True),
+                               ("extended_smp_test.sh", True), ("boot_check.sh", False)):
+            with self.subTest(script=name):
+                self.assert_gate(self.run_gate(name), 0)
+                self.assertEqual(netdev in (self.work / "qemu.arguments").read_text(), attached)
+
     def test_extended_aggregate_does_not_turn_qualified_into_pass(self):
         self.assert_gate(self.run_gate("extended_smp_test.sh", second_serial=QUALIFIED), 3)
         self.assert_gate(self.run_gate("extended_smp_test.sh", FAILED, second_serial=""), 1)
