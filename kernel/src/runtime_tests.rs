@@ -1956,6 +1956,199 @@ impl RuntimeTest for TlbShootdownCoherencyTest {
     }
 }
 
+/// C3 repair (#90): a reclaimed kernel stack keeps its frames and its PID
+/// slot until the batched TLB flush, and that flush gives both back.
+///
+/// The boot suite runs before the BSP enables interrupts and before any AP
+/// drains deferred work: no tick ages the batch and no other CPU completes it,
+/// so every completion below is this test's own. Run later from the kernel
+/// shell, another CPU can complete the batch or move the free-page count
+/// inside the test's window and fail it.
+struct KstackFlushBatchTest;
+
+impl KstackFlushBatchTest {
+    /// Bound on waiting for a grace period, in TSC cycles (as the ST-K2-P2
+    /// oracles bound their pauses): a stalled CPU fails the test, not the boot.
+    const DRAIN_TSC: u64 = 10_000_000_000;
+
+    /// Run every queued RCU callback. With its interrupts off the BSP reports
+    /// its own quiescent states; the APs report theirs from their ticks.
+    fn drain_rcu() -> bool {
+        use kernel_core::rcu::{callback_backlog, poll, rcu_quiescent_state};
+        use kernel_core::time::read_tsc;
+
+        let start = read_tsc();
+        loop {
+            rcu_quiescent_state();
+            poll();
+            if callback_backlog() == 0 {
+                return true;
+            }
+            if read_tsc().saturating_sub(start) > Self::DRAIN_TSC {
+                return false;
+            }
+            spin_loop();
+        }
+    }
+}
+
+impl RuntimeTest for KstackFlushBatchTest {
+    fn name(&self) -> &'static str {
+        "kstack_flush_batch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Reclaimed kernel stacks keep their frames and PID slots until the batched TLB flush"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::kstack_flush::{complete_now, stats};
+        use kernel_core::process::{
+            allocate_kernel_stack, free_kernel_stack, KernelStackError, PID_MAX,
+        };
+
+        const STACKS: usize = 3;
+        let free_pages =
+            || mm::buddy_allocator::get_allocator_stats().map(|buddy| buddy.free_pages);
+        let stalled = || TestResult::Fail(String::from("RCU callbacks did not drain"));
+
+        // Earlier boot work may have left callbacks queued and stacks waiting.
+        if !Self::drain_rcu() {
+            return stalled();
+        }
+        complete_now();
+
+        // PIDs at the top of the range: free, and far outside the reuse window.
+        let mut held = Vec::new();
+        for pid in (PID_MAX + 1 - STACKS)..=PID_MAX {
+            match allocate_kernel_stack(pid) {
+                Ok((base, top, phys, permit)) => held.push((pid, base, top, phys, permit)),
+                Err(error) => {
+                    for (pid, base, _, phys, permit) in held {
+                        free_kernel_stack(pid, base, phys, permit);
+                    }
+                    return TestResult::Fail(alloc::format!(
+                        "no kernel stack for PID {}: {:?}",
+                        pid,
+                        error
+                    ));
+                }
+            }
+        }
+        let stack_pages = ((held[0].2 - held[0].1) / 4096) as usize;
+        let Some(free_allocated) = free_pages() else {
+            return TestResult::Fail(String::from("buddy allocator statistics unavailable"));
+        };
+        let before = stats();
+
+        for (pid, base, _, phys, permit) in held {
+            free_kernel_stack(pid, base, phys, permit);
+        }
+        if !Self::drain_rcu() {
+            return stalled();
+        }
+
+        // The callbacks have cleared the leaves; nothing is flushed yet.
+        let waiting = stats();
+        if waiting.pending != STACKS || waiting.batches != before.batches {
+            return TestResult::Fail(alloc::format!(
+                "{} stacks waiting after {} reclaims, batches {}->{}",
+                waiting.pending,
+                STACKS,
+                before.batches,
+                waiting.batches
+            ));
+        }
+        if free_pages() != Some(free_allocated) {
+            return TestResult::Fail(alloc::format!(
+                "frames returned before the flush: free pages {} -> {:?}",
+                free_allocated,
+                free_pages()
+            ));
+        }
+        for pid in (PID_MAX + 1 - STACKS)..=PID_MAX {
+            match allocate_kernel_stack(pid) {
+                Err(KernelStackError::ReclaimPending) => {}
+                Ok((base, _, phys, permit)) => {
+                    free_kernel_stack(pid, base, phys, permit);
+                    return TestResult::Fail(alloc::format!(
+                        "PID {} was allocatable before its stack's flush",
+                        pid
+                    ));
+                }
+                Err(error) => {
+                    return TestResult::Fail(alloc::format!(
+                        "PID {} before the flush: {:?}, expected ReclaimPending",
+                        pid,
+                        error
+                    ));
+                }
+            }
+        }
+
+        let tlb_before = mm::tlb_shootdown::get_stats();
+        complete_now();
+        let tlb = mm::tlb_shootdown::get_stats();
+        let after = stats();
+        if after.batches != before.batches + 1
+            || after.stacks != before.stacks + STACKS as u64
+            || after.quarantined != before.quarantined
+            || after.pending != 0
+        {
+            return TestResult::Fail(alloc::format!(
+                "one completion of {} stacks expected: batches {}->{}, stacks {}->{}, quarantined {}->{}, {} waiting",
+                STACKS,
+                before.batches,
+                after.batches,
+                before.stacks,
+                after.stacks,
+                before.quarantined,
+                after.quarantined,
+                after.pending
+            ));
+        }
+        if tlb.broadcast_fallbacks <= tlb_before.broadcast_fallbacks {
+            return TestResult::Fail(String::from("the completion sent no CR3-0 broadcast"));
+        }
+        let free_returned = free_allocated + STACKS * stack_pages;
+        if free_pages() != Some(free_returned) {
+            return TestResult::Fail(alloc::format!(
+                "the flush returned the wrong frames: free pages {} -> {:?}, expected {}",
+                free_allocated,
+                free_pages(),
+                free_returned
+            ));
+        }
+
+        // Every PID and its virtual stack slot are usable again. Their page
+        // tables exist now, so this second cycle must return to the same count.
+        for pid in (PID_MAX + 1 - STACKS)..=PID_MAX {
+            match allocate_kernel_stack(pid) {
+                Ok((base, _, phys, permit)) => free_kernel_stack(pid, base, phys, permit),
+                Err(error) => {
+                    return TestResult::Fail(alloc::format!(
+                        "PID {} not allocatable after its stack's flush: {:?}",
+                        pid,
+                        error
+                    ));
+                }
+            }
+        }
+        if !Self::drain_rcu() {
+            return stalled();
+        }
+        complete_now();
+        if free_pages() != Some(free_returned) {
+            return TestResult::Fail(alloc::format!(
+                "the second cycle did not balance: free pages {:?}, expected {}",
+                free_pages(),
+                free_returned
+            ));
+        }
+        TestResult::Pass
+    }
+}
+
 // ============================================================================
 // Cpuset Tests
 // ============================================================================
@@ -2457,6 +2650,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &IpiPingPongTest,
         &SchedstatEventCountersTest,
         &TlbShootdownCoherencyTest,
+        &KstackFlushBatchTest,
         &CpusetIsolationTest,
         &SchedulerAffinityTest,
         &SchedulerStarvationTest,
