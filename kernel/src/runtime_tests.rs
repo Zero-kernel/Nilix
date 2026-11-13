@@ -1959,9 +1959,11 @@ impl RuntimeTest for TlbShootdownCoherencyTest {
 /// C3 repair (#90): a reclaimed kernel stack keeps its frames and its PID
 /// slot until the batched TLB flush, and that flush gives both back.
 ///
-/// The suite runs before the BSP enables interrupts and before any AP drains
-/// deferred work: no tick ages the batch and no other CPU completes it, so
-/// every completion below is this test's own.
+/// The boot suite runs before the BSP enables interrupts and before any AP
+/// drains deferred work: no tick ages the batch and no other CPU completes it,
+/// so every completion below is this test's own. Run later from the kernel
+/// shell, another CPU can complete the batch or move the free-page count
+/// inside the test's window and fail it.
 struct KstackFlushBatchTest;
 
 impl KstackFlushBatchTest {
