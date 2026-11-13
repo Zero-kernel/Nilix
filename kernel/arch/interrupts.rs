@@ -2446,7 +2446,10 @@ extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFra
     clac_if_smap();
 
     // R69-3 FIX: Mark entering IRQ context
-    current_cpu().irq_enter();
+    let this_cpu = current_cpu();
+    this_cpu.irq_enter();
+    // C3 E1 (#90): per-CPU handled count for /proc/schedstat.
+    kernel_core::process::note_ipi_handled(this_cpu.cpu_id.load(Ordering::Relaxed));
 
     // R155-11 FIX: Save FPU state before any code that might use SSE.
     // Compiler auto-vectorization can emit SSE instructions in handler code,
@@ -2494,7 +2497,10 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
     clac_if_smap();
 
     // R69-3 FIX: Mark entering IRQ context
-    current_cpu().irq_enter();
+    let this_cpu = current_cpu();
+    this_cpu.irq_enter();
+    // C3 E1 (#90): per-CPU handled count for /proc/schedstat.
+    kernel_core::process::note_ipi_handled(this_cpu.cpu_id.load(Ordering::Relaxed));
 
     // R155-11 FIX: Save FPU state before any code that might use SSE.
     // Compiler auto-vectorization can emit SSE instructions in handler code,

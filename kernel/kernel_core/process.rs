@@ -6808,6 +6808,48 @@ pub fn note_task_migration(cpu: usize) {
     }
 }
 
+/// C3 E1 (#90): reschedule and TLB-shootdown IPIs sent to each CPU, and the
+/// handler runs on it. Counting by target needs no LAPIC read on the sending
+/// side. These cumulative counts are sampled independently: handled may
+/// temporarily exceed sent because send accounting follows the ICR write or
+/// events occur between reads. The LAPIC can also coalesce sends, so their
+/// difference is not a pending- or dropped-IPI count.
+/// Statistics only: Relaxed, wrapping modulo 2^64.
+static CPU_IPIS_SENT: [AtomicU64; cpu_local::max_cpus()] =
+    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
+static CPU_IPIS_HANDLED: [AtomicU64; cpu_local::max_cpus()] =
+    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
+
+/// Record one reschedule or TLB-shootdown IPI sent to `cpu` (IRQ-safe, lock-free).
+pub fn note_ipi_sent(cpu: usize) {
+    if let Some(counter) = CPU_IPIS_SENT.get(cpu) {
+        // lint-fetch-add: allow (statistics counter)
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record one reschedule or TLB-shootdown IPI handler run on `cpu`.
+pub fn note_ipi_handled(cpu: usize) {
+    if let Some(counter) = CPU_IPIS_HANDLED.get(cpu) {
+        // lint-fetch-add: allow (statistics counter)
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(IPIs sent to, IPIs handled on)` `cpu` since boot.
+///
+/// The two loads are not a coherent snapshot. For samples from the same boot,
+/// compare each counter's wrapping interval delta separately; subtracting the
+/// two fields does not measure outstanding or lost IPIs.
+pub fn cpu_ipi_counters(cpu: usize) -> (u64, u64) {
+    let load = |counters: &[AtomicU64]| {
+        counters
+            .get(cpu)
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    };
+    (load(&CPU_IPIS_SENT), load(&CPU_IPIS_HANDLED))
+}
+
 /// The CPUs currently online, as a bit mask (for `/proc/schedstat`).
 pub fn sched_online_cpu_mask() -> u64 {
     cpu_local::online_cpu_mask()

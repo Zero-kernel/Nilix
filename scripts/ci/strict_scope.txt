@@ -20,6 +20,9 @@ RUNTIME r175_d0_cross_3_sched_atomic not_applicable needs_cpus:2
 RUNTIME rf178_33_sched_smp_gate not_applicable needs_cpus:2
 RUNTIME tlb_shootdown_pcid not_applicable needs_cpus:2
 
+# C3 E1 (#90): the IPI and shootdown counter check is an SMP check too.
+RUNTIME schedstat_event_counters not_applicable needs_cpus:2
+
 # D3: Spectre hardware mitigations and retpoline are N6.
 SECURITY spectre_mitigation_status out_of_scope out_of_scope:N6
 SECURITY spectre_v2_retpoline out_of_scope out_of_scope:N6

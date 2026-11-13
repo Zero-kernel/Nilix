@@ -54,6 +54,13 @@ pub struct TlbShootdownStats {
     pub pages_flushed: u64,
     /// R106-5: Number of times mailbox saturation forced a full-flush fallback
     pub coalesced_fallbacks: u64,
+    /// C3 E1 (#90): target scans that found a CPU running the modified CR3
+    pub targeted_shootdowns: u64,
+    /// C3 E1: target scans that fell back to every other online CPU (also
+    /// counted when there is none)
+    pub broadcast_fallbacks: u64,
+    /// C3 E1: shootdown IPIs sent, including ACK-timeout resends
+    pub shootdown_ipis: u64,
 }
 
 // Atomic statistics for SMP-safe updates
@@ -99,6 +106,9 @@ static CPU_ACTIVE_CR3: [AtomicU64; cpu_local::max_cpus()] =
 /// Statistics for optimized TLB shootdowns
 static STATS_TARGETED_SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
 static STATS_BROADCAST_FALLBACK: AtomicU64 = AtomicU64::new(0);
+/// C3 E1 (#90): shootdown IPIs sent; divided by the two counters above, the
+/// mean fanout of a remote dispatch.
+static STATS_SHOOTDOWN_IPIS: AtomicU64 = AtomicU64::new(0);
 
 /// Registered function used to send the TLB shootdown IPI
 /// Stored as usize to avoid function pointer in static
@@ -723,6 +733,7 @@ fn post_requests(targets: CpuMask, cr3: u64, start: u64, len: u64, generation: u
 fn send_ipis(targets: CpuMask, sender: TlbIpiSender) {
     for cpu in targets.iter() {
         sender(cpu);
+        STATS_SHOOTDOWN_IPIS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -813,9 +824,7 @@ fn wait_for_acks_with_retry(targets: CpuMask, generation: u64, sender: TlbIpiSen
 
         if attempt < ACK_TIMEOUT_RETRIES {
             // Resend IPIs to unacked CPUs
-            for cpu in unacked.iter() {
-                sender(cpu);
-            }
+            send_ipis(unacked, sender);
         } else {
             // Final timeout - this is a critical error
             kprintln!(
@@ -1258,6 +1267,9 @@ pub fn get_stats() -> TlbShootdownStats {
         range_flushes: STATS_RANGE_FLUSHES.load(Ordering::Relaxed),
         pages_flushed: STATS_PAGES_FLUSHED.load(Ordering::Relaxed),
         coalesced_fallbacks: STATS_COALESCED_FALLBACKS.load(Ordering::Relaxed),
+        targeted_shootdowns: STATS_TARGETED_SHOOTDOWNS.load(Ordering::Relaxed),
+        broadcast_fallbacks: STATS_BROADCAST_FALLBACK.load(Ordering::Relaxed),
+        shootdown_ipis: STATS_SHOOTDOWN_IPIS.load(Ordering::Relaxed),
     }
 }
 

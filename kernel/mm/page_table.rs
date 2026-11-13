@@ -51,28 +51,101 @@ static PT_LOCK: Mutex<()> = Mutex::new(());
 const NO_PT_LOCK_OWNER: usize = usize::MAX;
 static PT_LOCK_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_PT_LOCK_OWNER);
 
+/// C3 E1 (#90): `PT_LOCK` statistics for `/proc/schedstat`. Observability
+/// only: Relaxed, and a wrap is harmless. Wait time is measured only for a
+/// contended `lock_pt`; hold time runs from acquisition to guard drop. Both
+/// are raw TSC deltas, since the guest tick clock lags host time under TCG.
+static PT_LOCK_ACQUIRED: AtomicU64 = AtomicU64::new(0);
+static PT_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+static PT_LOCK_BUSY: AtomicU64 = AtomicU64::new(0);
+static PT_LOCK_WAIT_TSC: AtomicU64 = AtomicU64::new(0);
+static PT_LOCK_WAIT_TSC_MAX: AtomicU64 = AtomicU64::new(0);
+static PT_LOCK_HOLD_TSC: AtomicU64 = AtomicU64::new(0);
+static PT_LOCK_HOLD_TSC_MAX: AtomicU64 = AtomicU64::new(0);
+/// TSC at the current holder's acquisition, written and read only by it.
+static PT_LOCK_SINCE_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the `PT_LOCK` statistics (see [`pt_lock_stats`]).
+#[derive(Debug, Clone, Copy)]
+pub struct PtLockStats {
+    /// Acquisitions by `lock_pt` and successful `try_lock_pt`.
+    pub acquired: u64,
+    /// `lock_pt` calls that found the lock held (counted before they spin).
+    pub contended: u64,
+    /// `try_lock_pt` calls that found the lock held (the #PF Busy path).
+    pub busy: u64,
+    /// Sum and maximum of contended `lock_pt` spin time, in TSC cycles.
+    pub wait_tsc: u64,
+    pub wait_tsc_max: u64,
+    /// Sum and maximum of hold time, in TSC cycles.
+    pub hold_tsc: u64,
+    pub hold_tsc_max: u64,
+}
+
+/// Current `PT_LOCK` statistics; each field is read independently.
+pub fn pt_lock_stats() -> PtLockStats {
+    PtLockStats {
+        acquired: PT_LOCK_ACQUIRED.load(Ordering::Relaxed),
+        contended: PT_LOCK_CONTENDED.load(Ordering::Relaxed),
+        busy: PT_LOCK_BUSY.load(Ordering::Relaxed),
+        wait_tsc: PT_LOCK_WAIT_TSC.load(Ordering::Relaxed),
+        wait_tsc_max: PT_LOCK_WAIT_TSC_MAX.load(Ordering::Relaxed),
+        hold_tsc: PT_LOCK_HOLD_TSC.load(Ordering::Relaxed),
+        hold_tsc_max: PT_LOCK_HOLD_TSC_MAX.load(Ordering::Relaxed),
+    }
+}
+
+#[inline]
+fn read_tsc() -> u64 {
+    // SAFETY: RDTSC only reads the time-stamp counter.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 struct PtLockGuard {
     _guard: spin::MutexGuard<'static, ()>,
 }
 
+impl PtLockGuard {
+    #[inline]
+    fn new(guard: spin::MutexGuard<'static, ()>) -> Self {
+        PT_LOCK_OWNER_CPU.store(cpu_local::current_cpu_id(), Ordering::Release);
+        PT_LOCK_ACQUIRED.fetch_add(1, Ordering::Relaxed);
+        PT_LOCK_SINCE_TSC.store(read_tsc(), Ordering::Relaxed);
+        Self { _guard: guard }
+    }
+}
+
 impl Drop for PtLockGuard {
     fn drop(&mut self) {
+        // Still the holder: `_guard` is released after this body.
+        let held = read_tsc().saturating_sub(PT_LOCK_SINCE_TSC.load(Ordering::Relaxed));
+        PT_LOCK_HOLD_TSC.fetch_add(held, Ordering::Relaxed);
+        PT_LOCK_HOLD_TSC_MAX.fetch_max(held, Ordering::Relaxed);
         PT_LOCK_OWNER_CPU.store(NO_PT_LOCK_OWNER, Ordering::Release);
     }
 }
 
 #[inline]
 fn lock_pt() -> PtLockGuard {
+    if let Some(guard) = PT_LOCK.try_lock() {
+        return PtLockGuard::new(guard);
+    }
+    PT_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+    let start = read_tsc();
     let guard = PT_LOCK.lock();
-    PT_LOCK_OWNER_CPU.store(cpu_local::current_cpu_id(), Ordering::Release);
-    PtLockGuard { _guard: guard }
+    let waited = read_tsc().saturating_sub(start);
+    PT_LOCK_WAIT_TSC.fetch_add(waited, Ordering::Relaxed);
+    PT_LOCK_WAIT_TSC_MAX.fetch_max(waited, Ordering::Relaxed);
+    PtLockGuard::new(guard)
 }
 
 #[inline]
 fn try_lock_pt() -> Option<PtLockGuard> {
-    let guard = PT_LOCK.try_lock()?;
-    PT_LOCK_OWNER_CPU.store(cpu_local::current_cpu_id(), Ordering::Release);
-    Some(PtLockGuard { _guard: guard })
+    let Some(guard) = PT_LOCK.try_lock() else {
+        PT_LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    Some(PtLockGuard::new(guard))
 }
 
 /// CPU that currently owns the global page-table lock, if any.
@@ -2122,6 +2195,45 @@ unsafe impl FrameAllocator<Size4KiB> for MmioPtRecorder<'_> {
     }
 }
 
+/// Serializes the hosted tests that take `PT_LOCK`: the other asserts the lock
+/// is free at its start and end.
+#[cfg(test)]
+static PT_LOCK_TEST_SERIAL: spin::Mutex<()> = spin::Mutex::new(());
+
+#[cfg(test)]
+mod pt_lock_stats_tests {
+    use super::*;
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    /// C3 E1 (#90): a held `PT_LOCK` makes `try_lock_pt` busy and `lock_pt`
+    /// contended, and the wait and both holds are timed.
+    #[test]
+    fn busy_contention_wait_and_hold_are_counted() {
+        let _serial = PT_LOCK_TEST_SERIAL.lock();
+        let before = pt_lock_stats();
+        let holder = lock_pt();
+        assert!(thread::spawn(|| try_lock_pt().is_none()).join().unwrap());
+        let waiter = thread::spawn(|| drop(lock_pt()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pt_lock_stats().contended == before.contended && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(5));
+        drop(holder);
+        waiter.join().unwrap();
+
+        let after = pt_lock_stats();
+        assert!(after.acquired >= before.acquired + 2);
+        assert!(after.contended > before.contended);
+        assert!(after.busy > before.busy);
+        assert!(after.wait_tsc > before.wait_tsc && after.wait_tsc_max > 0);
+        assert!(after.hold_tsc > before.hold_tsc && after.hold_tsc_max > 0);
+    }
+}
+
 #[cfg(test)]
 mod cow_replace_tests {
     use super::*;
@@ -2269,11 +2381,12 @@ mod kernel_stack_directory_tests {
 
 #[cfg(test)]
 mod pt_lock_tests {
-    use super::{pt_lock_owner_cpu, try_with_current_manager, with_pt_lock};
+    use super::{pt_lock_owner_cpu, try_with_current_manager, with_pt_lock, PT_LOCK_TEST_SERIAL};
     use x86_64::VirtAddr;
 
     #[test]
     fn try_manager_rejects_same_cpu_reentry() {
+        let _serial = PT_LOCK_TEST_SERIAL.lock();
         assert_eq!(pt_lock_owner_cpu(), None);
         with_pt_lock(|| {
             let owner = pt_lock_owner_cpu();
