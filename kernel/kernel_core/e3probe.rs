@@ -20,11 +20,14 @@
 //! - `QUIET`: the batch, and the kernel does not print its two console lines
 //!   per task exit (`Process N exited with code C`, `Process N terminated
 //!   with exit code C`).
+//! - `NO_DISPLAY`: the batch, and console output (the kernel's and user
+//!   tasks') goes to the serial port only, not to the framebuffer as well.
 //!
 //! This branch runs the committed stress runner (a schedstat copy every 256th
 //! round), so the kernel prints `E3_MODE <mode> <window>` on the console at
 //! each window change, and the cycle is [`MODE_CYCLE`]: on this branch the
-//! batch against `QUIET`, to price those two lines. The tables are not
+//! batch against `QUIET` and `NO_DISPLAY`, to price those two lines and the
+//! display copy of the console. The tables are not
 //! printed here: at 16 vCPUs their console output took 21 s in one piece,
 //! which is past the stress gate's 15 s heartbeat bound.
 //!
@@ -56,7 +59,8 @@ pub mod mode {
     pub const KICK_RUNNING: usize = 4;
     pub const FLUSH_EACH: usize = 5;
     pub const QUIET: usize = 6;
-    pub const COUNT: usize = 7;
+    pub const NO_DISPLAY: usize = 7;
+    pub const COUNT: usize = 8;
 }
 
 /// What made a task Ready.
@@ -119,7 +123,7 @@ const MODE_WINDOW_TICKS: u64 = 10_000;
 /// Whether `/proc/schedstat` carries the tables on this branch.
 const PRINT_TABLES: bool = false;
 /// The modes this branch cycles through.
-const MODE_CYCLE: [usize; 2] = [mode::BATCH, mode::QUIET];
+const MODE_CYCLE: [usize; 3] = [mode::BATCH, mode::QUIET, mode::NO_DISPLAY];
 const REPORT_INTERVAL_TICKS: u64 = 50_000;
 
 /// Whether the current window completes the flush batch in every drain pass.
@@ -208,6 +212,10 @@ pub fn announce_window() {
     {
         return;
     }
+    drivers::vga_buffer::E3_SKIP_DISPLAY.store(
+        mode_of_window(window) == mode::NO_DISPLAY,
+        Ordering::Relaxed,
+    );
     klog::klog_force!("E3_MODE {} {}", mode_of_window(window), window);
 }
 

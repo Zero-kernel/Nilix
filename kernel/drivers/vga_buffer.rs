@@ -224,9 +224,15 @@ fn console_owner_token() -> usize {
     cpu_local::try_current_registered_cpu_id().unwrap_or(UNREGISTERED_DISPLAY_OWNER)
 }
 
+/// C3 E3 DIAGNOSTIC, not for merge: console output skips the display while set.
+pub static E3_SKIP_DISPLAY: AtomicBool = AtomicBool::new(false);
+
 /// Render to the active display backend.
 fn write_display(args: fmt::Arguments) {
     use core::fmt::Write;
+    if E3_SKIP_DISPLAY.load(Ordering::Relaxed) {
+        return;
+    }
     let _ = with_display(|| {
         // 优先输出到 framebuffer（现代 GOP 方式）
         if crate::framebuffer::is_initialized() {
