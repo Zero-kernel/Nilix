@@ -23,7 +23,8 @@
 //! and the cycle is [`MODE_CYCLE`]. The kernel also prints `E3_MODE <mode>
 //! <window>` on the console at each window change.
 //!
-//! `/proc/schedstat` gets `e3_mode <mode> <window>` on every read and, at most
+//! `/proc/schedstat` gets `e3_mode <mode> <window>` and the serial console's
+//! hold totals (`e3_serial`) on every read and, at most
 //! once per [`REPORT_INTERVAL_TICKS`], three cumulative tables per mode:
 //!
 //! - `e3_ready <mode>`: Ready publications by source.
@@ -370,6 +371,15 @@ pub fn write_report(out: &mut impl core::fmt::Write, now_tick: u64) -> core::fmt
     );
     let window = window(now_tick).unwrap_or(0);
     writeln!(out, "e3_mode {} {}", mode_of_window(window), window)?;
+    // The serial console's locked holds since boot (TD-SERIAL-1): each masks
+    // interrupts on the writing CPU for its whole chunk.
+    if let Some(serial) = drivers::vga_buffer::serial_hold_stats() {
+        writeln!(
+            out,
+            "e3_serial holds={} bytes={} tsc={} max_tsc={} max_bytes={}",
+            serial.holds, serial.bytes, serial.tsc, serial.max_tsc, serial.max_bytes
+        )?;
+    }
 
     let last = LAST_REPORT_TICK.load(Ordering::Relaxed);
     if now_tick.saturating_sub(last) < REPORT_INTERVAL_TICKS
