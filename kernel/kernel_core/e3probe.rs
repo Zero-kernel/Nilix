@@ -18,9 +18,10 @@
 //!   whatever waits: about one broadcast flush per stack again, outside the
 //!   `PT_LOCK` section.
 //!
-//! This branch runs the committed stress runner (a schedstat copy every 256th
-//! round), so the kernel prints `E3_MODE <mode> <window>` on the console at
-//! each window change, and the cycle is [`MODE_CYCLE`].
+//! This branch is for 16 vCPUs with E2's diagnostic runner (a schedstat copy
+//! after every round, which takes about 5 s there): a window is 40000 ticks
+//! and the cycle is [`MODE_CYCLE`]. The kernel also prints `E3_MODE <mode>
+//! <window>` on the console at each window change.
 //!
 //! `/proc/schedstat` gets `e3_mode <mode> <window>` on every read and, at most
 //! once per [`REPORT_INTERVAL_TICKS`], three cumulative tables per mode:
@@ -108,10 +109,10 @@ const CTX_COUNT: usize = CTX_RUNNABLE + 1;
 
 const CPUS: usize = cpu_local::max_cpus();
 const PIDS: usize = crate::process::PID_MAX + 1;
-const MODE_WINDOW_TICKS: u64 = 10_000;
+const MODE_WINDOW_TICKS: u64 = 40_000;
 /// The modes this branch cycles through.
 const MODE_CYCLE: [usize; 3] = [mode::BATCH, mode::PARENT, mode::KICK_ALL];
-const REPORT_INTERVAL_TICKS: u64 = 50_000;
+const REPORT_INTERVAL_TICKS: u64 = 100_000;
 
 /// Whether the current window completes the flush batch in every drain pass.
 pub fn completes_every_drain() -> bool {
