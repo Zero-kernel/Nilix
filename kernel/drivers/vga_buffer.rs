@@ -224,9 +224,15 @@ fn console_owner_token() -> usize {
     cpu_local::try_current_registered_cpu_id().unwrap_or(UNREGISTERED_DISPLAY_OWNER)
 }
 
+/// C3 E3 DIAGNOSTIC, not for merge: calls of `write_display` and the TSC
+/// cycles spent in them, the wait for the display lock included.
+pub static E3_DISPLAY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static E3_DISPLAY_TSC: AtomicU64 = AtomicU64::new(0);
+
 /// Render to the active display backend.
 fn write_display(args: fmt::Arguments) {
     use core::fmt::Write;
+    let start = read_tsc();
     let _ = with_display(|| {
         // 优先输出到 framebuffer（现代 GOP 方式）
         if crate::framebuffer::is_initialized() {
@@ -236,6 +242,8 @@ fn write_display(args: fmt::Arguments) {
             let _ = WRITER.lock().write_fmt(args);
         }
     });
+    E3_DISPLAY_CALLS.fetch_add(1, Ordering::Relaxed);
+    E3_DISPLAY_TSC.fetch_add(read_tsc().wrapping_sub(start), Ordering::Relaxed);
 }
 
 /// R190-13 FIX: the character a kernel message may put on the serial console.

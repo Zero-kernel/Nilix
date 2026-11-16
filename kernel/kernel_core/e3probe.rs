@@ -24,7 +24,8 @@
 //! <window>` on the console at each window change.
 //!
 //! `/proc/schedstat` gets `e3_mode <mode> <window>` and the serial console's
-//! hold totals (`e3_serial`) on every read and, at most
+//! hold totals (`e3_serial`) and the display copy's totals (`e3_display`) on
+//! every read and, at most
 //! once per [`REPORT_INTERVAL_TICKS`], three cumulative tables per mode:
 //!
 //! - `e3_ready <mode>`: Ready publications by source.
@@ -380,6 +381,13 @@ pub fn write_report(out: &mut impl core::fmt::Write, now_tick: u64) -> core::fmt
             serial.holds, serial.bytes, serial.tsc, serial.max_tsc, serial.max_bytes
         )?;
     }
+    // The display copy of the console: calls and their cycles, lock wait included.
+    writeln!(
+        out,
+        "e3_display calls={} tsc={}",
+        drivers::vga_buffer::E3_DISPLAY_CALLS.load(Ordering::Relaxed),
+        drivers::vga_buffer::E3_DISPLAY_TSC.load(Ordering::Relaxed)
+    )?;
 
     let last = LAST_REPORT_TICK.load(Ordering::Relaxed);
     if now_tick.saturating_sub(last) < REPORT_INTERVAL_TICKS
