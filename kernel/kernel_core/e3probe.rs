@@ -17,10 +17,14 @@
 //! - `FLUSH_EACH`: the batch's code path, but every RCU drain pass completes
 //!   whatever waits: about one broadcast flush per stack again, outside the
 //!   `PT_LOCK` section.
+//! - `QUIET`: the batch, and the kernel does not print its two console lines
+//!   per task exit (`Process N exited with code C`, `Process N terminated
+//!   with exit code C`).
 //!
 //! This branch runs the committed stress runner (a schedstat copy every 256th
 //! round), so the kernel prints `E3_MODE <mode> <window>` on the console at
-//! each window change, and the cycle is [`MODE_CYCLE`]. The tables are not
+//! each window change, and the cycle is [`MODE_CYCLE`]: on this branch the
+//! batch against `QUIET`, to price those two lines. The tables are not
 //! printed here: at 16 vCPUs their console output took 21 s in one piece,
 //! which is past the stress gate's 15 s heartbeat bound.
 //!
@@ -51,7 +55,8 @@ pub mod mode {
     pub const KICK_HALTED: usize = 3;
     pub const KICK_RUNNING: usize = 4;
     pub const FLUSH_EACH: usize = 5;
-    pub const COUNT: usize = 6;
+    pub const QUIET: usize = 6;
+    pub const COUNT: usize = 7;
 }
 
 /// What made a task Ready.
@@ -114,7 +119,7 @@ const MODE_WINDOW_TICKS: u64 = 10_000;
 /// Whether `/proc/schedstat` carries the tables on this branch.
 const PRINT_TABLES: bool = false;
 /// The modes this branch cycles through.
-const MODE_CYCLE: [usize; 3] = [mode::BATCH, mode::PARENT, mode::KICK_ALL];
+const MODE_CYCLE: [usize; 2] = [mode::BATCH, mode::QUIET];
 const REPORT_INTERVAL_TICKS: u64 = 50_000;
 
 /// Whether the current window completes the flush batch in every drain pass.
@@ -204,6 +209,11 @@ pub fn announce_window() {
         return;
     }
     klog::klog_force!("E3_MODE {} {}", mode_of_window(window), window);
+}
+
+/// Whether the kernel prints its per-exit console lines in this window.
+pub fn prints_exit_lines() -> bool {
+    current_mode() != mode::QUIET
 }
 
 /// Register the scheduler's selective reschedule kick.

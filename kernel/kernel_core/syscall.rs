@@ -4874,7 +4874,10 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
         // terminate_process() is the sole call site for the LSM exit hook,
         // preventing double-fire in audit logs.
         // R104-2 FIX: Gate to prevent leaking PID in release builds.
-        klog_always!("Process {} exited with code {}", pid, exit_code);
+        // C3 E3 DIAGNOSTIC, not for merge.
+        if crate::e3probe::prints_exit_lines() {
+            klog_always!("Process {} exited with code {}", pid, exit_code);
+        }
 
         // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
         // interrupts and switches to boot CR3 before halting.
