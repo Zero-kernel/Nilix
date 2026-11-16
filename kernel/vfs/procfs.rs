@@ -2169,6 +2169,9 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
             kstack.batches, kstack.stacks, kstack.by_count, kstack.by_age, kstack.quarantined
         ))
         .map_err(|_| FsError::NoSpace)?;
+    // C3 E3 DIAGNOSTIC, not for merge.
+    kernel_core::e3probe::write_report(&mut content, kernel_core::get_ticks())
+        .map_err(|_| FsError::NoSpace)?;
     Ok(content)
 }
 

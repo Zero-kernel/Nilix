@@ -7221,7 +7221,10 @@ fn run_exec_handoff() -> SyscallResult {
 fn yield_and_halt() {
     yield_with_deferred_work();
     if x86_64::instructions::interrupts::are_enabled() {
+        // C3 E3 DIAGNOSTIC, not for merge.
+        crate::e3probe::halt_begin(crate::e3probe::site::YIELD);
         x86_64::instructions::hlt();
+        crate::e3probe::halt_end();
     } else {
         core::hint::spin_loop();
     }

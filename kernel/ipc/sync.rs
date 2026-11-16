@@ -799,7 +799,10 @@ impl WaitQueue {
                             continue;
                         }
                     }
+                    // C3 E3 DIAGNOSTIC, not for merge.
+                    kernel_core::e3probe::src_hint(kernel_core::e3probe::src::WAITQ);
                     proc.enter_ready_at(kernel_core::get_ticks());
+                    kernel_core::e3probe::src_hint(kernel_core::e3probe::src::NONE);
                     return Some(pid);
                 }
             }
@@ -829,7 +832,10 @@ impl WaitQueue {
                             continue;
                         }
                     }
+                    // C3 E3 DIAGNOSTIC, not for merge.
+                    kernel_core::e3probe::src_hint(kernel_core::e3probe::src::WAITQ);
                     proc.enter_ready_at(kernel_core::get_ticks());
+                    kernel_core::e3probe::src_hint(kernel_core::e3probe::src::NONE);
                     woken += 1;
                 }
             }
@@ -873,7 +879,10 @@ impl WaitQueue {
                                 continue;
                             }
                         }
+                        // C3 E3 DIAGNOSTIC, not for merge.
+                        kernel_core::e3probe::src_hint(kernel_core::e3probe::src::WAITQ);
                         proc.enter_ready_at(kernel_core::get_ticks());
+                        kernel_core::e3probe::src_hint(kernel_core::e3probe::src::NONE);
                         woken += 1;
                     }
                 } else {
@@ -927,7 +936,10 @@ impl WaitQueue {
                             return false;
                         }
                     }
+                    // C3 E3 DIAGNOSTIC, not for merge.
+                    kernel_core::e3probe::src_hint(kernel_core::e3probe::src::WAITQ);
                     proc.enter_ready_at(kernel_core::get_ticks());
+                    kernel_core::e3probe::src_hint(kernel_core::e3probe::src::NONE);
                 }
                 true
             } else {

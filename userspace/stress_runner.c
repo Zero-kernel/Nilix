@@ -334,7 +334,8 @@ static void emit(const char *format, ...) {
 #define SCHEDSTAT_SAMPLE_ROUNDS 256u
 
 static void emit_schedstat(uint64_t seq) {
-    char buffer[4096];
+    /* C3 E3 DIAGNOSTIC, not for merge: room for the e3 tables. */
+    static char buffer[16384];
     size_t total = 0;
     const int fd = open("/proc/schedstat", O_RDONLY);
     if (fd < 0) {

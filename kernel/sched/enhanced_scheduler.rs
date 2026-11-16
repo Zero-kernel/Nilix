@@ -1520,6 +1520,29 @@ impl Scheduler {
         }
     }
 
+    /// C3 E3 DIAGNOSTIC, not for merge: the reschedule kicks of one deferred
+    /// kernel stack, by `kernel_core::e3probe::mode`.
+    pub fn e3_kick(mode: usize) {
+        use kernel_core::e3probe::{is_halted, mode as reclaim};
+        let self_cpu = current_cpu_id();
+        if mode != reclaim::KICK_HALTED {
+            current_cpu().set_need_resched();
+        }
+        for cpu_id in Self::online_cpu_ids() {
+            if cpu_id == self_cpu {
+                continue;
+            }
+            let send = match mode {
+                reclaim::KICK_ALL => true,
+                reclaim::KICK_HALTED => is_halted(cpu_id),
+                _ => !is_halted(cpu_id),
+            };
+            if send {
+                Self::kick_cpu(cpu_id);
+            }
+        }
+    }
+
     /// RF178-24: snapshot the authoritative online-ID bitmap and iterate set
     /// bits. A population count is not an ID ceiling when topology is sparse.
     #[inline]
@@ -1981,6 +2004,8 @@ impl Scheduler {
             drop(retired);
             drop(pcb);
             process::note_task_migration(local_cpu);
+            // C3 E3 DIAGNOSTIC, not for merge.
+            kernel_core::e3probe::note_stolen(pid);
             Self::arm_ready_cpu(local_cpu);
             true
         } else {
@@ -2789,6 +2814,18 @@ impl Scheduler {
         let next_generation = next.generation;
         let next_heap_owner = next.thread_group.heap_owner.clone();
 
+        // C3 E3 DIAGNOSTIC, not for merge.
+        kernel_core::e3probe::note_dispatch(
+            next_pid,
+            match old.as_ref().map(|old| old.state) {
+                None => kernel_core::e3probe::old::IDLE,
+                Some(ProcessState::Blocked) => kernel_core::e3probe::old::BLOCKED,
+                Some(ProcessState::Running | ProcessState::Ready) => {
+                    kernel_core::e3probe::old::RUNNABLE
+                }
+                Some(_) => kernel_core::e3probe::old::TERMINAL,
+            },
+        );
         if let Some(old) = old.as_mut() {
             if matches!(old.state, ProcessState::Running | ProcessState::Ready) {
                 old.enter_ready_at(now_tick);
@@ -3787,6 +3824,8 @@ pub fn init() {
     // M0-5 1b: register the cross-CPU reschedule-kick so a signal-wake's Blocked->Ready flip
     // promptly re-selects the target on the (idle, non-empty-queue) CPU that owns it.
     kernel_core::register_kick_callback(Scheduler::kick_all_for_reschedule);
+    // C3 E3 DIAGNOSTIC, not for merge.
+    kernel_core::e3probe::register_kick(Scheduler::e3_kick);
 
     klog_always!("Enhanced scheduler initialized");
     klog_always!("  Ready queue: per-CPU with work stealing (R69-1)");

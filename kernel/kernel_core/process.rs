@@ -3454,7 +3454,10 @@ impl Process {
         {
             return false;
         }
+        // C3 E3 DIAGNOSTIC, not for merge.
+        crate::e3probe::src_hint(crate::e3probe::src::CHILD);
         self.enter_ready_at(now_tick);
+        crate::e3probe::src_hint(crate::e3probe::src::NONE);
         self.waiting_child = None;
         true
     }
@@ -4364,6 +4367,17 @@ impl Process {
         let starts_new_epoch = self.state != ProcessState::Ready
             || self.stopped
             || self.on_cpu.load(Ordering::Acquire);
+        if starts_new_epoch {
+            // C3 E3 DIAGNOSTIC, not for merge.
+            crate::e3probe::note_ready(
+                self.pid,
+                match self.state {
+                    ProcessState::Blocked => crate::e3probe::src::WAKE,
+                    ProcessState::Running => crate::e3probe::src::PREEMPT,
+                    _ => crate::e3probe::src::OTHER,
+                },
+            );
+        }
         self.state = ProcessState::Ready;
         if starts_new_epoch {
             self.wait_ticks = 0;
@@ -4375,6 +4389,8 @@ impl Process {
     /// Constructor/fork preparation time is not scheduler queue residence.
     #[inline]
     pub fn publish_ready_at(&mut self, now_tick: u64) {
+        // C3 E3 DIAGNOSTIC, not for merge.
+        crate::e3probe::note_ready(self.pid, crate::e3probe::src::NEW);
         self.state = ProcessState::Ready;
         self.wait_ticks = 0;
         self.wait_age_tick = now_tick;
@@ -11380,8 +11396,11 @@ pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
     // has durably saved it and finish-task-switch clears the publication.
     loop {
         crate::force_reschedule_from_irq();
+        // C3 E3 DIAGNOSTIC, not for merge.
+        crate::e3probe::halt_begin(crate::e3probe::site::EXIT);
         x86_64::instructions::interrupts::enable_and_hlt();
         x86_64::instructions::interrupts::disable();
+        crate::e3probe::halt_end();
     }
 }
 
@@ -13391,6 +13410,9 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
     let (stack_base, _) = kernel_stack_slot(pid)
         .unwrap_or_else(|_| panic!("RCU: invalid PID in kernel-stack callback"));
 
+    // C3 E3 DIAGNOSTIC, not for merge: one mode decision per stack.
+    let parent_mode = crate::e3probe::current_mode() == crate::e3probe::mode::PARENT;
+
     // Prevalidate every leaf against the immutable original buddy-block
     // identity before mutating any PTE. A mismatch is quarantined in place.
     let reclaim_ready = unsafe {
@@ -13439,7 +13461,7 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
             // leaves are broadcast here. C3 (#90): a fully verified stack
             // leaves its broadcast to the flush batch.
             let verified = exact && matched == KSTACK_PAGES;
-            if cleared != 0 && !verified {
+            if cleared != 0 && (!verified || parent_mode) {
                 mm::flush_all_address_spaces();
             }
             verified
@@ -13455,12 +13477,28 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
         return;
     }
 
+    if parent_mode {
+        // C3 E3 DIAGNOSTIC, not for merge: the flush above covered this
+        // stack, so free it here as the parent of the batch did. The slot
+        // stays `Running` and is released when this callback returns.
+        let mut frame_alloc = FrameAllocator::new();
+        if frame_alloc
+            .try_deallocate_contiguous_frames(expected_phys, KSTACK_PAGES)
+            .is_err()
+        {
+            crate::rcu::quarantine_running_stack_callback(pid);
+        }
+        return;
+    }
+
     // C3 (#90): the leaves are cleared but no CPU has been flushed. The batch
     // keeps the block allocated and this PID's slot occupied until one
     // broadcast has covered this stack and its batch mates; only then does it
     // return the block and release the slot (or quarantine it, if the buddy
     // allocator rejects the block).
     crate::kstack_flush::defer_reclaimed_stack(pid, expected_phys.start_address().as_u64());
+    // C3 E3 DIAGNOSTIC, not for merge.
+    crate::e3probe::kick_after_defer();
 }
 
 pub fn free_kernel_stack(

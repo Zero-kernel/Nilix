@@ -221,11 +221,15 @@ impl Shell {
                 // Ready hands the CPU back here with need_resched set; loop to
                 // the drain and that task at once instead of waiting a tick.
                 if arch::current_cpu().need_resched.load(Ordering::Acquire) {
+                    // C3 E3 DIAGNOSTIC, not for merge.
+                    kernel_core::e3probe::halt_skip();
                     continue;
                 }
+                kernel_core::e3probe::halt_begin(kernel_core::e3probe::site::IDLE_BSP);
                 unsafe {
                     core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
                 }
+                kernel_core::e3probe::halt_end();
             }
         }
 

@@ -1946,6 +1946,8 @@ extern "C" fn timer_interrupt_body(
     // 通过钩子调用调度器的时钟 tick 处理
     // 调度器会更新时间片并设置 NEED_RESCHED 标志（如需要）
     // All CPUs need scheduler ticks for time slice management
+    // C3 E3 DIAGNOSTIC, not for merge.
+    kernel_core::e3probe::note_irq(kernel_core::e3probe::irq::TICK);
     on_scheduler_tick();
 
     // EOI handling: BSP sends to both PIC and LAPIC, AP only to LAPIC
@@ -1992,8 +1994,11 @@ extern "C" fn timer_interrupt_body(
                     // replacement context has actually been saved.
                     loop {
                         kernel_core::force_reschedule_from_irq();
+                        // C3 E3 DIAGNOSTIC, not for merge.
+                        kernel_core::e3probe::halt_begin(kernel_core::e3probe::site::IRQ_EXIT);
                         x86_64::instructions::interrupts::enable_and_hlt();
                         x86_interrupts::disable();
+                        kernel_core::e3probe::halt_end();
                     }
                 }
                 kernel_core::process::IrqExitDefer::Retry => retry_pending_exit = true,
@@ -2458,6 +2463,8 @@ extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFra
         irq_save_fpu();
     }
 
+    // C3 E3 DIAGNOSTIC, not for merge.
+    kernel_core::e3probe::note_irq(kernel_core::e3probe::irq::RESCHED);
     // Mark this CPU as needing a reschedule
     current_cpu().set_need_resched();
 
@@ -2509,6 +2516,8 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
         irq_save_fpu();
     }
 
+    // C3 E3 DIAGNOSTIC, not for merge.
+    kernel_core::e3probe::note_irq(kernel_core::e3probe::irq::TLB);
     // Delegate to the TLB shootdown module
     tlb_shootdown::handle_shootdown_ipi();
 

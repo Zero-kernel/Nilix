@@ -1490,12 +1490,16 @@ fn ap_idle_loop() -> ! {
         }
         if process_deferred_ready && cpu_local::current_cpu().need_resched.load(Ordering::SeqCst) {
             // Work is pending — loop; the top-of-loop enable() re-arms IRQs.
+            // C3 E3 DIAGNOSTIC, not for merge.
+            kernel_core::e3probe::halt_skip();
             continue;
         }
 
         // No work pending - use atomic sti;hlt sequence.
         // x86 guarantees that STI takes effect starting with the NEXT instruction,
         // so if an IPI is pending, the CPU will wake from HLT immediately.
+        // C3 E3 DIAGNOSTIC, not for merge.
+        kernel_core::e3probe::halt_begin(kernel_core::e3probe::site::IDLE_AP);
         unsafe {
             core::arch::asm!(
                 "sti", // Enable interrupts (takes effect starting with HLT)
@@ -1503,6 +1507,7 @@ fn ap_idle_loop() -> ! {
                 options(nomem, nostack, preserves_flags)
             );
         }
+        kernel_core::e3probe::halt_end();
     }
 }
 

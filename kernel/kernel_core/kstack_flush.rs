@@ -317,6 +317,13 @@ pub(crate) fn defer_reclaimed_stack(pid: usize, phys: u64) {
 /// The RCU drain epilogue: complete the batch if it is full or old enough.
 /// The caller holds drain ownership.
 pub(crate) fn drain_epilogue() {
+    // C3 E3 DIAGNOSTIC, not for merge.
+    if crate::e3probe::completes_every_drain() {
+        if KSTACK_FLUSH.pending.load(Ordering::Relaxed) != 0 {
+            KSTACK_FLUSH.complete_now(&mut KernelBackend);
+        }
+        return;
+    }
     KSTACK_FLUSH.drain_epilogue(crate::time::get_ticks(), &mut KernelBackend);
 }
 
