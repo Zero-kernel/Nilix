@@ -18,6 +18,10 @@
 //!   whatever waits: about one broadcast flush per stack again, outside the
 //!   `PT_LOCK` section.
 //!
+//! This branch runs the committed stress runner (a schedstat copy every 256th
+//! round), so the kernel prints `E3_MODE <mode> <window>` on the console at
+//! each window change, and the cycle is [`MODE_CYCLE`].
+//!
 //! `/proc/schedstat` gets `e3_mode <mode> <window>` on every read and, at most
 //! once per [`REPORT_INTERVAL_TICKS`], three cumulative tables per mode:
 //!
@@ -105,6 +109,8 @@ const CTX_COUNT: usize = CTX_RUNNABLE + 1;
 const CPUS: usize = cpu_local::max_cpus();
 const PIDS: usize = crate::process::PID_MAX + 1;
 const MODE_WINDOW_TICKS: u64 = 10_000;
+/// The modes this branch cycles through.
+const MODE_CYCLE: [usize; 3] = [mode::BATCH, mode::PARENT, mode::KICK_ALL];
 const REPORT_INTERVAL_TICKS: u64 = 50_000;
 
 /// Whether the current window completes the flush batch in every drain pass.
@@ -173,7 +179,27 @@ fn window(now_tick: u64) -> Option<u64> {
 
 /// The reclaim mode of the current window.
 pub fn current_mode() -> usize {
-    window(crate::get_ticks()).map_or(mode::BATCH, |window| (window % mode::COUNT as u64) as usize)
+    window(crate::get_ticks()).map_or(mode::BATCH, mode_of_window)
+}
+
+fn mode_of_window(window: u64) -> usize {
+    MODE_CYCLE[(window % MODE_CYCLE.len() as u64) as usize]
+}
+
+/// The last window announced on the console, plus one (0: none yet).
+static ANNOUNCED_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+/// Process context, interrupts enabled: announce a new window once.
+pub fn announce_window() {
+    let Some(window) = window(crate::get_ticks()) else {
+        return;
+    };
+    if ANNOUNCED_WINDOW.load(Ordering::Relaxed) == window + 1
+        || ANNOUNCED_WINDOW.swap(window + 1, Ordering::Relaxed) == window + 1
+    {
+        return;
+    }
+    klog::klog_force!("E3_MODE {} {}", mode_of_window(window), window);
 }
 
 /// Register the scheduler's selective reschedule kick.
@@ -342,7 +368,7 @@ pub fn write_report(out: &mut impl core::fmt::Write, now_tick: u64) -> core::fmt
         Ordering::Relaxed,
     );
     let window = window(now_tick).unwrap_or(0);
-    writeln!(out, "e3_mode {} {}", window % mode::COUNT as u64, window)?;
+    writeln!(out, "e3_mode {} {}", mode_of_window(window), window)?;
 
     let last = LAST_REPORT_TICK.load(Ordering::Relaxed);
     if now_tick.saturating_sub(last) < REPORT_INTERVAL_TICKS

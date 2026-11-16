@@ -386,6 +386,9 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
     // thread still switching out stays marked for the next pass).
     crate::process::drain_thread_autoreap();
 
+    // C3 E3 DIAGNOSTIC, not for merge.
+    crate::e3probe::announce_window();
+
     // E.4 RCU: Drain callbacks in process context.
     crate::rcu::poll();
 
