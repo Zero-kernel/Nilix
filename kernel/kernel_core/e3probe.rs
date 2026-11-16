@@ -20,7 +20,9 @@
 //!
 //! This branch runs the committed stress runner (a schedstat copy every 256th
 //! round), so the kernel prints `E3_MODE <mode> <window>` on the console at
-//! each window change, and the cycle is [`MODE_CYCLE`].
+//! each window change, and the cycle is [`MODE_CYCLE`]. The tables are not
+//! printed here: at 16 vCPUs their console output took 21 s in one piece,
+//! which is past the stress gate's 15 s heartbeat bound.
 //!
 //! `/proc/schedstat` gets `e3_mode <mode> <window>` on every read and, at most
 //! once per [`REPORT_INTERVAL_TICKS`], three cumulative tables per mode:
@@ -109,6 +111,8 @@ const CTX_COUNT: usize = CTX_RUNNABLE + 1;
 const CPUS: usize = cpu_local::max_cpus();
 const PIDS: usize = crate::process::PID_MAX + 1;
 const MODE_WINDOW_TICKS: u64 = 10_000;
+/// Whether `/proc/schedstat` carries the tables on this branch.
+const PRINT_TABLES: bool = false;
 /// The modes this branch cycles through.
 const MODE_CYCLE: [usize; 3] = [mode::BATCH, mode::PARENT, mode::KICK_ALL];
 const REPORT_INTERVAL_TICKS: u64 = 50_000;
@@ -369,6 +373,9 @@ pub fn write_report(out: &mut impl core::fmt::Write, now_tick: u64) -> core::fmt
     );
     let window = window(now_tick).unwrap_or(0);
     writeln!(out, "e3_mode {} {}", mode_of_window(window), window)?;
+    if !PRINT_TABLES {
+        return Ok(());
+    }
 
     let last = LAST_REPORT_TICK.load(Ordering::Relaxed);
     if now_tick.saturating_sub(last) < REPORT_INTERVAL_TICKS
