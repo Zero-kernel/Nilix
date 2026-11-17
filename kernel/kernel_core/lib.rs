@@ -75,6 +75,7 @@ pub use mm::fallible_map;
 pub mod fork;
 pub mod fs_context;
 pub mod ipc_namespace;
+pub mod kstack_flush;
 #[cfg(feature = "mitigation_probe")]
 mod mitigation_probe;
 pub mod mount_namespace;

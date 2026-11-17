@@ -2096,6 +2096,12 @@ impl Inode for ProcSchedstatInode {
 /// so `ipis_handled` may exceed `ipis_sent`. LAPIC coalescing also means their
 /// difference cannot measure pending or dropped requests. Compare same-boot
 /// interval deltas for each CPU's counter separately, allowing for u64 wrap.
+///
+/// The C3 repair (#90) appends `kstack_flush batches= stacks= by_count=
+/// by_age= quarantined=`: completed kernel-stack flush batches (one CR3-0
+/// broadcast each), the stacks they covered, the batches completed for being
+/// full and for being old, and the stacks quarantined after their flush.
+/// `stacks / batches` is the mean batch size.
 fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let mut content = AdmittedString::new(HeapClass::Procfs);
     let online = process::sched_online_cpu_mask();
@@ -2154,6 +2160,13 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
             pt.wait_tsc_max,
             pt.hold_tsc,
             pt.hold_tsc_max
+        ))
+        .map_err(|_| FsError::NoSpace)?;
+    let kstack = kernel_core::kstack_flush::stats();
+    content
+        .write_fmt(format_args!(
+            "kstack_flush batches={} stacks={} by_count={} by_age={} quarantined={}\n",
+            kstack.batches, kstack.stacks, kstack.by_count, kstack.by_age, kstack.quarantined
         ))
         .map_err(|_| FsError::NoSpace)?;
     Ok(content)

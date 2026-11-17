@@ -229,7 +229,7 @@ pub const KSTACK_BASE: u64 = mm::KSTACK_REGION_BASE;
 pub const KSTACK_STRIDE: u64 = 0x9000;
 
 /// 内核栈页数（32KB = 8 页）
-const KSTACK_PAGES: usize = 8;
+pub(crate) const KSTACK_PAGES: usize = 8;
 
 /// 守护页数
 const KSTACK_GUARD_PAGES: usize = 1;
@@ -788,7 +788,8 @@ pub enum KernelStackError {
     AddressOverflow,
     /// R180-12: fixed RCU callback pool is full. No stack was allocated.
     CallbackPoolExhausted,
-    /// The recycled PID's previous stack is still awaiting RCU reclamation.
+    /// The recycled PID's previous stack is still awaiting RCU reclamation or
+    /// its batched TLB flush (`kstack_flush`).
     ReclaimPending,
 }
 
@@ -13384,8 +13385,9 @@ fn free_process_resources(
 /// 如果当前 CPU 正在使用该栈，则仍跳过释放以避免自踩栈导致崩溃。
 fn reclaim_kernel_stack(args: [usize; 2]) {
     let pid = args[0];
-    let expected_phys = PhysFrame::from_start_address(PhysAddr::new(args[1] as u64))
-        .unwrap_or_else(|_| panic!("RCU: unaligned kernel-stack physical identity"));
+    let expected_phys: PhysFrame<Size4KiB> =
+        PhysFrame::from_start_address(PhysAddr::new(args[1] as u64))
+            .unwrap_or_else(|_| panic!("RCU: unaligned kernel-stack physical identity"));
     let (stack_base, _) = kernel_stack_slot(pid)
         .unwrap_or_else(|_| panic!("RCU: invalid PID in kernel-stack callback"));
 
@@ -13433,11 +13435,14 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
             }
 
             // Kernel-stack mappings are shared through many distinct CR3 roots.
-            // Broadcast before any physical reuse, even on a partial failure.
-            if cleared != 0 {
+            // A partial failure quarantines the stack below, so its cleared
+            // leaves are broadcast here. C3 (#90): a fully verified stack
+            // leaves its broadcast to the flush batch.
+            let verified = exact && matched == KSTACK_PAGES;
+            if cleared != 0 && !verified {
                 mm::flush_all_address_spaces();
             }
-            exact && matched == KSTACK_PAGES
+            verified
         })
     };
 
@@ -13450,20 +13455,12 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
         return;
     }
 
-    let mut frame_alloc = FrameAllocator::new();
-    if frame_alloc
-        .try_deallocate_contiguous_frames(expected_phys, KSTACK_PAGES)
-        .is_err()
-    {
-        kprintln!(
-            "  CRITICAL: buddy rejected kernel-stack block for PID {}; quarantining slot",
-            pid
-        );
-        crate::rcu::quarantine_running_stack_callback(pid);
-        return;
-    }
-
-    kprintln!("  Released kernel stack for PID {}", pid);
+    // C3 (#90): the leaves are cleared but no CPU has been flushed. The batch
+    // keeps the block allocated and this PID's slot occupied until one
+    // broadcast has covered this stack and its batch mates; only then does it
+    // return the block and release the slot (or quarantine it, if the buddy
+    // allocator rejects the block).
+    crate::kstack_flush::defer_reclaimed_stack(pid, expected_phys.start_address().as_u64());
 }
 
 pub fn free_kernel_stack(
