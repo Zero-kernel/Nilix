@@ -774,7 +774,11 @@ pub fn dump_futexes_for_stall() {
                 .try_lock()
                 .map(|proc| FutexSpace::id_of_mm(&proc.mm))
         });
-    klog_always!("STALL-DUMP futex begin: dumper space={:#x?}", own_space);
+    klog_always!("STALL-DUMP futex begin: dumper space={:x?}", own_space);
+    // Futex words of the dumping task's own space, walked after the futex
+    // locks are dropped (the walk takes PT_LOCK).
+    let mut own_words = [0usize; 32];
+    let mut own_count = 0;
     match FUTEX_TABLE.try_lock() {
         Some(table) => {
             for (key, bucket) in
@@ -795,6 +799,10 @@ pub fn dump_futexes_for_stall() {
                         None
                     }
                 };
+                if own_space == Some(key.0) && own_count < own_words.len() {
+                    own_words[own_count] = key.1;
+                    own_count += 1;
+                }
                 klog_always!(
                     "STALL-DUMP futex space={:#x} uaddr={:#x} queue={:#x} waiter_count={} records={} unlinked={} pi_owner={} pi_waiters={} words[-4,0,+4]={:x?}",
                     key.0,
@@ -824,6 +832,41 @@ pub fn dump_futexes_for_stall() {
             }
         }
         None => klog_always!("STALL-DUMP futex: FUTEX_TABLE busy"),
+    }
+    // What the page tables say about each word, against what this CPU reads
+    // through its TLB: a difference, or a word that is not mapped, means a
+    // stale translation.
+    for &uaddr in &own_words[..own_count] {
+        // SAFETY: process context with no futex lock held; the manager only
+        // translates.
+        let mapped = unsafe {
+            mm::page_table::with_current_manager(x86_64::VirtAddr::new(0), |manager| {
+                manager.translate_with_flags(x86_64::VirtAddr::new(uaddr as u64))
+            })
+        };
+        let by_this_cpu = LockedUserWord(uaddr).read().ok();
+        match mapped {
+            Some((phys, flags)) => {
+                // SAFETY: a mapped user frame is covered by the kernel's
+                // physical map, and a u32 at a 4-aligned address stays in it.
+                let by_page_table = unsafe {
+                    core::ptr::read_volatile(mm::page_table::phys_to_virt(phys).as_ptr::<u32>())
+                };
+                klog_always!(
+                    "STALL-DUMP futex word uaddr={:#x} phys={:#x} flags={:?} by_page_table={:#x} by_this_cpu={:x?}",
+                    uaddr,
+                    phys.as_u64(),
+                    flags,
+                    by_page_table,
+                    by_this_cpu
+                );
+            }
+            None => klog_always!(
+                "STALL-DUMP futex word uaddr={:#x} not mapped; by_this_cpu={:x?}",
+                uaddr,
+                by_this_cpu
+            ),
+        }
     }
     for pid in 1..=process::PID_MAX {
         if wake_mark_is_set(pid) && process::get_process(pid).is_some() {
