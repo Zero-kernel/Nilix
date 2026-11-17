@@ -128,6 +128,20 @@ fn print(slot: &Slot, back: usize) {
     );
 }
 
+/// The second word of the newest FUTEX_REQUEUE: in the thread profile, the
+/// futex word of the wave's mutex, which a condition-variable broadcast
+/// requeues its waiters to.
+pub(crate) fn newest_requeue_target() -> Option<usize> {
+    let end = NEXT.load(Ordering::Relaxed);
+    for back in 1..=end.min(SLOTS) {
+        let slot = &RING[end.wrapping_sub(back) % SLOTS];
+        if slot.who.load(Ordering::Relaxed) >> 56 == Event::RequeueEnter as u64 {
+            return Some(slot.value.load(Ordering::Relaxed) as usize);
+        }
+    }
+    None
+}
+
 pub(crate) fn dump() {
     let end = NEXT.load(Ordering::Relaxed);
     let count = end.min(SLOTS);
