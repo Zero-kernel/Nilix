@@ -737,11 +737,22 @@ impl FutexDeferredWakes {
     fn run(&self, space: usize) {
         for &(origin, pid) in &self.entries[..self.len] {
             let bucket = lookup_bucket((space, origin));
+            #[cfg(feature = "stall_dump")]
+            let found = bucket.is_some();
+            let mut _readied = false;
             if let Some(bucket) = bucket {
                 let queue = bucket.lock().queue.clone();
                 let pid = pid as ProcessId;
-                let _ = queue.wake_specific_if(pid, || wake_mark_is_set(pid));
+                _readied = queue.wake_specific_if(pid, || wake_mark_is_set(pid));
             }
+            #[cfg(feature = "stall_dump")]
+            crate::stall_trace::record(
+                crate::stall_trace::Event::WakeTask,
+                origin,
+                u64::from(pid)
+                    | if _readied { crate::stall_trace::FLAG_A } else { 0 }
+                    | if found { crate::stall_trace::FLAG_B } else { 0 },
+            );
         }
     }
 }
@@ -820,6 +831,7 @@ pub fn dump_futexes_for_stall() {
         }
     }
     klog_always!("STALL-DUMP futex end");
+    crate::stall_trace::dump();
 }
 
 /// Complete a waker's removal of `record` from `bucket` (whose address is
@@ -833,8 +845,22 @@ fn dequeue_record_locked(
 ) {
     set_wake_mark(record.pid as ProcessId);
     let origin = record.sleep_origin(home);
+    #[cfg(feature = "stall_dump")]
+    crate::stall_trace::record(
+        crate::stall_trace::Event::TakeRecord,
+        home,
+        u64::from(record.pid) | if origin == home { crate::stall_trace::FLAG_A } else { 0 },
+    );
     if origin == home {
-        let _ = bucket.queue.wake_specific(record.pid as ProcessId);
+        let _readied = bucket.queue.wake_specific(record.pid as ProcessId);
+        #[cfg(feature = "stall_dump")]
+        crate::stall_trace::record(
+            crate::stall_trace::Event::WakeTask,
+            origin,
+            u64::from(record.pid)
+                | if _readied { crate::stall_trace::FLAG_A } else { 0 }
+                | crate::stall_trace::FLAG_B,
+        );
     } else {
         deferred.push(origin, record.pid);
     }
@@ -905,6 +931,14 @@ fn requeue_locked(
         };
         if !moved {
             dequeue_record_locked(source, source_addr, record, deferred);
+        }
+        #[cfg(feature = "stall_dump")]
+        if moved {
+            crate::stall_trace::record(
+                crate::stall_trace::Event::RequeueMove,
+                source_addr,
+                u64::from(record.pid),
+            );
         }
         requeued += 1;
     }
@@ -1798,6 +1832,8 @@ pub fn futex_wait(
     // is cleared before any waker can see the record published below.
     clear_wake_mark(pid);
     let (bucket, queue) = publish_plain_waiter(key, space, record, expected, &prepare_permit)?;
+    #[cfg(feature = "stall_dump")]
+    crate::stall_trace::record(crate::stall_trace::Event::WaitPublished, uaddr, 0);
 
     // Sleep on the origin queue unless a waker has already taken the record.
     // The mark is read under the queue's `waiters` lock, which a waker's
@@ -1811,6 +1847,17 @@ pub fn futex_wait(
         }
     });
     drop(prepare_permit);
+    #[cfg(feature = "stall_dump")]
+    match &prepared {
+        Ok(Ok(PrepareWait::Armed(_))) => {
+            crate::stall_trace::record(crate::stall_trace::Event::WaitArmed, uaddr, 0)
+        }
+        Ok(Err(())) => crate::stall_trace::record(crate::stall_trace::Event::WaitNotArmed, uaddr, 1),
+        Ok(Ok(PrepareWait::Immediate(_))) => {
+            crate::stall_trace::record(crate::stall_trace::Event::WaitNotArmed, uaddr, 2)
+        }
+        Err(_) => crate::stall_trace::record(crate::stall_trace::Event::WaitNotArmed, uaddr, 3),
+    }
     let outcome = match prepared {
         Ok(Ok(PrepareWait::Armed(ticket))) => queue.finish_prepared(ticket),
         Ok(Ok(PrepareWait::Immediate(outcome))) => outcome,
@@ -1818,7 +1865,22 @@ pub fn futex_wait(
         Err(_) => WaitOutcome::ResourceExhausted,
     };
 
-    if finish_plain_wait(key, &bucket, &queue, pid) {
+    let taken_by_waker = finish_plain_wait(key, &bucket, &queue, pid);
+    #[cfg(feature = "stall_dump")]
+    crate::stall_trace::record(
+        crate::stall_trace::Event::WaitDone,
+        uaddr,
+        u64::from(taken_by_waker)
+            | match outcome {
+                WaitOutcome::Woken => 0,
+                WaitOutcome::TimedOut => 1,
+                WaitOutcome::Closed => 2,
+                WaitOutcome::NoProcess => 3,
+                WaitOutcome::Interrupted => 4,
+                WaitOutcome::ResourceExhausted => 5,
+            } << 8,
+    );
+    if taken_by_waker {
         return Ok(0);
     }
 

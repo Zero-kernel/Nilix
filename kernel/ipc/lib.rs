@@ -30,6 +30,8 @@ use kernel_core::{NamespaceId, SyscallError};
 
 pub mod futex;
 pub mod ipc;
+#[cfg(feature = "stall_dump")]
+pub(crate) mod stall_trace;
 pub mod pipe;
 pub mod sync;
 
@@ -792,6 +794,24 @@ fn futex_callback(
         (futex::FutexSpace::of_process(&proc), pi_caller)
     };
 
+    #[cfg(feature = "stall_dump")]
+    match &request {
+        FutexRequest::Wait {
+            expected, current, ..
+        } => stall_trace::record(
+            stall_trace::Event::WaitEnter,
+            uaddr,
+            u64::from(*expected) | u64::from(*current) << 32,
+        ),
+        FutexRequest::Wake { count, .. } => {
+            stall_trace::record(stall_trace::Event::WakeEnter, uaddr, u64::from(*count))
+        }
+        FutexRequest::Requeue { uaddr2, .. } => {
+            stall_trace::record(stall_trace::Event::RequeueEnter, uaddr, *uaddr2 as u64)
+        }
+        _ => {}
+    }
+
     let result = match request {
         FutexRequest::Wait {
             expected,
@@ -865,6 +885,20 @@ fn futex_callback(
     // The namespace reference the PI caller holds is dropped here, with no
     // lock held.
     drop(pi_caller);
+    #[cfg(feature = "stall_dump")]
+    stall_trace::record(
+        stall_trace::Event::OpExit,
+        uaddr,
+        match &result {
+            Ok(value) => *value as u64,
+            Err(FutexError::WouldBlock) => 1 << 63 | 11,
+            Err(FutexError::TimedOut) => 1 << 63 | 110,
+            Err(FutexError::Interrupted) => 1 << 63 | 4,
+            Err(FutexError::TooManyBuckets) => 1 << 63 | 12,
+            Err(FutexError::Fault) => 1 << 63 | 14,
+            Err(_) => 1 << 63 | 1,
+        },
+    );
     result.map_err(futex_error_to_syscall)
 }
 
@@ -939,7 +973,10 @@ fn futex_wake_callback(tgid: process::ProcessId, uaddr: usize, max_wake: usize) 
         Some(leader) => futex::FutexSpace::id_of_mm(&leader.lock().mm),
         None => return 0,
     };
-    futex_wake(space, uaddr, max_wake)
+    let woken = futex_wake(space, uaddr, max_wake);
+    #[cfg(feature = "stall_dump")]
+    stall_trace::record(stall_trace::Event::ExitWake, uaddr, woken as u64);
+    woken
 }
 
 /// 初始化IPC子系统
