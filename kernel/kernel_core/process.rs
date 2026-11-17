@@ -6771,6 +6771,77 @@ pub fn register_stall_dump_hook(hook: fn()) {
     *STALL_DUMP_HOOK.lock() = Some(hook);
 }
 
+/// Stall diagnostic: the IPC crate's event ring, as a `fn(u8, usize, u64)`.
+#[cfg(feature = "stall_dump")]
+static STALL_TRACE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Stall diagnostic: where `stall_trace_event` sends its events.
+#[cfg(feature = "stall_dump")]
+pub fn register_stall_trace_hook(hook: fn(u8, usize, u64)) {
+    STALL_TRACE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Stall diagnostic: record one event in the futex event ring.
+#[cfg(feature = "stall_dump")]
+pub fn stall_trace_event(event: u8, addr: usize, value: u64) {
+    let hook = STALL_TRACE_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: the slot only ever holds a `fn(u8, usize, u64)`.
+        let hook: fn(u8, usize, u64) = unsafe { core::mem::transmute(hook) };
+        hook(event, addr, value);
+    }
+}
+
+/// Stall diagnostic: walk the page tables under `root` for `vaddr` without a
+/// lock. Returns the physical address and the leaf entry.
+#[cfg(feature = "stall_dump")]
+pub fn stall_walk(root: usize, vaddr: usize) -> Option<(u64, u64)> {
+    const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+    let mut table = root as u64 & ADDRESS;
+    for level in (0..4u32).rev() {
+        if !mm::page_table::page_table_frame_address_valid(table) {
+            return None;
+        }
+        let index = (vaddr >> (12 + 9 * level)) & 0x1ff;
+        // SAFETY: `table` is a frame the kernel's physical map covers; the
+        // read is of one aligned entry and may be stale, never invalid.
+        let entry = unsafe {
+            core::ptr::read_volatile(
+                mm::page_table::phys_to_virt(x86_64::PhysAddr::new(table))
+                    .as_ptr::<u64>()
+                    .add(index),
+            )
+        };
+        if entry & 1 == 0 {
+            return None;
+        }
+        let address = entry & ADDRESS;
+        if level == 0 || entry & 0x80 != 0 {
+            let mask = (1u64 << (12 + 9 * level)) - 1;
+            return Some(((address & !mask) | (vaddr as u64 & mask), entry));
+        }
+        table = address;
+    }
+    None
+}
+
+/// Stall diagnostic: the u32 at the 4-aligned `vaddr` as `root`'s page tables
+/// map it.
+#[cfg(feature = "stall_dump")]
+pub fn stall_word(root: usize, vaddr: usize) -> Option<u32> {
+    let (phys, _) = stall_walk(root, vaddr)?;
+    if vaddr & 3 != 0 || !mm::page_table::page_table_frame_address_valid(phys & !0xfff) {
+        return None;
+    }
+    // SAFETY: a mapped user frame is covered by the kernel's physical map,
+    // and the address is 4-aligned, so the u32 stays inside the frame.
+    Some(unsafe {
+        core::ptr::read_volatile(
+            mm::page_table::phys_to_virt(x86_64::PhysAddr::new(phys)).as_ptr::<u32>(),
+        )
+    })
+}
+
 /// Stall diagnostic: the wait queue `pid` is about to block on.
 #[cfg(feature = "stall_dump")]
 pub fn note_stall_wait_queue(pid: ProcessId, queue: usize) {
@@ -11809,6 +11880,10 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 
             // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
             // 注意：需要在正确的地址空间中执行
+            // Stall diagnostic (not for merge): the word before the clear, as
+            // this CPU reads it and as the task's page tables map it.
+            #[cfg(feature = "stall_dump")]
+            let mut seen = (0xffff_ffffu32, 0xffff_ffffu32);
             let cleared = unsafe {
                 use crate::usercopy::copy_to_user_safe;
                 use x86_64::structures::paging::PhysFrame;
@@ -11820,11 +11895,25 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                     .map(PhysFrame::containing_address);
                 target.is_some_and(|target| {
                     mm::tlb_shootdown::with_temporary_address_space(target, || {
+                        #[cfg(feature = "stall_dump")]
+                        {
+                            seen.0 = crate::usercopy::read_user_u32_atomic_nofault(
+                                crate::usercopy::UserAddr::new(tid_addr),
+                            )
+                            .unwrap_or(0xffff_fffe);
+                            seen.1 = stall_word(memory_space, tid_addr).unwrap_or(0xffff_fffe);
+                        }
                         let zero = 0i32.to_ne_bytes();
                         copy_to_user_safe(tid_addr as *mut u8, &zero).is_ok()
                     })
                 })
             };
+            #[cfg(feature = "stall_dump")]
+            {
+                // 15: the exiting task; 13: the word it clears.
+                stall_trace_event(15, memory_space, pid as u64 | (tgid as u64) << 32);
+                stall_trace_event(13, tid_addr, u64::from(seen.0) | u64::from(seen.1) << 32);
+            }
 
             if cleared {
                 // 唤醒等待在 clear_child_tid 地址上的 futex

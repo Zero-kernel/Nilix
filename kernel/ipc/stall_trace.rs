@@ -16,6 +16,8 @@ const PER_TASK: usize = 20;
 const NEWEST: usize = 96;
 /// Blocked tasks covered.
 const TASKS: usize = 12;
+/// Clone and exit events printed.
+const LIFECYCLE: usize = 144;
 
 struct Slot {
     tsc: AtomicU64,
@@ -70,6 +72,14 @@ pub(crate) enum Event {
     RequeueMove = 11,
     /// The clear_child_tid wake of an exiting task. addr = uaddr, value = woken.
     ExitWake = 12,
+    // Recorded by kernel_core through `record_raw`:
+    // 13 exit-clear: the clear_child_tid word before an exiting task clears
+    //    it. addr = uaddr, value = as this CPU reads it | as the task's page
+    //    tables map it << 32.
+    // 14 clone-tid: the CLONE_PARENT_SETTID word after the write. addr =
+    //    uaddr, value = as this CPU reads it | as the page tables map it << 32.
+    // 15 exit-task: the exiting task. addr = its page-table root, value = pid
+    //    | tgid << 32.
 }
 
 fn name(event: u64) -> &'static str {
@@ -86,11 +96,19 @@ fn name(event: u64) -> &'static str {
         10 => "wake-task",
         11 => "requeue-move",
         12 => "exit-wake",
+        13 => "exit-clear",
+        14 => "clone-tid",
+        15 => "exit-task",
         _ => "?",
     }
 }
 
 pub(crate) fn record(event: Event, addr: usize, value: u64) {
+    record_raw(event as u8, addr, value);
+}
+
+/// [`record`] for the events kernel_core sends by number.
+pub(crate) fn record_raw(event: u8, addr: usize, value: u64) {
     let pid = process::current_pid().unwrap_or(0) as u64;
     // Diagnostic ring index; wrap is intended. lint-fetch-add: allow
     let index = NEXT.fetch_add(1, Ordering::Relaxed) % SLOTS;
@@ -179,6 +197,19 @@ pub(crate) fn dump() {
                 print(slot(back), back);
                 shown += 1;
             }
+        }
+    }
+    // Thread creation and exit: the newest clone-tid, exit-task and
+    // exit-clear events.
+    klog_always!("STALL-DUMP trace clone and exit, newest {}", LIFECYCLE);
+    let mut shown = 0;
+    for back in 1..=count {
+        if shown == LIFECYCLE {
+            break;
+        }
+        if matches!(slot(back).who.load(Ordering::Relaxed) >> 56, 13..=15) {
+            print(slot(back), back);
+            shown += 1;
         }
     }
     klog_always!("STALL-DUMP trace newest {}", count.min(NEWEST));

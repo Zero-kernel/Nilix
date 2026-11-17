@@ -911,16 +911,16 @@ pub fn dump_futexes_for_stall() {
         } else {
             [None; 3]
         };
+        let mut by_page_table = [None; 9];
+        for (index, word) in by_page_table.iter_mut().enumerate() {
+            *word = stall_word(root, uaddr.wrapping_sub(16).wrapping_add(index * 4));
+        }
         klog_always!(
-            "STALL-DUMP futex word uaddr={:#x} root={:#x} mapping={:x?} by_page_table[-4,0,+4]={:x?} by_this_cpu={:x?}",
+            "STALL-DUMP futex word uaddr={:#x} root={:#x} mapping={:x?} by_page_table[-16..+16]={:x?} by_this_cpu[-4,0,+4]={:x?}",
             uaddr,
             root,
             stall_walk(root, uaddr),
-            [
-                stall_word(root, uaddr.wrapping_sub(4)),
-                stall_word(root, uaddr),
-                stall_word(root, uaddr.wrapping_add(4))
-            ],
+            by_page_table,
             by_this_cpu
         );
     }
