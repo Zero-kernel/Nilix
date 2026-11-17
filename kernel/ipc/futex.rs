@@ -876,6 +876,41 @@ pub fn dump_futexes_for_stall() {
         }
     }
     klog_always!("STALL-DUMP futex words end");
+    // The object around the mutex word the newest requeue named (the thread
+    // profile's ThreadWave: mutex, condition variable, counter, arrived,
+    // parties, generation, errors), in both views.
+    if let (Some(_), Some(mutex_word)) = (own_space, crate::stall_trace::newest_requeue_target()) {
+        let base = mutex_word.wrapping_sub(4);
+        for row in 0..4usize {
+            let mut by_this_cpu = [None; 8];
+            let mut by_page_table = [None; 8];
+            for column in 0..8usize {
+                let addr = base.wrapping_add((row * 8 + column) * 4);
+                by_this_cpu[column] = LockedUserWord(addr).read().ok();
+                // SAFETY: as for the futex words above.
+                by_page_table[column] = unsafe {
+                    mm::page_table::with_current_manager(x86_64::VirtAddr::new(0), |manager| {
+                        manager.translate_with_flags(x86_64::VirtAddr::new(addr as u64))
+                    })
+                }
+                .map(|(phys, _)| {
+                    // SAFETY: a mapped user frame is covered by the kernel's
+                    // physical map, and the address is 4-aligned.
+                    unsafe {
+                        core::ptr::read_volatile(mm::page_table::phys_to_virt(phys).as_ptr::<u32>())
+                    }
+                });
+            }
+            klog_always!(
+                "STALL-DUMP object {:#x}+{:#x} by_this_cpu={:x?} by_page_table={:x?}",
+                base,
+                row * 32,
+                by_this_cpu,
+                by_page_table
+            );
+        }
+    }
+    klog_always!("STALL-DUMP object end");
 }
 
 /// Complete a waker's removal of `record` from `bucket` (whose address is
