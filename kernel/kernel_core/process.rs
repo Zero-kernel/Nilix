@@ -4390,7 +4390,15 @@ impl Process {
 
     /// RF178-33 FIX: Mark a task blocked and exclude the blocked interval.
     #[inline]
+    #[cfg_attr(feature = "stall_dump", track_caller)]
     pub fn enter_blocked_at(&mut self, now_tick: u64) {
+        #[cfg(feature = "stall_dump")]
+        if let Some(slot) = STALL_BLOCK_SITE.get(self.pid) {
+            slot.store(
+                core::panic::Location::caller() as *const core::panic::Location<'static> as usize,
+                Ordering::Relaxed,
+            );
+        }
         self.state = ProcessState::Blocked;
         self.wait_ticks = 0;
         self.wait_age_tick = now_tick;
@@ -6748,6 +6756,29 @@ pub fn idle_rearm_count() -> u64 {
 #[cfg(feature = "stall_dump")]
 pub static LAST_CONSOLE_WRITE_TICK: AtomicU64 = AtomicU64::new(0);
 
+/// Stall diagnostic (not for merge): the source location where each PID last
+/// entered `Blocked`, and the wait queue it armed on, if any.
+#[cfg(feature = "stall_dump")]
+static STALL_BLOCK_SITE: [AtomicUsize; PID_MAX + 1] = [const { AtomicUsize::new(0) }; PID_MAX + 1];
+#[cfg(feature = "stall_dump")]
+static STALL_WAIT_QUEUE: [AtomicUsize; PID_MAX + 1] = [const { AtomicUsize::new(0) }; PID_MAX + 1];
+#[cfg(feature = "stall_dump")]
+static STALL_DUMP_HOOK: spin::Mutex<Option<fn()>> = spin::Mutex::new(None);
+
+/// Stall diagnostic: a subsystem's own dump, run after the task dump.
+#[cfg(feature = "stall_dump")]
+pub fn register_stall_dump_hook(hook: fn()) {
+    *STALL_DUMP_HOOK.lock() = Some(hook);
+}
+
+/// Stall diagnostic: the wait queue `pid` is about to block on.
+#[cfg(feature = "stall_dump")]
+pub fn note_stall_wait_queue(pid: ProcessId, queue: usize) {
+    if let Some(slot) = STALL_WAIT_QUEUE.get(pid) {
+        slot.store(queue, Ordering::Relaxed);
+    }
+}
+
 /// GAP-6 F11 diagnostic: print every task's wait and reapability state. Uses
 /// try-locks only and prints whatever it can reach; called once per stall.
 #[cfg(feature = "stall_dump")]
@@ -6765,6 +6796,25 @@ pub fn dump_tasks_for_stall() {
             continue;
         };
         let shown = proc.children.len().min(8);
+        let site = STALL_BLOCK_SITE
+            .get(pid)
+            .map_or(0, |slot| slot.load(Ordering::Relaxed));
+        let (file, line) = if site == 0 {
+            ("-", 0)
+        } else {
+            // SAFETY: the slot only ever holds a `&'static Location`.
+            let location = unsafe { &*(site as *const core::panic::Location<'static>) };
+            (location.file(), location.line())
+        };
+        klog_always!(
+            "STALL-DUMP wait pid={} blocked_at={}:{} wait_queue={:#x}",
+            pid,
+            file,
+            line,
+            STALL_WAIT_QUEUE
+                .get(pid)
+                .map_or(0, |slot| slot.load(Ordering::Relaxed))
+        );
         klog_always!(
             "STALL-DUMP task pid={} gen={} ppid={} tgid={} state={:?} waiting_child={:?} on_cpu={} switch_reap_pending={} teardown_done={} members={} pending_kill={} allowed_cpus={:#x} cpuset={:?} children={} {:?}",
             pid,
@@ -6783,6 +6833,11 @@ pub fn dump_tasks_for_stall() {
             proc.children.len(),
             &proc.children[..shown]
         );
+    }
+    drop(table);
+    let hook = *STALL_DUMP_HOOK.lock();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

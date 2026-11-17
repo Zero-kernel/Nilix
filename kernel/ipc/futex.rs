@@ -751,6 +751,77 @@ fn lookup_bucket(key: FutexKey) -> Option<FutexBucketRef> {
     table.get(&key).cloned()
 }
 
+/// Stall diagnostic (not for merge): every futex bucket with its records and
+/// its queue, the user words around each futex word of the dumping task's own
+/// address space, and the wake marks of live tasks. Try-locks only.
+#[cfg(feature = "stall_dump")]
+pub fn dump_futexes_for_stall() {
+    let own_space = process::current_pid()
+        .and_then(process::get_process)
+        .and_then(|process| {
+            process
+                .try_lock()
+                .map(|proc| FutexSpace::id_of_mm(&proc.mm))
+        });
+    klog_always!("STALL-DUMP futex begin: dumper space={:#x?}", own_space);
+    match FUTEX_TABLE.try_lock() {
+        Some(table) => {
+            for (key, bucket) in
+                table.range((Bound::<FutexKey>::Unbounded, Bound::<FutexKey>::Unbounded))
+            {
+                let Some(b) = bucket.try_lock() else {
+                    klog_always!(
+                        "STALL-DUMP futex space={:#x} uaddr={:#x} <locked>",
+                        key.0,
+                        key.1
+                    );
+                    continue;
+                };
+                let word = |addr: usize| {
+                    if own_space == Some(key.0) {
+                        LockedUserWord(addr).read().ok()
+                    } else {
+                        None
+                    }
+                };
+                klog_always!(
+                    "STALL-DUMP futex space={:#x} uaddr={:#x} queue={:#x} waiter_count={} records={} unlinked={} pi_owner={} pi_waiters={} words[-4,0,+4]={:x?}",
+                    key.0,
+                    key.1,
+                    &*b.queue as *const WaitQueue as usize,
+                    b.waiter_count,
+                    b.waiters.len(),
+                    b.unlinked,
+                    b.pi_owner.is_some(),
+                    !b.pi_waiters.is_empty(),
+                    [
+                        word(key.1.wrapping_sub(4)),
+                        word(key.1),
+                        word(key.1.wrapping_add(4))
+                    ]
+                );
+                for record in b.waiters.iter() {
+                    klog_always!(
+                        "STALL-DUMP futex   record pid={} origin={:#x} bitset={:#x} wake_mark={}",
+                        record.pid,
+                        record.origin,
+                        record.bitset,
+                        wake_mark_is_set(record.pid as ProcessId)
+                    );
+                }
+                b.queue.dump_for_stall(wake_mark_is_set);
+            }
+        }
+        None => klog_always!("STALL-DUMP futex: FUTEX_TABLE busy"),
+    }
+    for pid in 1..=process::PID_MAX {
+        if wake_mark_is_set(pid) && process::get_process(pid).is_some() {
+            klog_always!("STALL-DUMP futex wake_mark pid={}", pid);
+        }
+    }
+    klog_always!("STALL-DUMP futex end");
+}
+
 /// Complete a waker's removal of `record` from `bucket` (whose address is
 /// `home`): publish the wake mark, then ready the task on its origin queue,
 /// now if that is this bucket's queue, else after the lock is dropped.

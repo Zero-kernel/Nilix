@@ -23,3 +23,7 @@ klog = { path = "../klog" }
 cap = { path = "../cap" }
 lsm = { path = "../lsm" }
 audit = { path = "../audit" }
+
+[features]
+# Stall diagnostic (stress builds only; not for merge).
+stall_dump = ["kernel_core/stall_dump"]

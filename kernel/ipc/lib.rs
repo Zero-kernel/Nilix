@@ -964,6 +964,10 @@ pub fn init() {
     // GAP-5 futex parity (review F7): exec drops the old image's buckets.
     process::register_futex_exec(futex::futex_drop_space);
 
+    // Stall diagnostic (not for merge).
+    #[cfg(feature = "stall_dump")]
+    process::register_stall_dump_hook(futex::dump_futexes_for_stall);
+
     // 注册系统调用回调
     kernel_core::register_pipe_callback(pipe_create_callback);
     kernel_core::register_fd_read_callback(fd_read_callback);
