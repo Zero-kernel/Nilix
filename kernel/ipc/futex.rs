@@ -762,9 +762,60 @@ fn lookup_bucket(key: FutexKey) -> Option<FutexBucketRef> {
     table.get(&key).cloned()
 }
 
+/// Stall diagnostic (not for merge): walk the page tables under `root` for
+/// `vaddr` without a lock. Returns the physical address and the leaf entry.
+#[cfg(feature = "stall_dump")]
+fn stall_walk(root: usize, vaddr: usize) -> Option<(u64, u64)> {
+    const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+    let mut table = root as u64 & ADDRESS;
+    for level in (0..4u32).rev() {
+        if !mm::page_table::page_table_frame_address_valid(table) {
+            return None;
+        }
+        let index = (vaddr >> (12 + 9 * level)) & 0x1ff;
+        // SAFETY: `table` is a frame the kernel's physical map covers; the
+        // read is of one aligned entry and may be stale, never invalid.
+        let entry = unsafe {
+            core::ptr::read_volatile(
+                mm::page_table::phys_to_virt(x86_64::PhysAddr::new(table))
+                    .as_ptr::<u64>()
+                    .add(index),
+            )
+        };
+        if entry & 1 == 0 {
+            return None;
+        }
+        let address = entry & ADDRESS;
+        if level == 0 || entry & 0x80 != 0 {
+            let mask = (1u64 << (12 + 9 * level)) - 1;
+            return Some(((address & !mask) | (vaddr as u64 & mask), entry));
+        }
+        table = address;
+    }
+    None
+}
+
+/// Stall diagnostic: the u32 at `vaddr` as `root`'s page tables map it.
+#[cfg(feature = "stall_dump")]
+fn stall_word(root: usize, vaddr: usize) -> Option<u32> {
+    let (phys, _) = stall_walk(root, vaddr)?;
+    if !mm::page_table::page_table_frame_address_valid(phys & !0xfff) {
+        return None;
+    }
+    // SAFETY: a mapped user frame is covered by the kernel's physical map,
+    // and `vaddr` is 4-aligned, so the u32 stays inside the frame.
+    Some(unsafe {
+        core::ptr::read_volatile(
+            mm::page_table::phys_to_virt(x86_64::PhysAddr::new(phys)).as_ptr::<u32>(),
+        )
+    })
+}
+
 /// Stall diagnostic (not for merge): every futex bucket with its records and
-/// its queue, the user words around each futex word of the dumping task's own
-/// address space, and the wake marks of live tasks. Try-locks only.
+/// its queue, each futex word as the waiter's page tables map it and, for the
+/// dumping task's own address space, as this CPU reads it; the wake marks of
+/// live tasks; the futex event trace; and the object around the mutex word
+/// that the newest FUTEX_REQUEUE named. Try-locks only.
 #[cfg(feature = "stall_dump")]
 pub fn dump_futexes_for_stall() {
     let own_space = process::current_pid()
@@ -775,10 +826,10 @@ pub fn dump_futexes_for_stall() {
                 .map(|proc| FutexSpace::id_of_mm(&proc.mm))
         });
     klog_always!("STALL-DUMP futex begin: dumper space={:x?}", own_space);
-    // Futex words of the dumping task's own space, walked after the futex
-    // locks are dropped (the walk takes PT_LOCK).
-    let mut own_words = [0usize; 32];
-    let mut own_count = 0;
+    // (space, uaddr, a waiter's pid) of each bucket, resolved after the futex
+    // locks are dropped.
+    let mut words = [(0usize, 0usize, 0u32); 32];
+    let mut word_count = 0;
     match FUTEX_TABLE.try_lock() {
         Some(table) => {
             for (key, bucket) in
@@ -792,19 +843,8 @@ pub fn dump_futexes_for_stall() {
                     );
                     continue;
                 };
-                let word = |addr: usize| {
-                    if own_space == Some(key.0) {
-                        LockedUserWord(addr).read().ok()
-                    } else {
-                        None
-                    }
-                };
-                if own_space == Some(key.0) && own_count < own_words.len() {
-                    own_words[own_count] = key.1;
-                    own_count += 1;
-                }
                 klog_always!(
-                    "STALL-DUMP futex space={:#x} uaddr={:#x} queue={:#x} waiter_count={} records={} unlinked={} pi_owner={} pi_waiters={} words[-4,0,+4]={:x?}",
+                    "STALL-DUMP futex space={:#x} uaddr={:#x} queue={:#x} waiter_count={} records={} unlinked={} pi_owner={} pi_waiters={}",
                     key.0,
                     key.1,
                     &*b.queue as *const WaitQueue as usize,
@@ -812,14 +852,11 @@ pub fn dump_futexes_for_stall() {
                     b.waiters.len(),
                     b.unlinked,
                     b.pi_owner.is_some(),
-                    !b.pi_waiters.is_empty(),
-                    [
-                        word(key.1.wrapping_sub(4)),
-                        word(key.1),
-                        word(key.1.wrapping_add(4))
-                    ]
+                    !b.pi_waiters.is_empty()
                 );
+                let mut waiter = 0u32;
                 for record in b.waiters.iter() {
+                    waiter = record.pid;
                     klog_always!(
                         "STALL-DUMP futex   record pid={} origin={:#x} bitset={:#x} wake_mark={}",
                         record.pid,
@@ -829,6 +866,10 @@ pub fn dump_futexes_for_stall() {
                     );
                 }
                 b.queue.dump_for_stall(wake_mark_is_set);
+                if word_count < words.len() {
+                    words[word_count] = (key.0, key.1, waiter);
+                    word_count += 1;
+                }
             }
         }
         None => klog_always!("STALL-DUMP futex: FUTEX_TABLE busy"),
@@ -840,73 +881,72 @@ pub fn dump_futexes_for_stall() {
     }
     klog_always!("STALL-DUMP futex end");
     crate::stall_trace::dump();
-    // What the page tables say about each word, against what this CPU reads
-    // through its TLB: a difference, or a word that is not mapped, means a
-    // stale translation.
-    for &uaddr in &own_words[..own_count] {
-        // SAFETY: process context with no futex lock held; the manager only
-        // translates.
-        let mapped = unsafe {
-            mm::page_table::with_current_manager(x86_64::VirtAddr::new(0), |manager| {
-                manager.translate_with_flags(x86_64::VirtAddr::new(uaddr as u64))
-            })
+
+    // The page-table root of the tasks that wait on futexes: a record's task,
+    // else any Blocked task with an address space of its own.
+    let root_of = |pid: ProcessId| {
+        process::get_process(pid)
+            .and_then(|process| process.try_lock().map(|proc| proc.memory_space))
+            .filter(|root| *root != 0)
+    };
+    let mut root = None;
+    for &(_, _, waiter) in &words[..word_count] {
+        root = root.or_else(|| root_of(waiter as ProcessId));
+    }
+    // What the page tables say about each futex word, beside what this CPU
+    // reads through its TLB when it runs in the same address space: a
+    // difference, or a waited-on word that is not mapped, means a stale
+    // translation on this CPU.
+    for &(space, uaddr, waiter) in &words[..word_count] {
+        let Some(root) = root_of(waiter as ProcessId).or(root) else {
+            klog_always!("STALL-DUMP futex word uaddr={:#x}: no page-table root", uaddr);
+            continue;
         };
-        let by_this_cpu = LockedUserWord(uaddr).read().ok();
-        match mapped {
-            Some((phys, flags)) => {
-                // SAFETY: a mapped user frame is covered by the kernel's
-                // physical map, and a u32 at a 4-aligned address stays in it.
-                let by_page_table = unsafe {
-                    core::ptr::read_volatile(mm::page_table::phys_to_virt(phys).as_ptr::<u32>())
-                };
-                klog_always!(
-                    "STALL-DUMP futex word uaddr={:#x} phys={:#x} flags={:?} by_page_table={:#x} by_this_cpu={:x?}",
-                    uaddr,
-                    phys.as_u64(),
-                    flags,
-                    by_page_table,
-                    by_this_cpu
-                );
-            }
-            None => klog_always!(
-                "STALL-DUMP futex word uaddr={:#x} not mapped; by_this_cpu={:x?}",
-                uaddr,
-                by_this_cpu
-            ),
-        }
+        let by_this_cpu = if own_space == Some(space) {
+            [
+                LockedUserWord(uaddr.wrapping_sub(4)).read().ok(),
+                LockedUserWord(uaddr).read().ok(),
+                LockedUserWord(uaddr.wrapping_add(4)).read().ok(),
+            ]
+        } else {
+            [None; 3]
+        };
+        klog_always!(
+            "STALL-DUMP futex word uaddr={:#x} root={:#x} mapping={:x?} by_page_table[-4,0,+4]={:x?} by_this_cpu={:x?}",
+            uaddr,
+            root,
+            stall_walk(root, uaddr),
+            [
+                stall_word(root, uaddr.wrapping_sub(4)),
+                stall_word(root, uaddr),
+                stall_word(root, uaddr.wrapping_add(4))
+            ],
+            by_this_cpu
+        );
     }
     klog_always!("STALL-DUMP futex words end");
     // The object around the mutex word the newest requeue named (the thread
     // profile's ThreadWave: mutex, condition variable, counter, arrived,
     // parties, generation, errors), in both views.
-    if let (Some(_), Some(mutex_word)) = (own_space, crate::stall_trace::newest_requeue_target()) {
+    if let (Some(root), Some(mutex_word)) = (root, crate::stall_trace::newest_requeue_target()) {
         let base = mutex_word.wrapping_sub(4);
+        let same_space = word_count != 0 && own_space == Some(words[0].0);
         for row in 0..4usize {
             let mut by_this_cpu = [None; 8];
             let mut by_page_table = [None; 8];
             for column in 0..8usize {
                 let addr = base.wrapping_add((row * 8 + column) * 4);
-                by_this_cpu[column] = LockedUserWord(addr).read().ok();
-                // SAFETY: as for the futex words above.
-                by_page_table[column] = unsafe {
-                    mm::page_table::with_current_manager(x86_64::VirtAddr::new(0), |manager| {
-                        manager.translate_with_flags(x86_64::VirtAddr::new(addr as u64))
-                    })
+                by_page_table[column] = stall_word(root, addr);
+                if same_space {
+                    by_this_cpu[column] = LockedUserWord(addr).read().ok();
                 }
-                .map(|(phys, _)| {
-                    // SAFETY: a mapped user frame is covered by the kernel's
-                    // physical map, and the address is 4-aligned.
-                    unsafe {
-                        core::ptr::read_volatile(mm::page_table::phys_to_virt(phys).as_ptr::<u32>())
-                    }
-                });
             }
             klog_always!(
-                "STALL-DUMP object {:#x}+{:#x} by_this_cpu={:x?} by_page_table={:x?}",
+                "STALL-DUMP object {:#x}+{:#x} by_page_table={:x?} by_this_cpu={:x?}",
                 base,
                 row * 32,
-                by_this_cpu,
-                by_page_table
+                by_page_table,
+                by_this_cpu
             );
         }
     }
