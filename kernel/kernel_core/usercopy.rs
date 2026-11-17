@@ -968,6 +968,12 @@ fn compare_exchange_user_u32_inner(
     desired: u32,
     nofault: bool,
 ) -> Result<bool, ()> {
+    exchange_user_u32(dst, expected, desired, nofault).map(|observed| observed == expected)
+}
+
+/// One compare-and-exchange of the aligned user word at `dst`. Returns the
+/// value the exchange observed: `expected` when it stored `desired`.
+fn exchange_user_u32(dst: UserAddr, expected: u32, desired: u32, nofault: bool) -> Result<u32, ()> {
     let addr = dst.as_usize();
     if addr & (core::mem::align_of::<u32>() - 1) != 0
         || !validate_user_range(addr, core::mem::size_of::<u32>())
@@ -993,8 +999,51 @@ fn compare_exchange_user_u32_inner(
     if observed & 0x1_0000_0000 != 0 {
         Err(())
     } else {
-        Ok(observed as u32 == expected)
+        Ok(observed as u32)
     }
+}
+
+/// Exchanges a store may take before it reports a word that keeps changing.
+const ATOMIC_STORE_ATTEMPTS: usize = 16;
+
+/// C3 (#90): store `value` in the aligned user word at `dst` as one 32-bit
+/// write, as Linux `put_user` does.
+///
+/// [`copy_to_user_safe`] writes the four bytes of a word one after another,
+/// and a task that loads the word in between sees a value nobody stored. For
+/// the `clear_child_tid` word that is not harmless: an exiting thread of TID
+/// `0x501` left `0x500` in musl's thread-list lock for a moment, the sibling
+/// with TID `0x500` took that for a lock it already held, and the thread group
+/// deadlocked on the lock one wave of threads later.
+///
+/// The store is a compare-and-exchange against the value last observed,
+/// repeated when another task changed the word in between, so the one `lock
+/// cmpxchg` helper carries it and a fault is resolved or reported as for
+/// [`compare_exchange_user_u32`]. `Err(())` means a misaligned or out-of-range
+/// address, a fault, or a word that changed under every one of
+/// [`ATOMIC_STORE_ATTEMPTS`] exchanges; nothing was stored.
+pub fn write_user_u32_atomic(dst: UserAddr, value: u32) -> Result<(), ()> {
+    store_by_exchange(value, |expected, desired| {
+        exchange_user_u32(dst, expected, desired, false)
+    })
+}
+
+/// [`write_user_u32_atomic`] over an exchange primitive that returns the value
+/// it observed. The first exchange expects `value` itself: a word that already
+/// holds it is rewritten, any other word reports what it holds.
+fn store_by_exchange(
+    value: u32,
+    mut exchange: impl FnMut(u32, u32) -> Result<u32, ()>,
+) -> Result<(), ()> {
+    let mut expected = value;
+    for _ in 0..ATOMIC_STORE_ATTEMPTS {
+        let observed = exchange(expected, value)?;
+        if observed == expected {
+            return Ok(());
+        }
+        expected = observed;
+    }
+    Err(())
 }
 
 /// ST-K2-P2a: make the user page holding `addr` present for a later read or,
@@ -1906,5 +1955,101 @@ mod robust_usercopy_tests {
         assert!(read_user_u64_atomic(UserAddr::new(MMAP_MIN_ADDR - 8)).is_err());
         assert!(read_user_u64_atomic(UserAddr::new(MMAP_MIN_ADDR + 1)).is_err());
         assert!(compare_exchange_user_u32(UserAddr::new(MMAP_MIN_ADDR + 1), 1, 2).is_err());
+        assert!(write_user_u32_atomic(UserAddr::new(MMAP_MIN_ADDR - 8), 0).is_err());
+        assert!(write_user_u32_atomic(UserAddr::new(MMAP_MIN_ADDR + 1), 0).is_err());
+    }
+
+    /// The exchange [`write_user_u32_atomic`] is built on, against a word of
+    /// the test's own.
+    #[cfg(target_os = "linux")]
+    fn exchange_word(word: *mut u32, expected: u32, desired: u32) -> Result<u32, ()> {
+        let observed = unsafe { __zero_os_usercopy_cmpxchg_u32(word, expected, desired) };
+        assert_eq!(observed >> 32, 0, "a mapped word cannot fault");
+        Ok(observed as u32)
+    }
+
+    /// C3 (#90): the store writes the word whatever it held, with one exchange
+    /// when the word already holds the value and two otherwise.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c3_store_by_exchange_writes_the_word_whatever_it_held() {
+        for initial in [0u32, 0x500, 0x501, u32::MAX] {
+            for value in [0u32, 0x500, 0x501] {
+                let mut word = initial;
+                let mut exchanges = 0;
+                let stored = store_by_exchange(value, |expected, desired| {
+                    exchanges += 1;
+                    exchange_word(&mut word, expected, desired)
+                });
+                assert_eq!(stored, Ok(()));
+                assert_eq!(word, value);
+                assert_eq!(exchanges, if initial == value { 1 } else { 2 });
+            }
+        }
+    }
+
+    /// C3 (#90): a word that changes under every exchange, and a fault, end the
+    /// store with nothing written by it.
+    #[test]
+    fn c3_store_by_exchange_stops_on_a_changing_word_and_on_a_fault() {
+        let mut exchanges = 0;
+        let mut held = 1u32;
+        let stored = store_by_exchange(0, |expected, _| {
+            // Each exchange expects what the one before observed, and another
+            // task has replaced the word since.
+            assert_eq!(expected, if exchanges == 0 { 0 } else { held });
+            exchanges += 1;
+            held += 1;
+            Ok(held)
+        });
+        assert_eq!(stored, Err(()));
+        assert_eq!(exchanges, ATOMIC_STORE_ATTEMPTS);
+
+        let mut exchanges = 0;
+        let stored = store_by_exchange(0, |_, _| {
+            exchanges += 1;
+            Err(())
+        });
+        assert_eq!(stored, Err(()));
+        assert_eq!(exchanges, 1);
+    }
+
+    /// C3 (#90): while one thread clears a word that holds a TID, another
+    /// thread loads nothing but that TID or zero. A byte-wise clear of `0x501`
+    /// passes through `0x500`, which is another thread's TID.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c3_store_by_exchange_never_shows_a_partly_cleared_tid() {
+        extern crate std;
+        use core::sync::atomic::{AtomicBool, AtomicU32};
+        use std::thread;
+
+        const TID: u32 = 0x0101_0501;
+        const CLEARS: usize = 200_000;
+        static WORD: AtomicU32 = AtomicU32::new(0);
+        static DONE: AtomicBool = AtomicBool::new(false);
+
+        let reader = thread::spawn(|| {
+            let mut loads = 0u64;
+            while !DONE.load(Ordering::Acquire) {
+                let value = WORD.load(Ordering::Relaxed);
+                assert!(
+                    value == TID || value == 0,
+                    "loaded {value:#x}, which was never stored"
+                );
+                loads += 1;
+            }
+            loads
+        });
+        for _ in 0..CLEARS {
+            WORD.store(TID, Ordering::SeqCst);
+            let stored = store_by_exchange(0, |expected, desired| {
+                exchange_word(WORD.as_ptr(), expected, desired)
+            });
+            assert_eq!(stored, Ok(()));
+            assert_eq!(WORD.load(Ordering::SeqCst), 0);
+        }
+        DONE.store(true, Ordering::Release);
+        assert!(reader.join().expect("reader thread") > 0);
     }
 }

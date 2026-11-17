@@ -249,6 +249,8 @@ class OtherCallerOutcomeTests(unittest.TestCase):
             for phase, cpu in ((2, 2), (3, 1), (4, 2), (5, 1))
         ]
         tls_done = "MUSL-TLS-IRQ-OK migrations=4"
+        tid_clear = "MUSL-TID-CLEAR-OK exits=200 concurrent=187"
+        tid_clear_skip = "MUSL-TID-CLEAR-SKIP reason=requires-multiple-cpus"
         markers = [
             "42 * 2 = 84", "MUSL-POLL-OK", "MUSL-SOCKET-ZERO-OK", "MUSL-STAT-OK",
             "MUSL-UNAME-OK", "MUSL-SHARED-MMAP-OK", "MUSL-STANDARD-FD-OK", "MUSL-OPEN-TRUNC-OK",
@@ -260,6 +262,7 @@ class OtherCallerOutcomeTests(unittest.TestCase):
             "MUSL-VFS-CONTEXT-OK scope=cwd-components-dac-ids-chroot",
             "musl libc test passed!",
             "MUSL-EXIT-IDLE-OK cases=6",
+            tid_clear,
             *[f"KSA-013-CASE PASS case={case}" for case in ("regular", "pipe", "socket", "nofile")],
         ]
         serial = "\n".join(markers + ["Process 1 terminated with exit code 0"]) + "\n"
@@ -290,6 +293,11 @@ class OtherCallerOutcomeTests(unittest.TestCase):
             serial.replace(tls_cases[0] + "\n" + tls_cases[1], tls_cases[1] + "\n" + tls_cases[0]),
             tls_done + "\n" + serial.replace(tls_done + "\n", ""),
             serial.replace(tls_done, "MUSL-TLS-IRQ-SKIP reason=requires-three-cpus"),
+            serial.replace(tid_clear, "MUSL-TID-CLEAR-OK exits=200 concurrent=0"),
+            serial.replace(tid_clear, "MUSL-TID-CLEAR-OK exits=100 concurrent=87"),
+            serial.replace(tid_clear, tid_clear_skip),
+            serial + tid_clear_skip + "\n",
+            serial + "MUSL-TID-CLEAR-FAIL stage=torn exit=3 value=01010100\n",
         ))
         with mock.patch.dict(os.environ, {"MUSL_CHECK_CPUS": "4", "MUSL_CHECK_TIMEOUT": "1"}):
             for content, parameters, expected in scenarios:
@@ -300,13 +308,18 @@ class OtherCallerOutcomeTests(unittest.TestCase):
                         self.assertNotIn("MUSL-CHECK OK:", result.stdout)
 
         up_serial = serial.replace(tls_done, "MUSL-TLS-IRQ-SKIP reason=requires-three-cpus")
+        up_serial = up_serial.replace(tid_clear, tid_clear_skip)
         for case in tls_cases:
             up_serial = up_serial.replace(case + "\n", "")
         with mock.patch.dict(os.environ, {"MUSL_CHECK_CPUS": "1", "MUSL_CHECK_TIMEOUT": "1"}):
             for content, expected in ((up_serial, 0), (up_serial + tls_cases[0] + "\n", 1),
                                       (up_serial.replace("requires-three-cpus", "unavailable"), 1),
                                       (up_serial + "MUSL-TLS-IRQ-SKIP reason=unavailable\n", 1),
-                                      (up_serial + "MUSL-TLS-IRQ-SKIP reason=requires-three-cpus\n", 1)):
+                                      (up_serial + "MUSL-TLS-IRQ-SKIP reason=requires-three-cpus\n", 1),
+                                      (up_serial.replace(tid_clear_skip, tid_clear), 1),
+                                      (up_serial.replace(tid_clear_skip + "\n", ""), 1),
+                                      (up_serial.replace("requires-multiple-cpus", "unavailable"), 1),
+                                      (up_serial + tid_clear + "\n", 1)):
                 result = self.fixture.run_gate("musl_check.sh", content)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 

@@ -25,6 +25,7 @@
 #include "wait_signal_probe.c"
 #include "fcntl_limit_probe.c"
 #include "exit_idle_probe.c"
+#include "tid_clear_probe.c"
 #include "vfs_context_probe.c"
 #include "tls_context_probe.c"
 #include "pthread_probe.c"
@@ -425,6 +426,7 @@ int main(int argc, char *argv[]) {
     if (standard_fd_smoke() || robust_usercopy_smoke()) return 1;
     if (fcntl_limit_smoke()) return 1;
     if (exit_idle_smoke()) return 1;
+    if (tid_clear_smoke()) return 1;
     if (tls_context_smoke()) return 1;
     if (pthread_smoke() || pthread_signal_smoke()) return 1;
     if (vfs_context_probe()) return 1;
