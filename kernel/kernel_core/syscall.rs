@@ -6591,6 +6591,26 @@ fn sys_clone(
             cleanup_unscheduled_process(child_pid);
             return Err(e);
         }
+        // Stall diagnostic (not for merge): read the TID back, as this CPU
+        // reads it and as the page tables map it. 14: the clone's TID word.
+        #[cfg(feature = "stall_dump")]
+        {
+            let by_this_cpu = crate::usercopy::read_user_u32_atomic_nofault(
+                crate::usercopy::UserAddr::new(parent_tid as usize),
+            )
+            .unwrap_or(0xffff_fffe);
+            let root = x86_64::registers::control::Cr3::read()
+                .0
+                .start_address()
+                .as_u64() as usize;
+            let by_page_table =
+                crate::process::stall_word(root, parent_tid as usize).unwrap_or(0xffff_fffe);
+            crate::process::stall_trace_event(
+                14,
+                parent_tid as usize,
+                u64::from(by_this_cpu) | u64::from(by_page_table) << 32,
+            );
+        }
     }
 
     // 写入 child_tid（在共享地址空间中，子进程会看到此值）

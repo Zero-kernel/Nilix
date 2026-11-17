@@ -803,9 +803,19 @@ fn futex_callback(
             uaddr,
             u64::from(*expected) | u64::from(*current) << 32,
         ),
-        FutexRequest::Wake { count, .. } => {
-            stall_trace::record(stall_trace::Event::WakeEnter, uaddr, u64::from(*count))
-        }
+        // The word 8 bytes below: for a thread's wake of its own
+        // `detach_state`, musl's `tid` field of that thread.
+        FutexRequest::Wake { count, .. } => stall_trace::record(
+            stall_trace::Event::WakeEnter,
+            uaddr,
+            u64::from(*count & 0xffff)
+                | u64::from(
+                    kernel_core::usercopy::read_user_u32_atomic_nofault(
+                        kernel_core::usercopy::UserAddr::new(uaddr.wrapping_sub(8)),
+                    )
+                    .unwrap_or(0xffff_fffe),
+                ) << 32,
+        ),
         FutexRequest::Requeue { uaddr2, .. } => {
             stall_trace::record(stall_trace::Event::RequeueEnter, uaddr, *uaddr2 as u64)
         }
@@ -1003,7 +1013,10 @@ pub fn init() {
 
     // Stall diagnostic (not for merge).
     #[cfg(feature = "stall_dump")]
-    process::register_stall_dump_hook(futex::dump_futexes_for_stall);
+    {
+        process::register_stall_dump_hook(futex::dump_futexes_for_stall);
+        process::register_stall_trace_hook(stall_trace::record_raw);
+    }
 
     // 注册系统调用回调
     kernel_core::register_pipe_callback(pipe_create_callback);
