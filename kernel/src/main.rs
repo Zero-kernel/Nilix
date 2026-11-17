@@ -255,12 +255,23 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // 初始化 framebuffer 控制台（现代 GOP 方式，必须在第一个 println! 之前）
     if let Some(info) = boot_info {
+        // C3 (#90): a firmware that hands over a GOP framebuffer has left the
+        // display adapter in a graphics mode. The legacy VGA text buffer is
+        // then not the display, whether or not the framebuffer is accepted
+        // below, so console output must not be mirrored into it.
+        let framebuffer_offered = info.framebuffer.base != 0 && info.framebuffer.size != 0;
+        if framebuffer_offered {
+            drivers::vga_buffer::disable_text_display();
+        }
         if !mm::validate_framebuffer_region(&info.framebuffer, &info.memory_map) {
             // R188-U51-2 FIX: do not trust a GOP pointer solely because its
             // dimensions fit.  The physical range must also be covered by an
             // allowed firmware memory descriptor before any pixel write.
             unsafe {
                 serial_write_str("Framebuffer rejected: not covered by memory map\n");
+                if framebuffer_offered {
+                    serial_write_str("No display: console output goes to the serial port only\n");
+                }
             }
         } else {
             // 转换 mm::memory::FramebufferInfo 到 drivers::framebuffer::FramebufferInfo

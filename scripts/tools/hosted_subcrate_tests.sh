@@ -144,7 +144,9 @@ run_suite audit 16 0 \
 # control-character sanitizer are pure logic over the drivers crate.
 # TD-SERIAL-1: serial chunking, lock, line state and panic claim (the port
 # and IRQ masking are compiled out under cfg(test)).
-run_suite drivers 14 0 \
+# C3 (#90): which display backend console output is mirrored to, and that
+# none is touched when the firmware's framebuffer was rejected.
+run_suite drivers 16 0 \
     --manifest-path kernel/drivers/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features cpu_local/host_harness \
