@@ -3526,6 +3526,14 @@ pub(crate) fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallE
     crate::usercopy::copy_to_user_safe(user_dst, src).map_err(|_| SyscallError::EFAULT)
 }
 
+/// C3 (#90): write a TID to a user `pid_t` word (`CLONE_PARENT_SETTID`,
+/// `CLONE_CHILD_SETTID`) as one store; see `process::store_user_tid_word`.
+fn store_user_tid(user_dst: *mut i32, tid: ProcessId) -> Result<(), SyscallError> {
+    validate_user_ptr(user_dst as *const u8, mem::size_of::<i32>())?;
+    crate::process::store_user_tid_word(user_dst as usize, tid as u32)
+        .map_err(|()| SyscallError::EFAULT)
+}
+
 /// 从用户空间复制以 '\0' 结尾的 C 字符串到内核缓冲区
 ///
 /// V-2 fix: 使用 usercopy 容错拷贝机制，防止 TOCTOU 攻击。
@@ -6574,8 +6582,7 @@ fn sys_clone(
 
     // 写入 parent_tid (F.1: use parent's view of child's PID)
     if flags & CLONE_PARENT_SETTID != 0 {
-        let tid_bytes = (parent_view_pid as i32).to_ne_bytes();
-        if let Err(e) = copy_to_user(parent_tid as *mut u8, &tid_bytes) {
+        if let Err(e) = store_user_tid(parent_tid, parent_view_pid) {
             drop(scheduler_permit);
             // R104-3 FIX: Clean up child process on copy_to_user failure to prevent
             // PID / kernel-stack / address-space leak.
@@ -6620,8 +6627,7 @@ fn sys_clone(
     // The child uses this value for futex operations, robust_list, etc., so it must match
     // what gettid() returns to the child.
     if flags & CLONE_CHILD_SETTID != 0 {
-        let tid_bytes = (child_view_pid as i32).to_ne_bytes();
-        if let Err(e) = copy_to_user(child_tid as *mut u8, &tid_bytes) {
+        if let Err(e) = store_user_tid(child_tid, child_view_pid) {
             drop(scheduler_permit);
             // R104-3 FIX: Clean up child process on copy_to_user failure.
             // R123-2 FIX: Child is now attached to cgroup + cpuset; roll back
