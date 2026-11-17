@@ -567,6 +567,8 @@ impl WaitQueue {
                     }
                     proc.wq_timeout_marker.store(0, Ordering::Relaxed);
                     proc.active_wait_seq.store(seq, Ordering::Relaxed);
+                    #[cfg(feature = "stall_dump")]
+                    process::note_stall_wait_queue(pid, self as *const Self as usize);
                     proc.enter_blocked_at(kernel_core::get_ticks());
 
                     let timer = TimedWaiter {
@@ -606,6 +608,8 @@ impl WaitQueue {
                             });
                     }
                     proc.wq_timeout_marker.store(0, Ordering::Relaxed);
+                    #[cfg(feature = "stall_dump")]
+                    process::note_stall_wait_queue(pid, self as *const Self as usize);
                     proc.enter_blocked_at(kernel_core::get_ticks());
                     ArmAttempt::Complete(Ok(PrepareWait::Armed(WaitTicket {
                         pid,
@@ -936,6 +940,24 @@ impl WaitQueue {
         })
     }
 
+    /// Stall diagnostic (not for merge): print the queued entries.
+    #[cfg(feature = "stall_dump")]
+    pub(crate) fn dump_for_stall(&self, wake_mark: impl Fn(ProcessId) -> bool) {
+        match self.waiters.try_lock() {
+            Some(waiters) => {
+                for &(pid, generation) in waiters.iter() {
+                    klog_always!(
+                        "STALL-DUMP futex   queued pid={} wait_gen={:#x} wake_mark={}",
+                        pid,
+                        generation,
+                        wake_mark(pid)
+                    );
+                }
+            }
+            None => klog_always!("STALL-DUMP futex   queue <locked>"),
+        }
+    }
+
     /// 检查等待队列是否为空
     pub fn is_empty(&self) -> bool {
         self.waiters.lock().is_empty()
@@ -1028,6 +1050,8 @@ impl WaitQueue {
                     }
                     entry.1 = stamp_process_generation(proc.generation);
                     if proc.state != ProcessState::Blocked {
+                        #[cfg(feature = "stall_dump")]
+                        process::note_stall_wait_queue(pid, self as *const Self as usize);
                         proc.enter_blocked_at(kernel_core::get_ticks());
                     }
                     return PrepareToWaitCapacityOutcome::Prepared(true);
@@ -1054,6 +1078,8 @@ impl WaitQueue {
             waiters
                 .push_back_reserved((pid, generation))
                 .unwrap_or_else(|_| panic!("RF180-42 queue capacity vanished under lock"));
+            #[cfg(feature = "stall_dump")]
+            process::note_stall_wait_queue(pid, self as *const Self as usize);
             proc.enter_blocked_at(kernel_core::get_ticks());
             PrepareToWaitCapacityOutcome::Prepared(true)
         })
