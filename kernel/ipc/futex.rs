@@ -833,6 +833,13 @@ pub fn dump_futexes_for_stall() {
         }
         None => klog_always!("STALL-DUMP futex: FUTEX_TABLE busy"),
     }
+    for pid in 1..=process::PID_MAX {
+        if wake_mark_is_set(pid) && process::get_process(pid).is_some() {
+            klog_always!("STALL-DUMP futex wake_mark pid={}", pid);
+        }
+    }
+    klog_always!("STALL-DUMP futex end");
+    crate::stall_trace::dump();
     // What the page tables say about each word, against what this CPU reads
     // through its TLB: a difference, or a word that is not mapped, means a
     // stale translation.
@@ -868,13 +875,7 @@ pub fn dump_futexes_for_stall() {
             ),
         }
     }
-    for pid in 1..=process::PID_MAX {
-        if wake_mark_is_set(pid) && process::get_process(pid).is_some() {
-            klog_always!("STALL-DUMP futex wake_mark pid={}", pid);
-        }
-    }
-    klog_always!("STALL-DUMP futex end");
-    crate::stall_trace::dump();
+    klog_always!("STALL-DUMP futex words end");
 }
 
 /// Complete a waker's removal of `record` from `bucket` (whose address is
