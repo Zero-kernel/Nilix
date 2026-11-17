@@ -501,7 +501,15 @@ fn stall_dump_if_silent() {
     static DUMPED: AtomicBool = AtomicBool::new(false);
     let last = process::LAST_CONSOLE_WRITE_TICK.load(Ordering::Relaxed);
     let now = kernel_core::get_ticks();
-    if last == 0 || now.saturating_sub(last) < STALL_TICKS || DUMPED.swap(true, Ordering::AcqRel) {
+    if last == 0 || now.saturating_sub(last) < STALL_TICKS {
+        return;
+    }
+    // Stall diagnostic (not for merge): for the first 1500 ticks leave the
+    // dump to a CPU that runs a task, whose user memory the dump can read.
+    if Scheduler::get_current().is_none() && now.saturating_sub(last) < STALL_TICKS + 1500 {
+        return;
+    }
+    if DUMPED.swap(true, Ordering::AcqRel) {
         return;
     }
     klog_always!(
