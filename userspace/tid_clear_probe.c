@@ -86,11 +86,17 @@ static int tid_clear_smoke(void) {
         printf("MUSL-TID-CLEAR-FAIL stage=getaffinity errno=%d\n", errno);
         return 1;
     }
-    uint64_t other_cpus = cpus & (cpus - 1);
-    if (!other_cpus) {
+    if (!(cpus & (cpus - 1))) {
         puts("MUSL-TID-CLEAR-SKIP reason=requires-multiple-cpus");
         return 0;
     }
+    /* The reader may be the only runnable task before the first clone. */
+    unsigned reader_cpu = exit_idle_cpu();
+    if (reader_cpu >= 64 || !(cpus & (UINT64_C(1) << reader_cpu))) {
+        printf("MUSL-TID-CLEAR-FAIL stage=reader-affinity cpu=%u\n", reader_cpu);
+        return 1;
+    }
+    uint64_t other_cpus = cpus & ~(UINT64_C(1) << reader_cpu);
     char *stack = mmap(NULL, TID_CLEAR_STACK_BYTES, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stack == MAP_FAILED) {
@@ -98,7 +104,6 @@ static int tid_clear_smoke(void) {
         return 1;
     }
 
-    unsigned reader_cpu = (unsigned)__builtin_ctzll(cpus);
     state.child_cpu = (unsigned)__builtin_ctzll(other_cpus);
     const char *failure = NULL;
     unsigned completed = 0;

@@ -48,3 +48,5 @@ The archive above describes the original compare-and-exchange implementation. Re
 | Musl gate given an impossible count or conflicting success records | Both logs passed. | Both logs failed. The SMP gate checks one record covering all 200 exits and two distinct, in-range CPU IDs. |
 
 The first two comparisons used the production Rust functions with hosted memory primitives. The placement check used the guest C probe with controlled scheduling. The linked-ELF check verifies the new store instruction and its exception-table entry, and the Linux fault test exercises that entry on a read-only page.
+
+In the first repair, `45abac8`, the four-vCPU guest started the reader on CPU 1 and failed before its first clone while trying to pin it to CPU 0. The revised probe keeps the reader on its current allowed CPU and selects a different CPU for the child. The Linux QEMU musl gate then passed on its first attempt at both one and four vCPUs. The single-vCPU run recorded the expected skip. The four-vCPU run recorded `MUSL-TID-CLEAR-OK exits=200 concurrent=200 reader_cpu=1 child_cpu=0`.
