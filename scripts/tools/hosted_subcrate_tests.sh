@@ -239,9 +239,8 @@ run_suite cgroup-access 1 0 \
     --features host_harness \
     --test cgroup_access --locked
 
-# C3 (#90): three of these pin the one-store write of a TID word to user
-# memory (usercopy::write_user_u32_atomic).
-run_suite kernel-core 154 0 \
+# Includes the C3 aligned TID store and concurrent word tests.
+run_suite kernel-core 153 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -274,7 +273,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 154 \
+run_suite mitigation-mappings 5 153 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

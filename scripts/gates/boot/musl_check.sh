@@ -214,17 +214,21 @@ if [ "$CPUS" -gt 1 ] && ! grep -Fxq "MUSL-EXIT-IDLE-OK cases=$(( (CPUS - 1) * 2 
     echo "MUSL-CHECK FAIL: missing cross-CPU exit/reap completion"
     rc=1
 fi
-# C3 (#90): an exiting task's clear_child_tid word is cleared by one store.
-# The probe needs a second CPU to read the word while the child exits.
-if [ "$CPUS" -gt 1 ]; then
-    if ! grep -Exq "MUSL-TID-CLEAR-OK exits=200 concurrent=[1-9][0-9]*" "$ser" ||
-        grep -Eq "^MUSL-TID-CLEAR-(FAIL|SKIP)" "$ser"; then
-        echo "MUSL-CHECK FAIL: missing or torn clear_child_tid store evidence"
-        rc=1
-    fi
-elif ! grep -Fxq "MUSL-TID-CLEAR-SKIP reason=requires-multiple-cpus" "$ser" ||
-    grep -Eq "^MUSL-TID-CLEAR-(OK|FAIL)" "$ser"; then
-    echo "MUSL-CHECK FAIL: invalid clear_child_tid applicability record"
+# Each child waits for its reader on another CPU before exiting.
+if ! awk -v cpus="$CPUS" '
+    /^MUSL-TID-CLEAR-/ {
+        records++
+        if (cpus == 1) {
+            if ($0 != "MUSL-TID-CLEAR-SKIP reason=requires-multiple-cpus") bad++
+        } else {
+            if ($0 !~ /^MUSL-TID-CLEAR-OK exits=200 concurrent=200 reader_cpu=(0|[1-9][0-9]*) child_cpu=(0|[1-9][0-9]*)$/) bad++
+            split($4, reader, "="); split($5, child, "=")
+            if (reader[2]+0 >= cpus || child[2]+0 >= cpus || reader[2]+0 == child[2]+0) bad++
+        }
+    }
+    END { exit !(records == 1 && !bad) }
+' "$ser"; then
+    echo "MUSL-CHECK FAIL: missing or invalid clear_child_tid observation"
     rc=1
 fi
 # KSA SMP TLS: an affinity mask or a skipped/partial probe cannot qualify the

@@ -35,3 +35,16 @@ Detailed commands, environment identities and artifact hashes are archived in th
 None of these results is a strict pass. Everything ran under TCG; KVM and real hardware were not measured. Ordinary builds and public CI do not require the private archive.
 
 The gates, probe and stalls receipts have aggregate status 1, from the remaining strict deferrals, the negative control and the four recorded stalls. Individual statuses and log hashes are preserved.
+
+## PR #106 review follow-up
+
+The archive above describes the original compare-and-exchange implementation. Review of `ce6e235` identified an aligned byte-copy fallback and three gaps in the regression checks.
+
+| Controlled check | At `ce6e235` | After the repair |
+| --- | --- | --- |
+| Aligned TID store with repeated compare mismatches | The hosted caller recorded four single-byte writes and returned success. | The caller selected one unconditional 32-bit store. An aligned fault propagated directly. |
+| Reader thread first scheduled when its writer blocks | The hosted test failed with zero loads in 8/8 runs. | The writer waited for the reader's first load and all eight runs passed. |
+| Probe participants kept on one simulated CPU with two CPUs advertised | The guest probe reported 200 concurrent exits. | The probe rejected the placement. Each successful exit now requires acknowledgement from a reader pinned to a distinct CPU. |
+| Musl gate given an impossible count or conflicting success records | Both logs passed. | Both logs failed. The SMP gate checks one record covering all 200 exits and two distinct, in-range CPU IDs. |
+
+The first two comparisons used the production Rust functions with hosted memory primitives. The placement check used the guest C probe with controlled scheduling. The linked-ELF check verifies the new store instruction and its exception-table entry, and the Linux fault test exercises that entry on a read-only page.

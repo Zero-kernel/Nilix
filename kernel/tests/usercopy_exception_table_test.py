@@ -17,6 +17,7 @@ EXPECTED = {
     "get_u32": bytes.fromhex("8b06"),
     "get_u64": bytes.fromhex("488b06"),
     "put_u8": bytes.fromhex("408837"),
+    "put_u32": bytes.fromhex("8937"),
     "cmpxchg_u32": bytes.fromhex("f00fb117"),
 }
 def nofault_bindings(source):
@@ -162,7 +163,7 @@ def main():
             run([compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie",
                  str(assembler), str(root / "kernel/tests/usercopy_fault_probe.c"), "-o", str(binary)])
             output = run([str(binary)])
-            assert "3 exact-RIP fault recoveries passed" in output
+            assert "4 exact-RIP fault recoveries passed" in output
             print(output.strip())
         else:
             print("Kernel/hosted runtime fault probe: NOT RUN (use --runtime on Linux)")

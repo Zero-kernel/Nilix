@@ -6,8 +6,8 @@
  * sibling's TID with only its low byte cleared (Nilix #90, #62).
  *
  * A CLONE_VM child fills the word with a pattern whose bytes are all non-zero
- * and exits. The parent, on another CPU, loads the word until it is clear.
- * Every value it loads must be the pattern or zero.
+ * and waits until the parent has observed it on a different CPU. The parent
+ * then loads the word until it is clear. Every load must be the pattern or zero.
  */
 #include <sched.h>
 #include <stdint.h>
@@ -18,28 +18,76 @@
 #define TID_CLEAR_TIMEOUT_SECONDS 10
 
 struct tid_clear_state {
-    /* The child's clear_child_tid word. */
     uint32_t word;
-    /* Set by the child once the word holds the pattern. */
-    uint32_t armed;
+    int reader_ready;
+    unsigned child_cpu;
+    time_t deadline;
 };
+
+static int tid_clear_timeout(unsigned spin, time_t deadline) {
+    if ((spin & 0xffff) != 0) return 0;
+    struct timespec now;
+    return clock_gettime(CLOCK_MONOTONIC, &now) || now.tv_sec >= deadline;
+}
 
 static int tid_clear_child(void *opaque) {
     struct tid_clear_state *state = opaque;
-    __atomic_store_n(&state->word, TID_CLEAR_PATTERN, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&state->armed, 1, __ATOMIC_SEQ_CST);
-    syscall(SYS_exit, 0);
-    __builtin_unreachable();
+    if (!exit_idle_pin(state->child_cpu) || !exit_idle_wait_cpu(state->child_cpu)) {
+        __atomic_store_n(&state->reader_ready, -1, __ATOMIC_RELEASE);
+        return 81;
+    }
+    __atomic_store_n(&state->word, TID_CLEAR_PATTERN, __ATOMIC_RELEASE);
+    for (unsigned spin = 1; !__atomic_load_n(&state->reader_ready, __ATOMIC_ACQUIRE); ++spin) {
+        if (tid_clear_timeout(spin, state->deadline)) return 82;
+        __asm__ volatile("pause");
+    }
+    /* musl's clone trampoline issues SYS_exit with this return value. */
+    return exit_idle_cpu() == state->child_cpu ? 0 : 83;
+}
+
+static const char *tid_clear_observe(struct tid_clear_state *state, unsigned reader_cpu,
+                                     uint32_t *value) {
+    int acknowledged = 0;
+    for (unsigned spin = 1;; ++spin) {
+        *value = __atomic_load_n(&state->word, __ATOMIC_ACQUIRE);
+        if (*value == TID_CLEAR_PATTERN) {
+            if (!acknowledged) {
+                if (exit_idle_cpu() != reader_cpu) return "reader-affinity";
+                __atomic_store_n(&state->reader_ready, 1, __ATOMIC_RELEASE);
+                acknowledged = 1;
+            }
+        } else if (*value != 0) {
+            return "torn";
+        } else if (acknowledged) {
+            return exit_idle_cpu() == reader_cpu ? NULL : "reader-affinity";
+        } else if (__atomic_load_n(&state->reader_ready, __ATOMIC_ACQUIRE) < 0) {
+            return "child-affinity";
+        }
+        if (tid_clear_timeout(spin, state->deadline)) return "timeout";
+    }
+}
+
+static int tid_clear_reap(pid_t child, int *status) {
+    for (unsigned attempt = 0; attempt < 1200; ++attempt) {
+        pid_t result = waitpid(child, status, WNOHANG);
+        if (result == child) return 1;
+        if (result < 0 && errno != EINTR) break;
+        if (attempt == 999) kill(child, SIGKILL);
+        struct timespec delay = {.tv_nsec = 5000000};
+        nanosleep(&delay, NULL);
+    }
+    return 0;
 }
 
 static int tid_clear_smoke(void) {
     static struct tid_clear_state state;
     uint64_t cpus = 0;
-    if (syscall(SYS_sched_getaffinity, 0, sizeof(cpus), &cpus) != sizeof(cpus)) {
+    if (syscall(SYS_sched_getaffinity, 0, sizeof(cpus), &cpus) != sizeof(cpus) || !cpus) {
         printf("MUSL-TID-CLEAR-FAIL stage=getaffinity errno=%d\n", errno);
         return 1;
     }
-    if (!cpus || !(cpus & (cpus - 1))) {
+    uint64_t other_cpus = cpus & (cpus - 1);
+    if (!other_cpus) {
         puts("MUSL-TID-CLEAR-SKIP reason=requires-multiple-cpus");
         return 0;
     }
@@ -50,73 +98,48 @@ static int tid_clear_smoke(void) {
         return 1;
     }
 
-    /* Exits during which the parent loaded the pattern, so it was reading
-     * while the child was on its way out. */
-    unsigned concurrent = 0;
-    for (unsigned exit_index = 0; exit_index < TID_CLEAR_EXITS; ++exit_index) {
-        __atomic_store_n(&state.word, 0, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&state.armed, 0, __ATOMIC_SEQ_CST);
+    unsigned reader_cpu = (unsigned)__builtin_ctzll(cpus);
+    state.child_cpu = (unsigned)__builtin_ctzll(other_cpus);
+    const char *failure = NULL;
+    unsigned completed = 0;
+    uint32_t value = 0;
+    int reaped = 1, status = -1;
+    if (!exit_idle_pin(reader_cpu) || !exit_idle_wait_cpu(reader_cpu)) failure = "reader-affinity";
+    while (!failure && completed < TID_CLEAR_EXITS) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+            failure = "clock";
+            break;
+        }
+        state.deadline = now.tv_sec + TID_CLEAR_TIMEOUT_SECONDS;
+        __atomic_store_n(&state.word, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&state.reader_ready, 0, __ATOMIC_RELAXED);
         /* Zero-OS accepts no CSIGNAL bits; wait4 selects this ordinary child. */
         pid_t child = clone(tid_clear_child, stack + TID_CLEAR_STACK_BYTES,
                             CLONE_VM | CLONE_CHILD_CLEARTID, &state, NULL, NULL, &state.word);
         if (child < 0) {
-            printf("MUSL-TID-CLEAR-FAIL stage=clone exit=%u errno=%d\n", exit_index, errno);
-            return 1;
+            failure = "clone";
+            break;
         }
-
-        struct timespec started;
-        clock_gettime(CLOCK_MONOTONIC, &started);
-        int saw_pattern = 0, torn = 0, timed_out = 0;
-        uint32_t value = 0;
-        for (uint64_t spin = 1;; ++spin) {
-            /* `armed` first: a clear word after it means the kernel cleared it. */
-            uint32_t armed = __atomic_load_n(&state.armed, __ATOMIC_ACQUIRE);
-            value = __atomic_load_n(&state.word, __ATOMIC_RELAXED);
-            if (value == TID_CLEAR_PATTERN) {
-                saw_pattern = 1;
-            } else if (value != 0) {
-                torn = 1;
-                break;
-            } else if (armed) {
-                break;
-            }
-            if ((spin & 0xfffff) == 0) {
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                if (now.tv_sec - started.tv_sec > TID_CLEAR_TIMEOUT_SECONDS) {
-                    timed_out = 1;
-                    break;
-                }
-            }
-        }
-
-        int status = -1;
-        if (timed_out) kill(child, SIGKILL);
-        pid_t reaped;
-        do {
-            reaped = waitpid(child, &status, 0);
-        } while (reaped < 0 && errno == EINTR);
-        if (torn) {
-            printf("MUSL-TID-CLEAR-FAIL stage=torn exit=%u value=%08x\n", exit_index, value);
-            return 1;
-        }
-        if (timed_out) {
-            printf("MUSL-TID-CLEAR-FAIL stage=timeout exit=%u value=%08x\n", exit_index, value);
-            return 1;
-        }
-        if (reaped != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            printf("MUSL-TID-CLEAR-FAIL stage=reap exit=%u status=%d errno=%d\n",
-                   exit_index, status, errno);
-            return 1;
-        }
-        concurrent += (unsigned)saw_pattern;
+        /* The child inherits the reader's single-CPU affinity at clone. */
+        syscall(SYS_sched_yield);
+        failure = tid_clear_observe(&state, reader_cpu, &value);
+        if (failure) kill(child, SIGKILL);
+        status = -1;
+        reaped = tid_clear_reap(child, &status);
+        if (!failure && (!reaped || !WIFEXITED(status) || WEXITSTATUS(status) != 0))
+            failure = "reap";
+        if (!failure) ++completed;
     }
-    munmap(stack, TID_CLEAR_STACK_BYTES);
-    if (concurrent == 0) {
-        /* No exit was observed in progress, so the probe saw no store at all. */
-        printf("MUSL-TID-CLEAR-FAIL stage=never-concurrent exits=%u\n", TID_CLEAR_EXITS);
+    if (syscall(SYS_sched_setaffinity, 0, sizeof(cpus), &cpus) && !failure) failure = "restore-affinity";
+    /* An unreaped CLONE_VM child may still be using its stack. */
+    if (reaped && munmap(stack, TID_CLEAR_STACK_BYTES) && !failure) failure = "unmap";
+    if (failure) {
+        printf("MUSL-TID-CLEAR-FAIL stage=%s exit=%u value=%08x status=%d reaped=%d\n",
+               failure, completed, value, status, reaped);
         return 1;
     }
-    printf("MUSL-TID-CLEAR-OK exits=%u concurrent=%u\n", TID_CLEAR_EXITS, concurrent);
+    printf("MUSL-TID-CLEAR-OK exits=%u concurrent=%u reader_cpu=%u child_cpu=%u\n",
+           TID_CLEAR_EXITS, completed, reader_cpu, state.child_cpu);
     return 0;
 }

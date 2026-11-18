@@ -249,7 +249,7 @@ class OtherCallerOutcomeTests(unittest.TestCase):
             for phase, cpu in ((2, 2), (3, 1), (4, 2), (5, 1))
         ]
         tls_done = "MUSL-TLS-IRQ-OK migrations=4"
-        tid_clear = "MUSL-TID-CLEAR-OK exits=200 concurrent=187"
+        tid_clear = "MUSL-TID-CLEAR-OK exits=200 concurrent=200 reader_cpu=0 child_cpu=1"
         tid_clear_skip = "MUSL-TID-CLEAR-SKIP reason=requires-multiple-cpus"
         markers = [
             "42 * 2 = 84", "MUSL-POLL-OK", "MUSL-SOCKET-ZERO-OK", "MUSL-STAT-OK",
@@ -293,8 +293,15 @@ class OtherCallerOutcomeTests(unittest.TestCase):
             serial.replace(tls_cases[0] + "\n" + tls_cases[1], tls_cases[1] + "\n" + tls_cases[0]),
             tls_done + "\n" + serial.replace(tls_done + "\n", ""),
             serial.replace(tls_done, "MUSL-TLS-IRQ-SKIP reason=requires-three-cpus"),
-            serial.replace(tid_clear, "MUSL-TID-CLEAR-OK exits=200 concurrent=0"),
-            serial.replace(tid_clear, "MUSL-TID-CLEAR-OK exits=100 concurrent=87"),
+            serial.replace(tid_clear, tid_clear.replace("concurrent=200", "concurrent=0")),
+            serial.replace(tid_clear, tid_clear.replace("concurrent=200", "concurrent=199")),
+            serial.replace(tid_clear, tid_clear.replace("concurrent=200", "concurrent=201")),
+            serial.replace(tid_clear, tid_clear.replace("exits=200", "exits=100")),
+            serial.replace(tid_clear, tid_clear.replace(" child_cpu=1", "")),
+            serial.replace(tid_clear, tid_clear.replace("child_cpu=1", "child_cpu=0")),
+            serial.replace(tid_clear, tid_clear.replace("child_cpu=1", "child_cpu=4")),
+            serial + tid_clear + "\n",
+            serial + tid_clear.replace("concurrent=200", "concurrent=15") + "\n",
             serial.replace(tid_clear, tid_clear_skip),
             serial + tid_clear_skip + "\n",
             serial + "MUSL-TID-CLEAR-FAIL stage=torn exit=3 value=01010100\n",
@@ -319,6 +326,7 @@ class OtherCallerOutcomeTests(unittest.TestCase):
                                       (up_serial.replace(tid_clear_skip, tid_clear), 1),
                                       (up_serial.replace(tid_clear_skip + "\n", ""), 1),
                                       (up_serial.replace("requires-multiple-cpus", "unavailable"), 1),
+                                      (up_serial + tid_clear_skip + "\n", 1),
                                       (up_serial + tid_clear + "\n", 1)):
                 result = self.fixture.run_gate("musl_check.sh", content)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
