@@ -10,11 +10,14 @@
 #include <unistd.h>
 
 extern uint64_t __zero_os_usercopy_cmpxchg_u32(uint32_t *, uint32_t, uint32_t);
+extern const unsigned char __zero_os_usercopy_cmpxchg_u32_access;
+extern uint32_t __zero_os_usercopy_put_u32(uint32_t *, uint32_t);
 extern const int32_t __ksa_ex_start[];
 extern const int32_t __ksa_ex_end[];
 
 static volatile sig_atomic_t recovered;
 static _Atomic(uintptr_t) active_address;
+static _Atomic(uintptr_t) active_instruction;
 
 static void recover_fault(int signal_number, siginfo_t *info, void *raw_context) {
     ucontext_t *context = raw_context;
@@ -27,8 +30,7 @@ static void recover_fault(int signal_number, siginfo_t *info, void *raw_context)
         const int32_t *entry = (const int32_t *)cursor;
         uintptr_t instruction = (uintptr_t)entry + (intptr_t)entry[0];
         if (instruction == fault_rip) {
-            const unsigned char *opcode = (const unsigned char *)instruction;
-            if (opcode[0] != 0xf0 || opcode[1] != 0x0f || opcode[2] != 0xb1) {
+            if (instruction != active_instruction) {
                 _Exit(92);
             }
             context->uc_mcontext.gregs[REG_RIP] =
@@ -58,16 +60,21 @@ int main(void) {
     assert(*word == 17);
     active_address = (uintptr_t)word;
     assert(mprotect(word, (size_t)page_size, PROT_READ) == 0);
-    assert(__zero_os_usercopy_cmpxchg_u32(word, 17, 23) == UINT64_C(0x100000000));
+    active_instruction = (uintptr_t)__zero_os_usercopy_put_u32;
+    assert(__zero_os_usercopy_put_u32(word, 0) == 1);
     assert(*word == 17);
     assert(recovered == 1);
+    active_instruction = (uintptr_t)&__zero_os_usercopy_cmpxchg_u32_access;
+    assert(__zero_os_usercopy_cmpxchg_u32(word, 17, 23) == UINT64_C(0x100000000));
+    assert(*word == 17);
+    assert(recovered == 2);
     assert(mprotect(word, (size_t)page_size, PROT_NONE) == 0);
     assert(__zero_os_usercopy_cmpxchg_u32(word, 17, 23) == UINT64_C(0x100000000));
-    assert(recovered == 2);
+    assert(recovered == 3);
     assert(munmap(word, (size_t)page_size) == 0);
     assert(__zero_os_usercopy_cmpxchg_u32((uint32_t *)active_address, 17, 23) ==
            UINT64_C(0x100000000));
-    assert(recovered == 3);
-    puts("KSA-002: mapped match/mismatch and 3 exact-RIP fault recoveries passed");
+    assert(recovered == 4);
+    puts("KSA-002: mapped match/mismatch and 4 exact-RIP fault recoveries passed");
     return 0;
 }

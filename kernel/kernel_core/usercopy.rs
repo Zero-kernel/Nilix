@@ -153,6 +153,23 @@ __zero_os_usercopy_put_u8:
 .Lex_put_u8_fixup:  .long .Lput_u8_fixup - .Lex_put_u8_fixup
     .popsection
 
+    // One naturally aligned 32-bit store to user memory.
+    .global __zero_os_usercopy_put_u32
+__zero_os_usercopy_put_u32:
+.Lput_u32_access:
+    mov dword ptr [rdi], esi
+    xor eax, eax
+    ret
+.Lput_u32_fixup:
+    mov eax, 1
+    ret
+
+    .pushsection .ex_table,"a"
+    .balign 8
+.Lex_put_u32_fault: .long .Lput_u32_access - .Lex_put_u32_fault
+.Lex_put_u32_fixup: .long .Lput_u32_fixup - .Lex_put_u32_fixup
+    .popsection
+
     // RF187-U34: fault-tolerant atomic compare-and-exchange of one aligned
     // user u32.  Arguments are (addr=rdi, expected=rsi, desired=rdx).  The
     // low 32 bits of the return value contain the value observed by cmpxchg;
@@ -200,6 +217,9 @@ extern "C" {
     /// Write one byte to user space.
     /// Returns 0 on success, 1 on fault.
     fn __zero_os_usercopy_put_u8(dst: *mut u8, val: u8) -> u32;
+
+    /// Store one aligned user u32. Returns 0 on success and 1 on fault.
+    fn __zero_os_usercopy_put_u32(dst: *mut u32, val: u32) -> u32;
 
     /// TD-USERCOPY-1: the user-access instructions of the two helpers the
     /// no-fault readers run (labels inside the helpers; never read or called).
@@ -994,6 +1014,33 @@ fn compare_exchange_user_u32_inner(
         Err(())
     } else {
         Ok(observed as u32 == expected)
+    }
+}
+
+/// Publish an aligned user word with one x86 store. A sibling can update the
+/// word concurrently without changing the width or success of this store.
+/// Copy-on-write and demand faults take the ordinary usercopy fault path.
+pub fn write_user_u32_atomic(dst: UserAddr, value: u32) -> Result<(), ()> {
+    let addr = dst.as_usize();
+    let len = size_of::<u32>();
+    if !validate_user_range_aligned(addr, len, align_of::<u32>()) {
+        return Err(());
+    }
+
+    let _smap_guard = UserAccessGuard::new();
+    if !user_page_permits(addr, true) {
+        return Err(());
+    }
+    let _guard = UserCopyGuard::new(addr, len);
+    USER_COPY_STATE.with(|s| s.remaining.store(len, Ordering::SeqCst));
+    // SAFETY: the aligned word fits in one validated user page. The assembly
+    // store has an exception-table fixup for a mapping that changes or faults.
+    let status = unsafe { __zero_os_usercopy_put_u32(dst.as_mut_ptr().cast(), value) };
+    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 
@@ -1891,6 +1938,7 @@ mod robust_usercopy_tests {
             __zero_os_usercopy_get_u8 as *const () as usize,
             __zero_os_usercopy_get_u64 as *const () as usize,
             __zero_os_usercopy_put_u8 as *const () as usize,
+            __zero_os_usercopy_put_u32 as *const () as usize,
             get_u32 + 1,
         ] {
             assert!(!nofault_access_ip(other));
@@ -1906,5 +1954,52 @@ mod robust_usercopy_tests {
         assert!(read_user_u64_atomic(UserAddr::new(MMAP_MIN_ADDR - 8)).is_err());
         assert!(read_user_u64_atomic(UserAddr::new(MMAP_MIN_ADDR + 1)).is_err());
         assert!(compare_exchange_user_u32(UserAddr::new(MMAP_MIN_ADDR + 1), 1, 2).is_err());
+        assert!(write_user_u32_atomic(UserAddr::new(MMAP_MIN_ADDR - 8), 0).is_err());
+        assert!(write_user_u32_atomic(UserAddr::new(MMAP_MIN_ADDR + 1), 0).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c3_put_u32_writes_only_the_destination_word() {
+        for value in [0, 0x501, u32::MAX] {
+            let mut words = [17u32, !value, 23];
+            // SAFETY: the destination is a live, aligned, writable u32.
+            assert_eq!(
+                unsafe { __zero_os_usercopy_put_u32(&mut words[1], value) },
+                0
+            );
+            assert_eq!(words, [17, value, 23]);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn c3_put_u32_publishes_whole_words_under_contention() {
+        extern crate std;
+        use core::sync::atomic::AtomicU32;
+        use std::{sync::Barrier, thread};
+
+        const TID: u32 = 0x0101_0501;
+        const CLEARS: usize = 200_000;
+        let word = AtomicU32::new(TID);
+        let ready = Barrier::new(2);
+        thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let first = word.load(Ordering::Relaxed);
+                ready.wait();
+                for _ in 0..CLEARS {
+                    // Inspect the previous value and race the next kernel store.
+                    let value = word.swap(TID, Ordering::Relaxed);
+                    assert!(value == TID || value == 0, "read a partial TID {value:#x}");
+                }
+                first
+            });
+            ready.wait();
+            for _ in 0..CLEARS {
+                // SAFETY: the shared atomic stays aligned and live through the join.
+                assert_eq!(unsafe { __zero_os_usercopy_put_u32(word.as_ptr(), 0) }, 0);
+            }
+            assert_eq!(reader.join().expect("reader thread"), TID);
+        });
     }
 }

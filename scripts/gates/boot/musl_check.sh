@@ -214,6 +214,23 @@ if [ "$CPUS" -gt 1 ] && ! grep -Fxq "MUSL-EXIT-IDLE-OK cases=$(( (CPUS - 1) * 2 
     echo "MUSL-CHECK FAIL: missing cross-CPU exit/reap completion"
     rc=1
 fi
+# Each child waits for its reader on another CPU before exiting.
+if ! awk -v cpus="$CPUS" '
+    /^MUSL-TID-CLEAR-/ {
+        records++
+        if (cpus == 1) {
+            if ($0 != "MUSL-TID-CLEAR-SKIP reason=requires-multiple-cpus") bad++
+        } else {
+            if ($0 !~ /^MUSL-TID-CLEAR-OK exits=200 concurrent=200 reader_cpu=(0|[1-9][0-9]*) child_cpu=(0|[1-9][0-9]*)$/) bad++
+            split($4, reader, "="); split($5, child, "=")
+            if (reader[2]+0 >= cpus || child[2]+0 >= cpus || reader[2]+0 == child[2]+0) bad++
+        }
+    }
+    END { exit !(records == 1 && !bad) }
+' "$ser"; then
+    echo "MUSL-CHECK FAIL: missing or invalid clear_child_tid observation"
+    rc=1
+fi
 # KSA SMP TLS: an affinity mask or a skipped/partial probe cannot qualify the
 # IRQ-only migration contract. Require four ordered measurements, alternating
 # distinct actual CPUs, with both exact TLS cookies before the final marker.

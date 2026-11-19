@@ -10763,6 +10763,22 @@ pub(crate) mod child_creation_test_support {
     }
 }
 
+/// C3 (#90): write a TID to the user word at `addr` in the active address
+/// space, as Linux `put_user` does for `clear_child_tid`, `CLONE_PARENT_SETTID`
+/// and `CLONE_CHILD_SETTID`.
+///
+/// Aligned words require a single store even when siblings are writing them.
+/// Misaligned pointers retain the legacy byte-wise copy.
+pub(crate) fn store_user_tid_word(addr: usize, tid: u32) -> Result<(), ()> {
+    use crate::usercopy::{copy_to_user_safe, write_user_u32_atomic, UserAddr};
+
+    if addr & (core::mem::align_of::<u32>() - 1) == 0 {
+        write_user_u32_atomic(UserAddr::new(addr), tid)
+    } else {
+        copy_to_user_safe(addr as *mut u8, &tid.to_ne_bytes())
+    }
+}
+
 /// 通知 futex 唤醒等待者
 ///
 /// 由线程退出时调用，用于 clear_child_tid 机制
@@ -11739,7 +11755,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // `.data` or on a stack, so most exits skipped both the clear and the
         // wake and a joiner waited forever. The write needs no such gate:
         // - it runs under this task's own root (CR3 switched below), and
-        //   `copy_to_user_safe` validates the user range (MMAP_MIN_ADDR up to
+        //   the usercopy helper validates the user range (MMAP_MIN_ADDR up to
         //   the user top) before touching it;
         // - a fault fails the copy through the exception table. A COW word is
         //   resolved in the active (this task's) page table. Shared-anonymous
@@ -11749,13 +11765,16 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // - a concurrent munmap/mmap by a CLONE_VM sibling can only redirect the
         //   write within that same address space, as on Linux.
         // The futex wake runs only after the write succeeded.
+        //
+        // C3 (#90): an aligned clear is one 32-bit store. A
+        // sibling that loads the word while it is cleared byte by byte can see
+        // its own TID in it.
         if clear_child_tid != 0 && memory_space != 0 {
             let tid_addr = clear_child_tid as usize;
 
             // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
             // 注意：需要在正确的地址空间中执行
             let cleared = unsafe {
-                use crate::usercopy::copy_to_user_safe;
                 use x86_64::structures::paging::PhysFrame;
                 use x86_64::PhysAddr;
 
@@ -11765,8 +11784,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                     .map(PhysFrame::containing_address);
                 target.is_some_and(|target| {
                     mm::tlb_shootdown::with_temporary_address_space(target, || {
-                        let zero = 0i32.to_ne_bytes();
-                        copy_to_user_safe(tid_addr as *mut u8, &zero).is_ok()
+                        store_user_tid_word(tid_addr, 0).is_ok()
                     })
                 })
             };
@@ -11784,8 +11802,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                     let _ = woken; // suppress unused warning in release
                 }
             } else {
-                // The word is outside user space or the copy faulted (unmapped or
-                // not present): nothing was written, so nothing is woken.
+                // A misaligned word can fault after a partial byte copy.
                 #[cfg(debug_assertions)]
                 kprintln!(
                     "[terminate_process] clear_child_tid write to 0x{:x} failed; no wake",
