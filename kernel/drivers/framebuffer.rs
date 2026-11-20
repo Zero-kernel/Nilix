@@ -479,8 +479,9 @@ pub fn get_drawn_region() -> Option<(u64, usize)> {
     }
 }
 
-/// Turn the framebuffer console off (output stays on serial and VGA text):
-/// no high-half mapping of it could be made.
+/// Turn the framebuffer console off: no high-half mapping of it could be
+/// made. Output stays on the serial port only, because the text buffer is not
+/// the display of a boot whose firmware handed over a framebuffer.
 pub fn disable() {
     crate::vga_buffer::with_display(|| {
         WRITER.lock().initialized = false;

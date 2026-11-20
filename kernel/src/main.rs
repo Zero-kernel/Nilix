@@ -269,9 +269,6 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             // allowed firmware memory descriptor before any pixel write.
             unsafe {
                 serial_write_str("Framebuffer rejected: not covered by memory map\n");
-                if framebuffer_offered {
-                    serial_write_str("No display: console output goes to the serial port only\n");
-                }
             }
         } else {
             // 转换 mm::memory::FramebufferInfo 到 drivers::framebuffer::FramebufferInfo
@@ -288,8 +285,21 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 },
             };
             drivers::framebuffer::init(&fb_info);
+            // The driver checks what the memory map cannot: that the geometry
+            // fits the region. It refuses a framebuffer whose geometry does not.
             unsafe {
-                serial_write_str("Framebuffer console initialized\n");
+                if drivers::framebuffer::is_initialized() {
+                    serial_write_str("Framebuffer console initialized\n");
+                } else {
+                    serial_write_str("Framebuffer rejected: geometry does not fit its region\n");
+                }
+            }
+        }
+        // C3 (#90): whichever check refused the framebuffer, this boot has no
+        // display. Say so once.
+        if !drivers::vga_buffer::has_display() {
+            unsafe {
+                serial_write_str("No display: console output goes to the serial port only\n");
             }
         }
     }
@@ -477,6 +487,9 @@ fn relocate_framebuffer() {
     } else {
         drivers::framebuffer::disable();
         klog_always!("      ! Framebuffer console off: no high-half mapping");
+        if !drivers::vga_buffer::has_display() {
+            klog_always!("      ! No display: console output goes to the serial port only");
+        }
     }
 }
 

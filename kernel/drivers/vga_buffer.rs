@@ -247,7 +247,8 @@ enum DisplayBackend {
     Framebuffer,
     /// The legacy text buffer: no framebuffer was handed over.
     VgaText,
-    /// A framebuffer was handed over and rejected: serial port only.
+    /// A framebuffer was handed over and is not in use, refused at boot or
+    /// turned off later: serial port only.
     Absent,
 }
 
@@ -266,6 +267,13 @@ fn active_display() -> DisplayBackend {
         crate::framebuffer::is_initialized(),
         TEXT_DISPLAY.load(Ordering::Acquire),
     )
+}
+
+/// Whether console output is rendered anywhere besides the serial port. The
+/// kernel reports a boot that has no display from this, whichever check
+/// refused the framebuffer.
+pub fn has_display() -> bool {
+    active_display() != DisplayBackend::Absent
 }
 
 /// Render to the active display backend.
@@ -870,6 +878,29 @@ mod tests {
         clear_screen();
         write_str("not rendered\n");
         assert_eq!(port_log(), b"Process 7 exited with code 0\nuser line\n");
+    }
+
+    /// The memory-map check does not look at the geometry. The framebuffer
+    /// driver does, and refuses one that does not fit its region. That boot
+    /// has no display either, and `has_display` is what the kernel reports
+    /// it from.
+    #[test]
+    fn c3_a_framebuffer_refused_for_its_geometry_leaves_no_display() {
+        let _guard = serial_test_state();
+        disable_text_display();
+        // 1024 x 768 at four bytes a pixel does not fit in one page.
+        crate::framebuffer::init(&crate::framebuffer::FramebufferInfo {
+            base: 0x8000_0000,
+            size: 0x1000,
+            width: 1024,
+            height: 768,
+            stride: 1024,
+            pixel_format: crate::framebuffer::PixelFormat::Bgr,
+        });
+        assert!(!crate::framebuffer::is_initialized());
+        assert!(!has_display());
+        _print(format_args!("serial only\n"));
+        assert_eq!(port_log(), b"serial only\n");
     }
 
     #[test]
