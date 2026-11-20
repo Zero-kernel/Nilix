@@ -255,6 +255,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // 初始化 framebuffer 控制台（现代 GOP 方式，必须在第一个 println! 之前）
     if let Some(info) = boot_info {
+        // C3 (#90): a firmware that hands over a GOP framebuffer has left the
+        // display adapter in a graphics mode. The legacy VGA text buffer is
+        // then not the display, whether or not the framebuffer is accepted
+        // below, so console output must not be mirrored into it.
+        let framebuffer_offered = info.framebuffer.base != 0 && info.framebuffer.size != 0;
+        if framebuffer_offered {
+            drivers::vga_buffer::disable_text_display();
+        }
         if !mm::validate_framebuffer_region(&info.framebuffer, &info.memory_map) {
             // R188-U51-2 FIX: do not trust a GOP pointer solely because its
             // dimensions fit.  The physical range must also be covered by an
@@ -277,8 +285,21 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 },
             };
             drivers::framebuffer::init(&fb_info);
+            // The driver checks what the memory map cannot: that the geometry
+            // fits the region. It refuses a framebuffer whose geometry does not.
             unsafe {
-                serial_write_str("Framebuffer console initialized\n");
+                if drivers::framebuffer::is_initialized() {
+                    serial_write_str("Framebuffer console initialized\n");
+                } else {
+                    serial_write_str("Framebuffer rejected: geometry does not fit its region\n");
+                }
+            }
+        }
+        // C3 (#90): whichever check refused the framebuffer, this boot has no
+        // display. Say so once.
+        if !drivers::vga_buffer::has_display() {
+            unsafe {
+                serial_write_str("No display: console output goes to the serial port only\n");
             }
         }
     }
@@ -466,6 +487,9 @@ fn relocate_framebuffer() {
     } else {
         drivers::framebuffer::disable();
         klog_always!("      ! Framebuffer console off: no high-half mapping");
+        if !drivers::vga_buffer::has_display() {
+            klog_always!("      ! No display: console output goes to the serial port only");
+        }
     }
 }
 

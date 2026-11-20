@@ -224,17 +224,74 @@ fn console_owner_token() -> usize {
     cpu_local::try_current_registered_cpu_id().unwrap_or(UNREGISTERED_DISPLAY_OWNER)
 }
 
+/// Whether the legacy VGA text buffer is this boot's display.
+///
+/// It is, unless the firmware handed over a graphics framebuffer. A firmware
+/// that does has left the adapter in a graphics mode, where the text buffer
+/// at `0xB8000` is not scanned out. Console output written there shows
+/// nothing, and one scrolled line costs 3920 single-cell accesses, each an
+/// emulated device access under an emulator (C3, #90).
+static TEXT_DISPLAY: AtomicBool = AtomicBool::new(true);
+
+/// C3 (#90): the firmware handed over a graphics framebuffer, so the text
+/// buffer is not the display for the rest of this boot, whether or not the
+/// kernel accepts that framebuffer. Call before the first console output.
+pub fn disable_text_display() {
+    TEXT_DISPLAY.store(false, Ordering::Release);
+}
+
+/// Where console output is rendered besides the serial port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayBackend {
+    /// The firmware's framebuffer, accepted by the kernel.
+    Framebuffer,
+    /// The legacy text buffer: no framebuffer was handed over.
+    VgaText,
+    /// A framebuffer was handed over and is not in use, refused at boot or
+    /// turned off later: serial port only.
+    Absent,
+}
+
+fn display_backend(framebuffer_ready: bool, text_display: bool) -> DisplayBackend {
+    if framebuffer_ready {
+        DisplayBackend::Framebuffer
+    } else if text_display {
+        DisplayBackend::VgaText
+    } else {
+        DisplayBackend::Absent
+    }
+}
+
+fn active_display() -> DisplayBackend {
+    display_backend(
+        crate::framebuffer::is_initialized(),
+        TEXT_DISPLAY.load(Ordering::Acquire),
+    )
+}
+
+/// Whether console output is rendered anywhere besides the serial port. The
+/// kernel reports a boot that has no display from this, whichever check
+/// refused the framebuffer.
+pub fn has_display() -> bool {
+    active_display() != DisplayBackend::Absent
+}
+
 /// Render to the active display backend.
 fn write_display(args: fmt::Arguments) {
     use core::fmt::Write;
-    let _ = with_display(|| {
+    // Without a display there is nothing to render, and no reason to queue
+    // every CPU's console output on the display lock.
+    if active_display() == DisplayBackend::Absent {
+        return;
+    }
+    let _ = with_display(|| match active_display() {
         // 优先输出到 framebuffer（现代 GOP 方式）
-        if crate::framebuffer::is_initialized() {
-            crate::framebuffer::write_args(args);
-        } else {
-            // 后备：输出到 VGA 文本缓冲区（旧式 BIOS）
+        DisplayBackend::Framebuffer => crate::framebuffer::write_args(args),
+        // 后备：输出到 VGA 文本缓冲区（旧式 BIOS）
+        DisplayBackend::VgaText => {
             let _ = WRITER.lock().write_fmt(args);
         }
+        DisplayBackend::Absent => {}
     });
 }
 
@@ -688,6 +745,10 @@ pub fn init() {
 }
 
 pub fn clear_screen() {
+    // The text buffer is touched only while it is the display.
+    if active_display() != DisplayBackend::VgaText {
+        return;
+    }
     let _ = with_display(|| {
         let mut writer = WRITER.lock();
         for row in 0..BUFFER_HEIGHT {
@@ -698,6 +759,9 @@ pub fn clear_screen() {
 
 pub fn write_str(s: &str) {
     use core::fmt::Write;
+    if active_display() != DisplayBackend::VgaText {
+        return;
+    }
     let _ = with_display(|| {
         let _ = WRITER.lock().write_str(s);
     });
@@ -792,6 +856,51 @@ mod tests {
 
     fn port_log() -> Vec<u8> {
         PORT_LOG.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn c3_display_backend_is_the_framebuffer_then_the_text_buffer_then_absent() {
+        assert_eq!(display_backend(true, true), DisplayBackend::Framebuffer);
+        assert_eq!(display_backend(true, false), DisplayBackend::Framebuffer);
+        assert_eq!(display_backend(false, true), DisplayBackend::VgaText);
+        assert_eq!(display_backend(false, false), DisplayBackend::Absent);
+    }
+
+    /// The hosted process has nothing mapped at the text buffer's address,
+    /// so a single access to it would end this test with a fault.
+    #[test]
+    fn c3_console_output_reaches_only_the_serial_port_without_a_display() {
+        let _guard = serial_test_state();
+        disable_text_display();
+        assert_eq!(active_display(), DisplayBackend::Absent);
+        _print(format_args!("Process {} exited with code {}\n", 7, 0));
+        ConsoleWrite::begin(7).write_str("user line\n");
+        clear_screen();
+        write_str("not rendered\n");
+        assert_eq!(port_log(), b"Process 7 exited with code 0\nuser line\n");
+    }
+
+    /// The memory-map check does not look at the geometry. The framebuffer
+    /// driver does, and refuses one that does not fit its region. That boot
+    /// has no display either, and `has_display` is what the kernel reports
+    /// it from.
+    #[test]
+    fn c3_a_framebuffer_refused_for_its_geometry_leaves_no_display() {
+        let _guard = serial_test_state();
+        disable_text_display();
+        // 1024 x 768 at four bytes a pixel does not fit in one page.
+        crate::framebuffer::init(&crate::framebuffer::FramebufferInfo {
+            base: 0x8000_0000,
+            size: 0x1000,
+            width: 1024,
+            height: 768,
+            stride: 1024,
+            pixel_format: crate::framebuffer::PixelFormat::Bgr,
+        });
+        assert!(!crate::framebuffer::is_initialized());
+        assert!(!has_display());
+        _print(format_args!("serial only\n"));
+        assert_eq!(port_log(), b"serial only\n");
     }
 
     #[test]
