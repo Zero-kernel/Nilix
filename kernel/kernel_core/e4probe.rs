@@ -22,7 +22,7 @@ use cpu_local::e4;
 
 const MODE_WINDOW_TICKS: u64 = 10_000;
 /// The modes this branch cycles through.
-const MODE_CYCLE: [usize; 2] = [e4::BASE, e4::FAST_ID];
+const MODE_CYCLE: [usize; 4] = [e4::BASE, e4::FAST_ID, e4::HALT, e4::FAST_ID_HALT];
 
 /// The tick of the first `/proc/schedstat` read; 0 until then (base mode).
 static MODE_BASE_TICK: AtomicU64 = AtomicU64::new(0);
