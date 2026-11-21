@@ -1838,7 +1838,15 @@ impl Scheduler {
             if cpu_id == local_cpu || count == sources.len() {
                 continue;
             }
-            let len = Self::queue_len_for_cpu(cpu_id);
+            // C3 E4 DIAGNOSTIC, not for merge: in the try-lock modes a queue
+            // whose lock is held is skipped instead of waited for.
+            let len = if cpu_local::e4::mode() & cpu_local::e4::TRY_LOCKS != 0 {
+                Self::ready_queue_for_cpu(cpu_id)
+                    .and_then(|queue| queue.try_lock())
+                    .map_or(0, |queue| Self::queue_len(&queue))
+            } else {
+                Self::queue_len_for_cpu(cpu_id)
+            };
             if len > 0 {
                 sources[count] = (len, cpu_id);
                 count += 1;
@@ -1859,7 +1867,12 @@ impl Scheduler {
         current_pid: Option<Pid>,
     ) -> Option<(Pid, ProcessControlBlock, Priority, usize, Priority)> {
         let queue = Self::ready_queue_for_cpu(source_cpu)?;
-        let mut guard = Self::lock_ready_queue_or_defer(queue)?;
+        // C3 E4 DIAGNOSTIC, not for merge.
+        let mut guard = if cpu_local::e4::mode() & cpu_local::e4::TRY_LOCKS != 0 {
+            queue.try_lock()?
+        } else {
+            Self::lock_ready_queue_or_defer(queue)?
+        };
         let mut retries = 0usize;
         let mut candidate =
             Self::select_next_for_migration_locked(&guard, source_cpu, local_cpu, current_pid);

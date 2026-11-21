@@ -3330,7 +3330,21 @@ impl SocketTable {
         // Take one fixed slot at a time and drop the leaf lock before entering
         // cgroup Level 5. No snapshot allocation and no lock-order regression.
         loop {
-            let next = {
+            // C3 E4 DIAGNOSTIC, not for merge: in the try-lock modes a pass
+            // does not wait for either lock; a later pass drains what is left.
+            let next = if cpu_local::e4::mode() & cpu_local::e4::TRY_LOCKS != 0 {
+                let primary = self
+                    .port_uncharge_pending
+                    .try_lock()
+                    .and_then(|mut queue| queue.take_one());
+                match primary {
+                    Some(item) => Some(item),
+                    None => self
+                        .port_uncharge_emergency
+                        .try_lock()
+                        .and_then(|mut queue| queue.take_one()),
+                }
+            } else {
                 let primary = self.port_uncharge_pending.lock().take_one();
                 match primary {
                     Some(item) => Some(item),

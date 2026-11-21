@@ -759,7 +759,8 @@ fn current_cpu_id_impl() -> usize {
 /// what the probe counts in each.
 ///
 /// Bit 0 of the mode selects the CPU lookup, bit 1 what a blocked waiter does when
-/// its CPU has nothing else to run.
+/// its CPU has nothing else to run, bit 2 whether the work-stealing scan and the
+/// deferred port-uncharge drain wait for a lock that is held.
 pub mod e4 {
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -770,7 +771,10 @@ pub mod e4 {
     /// A blocked waiter with nothing to run halts until the next interrupt.
     pub const HALT: usize = 2;
     pub const FAST_ID_HALT: usize = 3;
-    pub const MODES: usize = 4;
+    /// The work-stealing scan skips a ready queue whose lock is held, and the
+    /// deferred port-uncharge drain skips a pass when its lock is held.
+    pub const TRY_LOCKS: usize = 4;
+    pub const MODES: usize = 8;
 
     const IA32_TSC_AUX: u32 = 0xC000_0103;
 

@@ -12,17 +12,28 @@
 //!   logical id plus one in `init_syscall_percpu`.
 //! - `2` halt: such a blocked waiter halts until the next interrupt.
 //! - `3` fast_id_halt: both.
+//! - `4` try_locks: the work-stealing scan (`Scheduler::steal_one`,
+//!   `steal_from`) skips a ready queue whose lock is held instead of waiting
+//!   for it, and `SocketTable::drain_deferred_port_uncharges` skips a pass
+//!   when one of its two locks is held.
+//! - `5` fast_id_try_locks, `7` fast_id_halt_try_locks: the combinations.
 //!
 //! The first task exit in a new window switches the mode and prints
 //! `E4_MODE <mode> <window> lookups=<per mode> polls=<per mode>` with the
-//! cumulative CPU lookups and blocked-wait passes of each mode.
+//! cumulative CPU lookups and blocked-wait passes of each of the eight modes.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use cpu_local::e4;
 
 const MODE_WINDOW_TICKS: u64 = 10_000;
 /// The modes this branch cycles through.
-const MODE_CYCLE: [usize; 4] = [e4::BASE, e4::FAST_ID, e4::HALT, e4::FAST_ID_HALT];
+const MODE_CYCLE: [usize; 5] = [
+    e4::BASE,
+    e4::FAST_ID,
+    e4::TRY_LOCKS,
+    e4::FAST_ID | e4::TRY_LOCKS,
+    e4::FAST_ID | e4::HALT | e4::TRY_LOCKS,
+];
 
 /// The tick of the first `/proc/schedstat` read; 0 until then (base mode).
 static MODE_BASE_TICK: AtomicU64 = AtomicU64::new(0);
@@ -62,17 +73,25 @@ pub fn poll() {
     e4::set_mode(mode);
     let polls = |mode: usize| BLOCKED_POLLS[mode].load(Ordering::Relaxed);
     klog::klog_force!(
-        "E4_MODE {} {} lookups={}/{}/{}/{} polls={}/{}/{}/{}",
+        "E4_MODE {} {} lookups={}/{}/{}/{}/{}/{}/{}/{} polls={}/{}/{}/{}/{}/{}/{}/{}",
         mode,
         window,
         e4::lookups(0),
         e4::lookups(1),
         e4::lookups(2),
         e4::lookups(3),
+        e4::lookups(4),
+        e4::lookups(5),
+        e4::lookups(6),
+        e4::lookups(7),
         polls(0),
         polls(1),
         polls(2),
-        polls(3)
+        polls(3),
+        polls(4),
+        polls(5),
+        polls(6),
+        polls(7)
     );
 }
 
