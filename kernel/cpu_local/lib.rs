@@ -755,6 +755,95 @@ fn current_cpu_id_impl() -> usize {
     0
 }
 
+/// C3 E4 (#90) DIAGNOSTIC, not for merge: the modes one boot cycles through, and
+/// what the probe counts in each.
+///
+/// Bit 0 of the mode selects the CPU lookup, bit 1 what a blocked waiter does when
+/// its CPU has nothing else to run.
+pub mod e4 {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// As merged: every lookup reads the LAPIC ID register, a blocked waiter polls.
+    pub const BASE: usize = 0;
+    /// The lookup reads IA32_TSC_AUX instead of the LAPIC ID register.
+    pub const FAST_ID: usize = 1;
+    /// A blocked waiter with nothing to run halts until the next interrupt.
+    pub const HALT: usize = 2;
+    pub const FAST_ID_HALT: usize = 3;
+    pub const MODES: usize = 4;
+
+    const IA32_TSC_AUX: u32 = 0xC000_0103;
+
+    #[repr(align(64))]
+    struct Slot(AtomicU64);
+
+    static MODE: AtomicUsize = AtomicUsize::new(BASE);
+    /// CPU lookups by mode and CPU; a slot per cache line, so counting does not
+    /// make the CPUs share one.
+    static LOOKUPS: [[Slot; super::MAX_CPUS]; MODES] =
+        [const { [const { Slot(AtomicU64::new(0)) }; super::MAX_CPUS] }; MODES];
+
+    #[inline]
+    pub fn mode() -> usize {
+        MODE.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mode(mode: usize) {
+        MODE.store(mode % MODES, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn count_lookup(cpu: usize) {
+        if let Some(slot) = LOOKUPS[mode() % MODES].get(cpu) {
+            // Diagnostic counter only; wrap is harmless. lint-fetch-add: allow
+            slot.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Lookups made so far in `mode`, over all CPUs.
+    pub fn lookups(mode: usize) -> u64 {
+        LOOKUPS[mode % MODES]
+            .iter()
+            .map(|slot| slot.0.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Publish this CPU's logical id for the fast lookup. Runs on that CPU.
+    pub fn publish_cpu_id(cpu_id: usize) {
+        #[cfg(not(feature = "host_harness"))]
+        unsafe {
+            // SAFETY: CPL0; IA32_TSC_AUX has no effect besides RDTSCP/RDPID's result.
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_TSC_AUX,
+                in("eax") (cpu_id + 1) as u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags)
+            );
+        }
+        #[cfg(feature = "host_harness")]
+        let _ = cpu_id;
+    }
+
+    /// The id this CPU published, if it has.
+    #[cfg(not(feature = "host_harness"))]
+    #[inline]
+    pub(crate) fn published_cpu_id() -> Option<usize> {
+        let low: u32;
+        // SAFETY: CPL0; reading IA32_TSC_AUX has no side effect.
+        unsafe {
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") IA32_TSC_AUX,
+                out("eax") low,
+                out("edx") _,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        (low != 0 && low as usize <= super::MAX_CPUS).then(|| low as usize - 1)
+    }
+}
+
 /// Result of a hardware LAPIC-to-logical-CPU lookup.
 #[cfg(not(feature = "host_harness"))]
 enum CurrentCpuLookup {
@@ -788,6 +877,15 @@ fn current_cpu_lookup() -> CurrentCpuLookup {
         return CurrentCpuLookup::X2ApicActive;
     }
 
+    // C3 E4 DIAGNOSTIC, not for merge: in the fast-lookup modes the id comes from
+    // IA32_TSC_AUX, which each CPU sets once in `init_syscall_percpu`.
+    if e4::mode() & e4::FAST_ID != 0 {
+        if let Some(cpu_id) = e4::published_cpu_id() {
+            e4::count_lookup(cpu_id);
+            return CurrentCpuLookup::Registered(cpu_id);
+        }
+    }
+
     // R169-L7 FIX: read the LAPIC ID register (offset 0x20, bits 31:24) through the
     // single authoritative MMIO base shared with `arch::apic::lapic_read`, not a
     // hard-coded `0xFEE0_0020` literal. After memory initialization this is a
@@ -808,6 +906,8 @@ fn current_cpu_lookup() -> CurrentCpuLookup {
     // This rejects stale/reassigned LAPIC mappings instead of aliasing their
     // per-CPU KCOV state to a currently online logical slot.
     if registered_cpu_mapping_matches(cpu_idx, apic_id) {
+        // C3 E4 DIAGNOSTIC, not for merge.
+        e4::count_lookup(cpu_idx);
         return CurrentCpuLookup::Registered(cpu_idx);
     }
 

@@ -65,6 +65,7 @@ pub use drivers::vga_buffer;
 pub mod syscall_macros;
 
 pub mod cgroup;
+pub mod e4probe;
 pub mod elf_loader;
 pub mod exception_table;
 // R169-11: `fallible_map` was relocated to the `mm` crate (so `net` can use it

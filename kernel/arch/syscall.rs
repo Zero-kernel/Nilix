@@ -932,6 +932,8 @@ pub unsafe fn init_syscall_percpu(cpu_id: usize) {
         "CPU ID {} out of range for syscall per-CPU init",
         cpu_id
     );
+    // C3 E4 DIAGNOSTIC, not for merge.
+    cpu_local::e4::publish_cpu_id(cpu_id);
 
     // Pre-compute scratch stack top for this CPU
     let scratch_base = SYSCALL_SCRATCH_STACKS[cpu_id].0.as_ptr() as usize;

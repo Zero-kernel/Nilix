@@ -685,7 +685,12 @@ impl WaitQueue {
             {
                 return;
             }
-            core::hint::spin_loop();
+            // C3 E4 DIAGNOSTIC, not for merge.
+            if kernel_core::e4probe::blocked_wait_halts() {
+                x86_64::instructions::hlt();
+            } else {
+                core::hint::spin_loop();
+            }
         }
     }
 

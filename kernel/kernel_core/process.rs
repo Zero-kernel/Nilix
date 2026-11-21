@@ -11679,6 +11679,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
         klog_always!("Process {} terminated with exit code {}", pid, exit_code);
+        // C3 E4 DIAGNOSTIC, not for merge.
+        crate::e4probe::poll();
         // TD-SERIAL-1: record the IRQ-masked serial holds for the gates
         // (cycles per ms from the TSC over the BSP's serviced ticks; masked
         // intervals that lose ticks make this an upper bound).
