@@ -419,6 +419,10 @@ pub fn cpuset_set_cpus(admin: &CpusetAdmin, id: CpusetId, cpus: u64) -> Result<(
     }
 
     cpuset.set_cpus(cpus);
+    // C3 (#90): a wider mask can make a queued task dispatchable on a CPU
+    // that has ruled its queue out. The tasks of a cpuset are not listed, so
+    // every queue is published; each CPU then looks again on its next pass.
+    kernel_core::steal_hint::hint().publish_all();
     Ok(())
 }
 

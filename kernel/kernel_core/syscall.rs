@@ -20707,6 +20707,12 @@ fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Syscal
     let mut proc = proc_arc.lock();
     let old_mask = proc.allowed_cpus;
     proc.allowed_cpus = new_mask;
+    if old_mask != new_mask {
+        // C3 (#90): a CPU that the old mask excluded has ruled this task out
+        // and may now have to steal it. Publish under the PCB lock, after
+        // the mask is written.
+        crate::process::note_publication(target_pid);
+    }
     let is_running = proc.state == ProcessState::Running;
     // Note: We don't track which CPU a process is running on in the PCB currently,
     // so for cross-CPU migration we rely on the scheduler's periodic load balancing.

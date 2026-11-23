@@ -111,7 +111,7 @@ run_standalone_rust_suite() {
     echo "=== hosted standalone Rust suite: ${name} (expected ${expected_passed} passed; default parallelism) ==="
     if ! (
         cd "${repo_root}/${source_dir}"
-        NILIX_TEST_TOTAL=76 rustc +nightly-2025-12-08 \
+        NILIX_TEST_TOTAL=77 rustc +nightly-2025-12-08 \
             --edition=2021 "${rustc_flags[@]}" --test "${source_file}" -o "${test_binary}"
         "${test_binary}"
     ) 2>&1 | tee "${log_file}"; then
@@ -214,7 +214,8 @@ run_suite cap-cloexec 1 11 \
     --features mm/host_harness \
     --lib --locked -- ksa005_
 
-run_suite net 139 0 \
+# Includes the C3 port-uncharge drain's sequence gate.
+run_suite net 142 0 \
     --manifest-path kernel/net/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -242,15 +243,16 @@ run_suite cgroup-access 1 0 \
     --features host_harness \
     --test cgroup_access --locked
 
-# Includes the C3 aligned TID store and concurrent word tests.
-run_suite kernel-core 153 0 \
+# Includes the C3 aligned TID store and concurrent word tests, and the C3
+# work-stealing hint with its model.
+run_suite kernel-core 162 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
     --lib --locked
 
 # Source-discovery/placeholder polarity oracle.  This is intentionally a
-# separate integration target: it validates the same 76 RuntimeTest
+# separate integration target: it validates the same 77 RuntimeTest
 # implementations reported by kernel/build.rs and fails closed on stale P0/P1
 # placeholders or scanner drift.
 # This scanner is pure std source analysis and does not import the kernel.
@@ -276,7 +278,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 153 \
+run_suite mitigation-mappings 5 162 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

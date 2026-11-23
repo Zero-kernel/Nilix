@@ -30,6 +30,7 @@ use kernel_core::cgroup;
 use kernel_core::process::{
     self, Priority, Process, ProcessArc, ProcessId, ProcessNameSnapshot, ProcessState,
 };
+use kernel_core::steal_hint::{self, ScanOutcome};
 use lazy_static::lazy_static;
 use mm::{AdmittedMap, HeapClass, PreparedAdmittedMapCapacity, RetiredAdmittedMapCapacity};
 use spin::{Mutex, Once};
@@ -81,6 +82,14 @@ const TICK_NS: u64 = 1_000_000;
 /// invariant rather than a tuning hint. A rotating cursor guarantees progress
 /// across a queue containing arbitrarily many blocked or contended PCBs.
 const SELECT_VISIT_BUDGET: usize = 16;
+
+/// C3 (#90): bounded selection windows a thief runs in one hold of a source
+/// queue's lock, worth `STEAL_VISITS_PER_HOLD` visits. A hold may need one
+/// window more, because a window ends early where the cursor's cycle began,
+/// but never more visits. A longer queue never gives a conclusive scan: it is
+/// examined on every pass.
+const STEAL_WINDOWS_PER_HOLD: usize = 3;
+const STEAL_VISITS_PER_HOLD: usize = STEAL_WINDOWS_PER_HOLD * SELECT_VISIT_BUDGET;
 
 /// 调度器调试输出宏
 macro_rules! sched_debug {
@@ -748,6 +757,12 @@ fn finish_pending_prev() -> bool {
                 reap_pcb = Some(pcb.clone());
             }
             proc.on_cpu.store(false, Ordering::Release);
+            // C3 (#90): a task that became Ready while it was still on this
+            // CPU was not published then, because nobody could steal it.
+            // Now another CPU can.
+            if proc.state == ProcessState::Ready {
+                process::note_publication(pid as Pid);
+            }
         }
     }
     if let Some(parent_pid) = reaper {
@@ -846,6 +861,67 @@ struct SelectionResult {
     candidate: Option<(Pid, ProcessControlBlock, Priority)>,
     visited: usize,
     complete_cycle: bool,
+    /// C3 (#90): some visited entry was rejected for a reason that can end
+    /// without a publication (`SelectReject::ends_without_publication`). A
+    /// scan with this set proves nothing about the queue's future.
+    transient_reject: bool,
+}
+
+/// Why the bounded selector passed over an entry.
+///
+/// C3 (#90): the work-stealing hint needs to know whether the entry can
+/// become dispatchable without the kernel publishing it (`steal_hint`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectReject {
+    /// The caller asked for this PID to be skipped.
+    Skipped,
+    /// A timer-interrupt kill owns the task until it is a Zombie (R170-5).
+    PendingIrqKill,
+    /// The PCB lock is held elsewhere.
+    PcbContended,
+    /// Not Ready, stopped, or still on a CPU.
+    NotRunnable,
+    /// The cpuset registry's lock is held elsewhere, or the cpuset is empty.
+    CpusetUnavailable,
+    /// The target CPU is outside the task's effective mask.
+    NotAllowed,
+    /// The task's cgroup has used up its CPU quota for this period.
+    Throttled,
+}
+
+impl SelectReject {
+    const ALL: [Self; 7] = [
+        Self::Skipped,
+        Self::PendingIrqKill,
+        Self::PcbContended,
+        Self::NotRunnable,
+        Self::CpusetUnavailable,
+        Self::NotAllowed,
+        Self::Throttled,
+    ];
+
+    /// Whether the reason can go away with no publication: a lock is
+    /// released, or time passes. Every other reason ends in an event that
+    /// increments the queue's wake sequence, or never ends. No wildcard arm:
+    /// a new reason must be classified here.
+    const fn ends_without_publication(self) -> bool {
+        match self {
+            Self::PcbContended | Self::CpusetUnavailable | Self::Throttled => true,
+            Self::Skipped | Self::PendingIrqKill | Self::NotRunnable | Self::NotAllowed => false,
+        }
+    }
+}
+
+/// What one hold of a source queue's lock gave a thief (C3, #90).
+struct StealHold {
+    /// The task removed from the queue, with the priority of the bucket that
+    /// held it.
+    stolen: Option<(Pid, ProcessControlBlock, Priority, Priority)>,
+    /// Entries visited in this hold.
+    visited: usize,
+    /// Nothing was a candidate, every entry was visited, and none was
+    /// rejected for a reason that ends without a publication.
+    conclusive: bool,
 }
 
 /// Fully prepared context switch. PCB/table/cpuset locks have all been
@@ -1102,37 +1178,52 @@ impl Scheduler {
         let now_tick = kernel_core::get_ticks();
         let now_ns = now_tick.saturating_mul(TICK_NS);
         let mut best: Option<(Priority, u64, Pid, ProcessControlBlock)> = None;
+        let mut transient_reject = false;
         let (visited, complete_cycle) =
             Self::scan_queue_window(queue, cursor, queue_epoch, visit_budget, |key, pcb| {
                 let pid = key.1;
-                if Some(pid) == skip_pid || process::is_pending_irq_kill(pid) {
-                    return;
-                }
+                // The PCB guard lives only inside this closure.
+                let verdict = (|| {
+                    if Some(pid) == skip_pid {
+                        return Err(SelectReject::Skipped);
+                    }
+                    if process::is_pending_irq_kill(pid) {
+                        return Err(SelectReject::PendingIrqKill);
+                    }
 
-                // Timer-return scheduling has IF=0. Contention consumes one bounded
-                // visit and advances the cursor; it can never spin on a PCB lock.
-                let Some(mut proc) = pcb.try_lock() else {
-                    return;
+                    // Timer-return scheduling has IF=0. Contention consumes one bounded
+                    // visit and advances the cursor; it can never spin on a PCB lock.
+                    let Some(mut proc) = pcb.try_lock() else {
+                        return Err(SelectReject::PcbContended);
+                    };
+                    if proc.state != ProcessState::Ready
+                        || proc.stopped
+                        || proc.on_cpu.load(Ordering::Acquire)
+                    {
+                        return Err(SelectReject::NotRunnable);
+                    }
+
+                    proc.age_wait_ticks_to(now_tick);
+                    proc.check_and_boost_starved();
+                    let Some(effective_mask) = Self::try_effective_allowed_cpus(&proc) else {
+                        return Err(SelectReject::CpusetUnavailable);
+                    };
+                    if !Self::cpu_allowed(target_cpu, effective_mask) {
+                        return Err(SelectReject::NotAllowed);
+                    }
+                    if cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some() {
+                        return Err(SelectReject::Throttled);
+                    }
+                    Ok((proc.dynamic_priority, proc.wait_ticks, pid))
+                })();
+                let candidate = match verdict {
+                    Ok(candidate) => candidate,
+                    Err(reason) => {
+                        transient_reject |= reason.ends_without_publication();
+                        return;
+                    }
                 };
-                if proc.state != ProcessState::Ready
-                    || proc.stopped
-                    || proc.on_cpu.load(Ordering::Acquire)
-                {
-                    return;
-                }
 
-                proc.age_wait_ticks_to(now_tick);
-                proc.check_and_boost_starved();
-                let Some(effective_mask) = Self::try_effective_allowed_cpus(&proc) else {
-                    return;
-                };
-                if !Self::cpu_allowed(target_cpu, effective_mask)
-                    || cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some()
-                {
-                    return;
-                }
-
-                let candidate = (proc.dynamic_priority, proc.wait_ticks, pid);
                 let better = match best.as_ref() {
                     None => true,
                     Some((priority, waited, best_pid, _)) => {
@@ -1143,7 +1234,6 @@ impl Scheduler {
                                 && candidate.2 < *best_pid)
                     }
                 };
-                drop(proc);
                 if better {
                     best = Some((candidate.0, candidate.1, candidate.2, Arc::clone(pcb)));
                 }
@@ -1158,6 +1248,7 @@ impl Scheduler {
             candidate,
             visited,
             complete_cycle,
+            transient_reject,
         }
     }
 
@@ -1324,16 +1415,34 @@ impl Scheduler {
         queue.len()
     }
 
-    /// Get queue length for a specific CPU
+    /// Residents of a CPU's queue as that queue last published them.
+    ///
+    /// C3 (#90): one atomic load. Placement and balancing are heuristics, and
+    /// a length that is one mutation stale is as good to them as the exact
+    /// one; taking every queue's lock to read it made every new thread and
+    /// every steal pass wait for all the other CPUs.
     #[inline]
-    fn queue_len_for_cpu(cpu_id: usize) -> usize {
-        let Some(queue) = Self::ready_queue_for_cpu(cpu_id) else {
-            return 0;
-        };
-        let Some(queue) = Self::lock_ready_queue_or_defer(queue) else {
-            return 0;
-        };
-        Self::queue_len(&queue)
+    fn published_queue_len(cpu_id: usize) -> usize {
+        steal_hint::hint().queue_len(cpu_id)
+    }
+
+    /// Record under queue `cpu_id`'s lock that `pid` is now one of its
+    /// `queue.len()` residents. An insert is a publication: the task may be
+    /// Ready, and a CPU that found nothing here must look again.
+    #[inline]
+    fn note_enqueued(queue: &ReadyQueues, cpu_id: usize, pid: Pid) {
+        steal_hint::hint().note_enqueued(pid, cpu_id, queue.len());
+    }
+
+    /// Record under queue `cpu_id`'s lock that `pid` has left it.
+    ///
+    /// The queue can still hold another entry with the same PID: a reaped
+    /// task's PID can be live again before its old entry is dropped. The
+    /// record then stays with the entry that remains.
+    #[inline]
+    fn note_removed(queue: &ReadyQueues, cpu_id: usize, pid: Pid) {
+        let same_pid_resident = queue.entries.keys().any(|&(_, resident)| resident == pid);
+        steal_hint::hint().note_removed(pid, cpu_id, queue.len(), same_pid_resident);
     }
 
     // ========================================================================
@@ -1544,11 +1653,8 @@ impl Scheduler {
             if allowed_cpus != 0 && !Self::cpu_allowed(cpu_id, allowed_cpus) {
                 continue;
             }
-            if let Some(q) = Self::ready_queue_for_cpu(cpu_id) {
-                let Some(queue) = Self::lock_ready_queue_or_defer(q) else {
-                    continue;
-                };
-                let len = Self::queue_len(&queue);
+            if Self::ready_queue_for_cpu(cpu_id).is_some() {
+                let len = Self::published_queue_len(cpu_id);
                 if len < best_len {
                     best_len = len;
                     best_cpu = Some(cpu_id);
@@ -1566,7 +1672,7 @@ impl Scheduler {
     fn target_cpu_for_new_work(preferred_cpu: usize, allowed_cpus: u64) -> Option<usize> {
         // R70-2 FIX: Pass affinity mask to least_loaded_cpu
         let (least_cpu, least_len) = Self::least_loaded_cpu(None, allowed_cpus)?;
-        let preferred_len = Self::queue_len_for_cpu(preferred_cpu);
+        let preferred_len = Self::published_queue_len(preferred_cpu);
 
         // If preferred CPU is not allowed, always use least_cpu
         if allowed_cpus != 0 && !Self::cpu_allowed(preferred_cpu, allowed_cpus) {
@@ -1605,6 +1711,20 @@ impl Scheduler {
         if !interrupts::are_enabled() {
             return Err(process::SchedulerAddError::Unavailable);
         }
+        Self::insert_ready_detached(queue_ref, queue_cpu, priority, pid, pcb)
+    }
+
+    /// The body of `try_insert_ready`. Every production caller goes through
+    /// that function and its interrupts-on rule. The boot-time steal-hint
+    /// probe calls this directly: it runs before the BSP enables interrupts,
+    /// on a queue that no CPU schedules from yet.
+    fn insert_ready_detached(
+        queue_ref: &Mutex<ReadyQueues>,
+        queue_cpu: usize,
+        priority: Priority,
+        pid: Pid,
+        pcb: ProcessControlBlock,
+    ) -> Result<(), process::SchedulerAddError> {
         let mut value = Some(pcb);
         let mut prepared: Option<PreparedReadyBacking<ProcessControlBlock>> = None;
 
@@ -1669,6 +1789,7 @@ impl Scheduler {
                     return Err(process::SchedulerAddError::InvalidState);
                 }
                 Self::mark_queue_mutated(queue_cpu);
+                Self::note_enqueued(&queue, queue_cpu, pid);
                 Ok(None)
             })();
 
@@ -1732,6 +1853,7 @@ impl Scheduler {
         if removed.0.is_some() {
             if let Some(cpu_id) = queue_cpu {
                 Self::mark_queue_mutated(cpu_id);
+                Self::note_removed(queue, cpu_id, pid);
             }
         }
         removed
@@ -1748,22 +1870,40 @@ impl Scheduler {
     /// - Drop the slot only when the queued PCB's `(pid, generation)` matches.
     /// - Missing entry / generation mismatch: no-op (idempotent double-remove).
     /// - Process-context only (cleanup_zombie / reaper); may take PCB locks.
+    ///
+    /// C3 (#90): the task's queue is on record, so one lock is taken where
+    /// this used to take every CPU's. The record is a hint, not the
+    /// guarantee: a task that is not found where the record points (a
+    /// recycled PID's record names the successor's queue) is looked for in
+    /// every queue as before.
     fn remove_identity_from_all_queues(pid: Pid, generation: u64) {
-        for cpu_id in 0..max_cpus() {
-            if let Some(queue) = Self::ready_queue_for_cpu(cpu_id) {
-                let (removed, retired) = {
-                    let mut guard = queue.lock();
-                    Self::remove_identity_from_ready_queues(
-                        &mut guard,
-                        Some(cpu_id),
-                        pid,
-                        generation,
-                    )
-                };
-                drop(removed);
-                drop(retired);
+        let recorded = steal_hint::hint().queue_cpu(pid);
+        if let Some(cpu_id) = recorded {
+            if Self::remove_identity_from_queue_of(cpu_id, pid, generation) {
+                return;
             }
         }
+        for cpu_id in 0..max_cpus() {
+            if Some(cpu_id) != recorded {
+                Self::remove_identity_from_queue_of(cpu_id, pid, generation);
+            }
+        }
+    }
+
+    /// Lock `cpu_id`'s queue and drop the exact identity from it. Returns
+    /// whether it was there.
+    fn remove_identity_from_queue_of(cpu_id: usize, pid: Pid, generation: u64) -> bool {
+        let Some(queue) = Self::ready_queue_for_cpu(cpu_id) else {
+            return false;
+        };
+        let (removed, retired) = {
+            let mut guard = queue.lock();
+            Self::remove_identity_from_ready_queues(&mut guard, Some(cpu_id), pid, generation)
+        };
+        let found = removed.is_some();
+        drop(removed);
+        drop(retired);
+        found
     }
 
     /// Remove `pid` from whichever priority bucket of `queue` actually holds it — MEMBERSHIP
@@ -1793,6 +1933,7 @@ impl Scheduler {
         if pcb.is_some() {
             if let Some(cpu_id) = queue_cpu {
                 Self::mark_queue_mutated(cpu_id);
+                Self::note_removed(queue, cpu_id, pid);
             }
         }
         pcb.map(|pcb| (pcb, key))
@@ -1822,121 +1963,262 @@ impl Scheduler {
     /// which may not run it, while CPU 3 kept probing CPU 0 (longer only
     /// because it also held a Blocked task) and idled forever. Queue lengths
     /// count Blocked members, so the longest queue need not hold a candidate.
+    ///
+    /// C3 (#90): the scan waits for no lock. It skips a queue that has
+    /// published nothing since this CPU last examined every entry of it
+    /// (`steal_hint`), and it skips, for this pass, a queue whose lock is
+    /// held. Under multi-threaded TCG each wait for one of these locks went
+    /// through QEMU's global lock, and at 16 vCPUs 86% of the kernel's PAUSEs
+    /// were such waits.
     fn steal_one(
         current_pid: Option<Pid>,
     ) -> Option<(Pid, ProcessControlBlock, Priority, usize, Priority)> {
         let local_cpu = current_cpu_id();
-        let online_mask = cpu_local::online_cpu_mask();
-        if online_mask.count_ones() < 2 {
+        if cpu_local::online_cpu_mask().count_ones() < 2 {
             return None;
         }
+        Self::steal_pass(local_cpu, Self::online_cpu_ids(), current_pid, true)
+    }
+
+    /// One steal pass of `local_cpu` over `candidates`.
+    ///
+    /// For each source: read its wake sequence, skip it if this CPU has seen
+    /// that sequence, otherwise try its lock and examine it. The sequence is
+    /// read before anything else about the queue; that order is what makes a
+    /// stored mark safe (see `steal_hint`).
+    ///
+    /// Every `LOAD_BALANCE_INTERVAL_TICKS` of this CPU's ticks a pass ignores
+    /// the marks, so a publication the kernel failed to make delays a steal
+    /// and never loses it. That pass stays due until one has looked at every
+    /// source: a pass cut short by a steal, or by a held lock, is repeated.
+    /// Only a pass whose candidates are every online CPU (`all_sources`) can
+    /// be that pass; the runtime probe's passes over one queue never are.
+    fn steal_pass(
+        local_cpu: usize,
+        candidates: impl Iterator<Item = usize>,
+        current_pid: Option<Pid>,
+        all_sources: bool,
+    ) -> Option<(Pid, ProcessControlBlock, Priority, usize, Priority)> {
+        let hint = steal_hint::hint();
+        let full_pass = all_sources && hint.full_pass_due(local_cpu);
 
         // `online_cpu_ids` covers at most 64 CPUs.
-        let mut sources = [(0usize, 0usize); 64];
+        let mut sources = [(0usize, 0usize, 0u64); 64];
         let mut count = 0usize;
-        for cpu_id in Self::online_cpu_ids() {
+        for cpu_id in candidates {
             if cpu_id == local_cpu || count == sources.len() {
                 continue;
             }
-            let len = Self::queue_len_for_cpu(cpu_id);
-            if len > 0 {
-                sources[count] = (len, cpu_id);
-                count += 1;
+            let Some(seq) = hint.scan_begin(local_cpu, cpu_id, full_pass) else {
+                continue;
+            };
+            let len = Self::published_queue_len(cpu_id);
+            if len == 0 {
+                hint.scan_end(local_cpu, cpu_id, seq, ScanOutcome::Empty);
+                continue;
             }
+            sources[count] = (len, cpu_id, seq);
+            count += 1;
         }
         let sources = &mut sources[..count];
         sources.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        sources
-            .iter()
-            .find_map(|&(_, source_cpu)| Self::steal_from(source_cpu, local_cpu, current_pid))
+
+        let mut every_source_examined = true;
+        for &(_, source_cpu, seq) in sources.iter() {
+            let (outcome, stolen) = Self::steal_from(source_cpu, local_cpu, current_pid);
+            hint.scan_end(local_cpu, source_cpu, seq, outcome);
+            if stolen.is_some() {
+                return stolen;
+            }
+            every_source_examined &= outcome != ScanOutcome::LockHeld;
+        }
+        if full_pass && every_source_examined {
+            hint.complete_full_pass(local_cpu);
+        }
+        None
     }
 
-    /// Steal one ready task that may run on `local_cpu` from `source_cpu`'s
-    /// queue, removing it from that queue.
+    /// Look once at `source_cpu`'s queue for a task that may run on
+    /// `local_cpu`, and remove it from that queue.
+    ///
+    /// C3 (#90): `try_lock` only. A held lock means another CPU is working on
+    /// the queue; this pass skips it and the next one tries again.
     fn steal_from(
         source_cpu: usize,
         local_cpu: usize,
         current_pid: Option<Pid>,
-    ) -> Option<(Pid, ProcessControlBlock, Priority, usize, Priority)> {
-        let queue = Self::ready_queue_for_cpu(source_cpu)?;
-        let mut guard = Self::lock_ready_queue_or_defer(queue)?;
-        let mut retries = 0usize;
-        let mut candidate =
-            Self::select_next_for_migration_locked(&guard, source_cpu, local_cpu, current_pid);
-        while let Some((pid, proc_arc, _selected_priority)) = candidate {
-            if retries == 2 {
-                return None;
+    ) -> (
+        ScanOutcome,
+        Option<(Pid, ProcessControlBlock, Priority, usize, Priority)>,
+    ) {
+        let Some(queue) = Self::ready_queue_for_cpu(source_cpu) else {
+            return (ScanOutcome::Inconclusive, None);
+        };
+        let Some(mut guard) = queue.try_lock() else {
+            return (ScanOutcome::LockHeld, None);
+        };
+        debug_assert!(source_cpu < max_cpus());
+        // SAFETY: the guard above is queue `source_cpu`'s lock, which
+        // serializes every access to its migration cursor.
+        let cursor = unsafe { &mut *MIGRATION_SELECTION_CURSOR[source_cpu].0.get() };
+        let hold =
+            Self::steal_hold_locked(&mut guard, Some(source_cpu), cursor, local_cpu, current_pid);
+        drop(guard);
+        let outcome = Self::hold_outcome(&hold);
+        // RF180-46: stealing is a Ready-to-Ready migration. The normal
+        // local selection transaction claims Running/on_cpu only after
+        // destination publication has completed.
+        let stolen = hold
+            .stolen
+            .map(|(pid, pcb, priority, membership_priority)| {
+                (pid, pcb, priority, source_cpu, membership_priority)
+            });
+        (outcome, stolen)
+    }
+
+    /// What a hold tells the hint. Only a hold that proved the queue has
+    /// nothing for this thief may be remembered.
+    fn hold_outcome(hold: &StealHold) -> ScanOutcome {
+        if hold.stolen.is_some() {
+            ScanOutcome::Stolen
+        } else if hold.conclusive {
+            ScanOutcome::Conclusive
+        } else {
+            ScanOutcome::Inconclusive
+        }
+    }
+
+    /// The work of one hold of a source queue's lock: windows of the bounded
+    /// selector (RF178-33) for `local_cpu`, at most `STEAL_VISITS_PER_HOLD`
+    /// visits in all, each candidate revalidated under its PCB lock.
+    ///
+    /// The caller holds the queue's lock, which also serializes `cursor`.
+    /// `queue_cpu` is `None` for a queue that is not a CPU's (the self-test).
+    ///
+    /// The hold is conclusive when it found no candidate at all, it visited
+    /// every entry, and no entry was rejected for a reason that can end
+    /// without a publication. The selector walks the queue in cyclic order
+    /// and the windows of one hold continue each other, so `queue.len()`
+    /// consecutive visits cover every entry wherever the cursor stood; until
+    /// a candidate appears, a hold stops there. A hold whose candidate is
+    /// then refused is never conclusive: the selector returns only the best
+    /// entry of a window, and another runnable one may have been passed over
+    /// behind it.
+    fn steal_hold_locked(
+        queue: &mut ReadyQueues,
+        queue_cpu: Option<usize>,
+        cursor: &mut SelectionCursorState,
+        local_cpu: usize,
+        current_pid: Option<Pid>,
+    ) -> StealHold {
+        let residents = queue.len();
+        let queue_epoch = queue_cpu
+            .and_then(|cpu_id| QUEUE_MUTATION_EPOCH.get(cpu_id))
+            .map(|epoch| epoch.load(Ordering::Acquire))
+            .unwrap_or(0);
+        let mut visited = 0usize;
+        let mut conclusive = true;
+        let mut candidate_seen = false;
+        let mut skip_pid = current_pid;
+        for _ in 0..=STEAL_WINDOWS_PER_HOLD {
+            // After a refused candidate, later windows revisit the entries
+            // the selector passed over behind it, as before C3.
+            let turn = if candidate_seen {
+                usize::MAX
+            } else {
+                residents.saturating_sub(visited)
+            };
+            let budget = SELECT_VISIT_BUDGET
+                .min(STEAL_VISITS_PER_HOLD.saturating_sub(visited))
+                .min(turn);
+            if budget == 0 {
+                break;
             }
-            retries += 1;
+            let selection = Self::select_next_with_cursor(
+                queue,
+                local_cpu,
+                skip_pid,
+                cursor,
+                queue_epoch,
+                budget,
+            );
+            visited = visited.saturating_add(selection.visited);
+            conclusive &= !selection.transient_reject;
+            let Some((pid, proc_arc, _selected_priority)) = selection.candidate else {
+                continue;
+            };
+            candidate_seen = true;
+            conclusive = false;
+            skip_pid = Some(pid);
             // Skip if this is the current process
             if Some(pid) == current_pid {
-                candidate = Self::select_next_for_migration_locked(
-                    &guard,
-                    source_cpu,
-                    local_cpu,
-                    Some(pid),
-                );
                 continue;
             }
-            if let Some(pcb) = proc_arc.try_lock() {
-                // U40-2 FIX: source ready-queue locks are held while
-                // selecting a victim.  The blocking cpuset registry read
-                // would invert the scheduler/cpuset lock order and can
-                // deadlock against affinity updates.  Use the non-blocking
-                // snapshot; contention simply leaves the task in place for a
-                // later steal attempt.
-                let Some(effective_mask) = Self::try_effective_allowed_cpus(&pcb) else {
-                    candidate = Self::select_next_for_migration_locked(
-                        &guard,
-                        source_cpu,
-                        local_cpu,
-                        Some(pid),
-                    );
-                    continue;
-                };
-                let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
-                if pcb.state != ProcessState::Ready
-                    || pcb.on_cpu.load(Ordering::Acquire) // R172-03: outgoing save not yet durable
-                    || pcb.stopped // R98-1 FIX: Also skip job-control stopped processes
-                    || process::is_pending_irq_kill(pid)
-                    || !Self::cpu_allowed(local_cpu, effective_mask)
-                    || cgroup::cpu_quota_is_throttled(pcb.cgroup_id, now_ns).is_some()
-                // R169-9 FIX: don't steal IRQ-killed tasks
-                {
-                    drop(pcb);
-                    candidate = Self::select_next_for_migration_locked(
-                        &guard,
-                        source_cpu,
-                        local_cpu,
-                        Some(pid),
-                    );
-                    continue;
-                }
-                let priority = pcb.dynamic_priority;
-                drop(pcb);
-                // R171-M4-1 FIX: remove from the source queue by MEMBERSHIP, NOT by the
-                // (possibly PI-drifted) `priority` above. Keying the remove off
-                // `pcb.dynamic_priority` could miss the real bucket and leave the PCB in the
-                // source queue while the caller (`select_next_process`) inserts it locally —
-                // double-queuing one PCB across two CPUs. Only steal if the remove succeeded.
-                let (stolen, membership_priority) =
-                    Self::remove_pid_from_queue(&mut guard, Some(source_cpu), pid)
-                        .expect("selected steal candidate disappeared under its queue lock");
-                drop(guard);
-                // RF180-46: stealing is a Ready-to-Ready migration. The normal
-                // local selection transaction claims Running/on_cpu only after
-                // destination publication has completed.
-                return Some((pid, stolen, priority, source_cpu, membership_priority));
-            } else {
-                candidate = Self::select_next_for_migration_locked(
-                    &guard,
-                    source_cpu,
-                    local_cpu,
-                    Some(pid),
-                );
+            let Some(pcb) = proc_arc.try_lock() else {
+                continue;
+            };
+            // U40-2 FIX: source ready-queue locks are held while
+            // selecting a victim.  The blocking cpuset registry read
+            // would invert the scheduler/cpuset lock order and can
+            // deadlock against affinity updates.  Use the non-blocking
+            // snapshot; contention simply leaves the task in place for a
+            // later steal attempt.
+            let Some(effective_mask) = Self::try_effective_allowed_cpus(&pcb) else {
+                continue;
+            };
+            let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
+            if pcb.state != ProcessState::Ready
+                || pcb.on_cpu.load(Ordering::Acquire) // R172-03: outgoing save not yet durable
+                || pcb.stopped // R98-1 FIX: Also skip job-control stopped processes
+                || process::is_pending_irq_kill(pid) // R169-9 FIX: don't steal IRQ-killed tasks
+                || !Self::cpu_allowed(local_cpu, effective_mask)
+                || cgroup::cpu_quota_is_throttled(pcb.cgroup_id, now_ns).is_some()
+            {
+                continue;
             }
+            let priority = pcb.dynamic_priority;
+            drop(pcb);
+            // R171-M4-1 FIX: remove from the source queue by MEMBERSHIP, NOT by the
+            // (possibly PI-drifted) `priority` above. Keying the remove off
+            // `pcb.dynamic_priority` could miss the real bucket and leave the PCB in the
+            // source queue while the caller (`select_next_process`) inserts it locally —
+            // double-queuing one PCB across two CPUs. Only steal if the remove succeeded.
+            let (stolen, membership_priority) = Self::remove_pid_from_queue(queue, queue_cpu, pid)
+                .expect("selected steal candidate disappeared under its queue lock");
+            return StealHold {
+                stolen: Some((pid, stolen, priority, membership_priority)),
+                visited,
+                conclusive: false,
+            };
         }
-        None
+        StealHold {
+            stolen: None,
+            visited,
+            conclusive: conclusive && visited >= residents,
+        }
+    }
+
+    /// Put a task that was removed for a steal or a balance move back into
+    /// its source queue. The queue kept a slot for it, so this cannot fail.
+    fn restore_to_source(
+        source_cpu: usize,
+        source_priority: Priority,
+        pid: Pid,
+        pcb: ProcessControlBlock,
+    ) {
+        {
+            let source = Self::ready_queue_for_cpu(source_cpu)
+                .expect("migration source queue disappeared before rollback");
+            let mut source = source.lock();
+            let restored = source.restore_migration(source_priority, pid, pcb);
+            assert!(
+                restored.is_ok(),
+                "failed migration must restore retained source slot"
+            );
+            Self::mark_queue_mutated(source_cpu);
+            Self::note_enqueued(&source, source_cpu, pid);
+        }
+        Self::arm_ready_cpu(source_cpu);
     }
 
     // M4-1: `maybe_balance` was REMOVED — its cheap CPU0 cadence check is inlined into
@@ -1984,18 +2266,7 @@ impl Scheduler {
             Self::arm_ready_cpu(local_cpu);
             true
         } else {
-            {
-                let source = Self::ready_queue_for_cpu(source_cpu)
-                    .expect("steal source queue disappeared before rollback");
-                let mut source = source.lock();
-                let restored = source.restore_migration(source_priority, pid, pcb);
-                assert!(
-                    restored.is_ok(),
-                    "failed steal must restore retained source slot"
-                );
-                Self::mark_queue_mutated(source_cpu);
-            }
-            Self::arm_ready_cpu(source_cpu);
+            Self::restore_to_source(source_cpu, source_priority, pid, pcb);
             false
         }
     }
@@ -2036,7 +2307,9 @@ impl Scheduler {
         let mut idlest = None;
         let mut idlest_len = usize::MAX;
         for cpu_id in Self::online_cpu_ids() {
-            let len = Self::queue_len_for_cpu(cpu_id);
+            // C3 (#90): the published lengths; no queue lock is taken to
+            // decide whether there is anything to balance.
+            let len = Self::published_queue_len(cpu_id);
             if len > busiest_len {
                 busiest_len = len;
                 busiest = Some(cpu_id);
@@ -2067,7 +2340,11 @@ impl Scheduler {
         };
 
         let candidate = {
-            let mut guard = src_queue.lock();
+            // C3 (#90): balancing is periodic and optional. If the busiest
+            // queue's lock is held, give up until the next period.
+            let Some(mut guard) = src_queue.try_lock() else {
+                return;
+            };
             Self::pop_ready_process(&mut guard, src_cpu, dst_cpu)
         };
 
@@ -2075,28 +2352,14 @@ impl Scheduler {
             // R69-3 FIX: Check CPU affinity before migration
             // E.5: Use effective_allowed_cpus for cpuset-aware migration
             let Some(proc) = pcb.try_lock() else {
-                {
-                    let mut src_guard = src_queue.lock();
-                    // The source bucket retained its capacity when `pid` was
-                    // removed, so restoration is allocation-free and exact.
-                    let restored = src_guard.restore_migration(_priority, pid, pcb);
-                    assert!(
-                        restored.is_ok(),
-                        "source queue restoration must be reserved"
-                    );
-                    Self::mark_queue_mutated(src_cpu);
-                }
-                Self::arm_ready_cpu(src_cpu);
+                // The source bucket retained its capacity when `pid` was
+                // removed, so restoration is allocation-free and exact.
+                Self::restore_to_source(src_cpu, _priority, pid, pcb);
                 return;
             };
             let Some(allowed_cpus) = Self::effective_allowed_cpus(&proc) else {
                 drop(proc);
-                let mut src_guard = src_queue.lock();
-                let restored = src_guard.restore_migration(_priority, pid, pcb);
-                assert!(restored.is_ok(), "empty cpuset restore must be reserved");
-                Self::mark_queue_mutated(src_cpu);
-                drop(src_guard);
-                Self::arm_ready_cpu(src_cpu);
+                Self::restore_to_source(src_cpu, _priority, pid, pcb);
                 return;
             };
             let eff_prio = proc.dynamic_priority;
@@ -2108,16 +2371,7 @@ impl Scheduler {
             // Check if destination CPU is allowed by effective mask
             if !still_ready || !Self::cpu_allowed(dst_cpu, allowed_cpus) {
                 // Put the task back in its original retained-capacity bucket.
-                {
-                    let mut src_guard = src_queue.lock();
-                    let restored = src_guard.restore_migration(_priority, pid, pcb);
-                    assert!(
-                        restored.is_ok(),
-                        "source queue restoration must be reserved"
-                    );
-                    Self::mark_queue_mutated(src_cpu);
-                }
-                Self::arm_ready_cpu(src_cpu);
+                Self::restore_to_source(src_cpu, _priority, pid, pcb);
                 return;
             }
 
@@ -2133,18 +2387,7 @@ impl Scheduler {
                     process::note_task_migration(target_cpu);
                     Self::arm_ready_cpu(target_cpu);
                 }
-                Err(_) => {
-                    {
-                        let mut src_guard = src_queue.lock();
-                        let restored = src_guard.restore_migration(_priority, pid, pcb);
-                        assert!(
-                            restored.is_ok(),
-                            "failed migration must restore retained source slot"
-                        );
-                        Self::mark_queue_mutated(src_cpu);
-                    }
-                    Self::arm_ready_cpu(src_cpu);
-                }
+                Err(_) => Self::restore_to_source(src_cpu, _priority, pid, pcb),
             }
         }
     }
@@ -2272,6 +2515,7 @@ impl Scheduler {
             let removed = queue.remove_ordinary(token.priority, &token.pid);
             if removed.0.is_some() {
                 Self::mark_queue_mutated(token.cpu_id);
+                Self::note_removed(&queue, token.cpu_id, token.pid);
             }
             removed
         })();
@@ -2384,6 +2628,14 @@ impl Scheduler {
     pub fn on_clock_tick() {
         // 使用 without_interrupts 确保在持有锁期间不会被嵌套中断打断
         interrupts::without_interrupts(|| {
+            // C3 (#90): count this CPU's own ticks towards its periodic full
+            // steal pass. This comes before every early return below: a CPU
+            // whose current task is blocked or contended must get its full
+            // pass too. One atomic add and, once a period, one store; no
+            // lock and no allocation (M4-1).
+            let cpu_id = current_cpu_id();
+            steal_hint::hint().tick(cpu_id, LOAD_BALANCE_INTERVAL_TICKS);
+
             // R67-4 FIX: Use per-CPU current process
             let current_pid = process::current_pid();
             if current_pid
@@ -2524,7 +2776,7 @@ impl Scheduler {
             // ALLOCATING work (balance_queues Vec + migrate_one_ready BTreeMap inserts) now
             // runs from reschedule_now's prologue in process context. Just flag CPU0 when the
             // 64-tick interval elapses (wall-clock cadence preserved).
-            if current_cpu_id() == 0 {
+            if cpu_id == 0 {
                 let t = BALANCE_TICKER.fetch_add(1, Ordering::Relaxed) + 1; // lint-fetch-add: allow (coarse cadence)
                 if t % LOAD_BALANCE_INTERVAL_TICKS == 0 {
                     BALANCE_DUE.store(true, Ordering::Relaxed);
@@ -3674,6 +3926,387 @@ pub fn run_idle_probe_cursor_self_test() {
             );
         }
     }
+}
+
+/// C3 (#90) executable probes for the scheduler's side of the work-stealing
+/// hint: which selector rejections end without a publication, what makes one
+/// hold of a source queue conclusive, and that only a conclusive hold is
+/// remembered. The hint's own protocol is tested hosted, in
+/// `kernel_core::steal_hint`.
+pub fn run_steal_hint_self_test() {
+    const PRIORITY: Priority = 120;
+    // Above PID_MAX: these PCBs have no record in the kernel's hint.
+    const FIRST_PID: Pid = 0xc3_0000;
+
+    fn queue_of(count: usize) -> ReadyQueues {
+        let mut queue = ReadyQueues::new();
+        // One slot more than the residents: a steal keeps its rollback slot.
+        let backing = PreparedAdmittedMapCapacity::try_new(HeapClass::Scheduler, count + 1)
+            .expect("C3 steal-hint fixture reserve");
+        let retired = queue
+            .bucket_mut(PRIORITY)
+            .install_prepared_deferred(backing)
+            .expect("C3 steal-hint fixture install");
+        drop(retired);
+        for offset in 0..count {
+            let pid = FIRST_PID + offset;
+            let pcb = Process::try_new_pcb(
+                pid,
+                1,
+                ProcessNameSnapshot::from_parts("steal-hint", ""),
+                PRIORITY,
+            )
+            .expect("C3 steal-hint fixture PCB");
+            pcb.lock().enter_blocked_at(0);
+            assert!(queue
+                .bucket_mut(PRIORITY)
+                .insert_unique_reserved(pid, pcb)
+                .is_ok());
+        }
+        queue
+    }
+
+    fn pcb_of(queue: &ReadyQueues, offset: usize) -> ProcessControlBlock {
+        Arc::clone(
+            queue
+                .bucket(PRIORITY)
+                .get(&(FIRST_PID + offset))
+                .expect("C3 steal-hint fixture member"),
+        )
+    }
+
+    fn hold(queue: &mut ReadyQueues, cursor: &mut SelectionCursorState, thief: usize) -> StealHold {
+        Scheduler::steal_hold_locked(queue, None, cursor, thief, None)
+    }
+
+    // Every rejection reason is classified, and the classes are these.
+    for reason in SelectReject::ALL {
+        let silent = matches!(
+            reason,
+            SelectReject::PcbContended | SelectReject::CpusetUnavailable | SelectReject::Throttled
+        );
+        assert_eq!(
+            reason.ends_without_publication(),
+            silent,
+            "C3 steal hint: {:?} is in the wrong class",
+            reason
+        );
+    }
+
+    let me = current_cpu_id();
+    // A thief other than the CPU the fixture pins its task to. It may be
+    // offline, outside the root cpuset: it is never expected to take a task.
+    let other = (me + 1) % max_cpus();
+    let now = kernel_core::get_ticks();
+
+    // The selector reports each rejection in its class, and the hold's
+    // verdict follows: blocked, stopped, on a CPU and pinned elsewhere all
+    // end in a publication; a held PCB lock does not.
+    {
+        let mut queue = queue_of(4);
+        let mut cursor = SelectionCursorState::new();
+        let first = hold(&mut queue, &mut cursor, other);
+        assert!(first.stolen.is_none() && first.conclusive && first.visited == 4);
+
+        {
+            let stopped = pcb_of(&queue, 0);
+            let mut proc = stopped.lock();
+            proc.enter_ready_at(now);
+            proc.stopped = true;
+        }
+        {
+            let running = pcb_of(&queue, 1);
+            let mut proc = running.lock();
+            proc.enter_ready_at(now);
+            proc.on_cpu.store(true, Ordering::Release);
+        }
+        let pinned = pcb_of(&queue, 2);
+        {
+            let mut proc = pinned.lock();
+            proc.allowed_cpus = 1u64 << me;
+            proc.enter_ready_at(now);
+        }
+        let seen = hold(&mut queue, &mut cursor, other);
+        assert!(seen.stolen.is_none() && seen.conclusive && seen.visited == 4);
+
+        let contended = pcb_of(&queue, 3);
+        {
+            let _held = contended.lock();
+            let unsure = hold(&mut queue, &mut cursor, other);
+            assert!(unsure.stolen.is_none());
+            assert!(
+                !unsure.conclusive,
+                "C3 steal hint: a hold that met a locked PCB proved nothing"
+            );
+        }
+        assert!(hold(&mut queue, &mut cursor, other).conclusive);
+
+        // What one CPU saw says nothing about another (GAP-6 F11): the pinned
+        // task is this CPU's to take from the very same queue.
+        let taken = hold(&mut queue, &mut cursor, me);
+        let (pid, pcb, _, membership_priority) = taken
+            .stolen
+            .expect("C3 steal hint: the pinned task belongs to its own CPU");
+        assert!(pid == FIRST_PID + 2 && Arc::ptr_eq(&pcb, &pinned) && !taken.conclusive);
+        assert_eq!(queue.len(), 3);
+        queue
+            .restore_migration(membership_priority, pid, pcb)
+            .expect("C3 steal-hint fixture restore");
+        pcb_of(&queue, 1)
+            .lock()
+            .on_cpu
+            .store(false, Ordering::Release);
+    }
+
+    // A hold is conclusive only if it visited every entry. Wherever the
+    // cursor stood when it began, a hold that finds no candidate makes one
+    // full turn, and never more than `STEAL_VISITS_PER_HOLD` visits.
+    let reach = STEAL_VISITS_PER_HOLD;
+    for (count, expect_conclusive) in [
+        (0, true),
+        (SELECT_VISIT_BUDGET + 4, true),
+        (reach, true),
+        (reach + 1, false),
+    ] {
+        let mut queue = queue_of(count);
+        let mut cursor = SelectionCursorState::new();
+        // Leave the cursor in the middle of the queue, as an earlier pass does.
+        let _ = Scheduler::select_next_with_cursor(&queue, other, None, &mut cursor, 0, 5);
+        for _ in 0..2 {
+            let result = hold(&mut queue, &mut cursor, other);
+            assert!(result.stolen.is_none());
+            assert_eq!(result.visited, count.min(reach));
+            assert_eq!(
+                result.conclusive, expect_conclusive,
+                "C3 steal hint: a hold over {} entries",
+                count
+            );
+        }
+    }
+
+    // Only a conclusive hold is remembered. The thief here is this CPU, the
+    // one CPU sure to be in the cpuset at every CPU count.
+    {
+        let hint: steal_hint::StealHint<2, 1> = steal_hint::StealHint::new();
+        let mut queue = queue_of(2);
+        let mut cursor = SelectionCursorState::new();
+        let member = pcb_of(&queue, 0);
+
+        let seq = hint.scan_begin(0, 1, false).expect("first look");
+        {
+            let _held = member.lock();
+            let unsure = hold(&mut queue, &mut cursor, me);
+            hint.scan_end(0, 1, seq, Scheduler::hold_outcome(&unsure));
+        }
+        assert!(
+            !hint.would_skip(0, 1),
+            "C3 steal hint: an inconclusive scan must not be remembered"
+        );
+
+        let seq = hint.scan_begin(0, 1, false).expect("not remembered");
+        let sure = hold(&mut queue, &mut cursor, me);
+        hint.scan_end(0, 1, seq, Scheduler::hold_outcome(&sure));
+        assert!(hint.would_skip(0, 1));
+
+        member.lock().enter_ready_at(now);
+        hint.publish_cpu(1);
+        let seq = hint.scan_begin(0, 1, false).expect("published");
+        let taken = hold(&mut queue, &mut cursor, me);
+        hint.scan_end(0, 1, seq, Scheduler::hold_outcome(&taken));
+        assert!(!hint.would_skip(0, 1));
+        let (pid, pcb, _, membership_priority) =
+            taken.stolen.expect("C3 steal hint: a Ready task is taken");
+        queue
+            .restore_migration(membership_priority, pid, pcb)
+            .expect("C3 steal-hint fixture restore");
+    }
+}
+
+/// C3 (#90) runtime probe: the hint on the kernel's own queues.
+///
+/// A task that only this CPU may run sits blocked in another CPU's queue.
+/// This CPU's steal pass examines that queue and then rules it out. The wake
+/// must publish, so that the next pass looks again and takes the task. The
+/// per-task queue record and the published lengths are checked through the
+/// insert, a steal and its rollback, a steal and its commit, and the reap.
+///
+/// The task is a bare PCB with no context to run, so it is never left Ready
+/// in a queue: the first steal is rolled back at once, the second is blocked
+/// before it is committed to this CPU's queue, and the task is blocked again
+/// and removed before this returns, whatever the result. The probe drives the
+/// scan up to the removal from the source queue; it does not dispatch.
+///
+/// It needs a second online CPU, and runs with interrupts off: this CPU
+/// stays the thief throughout and never schedules, and no other CPU may run
+/// the task, so nothing can dispatch it. The task's PID lies outside the PID
+/// range, so no real task shares its record. At boot no CPU schedules yet and
+/// every step is deterministic. From the shell other CPUs may hold the source
+/// queue's lock or publish to it, which the retry bounds absorb; other work
+/// in the source queue that this CPU may run keeps the first scan from being
+/// conclusive, and the probe then fails without leaving the task queued.
+pub fn run_steal_hint_runtime_probe() -> Result<(), &'static str> {
+    interrupts::without_interrupts(steal_hint_probe)
+}
+
+fn steal_hint_probe() -> Result<(), &'static str> {
+    const PROBE_PID: Pid = steal_hint::PROBE_PID;
+    const PASSES: usize = 16;
+
+    type Stolen = (Pid, ProcessControlBlock, Priority, usize, Priority);
+
+    let thief = current_cpu_id();
+    let Some(source) = Scheduler::online_cpu_ids().find(|&cpu_id| cpu_id != thief) else {
+        return Err("no second online CPU");
+    };
+    let hint = steal_hint::hint();
+    if hint.queue_cpu(PROBE_PID).is_some() {
+        return Err("another probe is running");
+    }
+    let source_queue =
+        Scheduler::ready_queue_for_cpu(source).ok_or("the source CPU has no ready queue")?;
+    let local_queue = Scheduler::ready_queue_for_cpu(thief).ok_or("this CPU has no ready queue")?;
+
+    let pcb = Process::try_new_pcb(
+        PROBE_PID,
+        1,
+        ProcessNameSnapshot::from_parts("steal-hint-probe", ""),
+        120,
+    )
+    .map_err(|_| "no memory for the probe's PCB")?;
+    let generation = {
+        let mut proc = pcb.lock();
+        proc.allowed_cpus = 1u64 << thief;
+        proc.enter_blocked_at(kernel_core::get_ticks());
+        proc.generation
+    };
+    Scheduler::insert_ready_detached(source_queue, source, 120, PROBE_PID, Arc::clone(&pcb))
+        .map_err(|_| "the probe could not be queued")?;
+
+    // The published length is written under the queue's lock, so it is exact
+    // while that lock is held.
+    let published_len_is_exact = || {
+        source_queue.lock().len() == hint.queue_len(source)
+            && local_queue.lock().len() == hint.queue_len(thief)
+    };
+    let pass = || Scheduler::steal_pass(thief, core::iter::once(source), None, false);
+    let give_back = |stolen: Stolen| {
+        let (pid, pcb, _, source_cpu, source_priority) = stolen;
+        Scheduler::restore_to_source(source_cpu, source_priority, pid, pcb);
+    };
+
+    let result = (|| {
+        if hint.queue_cpu(PROBE_PID) != Some(source) {
+            return Err("the insert did not record the task's queue");
+        }
+        if !published_len_is_exact() {
+            return Err("the published length is wrong after the insert");
+        }
+
+        // Blocked: nothing to take. The scan is conclusive and the hint rules
+        // the queue out.
+        let mut ruled_out = false;
+        for _ in 0..PASSES {
+            if let Some(stolen) = pass() {
+                let was_probe = stolen.0 == PROBE_PID;
+                give_back(stolen);
+                if was_probe {
+                    return Err("a blocked task was stolen");
+                }
+                continue;
+            }
+            if hint.would_skip(thief, source) {
+                ruled_out = true;
+                break;
+            }
+        }
+        if !ruled_out {
+            return Err("no conclusive scan of a queue that holds nothing to run");
+        }
+
+        // The wake goes through the same function as every other wake.
+        pcb.lock().enter_ready_at(kernel_core::get_ticks());
+        if hint.would_skip(thief, source) {
+            return Err("a wake did not publish to the steal hint");
+        }
+
+        // The next pass that gets the queue's lock takes the task.
+        let mut taken = false;
+        let mut recorded_while_carried = false;
+        for _ in 0..PASSES {
+            let Some(stolen) = pass() else {
+                continue;
+            };
+            let was_probe = stolen.0 == PROBE_PID && Arc::ptr_eq(&stolen.1, &pcb);
+            if was_probe {
+                recorded_while_carried = hint.queue_cpu(PROBE_PID).is_some();
+            }
+            give_back(stolen);
+            if was_probe {
+                taken = true;
+                break;
+            }
+        }
+        if !taken {
+            return Err("a pinned task woken in another CPU's queue was not taken");
+        }
+        if recorded_while_carried {
+            return Err("a stolen task kept its queue record");
+        }
+        if hint.queue_cpu(PROBE_PID) != Some(source) {
+            return Err("the rollback did not restore the task's queue record");
+        }
+        if !published_len_is_exact() {
+            return Err("the published length is wrong after the rollback");
+        }
+
+        // The rollback published the queue again. This time the steal
+        // commits, as `try_steal_to_local_queue` does it, and the record
+        // follows the task.
+        let mut carried = None;
+        for _ in 0..PASSES {
+            let Some(stolen) = pass() else {
+                continue;
+            };
+            if stolen.0 == PROBE_PID && Arc::ptr_eq(&stolen.1, &pcb) {
+                carried = Some(stolen);
+                break;
+            }
+            give_back(stolen);
+        }
+        let (pid, stolen, priority, source_cpu, source_priority) =
+            carried.ok_or("a task given back to its queue was not taken again")?;
+        stolen.lock().enter_blocked_at(kernel_core::get_ticks());
+        if Scheduler::insert_ready_detached(local_queue, thief, priority, pid, Arc::clone(&stolen))
+            .is_err()
+        {
+            Scheduler::restore_to_source(source_cpu, source_priority, pid, stolen);
+            return Err("the probe could not commit its steal");
+        }
+        let retired = source_queue
+            .lock()
+            .commit_migration_removal(source_priority);
+        drop(retired);
+        drop(stolen);
+        if hint.queue_cpu(PROBE_PID) != Some(thief) {
+            return Err("the commit did not move the task's queue record");
+        }
+        if !published_len_is_exact() {
+            return Err("the published length is wrong after the commit");
+        }
+        Ok(())
+    })();
+
+    // Whatever happened: block the task again and take it out of its queue.
+    pcb.lock().enter_blocked_at(kernel_core::get_ticks());
+    Scheduler::remove_identity_from_all_queues(PROBE_PID, generation);
+    result?;
+    if hint.queue_cpu(PROBE_PID).is_some() {
+        return Err("the reap did not clear the task's queue record");
+    }
+    if !published_len_is_exact() {
+        return Err("the published length is wrong after the reap");
+    }
+    Ok(())
 }
 
 /// RF178-36 executable probe for identity-bound stopped/fatal resume.

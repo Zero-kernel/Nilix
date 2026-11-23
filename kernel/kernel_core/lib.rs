@@ -93,6 +93,7 @@ pub mod scheduler_hook;
 pub mod shared_fault_reentry_probe;
 pub mod signal;
 pub mod signal_frame;
+pub mod steal_hint;
 pub mod syscall;
 pub mod time;
 pub mod user_namespace;

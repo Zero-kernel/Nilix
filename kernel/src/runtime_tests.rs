@@ -1549,6 +1549,33 @@ impl RuntimeTest for SchedulerStarvationTest {
     }
 }
 
+/// C3 (#90): a task that only this CPU may run is woken in another CPU's
+/// queue; the wake reaches the work-stealing hint and this CPU's next pass
+/// takes the task.
+struct StealHintPinnedWakeTest;
+
+impl RuntimeTest for StealHintPinnedWakeTest {
+    fn name(&self) -> &'static str {
+        "steal_hint_pinned_wake"
+    }
+
+    // It needs another CPU's ready queue.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
+    fn description(&self) -> &'static str {
+        "A wake in another CPU's queue is published to the steal hint and the pinned task is taken"
+    }
+
+    fn run(&self) -> TestResult {
+        match sched::enhanced_scheduler::run_steal_hint_runtime_probe() {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(String::from(why)),
+        }
+    }
+}
+
 // ============================================================================
 // Process Tests
 // ============================================================================
@@ -2651,6 +2678,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &SchedstatEventCountersTest,
         &TlbShootdownCoherencyTest,
         &KstackFlushBatchTest,
+        &StealHintPinnedWakeTest,
         &CpusetIsolationTest,
         &SchedulerAffinityTest,
         &SchedulerStarvationTest,
