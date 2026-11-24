@@ -333,8 +333,53 @@ impl<T> PriorityQueues<T> {
 
 type ReadyQueues = PriorityQueues<ProcessControlBlock>;
 
+/// C3 follow-up DIAGNOSTIC (not for merge): a ready-queue lock that records
+/// the call site of its last acquisition. While the lock is held, the last
+/// acquirer is the holder, so a failed `try_lock` can name who holds it
+/// (`steal_hint::holders`). The tag is written just after the acquisition, so
+/// in that short window it still names the previous holder.
+pub struct ReadyQueueLock {
+    inner: Mutex<ReadyQueues>,
+    site: core::sync::atomic::AtomicUsize,
+}
+
+impl ReadyQueueLock {
+    pub fn new(queues: ReadyQueues) -> Self {
+        Self {
+            inner: Mutex::new(queues),
+            site: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[track_caller]
+    #[inline(always)]
+    pub fn lock(&self) -> spin::MutexGuard<'_, ReadyQueues> {
+        let guard = self.inner.lock();
+        self.tag(core::panic::Location::caller());
+        guard
+    }
+
+    #[track_caller]
+    #[inline(always)]
+    pub fn try_lock(&self) -> Option<spin::MutexGuard<'_, ReadyQueues>> {
+        let guard = self.inner.try_lock()?;
+        self.tag(core::panic::Location::caller());
+        Some(guard)
+    }
+
+    #[inline(always)]
+    fn tag(&self, site: &'static core::panic::Location<'static>) {
+        self.site.store(site as *const _ as usize, Ordering::Relaxed);
+    }
+
+    /// The call site of the last acquisition (0 before the first).
+    pub fn holder_site(&self) -> usize {
+        self.site.load(Ordering::Relaxed)
+    }
+}
+
 const _: () = assert!(
-    core::mem::size_of::<Mutex<ReadyQueues>>() * cpu_local::MAX_CPUS
+    core::mem::size_of::<ReadyQueueLock>() * cpu_local::MAX_CPUS
         + 2 * core::mem::size_of::<usize>()
         <= mm::NORMAL_UNADMITTED_RESERVE_BYTES / 8
 );
@@ -787,8 +832,8 @@ fn finish_pending_prev() -> bool {
 ///
 /// Using CpuLocal splits the lock across CPUs, reducing cross-CPU contention and
 /// enabling work stealing for load balancing.
-pub static READY_QUEUE: CpuLocal<Mutex<ReadyQueues>> =
-    CpuLocal::new(|| Mutex::new(ReadyQueues::new()));
+pub static READY_QUEUE: CpuLocal<ReadyQueueLock> =
+    CpuLocal::new(|| ReadyQueueLock::new(ReadyQueues::new()));
 
 lazy_static! {
     pub static ref SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats::new());
@@ -1373,8 +1418,8 @@ impl Scheduler {
 
     /// Get the current CPU's ready queue
     #[inline]
-    fn current_ready_queue() -> &'static Mutex<ReadyQueues> {
-        READY_QUEUE.with(|q: &Mutex<ReadyQueues>| unsafe { &*(q as *const Mutex<ReadyQueues>) })
+    fn current_ready_queue() -> &'static ReadyQueueLock {
+        READY_QUEUE.with(|q: &ReadyQueueLock| unsafe { &*(q as *const ReadyQueueLock) })
     }
 
     #[inline]
@@ -1384,7 +1429,7 @@ impl Scheduler {
 
     /// Get a specific CPU's ready queue
     #[inline]
-    fn ready_queue_for_cpu(cpu_id: usize) -> Option<&'static Mutex<ReadyQueues>> {
+    fn ready_queue_for_cpu(cpu_id: usize) -> Option<&'static ReadyQueueLock> {
         READY_QUEUE.get_cpu(cpu_id)
     }
 
@@ -1392,17 +1437,24 @@ impl Scheduler {
     /// sorted-map mutation with interrupts enabled. Never spin behind that
     /// owner after IF has been cleared: defer the scheduling point instead so
     /// the local CPU can restore IF and make forward progress.
+    #[track_caller]
     #[inline]
     fn lock_ready_queue_or_defer<'a>(
-        queue: &'a Mutex<ReadyQueues>,
+        queue: &'a ReadyQueueLock,
     ) -> Option<spin::MutexGuard<'a, ReadyQueues>> {
         if interrupts::are_enabled() {
+            // DIAGNOSTIC: try first, so that a wait can name the holder.
+            if let Some(guard) = queue.try_lock() {
+                return Some(guard);
+            }
+            steal_hint::holders::note(steal_hint::holders::WAIT, queue.holder_site());
             return Some(queue.lock());
         }
 
         match queue.try_lock() {
             Some(queue) => Some(queue),
             None => {
+                steal_hint::holders::note(steal_hint::holders::DEFER, queue.holder_site());
                 current_cpu().set_need_resched();
                 None
             }
@@ -1702,7 +1754,7 @@ impl Scheduler {
     /// obsolete and unused backings leave the ready-queue critical section
     /// before their destructors run.
     fn try_insert_ready(
-        queue_ref: &Mutex<ReadyQueues>,
+        queue_ref: &ReadyQueueLock,
         queue_cpu: usize,
         priority: Priority,
         pid: Pid,
@@ -1719,7 +1771,7 @@ impl Scheduler {
     /// probe calls this directly: it runs before the BSP enables interrupts,
     /// on a queue that no CPU schedules from yet.
     fn insert_ready_detached(
-        queue_ref: &Mutex<ReadyQueues>,
+        queue_ref: &ReadyQueueLock,
         queue_cpu: usize,
         priority: Priority,
         pid: Pid,
@@ -2055,6 +2107,7 @@ impl Scheduler {
             return (ScanOutcome::Inconclusive, None);
         };
         let Some(mut guard) = queue.try_lock() else {
+            steal_hint::holders::note(steal_hint::holders::SKIP, queue.holder_site());
             return (ScanOutcome::LockHeld, None);
         };
         debug_assert!(source_cpu < max_cpus());

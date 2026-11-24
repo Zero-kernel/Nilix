@@ -2183,6 +2183,17 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
             steal.scans, steal.hint_skips, steal.lock_skips, steal.stolen, steal.full_passes
         ))
         .map_err(|_| FsError::NoSpace)?;
+    // C3 follow-up DIAGNOSTIC (not for merge): who held the lock.
+    let mut failed = false;
+    kernel_core::steal_hint::holders::for_each(|kind, file, line, count| {
+        let file = file.rsplit('/').next().unwrap_or(file);
+        failed |= content
+            .write_fmt(format_args!("steal_holder {} {}:{} {}\n", kind, file, line, count))
+            .is_err();
+    });
+    if failed {
+        return Err(FsError::NoSpace);
+    }
     Ok(content)
 }
 

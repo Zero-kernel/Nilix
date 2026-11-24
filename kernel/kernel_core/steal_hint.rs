@@ -365,6 +365,76 @@ pub fn hint() -> &'static KernelStealHint {
     &HINT
 }
 
+/// C3 follow-up DIAGNOSTIC (not for merge): who holds a ready-queue lock when
+/// a CPU finds it held. Keyed by the kind of meeting and the call site of the
+/// holder's acquisition (a `&'static Location` address; its alignment leaves
+/// the low three bits free).
+pub mod holders {
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// A thief's `try_lock` in `steal_from` failed.
+    pub const SKIP: usize = 0;
+    /// `lock_ready_queue_or_defer` with interrupts on had to wait.
+    pub const WAIT: usize = 1;
+    /// `lock_ready_queue_or_defer` with interrupts off deferred.
+    pub const DEFER: usize = 2;
+    const USED: usize = 4;
+    const SLOTS: usize = 40;
+
+    static KEYS: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+    static COUNTS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+    pub fn note(kind: usize, site: usize) {
+        let key = site | kind | USED;
+        for slot in 0..SLOTS {
+            let mut current = KEYS[slot].load(Ordering::Relaxed);
+            if current == 0 {
+                current = match KEYS[slot].compare_exchange(
+                    0,
+                    key,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => key,
+                    Err(found) => found,
+                };
+            }
+            if current == key {
+                COUNTS[slot].fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow
+                return;
+            }
+        }
+        OVERFLOW.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow
+    }
+
+    /// Calls `f(kind, file, line, count)` for each slot in use, then once
+    /// with kind "overflow".
+    pub fn for_each(mut f: impl FnMut(&'static str, &'static str, u32, u64)) {
+        for slot in 0..SLOTS {
+            let key = KEYS[slot].load(Ordering::Relaxed);
+            if key == 0 {
+                continue;
+            }
+            let kind = match key & 3 {
+                SKIP => "skip",
+                WAIT => "wait",
+                _ => "defer",
+            };
+            let site = key & !7;
+            let (file, line) = if site == 0 {
+                ("untagged", 0)
+            } else {
+                // SAFETY: only addresses of `&'static Location<'static>` are stored.
+                let location = unsafe { &*(site as *const core::panic::Location<'static>) };
+                (location.file(), location.line())
+            };
+            f(kind, file, line, COUNTS[slot].load(Ordering::Relaxed));
+        }
+        f("overflow", "", 0, OVERFLOW.load(Ordering::Relaxed));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
