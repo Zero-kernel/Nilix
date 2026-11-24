@@ -365,16 +365,16 @@ fn cpuid_identity_reports() -> u8 {
 #[cfg(not(feature = "host_harness"))]
 #[inline(always)]
 fn read_tsc_aux_rdtscp() -> u64 {
+    // DIAGNOSTIC (not for merge): RDMSR of IA32_TSC_AUX in place of RDTSCP,
+    // to compare the two under TCG (design 5.4).
     let aux: u32;
-    // SAFETY: executed only when CPUID reported RDTSCP on this CPU
-    // (`publish_identity`) or on every CPU (`select_identity_method`). It
-    // writes EAX, EDX and ECX and touches no memory.
+    // SAFETY: as for RDTSCP: CPUID reported RDTSCP, so the MSR exists.
     unsafe {
         core::arch::asm!(
-            "rdtscp",
-            out("eax") _,
+            "rdmsr",
+            in("ecx") IA32_TSC_AUX,
+            out("eax") aux,
             out("edx") _,
-            out("ecx") aux,
             options(nomem, nostack, preserves_flags)
         );
     }
