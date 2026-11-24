@@ -99,6 +99,7 @@ pub mod time;
 pub mod user_namespace;
 pub mod user_stack;
 pub mod usercopy;
+pub mod wait_kick;
 
 pub use elf_loader::{
     load_elf, validate_elf_image, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP,

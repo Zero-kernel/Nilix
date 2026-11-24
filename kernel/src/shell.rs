@@ -209,6 +209,8 @@ impl Shell {
         );
 
         while self.running.load(Ordering::Acquire) {
+            // C3 repair 3 (#90): the BSP's wait sequence before the pass.
+            let snapshot = kernel_core::wait_kick::snapshot();
             // Check for serial input (non-blocking)
             if let Some(ch) = arch::try_read_serial_char() {
                 self.handle_input(ch);
@@ -220,12 +222,15 @@ impl Shell {
                 // GAP-5 G8: a task that exits or is killed while another is
                 // Ready hands the CPU back here with need_resched set; loop to
                 // the drain and that task at once instead of waiting a tick.
-                if arch::current_cpu().need_resched.load(Ordering::Acquire) {
-                    continue;
-                }
-                unsafe {
-                    core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
-                }
+                // C3 repair 3: the check and the halt are now atomic (as on
+                // the APs), so an IPI between them is no longer lost until the
+                // next tick, and a wake for this CPU's queue since the
+                // snapshot also stops the halt.
+                kernel_core::wait_kick::halt_until_event(
+                    snapshot,
+                    kernel_core::wait_kick::HaltSite::Idle,
+                    || arch::current_cpu().need_resched.load(Ordering::SeqCst),
+                );
             }
         }
 
@@ -680,9 +685,13 @@ pub fn init_and_run() -> ! {
 
     // If shell exits, return to idle loop
     loop {
+        let snapshot = kernel_core::wait_kick::snapshot();
         kernel_core::reschedule_if_needed();
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
+        // C3 repair 3 (#90): an atomic check and halt, as in the shell loop.
+        kernel_core::wait_kick::halt_until_event(
+            snapshot,
+            kernel_core::wait_kick::HaltSite::Idle,
+            || arch::current_cpu().need_resched.load(Ordering::SeqCst),
+        );
     }
 }

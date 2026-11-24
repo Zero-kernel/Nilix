@@ -26,6 +26,10 @@ RUNTIME schedstat_event_counters not_applicable needs_cpus:2
 # C3 (#90): the steal-hint check needs another CPU's ready queue.
 RUNTIME steal_hint_pinned_wake not_applicable needs_cpus:2
 
+# C3 repair 3 (#90): both wait-kick probes need another CPU to halt or kick.
+RUNTIME wait_kick_halted_cpu not_applicable needs_cpus:2
+RUNTIME wait_kick_one_ipi not_applicable needs_cpus:2
+
 # D3: Spectre hardware mitigations and retpoline are N6.
 SECURITY spectre_mitigation_status out_of_scope out_of_scope:N6
 SECURITY spectre_v2_retpoline out_of_scope out_of_scope:N6

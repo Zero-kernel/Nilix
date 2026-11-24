@@ -2114,6 +2114,13 @@ impl Inode for ProcSchedstatInode {
 /// `current_cpu_id()` finds the CPU (`lapic`, `rdtscp` or `rdpid`) and the
 /// timer tick's cross-checks against the LAPIC, summed over the CPUs. The line
 /// does not start with `cpu` and a digit, which readers take for a per-CPU line.
+///
+/// The blocked-wait halt (C3, #90) appends `wait halts= seq_aborts= kicks=
+/// targeted= notified=`, summed over the CPUs: halts taken in blocked waits,
+/// halts not taken there because a wake for the CPU's queue moved its
+/// sequence, IPIs sent to halted CPUs for plain wakes, IPIs sent by the
+/// targeted kick of the wakes that used to broadcast, and those wakes.
+/// `targeted / notified` is IPIs per such wake.
 fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let mut content = AdmittedString::new(HeapClass::Procfs);
     let online = process::sched_online_cpu_mask();
@@ -2193,6 +2200,13 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
         .write_fmt(format_args!(
             "identity method={} checks={}\n",
             identity_method, identity_checks
+        ))
+        .map_err(|_| FsError::NoSpace)?;
+    let wait = kernel_core::wait_kick::stats();
+    content
+        .write_fmt(format_args!(
+            "wait halts={} seq_aborts={} kicks={} targeted={} notified={}\n",
+            wait.halts, wait.seq_aborts, wait.kicks, wait.targeted, wait.notified
         ))
         .map_err(|_| FsError::NoSpace)?;
     Ok(content)

@@ -700,7 +700,8 @@ fn wake_reaper_after_switch(
     let woke = parent.wake_for_child_exit(child_pid, kernel_core::get_ticks());
     drop(child);
     drop(parent);
-    if woke {
+    // C3 repair 3 (#90): kick the parent's CPU, not every CPU.
+    if woke && kernel_core::wait_kick::kick_published().is_none() {
         Scheduler::kick_all_for_reschedule();
     }
     true
@@ -3206,6 +3207,10 @@ impl Scheduler {
         // context. The actual claim/save transaction below is shared with IRQ
         // return and is entirely try-only once IF is cleared.
         if origin == kernel_core::ReschedOrigin::Process && interrupts::are_enabled() {
+            // C3 repair 3 (#90): send the kicks this CPU recorded, before a
+            // blocking wait or an exit switches away. Process context, no
+            // lock held (RF178-35).
+            kernel_core::wait_kick::flush_wake_kicks();
             #[cfg(feature = "stall_dump")]
             stall_dump_if_silent();
             if BALANCE_DUE.swap(false, Ordering::Relaxed) {
@@ -4420,6 +4425,8 @@ pub fn init() {
     // M0-5 1b: register the cross-CPU reschedule-kick so a signal-wake's Blocked->Ready flip
     // promptly re-selects the target on the (idle, non-empty-queue) CPU that owns it.
     kernel_core::register_kick_callback(Scheduler::kick_all_for_reschedule);
+    // C3 repair 3 (#90): one reschedule IPI to one CPU, for wake kicks.
+    kernel_core::wait_kick::register_cpu_kick(Scheduler::kick_cpu);
 
     klog_always!("Enhanced scheduler initialized");
     klog_always!("  Ready queue: per-CPU with work stealing (R69-1)");

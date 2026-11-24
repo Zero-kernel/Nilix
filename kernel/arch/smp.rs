@@ -1462,6 +1462,11 @@ fn ap_idle_loop() -> ! {
         // with IRQs left disabled.
         x86_64::instructions::interrupts::enable();
 
+        // C3 repair 3 (#90): this CPU's wait sequence before the pass. A wake
+        // of a task in this CPU's queue after this point either moves it, so
+        // the halt below is not taken, or finds this CPU halted and kicks it.
+        let snapshot = kernel_core::wait_kick::snapshot();
+
         // RF180-52 FIX: APs are published before the BSP initializes the
         // scheduler and the complete process-deferred-work dependency graph.
         // Until the BSP's Release publication, this loop may only service
@@ -1490,31 +1495,28 @@ fn ap_idle_loop() -> ! {
             kernel_core::namespace_probe::step();
         }
 
-        // R70-1 FIX: narrow race-free window — disable IRQs only for the
-        // need_resched check + sti;hlt arming so no IPI can slip in between.
-        x86_64::instructions::interrupts::disable();
-
-        // RF180-52: close the publication-to-halt race. If readiness became
-        // visible after the IRQ-enabled check above, loop back before HLT so
-        // the full drain runs with interrupts enabled. If publication happens
-        // after this check, the BSP's post-publication reschedule IPI is held
-        // pending across sti;hlt and wakes this CPU atomically.
-        if !process_deferred_ready && kernel_core::process_deferred_work_ready() {
-            continue;
-        }
-        if process_deferred_ready && cpu_local::current_cpu().need_resched.load(Ordering::SeqCst) {
-            // Work is pending — loop; the top-of-loop enable() re-arms IRQs.
-            continue;
-        }
-
-        // No work pending - use atomic sti;hlt sequence.
-        // x86 guarantees that STI takes effect starting with the NEXT instruction,
-        // so if an IPI is pending, the CPU will wake from HLT immediately.
-        unsafe {
-            core::arch::asm!(
-                "sti", // Enable interrupts (takes effect starting with HLT)
-                "hlt", // Halt until interrupt - wakes immediately if interrupt pending
-                options(nomem, nostack, preserves_flags)
+        // R70-1 FIX: narrow race-free window. `halt_until_event` masks IRQs
+        // only for its checks and arms the halt with `sti; hlt`, so no IPI can
+        // slip in between: one that arrives is held pending across STI and
+        // ends the HLT at once. It returns without halting when a wake was
+        // published for this CPU's queue since the snapshot (C3 repair 3) or
+        // the check below finds work; the loop then runs again.
+        if process_deferred_ready {
+            kernel_core::wait_kick::halt_until_event(
+                snapshot,
+                kernel_core::wait_kick::HaltSite::Idle,
+                || cpu_local::current_cpu().need_resched.load(Ordering::SeqCst),
+            );
+        } else {
+            // RF180-52: close the publication-to-halt race. If readiness
+            // became visible after the IRQ-enabled check above, loop back
+            // before HLT so the full drain runs with interrupts enabled. If
+            // publication happens after this check, the BSP's post-publication
+            // reschedule IPI is held pending across sti;hlt and wakes this CPU.
+            kernel_core::wait_kick::halt_until_event(
+                snapshot,
+                kernel_core::wait_kick::HaltSite::Idle,
+                kernel_core::process_deferred_work_ready,
             );
         }
     }
