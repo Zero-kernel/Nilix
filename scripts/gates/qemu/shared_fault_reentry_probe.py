@@ -177,7 +177,7 @@ def main():
                     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
                     "-drive", f"format=raw,file=fat:{esp},snapshot=on", "-m", "256M",
                     "-vga", "std", "-no-reboot", "-no-shutdown",
-                    "-cpu", "qemu64,+smep,+smap,+umip,+rdrand",
+                    "-cpu", "qemu64,+smep,+smap,+umip,+rdrand,+rdtscp",
                     "-display", "none", "-serial", f"file:{serial}"]
             (case_dir / "qemu.command.json").write_text(json.dumps(qemu) + "\n")
             with (case_dir / "qemu.stderr").open("wb") as log:

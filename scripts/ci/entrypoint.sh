@@ -168,6 +168,18 @@ case "$group" in
         check_guest boot --allow-qualified -- bash scripts/gates/boot/boot_check.sh esp
         check_guest runtime --allow-qualified -- bash scripts/gates/boot/kernel_test.sh esp
         check_guest smp --allow-qualified -- bash scripts/gates/boot/smp_test_4core.sh esp
+        # C3 repair 2 (#90): the CPU-identity lookup's other two paths, each
+        # required to print its method. The standard model above uses RDTSCP.
+        # RDPID needs QEMU 8.2's TCG; this group runs on ubuntu-24.04 only.
+        # QEMU 8.2's TCG decodes RDPID only when CPUID.1:ECX bit 22 (MOVBE) is
+        # set, where it means CPUID.(7,0):ECX bit 22 (RDPID); without +movbe,
+        # RDPID raises #UD although CPUID reports it.
+        check_guest runtime-rdpid --allow-qualified -- env KERNEL_TEST_CPUS=4 \
+            KERNEL_TEST_CPU_MODEL=qemu64,+smep,+smap,+umip,+rdrand,+rdtscp,+rdpid,+movbe \
+            KERNEL_TEST_REQUIRE_CPU_ID=rdpid bash scripts/gates/boot/kernel_test.sh esp
+        check_guest runtime-lapic --allow-qualified -- env KERNEL_TEST_CPUS=4 \
+            KERNEL_TEST_CPU_MODEL=qemu64,+smep,+smap,+umip,+rdrand,-rdtscp \
+            KERNEL_TEST_REQUIRE_CPU_ID=lapic bash scripts/gates/boot/kernel_test.sh esp
         ;;
     strict)
         # STRICT-Q: boot, runtime at 1 and 4 vCPUs and SMP-4 under

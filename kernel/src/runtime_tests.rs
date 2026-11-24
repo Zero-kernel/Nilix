@@ -1576,6 +1576,101 @@ impl RuntimeTest for StealHintPinnedWakeTest {
     }
 }
 
+/// C3 repair 2 (#90): the current CPU's id, however it is looked up, is the
+/// CPU its LAPIC names; every CPU published its id; every CPU's timer tick
+/// cross-checks it.
+///
+/// The BSP runs this with its interrupts off, so it makes its own tick's
+/// check directly; the other CPUs make theirs from their ticks. Run from the
+/// kernel shell, a tick may add checks of its own, so counts are lower bounds.
+struct CpuIdentityLookupTest;
+
+impl CpuIdentityLookupTest {
+    /// Bound on waiting for the other CPUs' ticks, in TSC cycles (as the
+    /// kernel-stack batch test bounds its waits).
+    const TICK_WAIT_TSC: u64 = 10_000_000_000;
+}
+
+impl RuntimeTest for CpuIdentityLookupTest {
+    fn name(&self) -> &'static str {
+        "cpu_identity_lookup"
+    }
+
+    fn description(&self) -> &'static str {
+        "The current CPU's id agrees with its LAPIC on every CPU, and each tick checks it"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::{
+            check_identity_tick, current_cpu_id, identity_checks, identity_method,
+            identity_published_mask, lapic_registered_cpu_id, max_cpus, IdentityMethod,
+        };
+        use kernel_core::process::sched_online_cpu_mask as online_cpu_mask;
+        use kernel_core::time::read_tsc;
+        const MAX_CPUS: usize = max_cpus();
+
+        let by_lookup = current_cpu_id();
+        let Some(by_lapic) = lapic_registered_cpu_id() else {
+            return TestResult::Fail(String::from("this CPU's LAPIC names no registered CPU"));
+        };
+        if by_lookup != by_lapic {
+            return TestResult::Fail(alloc::format!(
+                "the lookup names CPU {}, the LAPIC CPU {}",
+                by_lookup,
+                by_lapic
+            ));
+        }
+        let method = identity_method();
+        if method == IdentityMethod::Lapic {
+            // The tick checks only an id that did not come from the LAPIC.
+            return if (0..MAX_CPUS).all(|cpu| identity_checks(cpu) == 0) {
+                TestResult::Pass
+            } else {
+                TestResult::Fail(String::from("tick checks were counted on the LAPIC path"))
+            };
+        }
+
+        let online = online_cpu_mask();
+        let published = identity_published_mask();
+        if published & online != online {
+            return TestResult::Fail(alloc::format!(
+                "{} lookup with online CPUs {:#x} but published {:#x}",
+                method.name(),
+                online,
+                published
+            ));
+        }
+
+        let own_before = identity_checks(by_lookup);
+        check_identity_tick();
+        if identity_checks(by_lookup) <= own_before {
+            return TestResult::Fail(String::from("this CPU's check was not counted"));
+        }
+
+        let mut before = [0u64; MAX_CPUS];
+        for (cpu, slot) in before.iter_mut().enumerate() {
+            *slot = identity_checks(cpu);
+        }
+        let others = online & !(1u64 << by_lookup);
+        let start = read_tsc();
+        loop {
+            let pending = (0..MAX_CPUS)
+                .filter(|&cpu| others & (1u64 << cpu) != 0 && identity_checks(cpu) <= before[cpu])
+                .fold(0u64, |mask, cpu| mask | (1u64 << cpu));
+            if pending == 0 {
+                return TestResult::Pass;
+            }
+            if read_tsc().saturating_sub(start) > Self::TICK_WAIT_TSC {
+                return TestResult::Fail(alloc::format!(
+                    "no tick check on CPUs {:#x} within the wait",
+                    pending
+                ));
+            }
+            spin_loop();
+        }
+    }
+}
+
 // ============================================================================
 // Process Tests
 // ============================================================================
@@ -2679,6 +2774,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &TlbShootdownCoherencyTest,
         &KstackFlushBatchTest,
         &StealHintPinnedWakeTest,
+        &CpuIdentityLookupTest,
         &CpusetIsolationTest,
         &SchedulerAffinityTest,
         &SchedulerStarvationTest,

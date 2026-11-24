@@ -65,6 +65,12 @@ pub use cpu_local::{
     current_cpu, init_bsp, num_online_cpus, register_cpu_id, PerCpuData, RawTaskPtr, PER_CPU_DATA,
 };
 
+// C3 repair 2 (#90): the current CPU's id from IA32_TSC_AUX.
+pub use cpu_local::{
+    check_identity_tick, identity_checks, identity_method, identity_published_mask,
+    lapic_registered_cpu_id, publish_identity, IdentityMethod,
+};
+
 // Re-export SMP bring-up functions
 pub use smp::{
     ap_rust_entry, online_cpus, register_ap_security_init, set_rsdp_address, smp_initialized,

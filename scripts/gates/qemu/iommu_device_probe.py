@@ -144,7 +144,7 @@ def main():
         images = {str(p): digest(p) for p in (esp / "kernel.elf", esp / "EFI/BOOT/BOOTX64.EFI")}
         result["images"] = images
         serial, trace, stderr = (run / x for x in ("serial.log", "vtd.trace", "qemu.stderr"))
-        cmd = [qemu, "-bios", str(firmware), "-machine", "q35", "-accel", "tcg,thread=single", "-smp", str(args.smp), "-m", "256M", "-cpu", "qemu64,+smep,+smap,+umip,+rdrand", "-device", "intel-iommu,intremap=on,aw-bits=48,caching-mode=on", "-device", "edu,addr=05.0,dma_mask=4294967295", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-drive", f"format=raw,file=fat:{esp},snapshot=on", "-display", "none", "-vga", "std", "-nic", "none", "-no-reboot", "-no-shutdown", "-serial", f"file:{serial}", "-trace", f"enable=vtd_*,file={trace}"]
+        cmd = [qemu, "-bios", str(firmware), "-machine", "q35", "-accel", "tcg,thread=single", "-smp", str(args.smp), "-m", "256M", "-cpu", "qemu64,+smep,+smap,+umip,+rdrand,+rdtscp", "-device", "intel-iommu,intremap=on,aw-bits=48,caching-mode=on", "-device", "edu,addr=05.0,dma_mask=4294967295", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-drive", f"format=raw,file=fat:{esp},snapshot=on", "-display", "none", "-vga", "std", "-nic", "none", "-no-reboot", "-no-shutdown", "-serial", f"file:{serial}", "-trace", f"enable=vtd_*,file={trace}"]
         (run / "qemu.command.json").write_text(json.dumps(cmd, indent=2) + "\n")
         try:
             with stderr.open("wb") as log:
