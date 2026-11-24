@@ -68,6 +68,7 @@ pub type FutexKey = (ProcessId, usize);
 /// byte ledger therefore rejects a 1025th process Arc before this fixed, heap-
 /// independent registry can be exhausted.
 const PROCESS_ARC_CHARGE_SLOTS: usize = 1024;
+const _: () = assert!(PROCESS_ARC_CHARGE_SLOTS <= (u16::MAX as usize) + 1);
 
 struct ProcessArcChargeSlot {
     generation: u64,
@@ -75,8 +76,92 @@ struct ProcessArcChargeSlot {
     charge: HeapCharge,
 }
 
-static PROCESS_ARC_CHARGES: Mutex<[Option<ProcessArcChargeSlot>; PROCESS_ARC_CHARGE_SLOTS]> =
-    Mutex::new([const { None }; PROCESS_ARC_CHARGE_SLOTS]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessArcReleaseError {
+    OutOfRange,
+    StaleGeneration,
+    DoubleRelease,
+}
+
+/// Fixed-capacity O(1) slot table for RF180-40 process `Arc` admission charges.
+///
+/// Invariant: every index in `0..next_fresh` is either live (`slots[i].is_some()`)
+/// or present exactly once in `free_stack[0..free_len]`, never both.
+struct ProcessArcChargeTable<const SLOTS: usize> {
+    slots: [Option<ProcessArcChargeSlot>; SLOTS],
+    free_stack: [u16; SLOTS],
+    free_len: usize,
+    next_fresh: usize,
+}
+
+impl<const SLOTS: usize> ProcessArcChargeTable<SLOTS> {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; SLOTS],
+            free_stack: [0; SLOTS],
+            free_len: 0,
+            next_fresh: 0,
+        }
+    }
+
+    fn install(&mut self, generation: u64, charge: HeapCharge) -> Result<u16, HeapCharge> {
+        let index = if self.free_len > 0 {
+            self.free_len -= 1;
+            self.free_stack[self.free_len] as usize
+        } else if self.next_fresh < SLOTS {
+            let idx = self.next_fresh;
+            self.next_fresh += 1;
+            idx
+        } else {
+            return Err(charge);
+        };
+
+        let slot = &mut self.slots[index];
+        assert!(
+            slot.is_none(),
+            "RF180-40 process Arc freelist returned occupied slot"
+        );
+        *slot = Some(ProcessArcChargeSlot {
+            generation,
+            allocated: false,
+            charge,
+        });
+        Ok(index as u16)
+    }
+
+    fn slot_mut(&mut self, slot: u16) -> Option<&mut ProcessArcChargeSlot> {
+        self.slots.get_mut(slot as usize).and_then(Option::as_mut)
+    }
+
+    fn try_take_charge(
+        &mut self,
+        slot_index: u16,
+        generation: u64,
+    ) -> Result<HeapCharge, ProcessArcReleaseError> {
+        let Some(slot) = self.slots.get_mut(slot_index as usize) else {
+            return Err(ProcessArcReleaseError::OutOfRange);
+        };
+        match slot.as_ref() {
+            Some(entry) if entry.generation == generation => {}
+            Some(_) => return Err(ProcessArcReleaseError::StaleGeneration),
+            None => return Err(ProcessArcReleaseError::DoubleRelease),
+        }
+        let charge = slot
+            .take()
+            .expect("validated process Arc charge disappeared")
+            .charge;
+        assert!(
+            self.free_len < SLOTS,
+            "RF180-40 process Arc freelist overflow"
+        );
+        self.free_stack[self.free_len] = slot_index;
+        self.free_len += 1;
+        Ok(charge)
+    }
+}
+
+static PROCESS_ARC_CHARGES: Mutex<ProcessArcChargeTable<PROCESS_ARC_CHARGE_SLOTS>> =
+    Mutex::new(ProcessArcChargeTable::new());
 static NEXT_PROCESS_ARC_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Allocator carried by every process `Arc` and `Weak` handle.
@@ -106,37 +191,25 @@ impl ProcessArcAllocator {
             Err(_) => return Err(charge),
         };
 
-        let mut charge = Some(charge);
-        let mut slots = PROCESS_ARC_CHARGES.lock();
-        for (index, slot) in slots.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(ProcessArcChargeSlot {
-                    generation,
-                    allocated: false,
-                    charge: charge.take().expect("process Arc charge moved once"),
-                });
-                return Ok(Self {
-                    slot: index as u16,
-                    generation,
-                });
-            }
-        }
-        Err(charge.expect("process Arc slot scan retained charge"))
+        let mut table = PROCESS_ARC_CHARGES.lock();
+        let slot = table.install(generation, charge)?;
+        Ok(Self { slot, generation })
     }
 
     fn take_charge(self) -> HeapCharge {
-        let mut slots = PROCESS_ARC_CHARGES.lock();
-        let slot = slots
-            .get_mut(self.slot as usize)
-            .expect("RF180-40 process Arc allocator slot out of range");
-        match slot.as_ref() {
-            Some(entry) if entry.generation == self.generation => {}
-            Some(_) => panic!("RF180-40 stale process Arc allocator generation"),
-            None => panic!("RF180-40 process Arc charge released twice"),
+        let mut table = PROCESS_ARC_CHARGES.lock();
+        match table.try_take_charge(self.slot, self.generation) {
+            Ok(charge) => charge,
+            Err(ProcessArcReleaseError::OutOfRange) => {
+                panic!("RF180-40 process Arc allocator slot out of range")
+            }
+            Err(ProcessArcReleaseError::StaleGeneration) => {
+                panic!("RF180-40 stale process Arc allocator generation")
+            }
+            Err(ProcessArcReleaseError::DoubleRelease) => {
+                panic!("RF180-40 process Arc charge released twice")
+            }
         }
-        slot.take()
-            .expect("validated process Arc charge disappeared")
-            .charge
     }
 
     fn cancel_failed_allocation(self) {
@@ -147,8 +220,8 @@ impl ProcessArcAllocator {
 unsafe impl Allocator for ProcessArcAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         {
-            let mut slots = PROCESS_ARC_CHARGES.lock();
-            let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) else {
+            let mut table = PROCESS_ARC_CHARGES.lock();
+            let Some(entry) = table.slot_mut(self.slot) else {
                 return Err(AllocError);
             };
             if entry.generation != self.generation || entry.allocated {
@@ -160,8 +233,8 @@ unsafe impl Allocator for ProcessArcAllocator {
         match Global.allocate(layout) {
             Ok(allocation) => Ok(allocation),
             Err(error) => {
-                let mut slots = PROCESS_ARC_CHARGES.lock();
-                if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                let mut table = PROCESS_ARC_CHARGES.lock();
+                if let Some(entry) = table.slot_mut(self.slot) {
                     if entry.generation == self.generation {
                         entry.allocated = false;
                     }
@@ -14462,6 +14535,99 @@ fn audit_20261031_oom_excludes_sparse_and_mremap_reservations() {
     };
     assert_eq!(large.rss_pages, 17);
     assert!(mm::score_oom_process(&large) > mm::score_oom_process(&small));
+}
+
+#[cfg(test)]
+mod process_arc_freelist_tests {
+    use super::*;
+
+    fn test_charge() -> HeapCharge {
+        try_reserve_heap(HeapClass::CoreProcess, 512)
+            .expect("reserve test CoreProcess charge")
+            .commit()
+            .expect("commit test CoreProcess charge")
+    }
+
+    #[test]
+    fn freelist_fills_exhausts_and_recycles_o1() {
+        let mut table = ProcessArcChargeTable::<4>::new();
+        let s0 = table.install(1, test_charge()).unwrap();
+        let s1 = table.install(2, test_charge()).unwrap();
+        let s2 = table.install(3, test_charge()).unwrap();
+        let s3 = table.install(4, test_charge()).unwrap();
+        assert_eq!([s0, s1, s2, s3], [0, 1, 2, 3]);
+        assert!(table.install(5, test_charge()).is_err());
+
+        // Out-of-order release pushes onto LIFO freelist; next installs pop O(1).
+        drop(table.try_take_charge(s1, 2).unwrap());
+        drop(table.try_take_charge(s3, 4).unwrap());
+        assert_eq!(table.free_len, 2);
+        let r0 = table.install(6, test_charge()).unwrap();
+        let r1 = table.install(7, test_charge()).unwrap();
+        assert_eq!([r0, r1], [s3, s1]);
+        assert_eq!(table.free_len, 0);
+        assert!(table.install(8, test_charge()).is_err());
+
+        drop(table.try_take_charge(s0, 1).unwrap());
+        drop(table.try_take_charge(s2, 3).unwrap());
+        drop(table.try_take_charge(r0, 6).unwrap());
+        drop(table.try_take_charge(r1, 7).unwrap());
+        assert_eq!(table.free_len, 4);
+    }
+
+    #[test]
+    fn freelist_rejects_out_of_range_stale_generation_and_double_release() {
+        let mut table = ProcessArcChargeTable::<2>::new();
+        assert_eq!(
+            table.try_take_charge(2, 1).unwrap_err(),
+            ProcessArcReleaseError::OutOfRange
+        );
+        assert_eq!(
+            table.try_take_charge(0, 1).unwrap_err(),
+            ProcessArcReleaseError::DoubleRelease
+        );
+
+        let slot = table.install(10, test_charge()).unwrap();
+        assert_eq!(
+            table.try_take_charge(slot, 9).unwrap_err(),
+            ProcessArcReleaseError::StaleGeneration
+        );
+        drop(table.try_take_charge(slot, 10).unwrap());
+        assert_eq!(
+            table.try_take_charge(slot, 10).unwrap_err(),
+            ProcessArcReleaseError::DoubleRelease
+        );
+
+        // Recycled slot gets a strictly newer generation; old generation stays rejected.
+        let recycled = table.install(11, test_charge()).unwrap();
+        assert_eq!(recycled, slot);
+        assert_eq!(
+            table.try_take_charge(recycled, 10).unwrap_err(),
+            ProcessArcReleaseError::StaleGeneration
+        );
+        drop(table.try_take_charge(recycled, 11).unwrap());
+    }
+
+    #[test]
+    fn allocator_single_use_capability_preserved_across_recycle() {
+        let alloc1 = ProcessArcAllocator::try_install(test_charge()).expect("install alloc1");
+        let copy1 = alloc1;
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr1 = alloc1.allocate(layout).expect("first allocation succeeds");
+        assert!(
+            copy1.allocate(layout).is_err(),
+            "copied allocator must remain single-use"
+        );
+        unsafe { alloc1.deallocate(ptr1.cast(), layout) };
+
+        // After deallocation, old capability cannot allocate again even if its slot is reused.
+        let alloc2 = ProcessArcAllocator::try_install(test_charge()).expect("install alloc2");
+        assert!(
+            copy1.allocate(layout).is_err(),
+            "stale generation must not allocate into a recycled slot"
+        );
+        alloc2.cancel_failed_allocation();
+    }
 }
 
 /// Return the highest-scoring currently observable OOM victim without allocating.
