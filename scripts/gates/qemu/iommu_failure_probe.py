@@ -124,7 +124,7 @@ def main():
             command = [qemu_path, "-bios", str(firmware), "-machine", "q35",
                        "-device", "intel-iommu,intremap=on", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
                        "-drive", f"format=raw,file=fat:{esp},snapshot=on", "-m", "256M", "-vga", "std",
-                       "-no-reboot", "-no-shutdown", "-cpu", "qemu64,+smep,+smap,+umip,+rdrand",
+                       "-no-reboot", "-no-shutdown", "-cpu", "qemu64,+smep,+smap,+umip,+rdrand,+rdtscp",
                        "-display", "none", "-serial", f"file:{serial}"]
             with (case_dir / "qemu.stderr").open("wb") as log:
                 try:

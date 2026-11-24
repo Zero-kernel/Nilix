@@ -166,7 +166,7 @@ echo "Timeout: ${TEST_TIMEOUT}s"
     -drive format=raw,file=fat:"$ESP",snapshot=on \
     -accel tcg -smp 1 -m 512M \
     -vga std -no-reboot -no-shutdown \
-    -cpu qemu64,+smep,+smap,+umip,+rdrand \
+    -cpu qemu64,+smep,+smap,+umip,+rdrand,+rdtscp \
     -display none -monitor none -serial "file:$serial_log" \
     -d int,cpu_reset -D "$interrupt_log" \
     >/dev/null 2>"$qemu_stderr" &

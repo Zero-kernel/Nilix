@@ -185,7 +185,7 @@ def main() -> int:
             qemu = [qemu_path, "-bios", str(firmware), "-drive", f"format=raw,file=fat:{esp},snapshot=on",
                     "-netdev", "user,id=net0,restrict=on,ipv6=off", "-device", "virtio-net-pci,netdev=net0,romfile=",
                     "-m", "256M", "-smp", str(args.cpus), "-vga", "std", "-no-reboot", "-no-shutdown",
-                    "-cpu", "qemu64,+smep,+smap,+umip,+rdrand", "-display", "none",
+                    "-cpu", "qemu64,+smep,+smap,+umip,+rdrand,+rdtscp", "-display", "none",
                     "-serial", f"file:{serial}", "-d", "int,cpu_reset", "-D", str(intlog)]
             supervisor = [sys.executable, str(ROOT / "scripts/ci/qemu_run.py"), "--serial", str(serial),
                           "--qemu-stderr", str(stderr), "--receipt", str(receipt_path), "--profile", "runtime",

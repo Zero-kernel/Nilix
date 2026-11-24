@@ -11,6 +11,11 @@
 # KERNEL_TEST_TRACE_DEFAULT=full|phased is the caller's interrupt-trace default
 # (full; the serial-only Ring-3 oracle selects phased). NILIX_QEMU_TRACE
 # overrides it; a phased run of this gate's own verdict is diagnostic only.
+# KERNEL_TEST_CPU_MODEL is the QEMU CPU model (default: the gates' standard
+# model); it must be qemu64 followed by +feature or -feature terms.
+# KERNEL_TEST_REQUIRE_CPU_ID=rdpid|rdtscp|lapic requires the boot to print
+# `CPU identity lookup: <method>` exactly once (C3 repair 2, #90): QEMU only
+# warns when it drops a CPU feature, so the line shows which path ran.
 set -u
 
 # Resolve the repo root from this script's own location so it runs from any
@@ -47,6 +52,16 @@ if [[ ! "$TRACE_DEFAULT" =~ ^(full|phased)$ ]]; then
     exit 2
 fi
 QEMU_TRACE_POLICY="$(qemu_trace_policy "$TRACE_DEFAULT")" || exit 2
+CPU_MODEL="${KERNEL_TEST_CPU_MODEL:-qemu64,+smep,+smap,+umip,+rdrand,+rdtscp}"
+if [[ ! "$CPU_MODEL" =~ ^qemu64(,[+-][a-z0-9_.]+)*$ ]]; then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_CPU_MODEL must be qemu64 followed by ,+feature or ,-feature terms"
+    exit 2
+fi
+REQUIRE_CPU_ID="${KERNEL_TEST_REQUIRE_CPU_ID:-}"
+if [[ -n "$REQUIRE_CPU_ID" && ! "$REQUIRE_CPU_ID" =~ ^(rdpid|rdtscp|lapic)$ ]]; then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_REQUIRE_CPU_ID must be rdpid, rdtscp or lapic"
+    exit 2
+fi
 for tool in "$QEMU" timeout python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "KERNEL-TEST BLOCKED: $tool not found in PATH"
@@ -119,7 +134,7 @@ run_gate_qemu "$TO" "${KERNEL_TEST_COMPLETION_PROFILE:-runtime}" "$QEMU" -bios "
     -netdev user,id=net0,restrict=on,ipv6=off \
     -device virtio-net-pci,netdev=net0,romfile= \
     -m "$MEM" "${smp_args[@]}" -vga std -no-reboot -no-shutdown \
-    -cpu qemu64,+smep,+smap,+umip,+rdrand \
+    -cpu "$CPU_MODEL" \
     -display none -serial "file:$ser" \
     -d int,cpu_reset -D "$intlog"
 qemu_status=$?
@@ -149,6 +164,13 @@ fi
 if [[ -n "${KERNEL_TEST_DISK:-}" ]] && ! grep -Eq "^KSA-019-BLOCK PASS sector_bytes=$logical_block_size sector=[0-9]+ capacity_sectors=[0-9]+ restored=exact$" "$ser"; then
     echo "KERNEL-TEST FAIL: missing actual logical-sector round-trip/restoration evidence"
     rc=1
+fi
+if [[ -n "$REQUIRE_CPU_ID" ]]; then
+    identity_lines="$(tr -d '\r' < "$ser" | grep -E '^CPU identity lookup: ' || true)"
+    if [[ "$identity_lines" != "CPU identity lookup: $REQUIRE_CPU_ID" ]]; then
+        echo "KERNEL-TEST FAIL: expected exactly one line 'CPU identity lookup: $REQUIRE_CPU_ID', found: ${identity_lines:-none}"
+        rc=1
+    fi
 fi
 if [ "$rc" -ne 0 ]; then
     echo "KERNEL-TEST NOT-PASSED: gate status=$rc (1=failure, 2=incomplete, 3=qualified)"

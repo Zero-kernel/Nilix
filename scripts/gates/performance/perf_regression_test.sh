@@ -96,7 +96,7 @@ run_perf_kernel() {
         -drive format=raw,file=fat:rw:"$ESP" \
         "${qemu_args[@]}" \
         -vga std -no-reboot -no-shutdown \
-        -cpu qemu64,+smep,+smap,+umip,+rdrand \
+        -cpu qemu64,+smep,+smap,+umip,+rdrand,+rdtscp \
         -display none -serial "file:$ser" \
         -d int,cpu_reset -D "$intlog" >/dev/null 2>&1 &
     local qpid=$!

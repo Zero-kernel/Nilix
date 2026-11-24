@@ -6877,6 +6877,15 @@ pub fn sched_online_cpu_mask() -> u64 {
     cpu_local::online_cpu_mask()
 }
 
+/// C3 repair 2 (#90): how `current_cpu_id()` finds the CPU, and the timer
+/// tick's cross-checks against the LAPIC made so far on all CPUs.
+pub fn cpu_identity_stats() -> (&'static str, u64) {
+    (
+        cpu_local::identity_method().name(),
+        cpu_local::identity_checks_total(),
+    )
+}
+
 /// `(context switches, migrations in)` recorded on `cpu` since boot.
 pub fn cpu_sched_counters(cpu: usize) -> (u64, u64) {
     let load = |counters: &[AtomicU64]| {

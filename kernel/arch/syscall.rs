@@ -160,8 +160,8 @@ struct AlignedStack<const N: usize>([u8; N]);
 // R23-2 fix: Per-CPU syscall 临时数据
 // ============================================================================
 // 将原来的全局变量改为 per-CPU 数组，为 SMP 支持做准备。
-// 当前 current_cpu_id() 总是返回 0，所以实际行为与单核相同。
-// 未来启用 SMP 时，只需实现真正的 CPU ID 获取逻辑即可。
+// current_cpu_id() 返回真实的逻辑 CPU 编号：SMP 启动完成前读取 LAPIC ID，
+// 之后（C3 repair 2, #90）在每个 CPU 都发布了 IA32_TSC_AUX 时用 RDPID 或 RDTSCP。
 //
 // **SMP 升级路径**：
 // 1. 实现 current_cpu_id() 读取 APIC ID

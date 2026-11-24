@@ -941,6 +941,9 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
             kernel_stack_top, // IRQ stack (same as kernel stack for now)
             kernel_stack_top, // Syscall stack (same for now)
         );
+        // C3 repair 2 (#90): publish the BSP's id in IA32_TSC_AUX. Every lookup
+        // still reads the LAPIC until start_aps selects the method.
+        arch::publish_identity(0);
         // R151-5 FIX: Force-initialize IRQ-path CpuLocal statics before interrupts
         // are enabled. Without this, the first IRQ triggering irq_save_fpu() can
         // deadlock if Once::call_once() heap-allocates while the heap lock is held.

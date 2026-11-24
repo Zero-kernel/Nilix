@@ -97,7 +97,7 @@ python3 "$ROOT/scripts/ci/gate_inputs.py" prepare --source "$ESP" --output "$ser
 run_gate_qemu "$TO" "runtime" "$QEMU" -bios "$OVMF" \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     -m "$MEM" -vga std -no-reboot -no-shutdown \
-    -cpu qemu64,+smep,+smap,+umip,+rdrand \
+    -cpu qemu64,+smep,+smap,+umip,+rdrand,+rdtscp \
     -display none -serial "file:$ser" \
     -d int,cpu_reset -D "$intlog"
 qemu_status=$?

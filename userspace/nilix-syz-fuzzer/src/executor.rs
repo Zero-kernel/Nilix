@@ -732,7 +732,7 @@ fn qemu_args(ovmf: &Path, esp_dir: &Path, disk: &Path, serial: &Path) -> Result<
         "-smp".into(),
         "1".into(),
         "-cpu".into(),
-        "qemu64,+smep,+smap,+umip,+rdrand".into(),
+        "qemu64,+smep,+smap,+umip,+rdrand,+rdtscp".into(),
         "-nic".into(),
         "none".into(),
         "-serial".into(),
