@@ -2102,6 +2102,13 @@ impl Inode for ProcSchedstatInode {
 /// broadcast each), the stacks they covered, the batches completed for being
 /// full and for being old, and the stacks quarantined after their flush.
 /// `stacks / batches` is the mean batch size.
+///
+/// The work-stealing hint (C3, #90) appends `steal scans= hint_skips=
+/// lock_skips= stolen= full_passes=`, summed over the CPUs: source queues a
+/// steal pass examined under their lock, queues it ruled out without touching
+/// the lock (nothing published since it last looked, or empty), queues it
+/// skipped because their lock was held, tasks it took, and passes that
+/// ignored what had been seen.
 fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let mut content = AdmittedString::new(HeapClass::Procfs);
     let online = process::sched_online_cpu_mask();
@@ -2167,6 +2174,13 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
         .write_fmt(format_args!(
             "kstack_flush batches={} stacks={} by_count={} by_age={} quarantined={}\n",
             kstack.batches, kstack.stacks, kstack.by_count, kstack.by_age, kstack.quarantined
+        ))
+        .map_err(|_| FsError::NoSpace)?;
+    let steal = kernel_core::steal_hint::hint().stats();
+    content
+        .write_fmt(format_args!(
+            "steal scans={} hint_skips={} lock_skips={} stolen={} full_passes={}\n",
+            steal.scans, steal.hint_skips, steal.lock_skips, steal.stolen, steal.full_passes
         ))
         .map_err(|_| FsError::NoSpace)?;
     Ok(content)

@@ -2612,7 +2612,14 @@ impl DeferredPortUncharges {
     /// `false` is returned instead of panicking or dropping the accounting
     /// event. The owning [`SocketTable`] retries in its emergency tier and
     /// permanently fails closed if both bounded tiers are exhausted.
-    fn enqueue(&mut self, cgid: u64, count: u64) -> bool {
+    ///
+    /// C3 (#90): `enqueued` is the owning table's sequence of stored events.
+    /// It is incremented here, after the event is in its slot and while the
+    /// caller still holds this tier's lock, so a drain that reads the new
+    /// value cannot reach the tier before the event is in it. Counting in
+    /// this method, and not in its callers, means no path can store an event
+    /// that the drain's lock-free check does not see.
+    fn enqueue(&mut self, cgid: u64, count: u64, enqueued: &AtomicU64) -> bool {
         if cgid == 0 || count == 0 {
             return true;
         }
@@ -2628,6 +2635,7 @@ impl DeferredPortUncharges {
                     return false;
                 };
                 slot.count = next;
+                Self::note_enqueued(enqueued);
                 return true;
             }
             if slot.cgid == 0 && empty.is_none() {
@@ -2636,10 +2644,17 @@ impl DeferredPortUncharges {
         }
         if let Some(index) = empty {
             self.slots[index] = DeferredPortUnchargeSlot { cgid, count };
+            Self::note_enqueued(enqueued);
             true
         } else {
             false
         }
+    }
+
+    #[inline]
+    fn note_enqueued(enqueued: &AtomicU64) {
+        // One per stored event; a wrap would need 2^64 of them.
+        enqueued.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (event sequence)
     }
 
     fn take_one(&mut self) -> Option<(u64, u64)> {
@@ -2898,6 +2913,13 @@ pub struct SocketTable {
     /// the primary queue and is consulted only when the primary representation
     /// rejects an event; no cgroup accounting event is intentionally dropped.
     port_uncharge_emergency: Mutex<DeferredPortUncharges>,
+    /// C3 (#90): events stored in either tier since boot, counted by
+    /// `DeferredPortUncharges::enqueue`.
+    port_uncharge_seq: AtomicU64,
+    /// C3 (#90): the value of `port_uncharge_seq` that the last drain read
+    /// before it emptied both tiers. While the two are equal nothing is
+    /// queued, and the drain takes no lock.
+    port_uncharge_drained: AtomicU64,
     /// Last observed timestamp (ms) used for TIME_WAIT bookkeeping.
     /// Updated by sweep_time_wait() and used by RX path when transitioning to TIME_WAIT.
     time_wait_clock: AtomicU64,
@@ -3074,6 +3096,8 @@ impl SocketTable {
             per_ns_recv_bytes: Mutex::new(AdmittedMap::new(HeapClass::SocketObject)), // J2-4 FIX
             port_uncharge_pending: Mutex::new(DeferredPortUncharges::new()),      // J2-8/R180-11
             port_uncharge_emergency: Mutex::new(DeferredPortUncharges::new()),    // R188-U11-3
+            port_uncharge_seq: AtomicU64::new(0),                                 // C3 (#90)
+            port_uncharge_drained: AtomicU64::new(0),                             // C3 (#90)
             time_wait_clock: AtomicU64::new(0),
             timer_sweeps_skipped: AtomicU64::new(0),
             created: AtomicU64::new(0),
@@ -3308,10 +3332,15 @@ impl SocketTable {
         // R188-U11-3: never panic on count overflow and never silently drop a
         // full-queue event.  The emergency tier is independently bounded by
         // the same 4096-cgroup registry invariant.
-        if self.port_uncharge_pending.lock().enqueue(cgid, n) {
+        let enqueued = &self.port_uncharge_seq;
+        if self.port_uncharge_pending.lock().enqueue(cgid, n, enqueued) {
             return;
         }
-        if self.port_uncharge_emergency.lock().enqueue(cgid, n) {
+        if self
+            .port_uncharge_emergency
+            .lock()
+            .enqueue(cgid, n, enqueued)
+        {
             return;
         }
         PORT_UNCHARGE_ACCOUNTING_FAULT.store(true, Ordering::Release);
@@ -3326,7 +3355,39 @@ impl SocketTable {
     /// cgroup uncharges (never under a binding lock, never in IRQ). Idempotent:
     /// a second drain finds the queue empty. Called from the scheduler reschedule
     /// hook after the deferred TCP-timer drain (a producer in the same pass).
+    ///
+    /// C3 (#90): this runs on every reschedule pass of every CPU, and the
+    /// queue is almost always empty. An empty drain used to take both tier
+    /// locks and scan their 2 x 4097 slots; under multi-threaded TCG the two
+    /// locks were 11% of the kernel's lock waits at 16 vCPUs. It now compares
+    /// two sequences and returns.
     pub fn drain_deferred_port_uncharges(&self) {
+        let Some(enqueued) = self.port_uncharge_drain_begin() else {
+            return;
+        };
+        self.drain_port_uncharge_tiers();
+        self.port_uncharge_drain_finish(enqueued);
+    }
+
+    /// The sequence of stored events, if any was stored since the last
+    /// drain's read. It must be read before the tiers are emptied: an event
+    /// stored while the drain runs then leaves the two sequences unequal, and
+    /// the next pass drains it. No deferred uncharge is dropped.
+    #[inline]
+    fn port_uncharge_drain_begin(&self) -> Option<u64> {
+        let enqueued = self.port_uncharge_seq.load(Ordering::SeqCst);
+        (enqueued != self.port_uncharge_drained.load(Ordering::SeqCst)).then_some(enqueued)
+    }
+
+    /// Record that both tiers were emptied after `enqueued` was read. Two
+    /// drains can finish out of order; the older value then only causes one
+    /// more drain.
+    #[inline]
+    fn port_uncharge_drain_finish(&self, enqueued: u64) {
+        self.port_uncharge_drained.store(enqueued, Ordering::SeqCst);
+    }
+
+    fn drain_port_uncharge_tiers(&self) {
         // Take one fixed slot at a time and drop the leaf lock before entering
         // cgroup Level 5. No snapshot allocation and no lock-order regression.
         loop {
@@ -13439,18 +13500,177 @@ mod tests {
     #[test]
     fn deferred_port_uncharges_do_not_alias_empty_sentinel() {
         let mut pending = DeferredPortUncharges::new();
+        let enqueued = AtomicU64::new(0);
 
         assert!(pending.get(&0).is_none());
-        pending.enqueue(0, 7);
-        pending.enqueue(7, 0);
+        pending.enqueue(0, 7, &enqueued);
+        pending.enqueue(7, 0, &enqueued);
         assert!(pending.is_empty());
+        // C3: an event that stored nothing is not counted, so it cannot make
+        // every CPU's next drain take the tier locks for nothing.
+        assert_eq!(enqueued.load(Ordering::SeqCst), 0);
 
-        pending.enqueue(7, 2);
-        pending.enqueue(7, 3);
+        pending.enqueue(7, 2, &enqueued);
+        pending.enqueue(7, 3, &enqueued);
+        assert_eq!(enqueued.load(Ordering::SeqCst), 2);
         assert_eq!(pending.get(&7).copied(), Some(5));
         assert_eq!(pending.take_one(), Some((7, 5)));
         assert!(pending.is_empty());
         assert_eq!(pending.take_one(), None);
+    }
+
+    #[test]
+    fn c3_port_uncharge_drain_takes_no_lock_until_an_event_is_stored() {
+        use std::sync::atomic::AtomicBool as StdAtomicBool;
+        use std::sync::Arc as StdArc;
+        use std::time::{Duration, Instant};
+
+        // With nothing stored the drain must return before the tier locks.
+        // This thread holds both while another one drains: a drain that
+        // reached for either would not finish.
+        fn drain_returns_while_the_tiers_are_held(table: &StdArc<SocketTable>) -> bool {
+            let _primary = table.port_uncharge_pending.lock();
+            let _emergency = table.port_uncharge_emergency.lock();
+            let done = StdArc::new(StdAtomicBool::new(false));
+            let drainer = {
+                let table = StdArc::clone(table);
+                let done = StdArc::clone(&done);
+                thread::spawn(move || {
+                    table.drain_deferred_port_uncharges();
+                    done.store(true, Ordering::SeqCst);
+                })
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let finished = done.load(Ordering::SeqCst);
+            if finished {
+                drainer.join().expect("drain thread");
+            }
+            finished
+        }
+
+        let table = StdArc::new(SocketTable::new());
+        assert!(table.port_uncharge_drain_begin().is_none());
+        // An event without a cgroup is never stored and moves nothing.
+        table.enqueue_port_uncharge(0, 3);
+        assert!(
+            drain_returns_while_the_tiers_are_held(&table),
+            "C3: a drain with nothing stored reached for a tier lock"
+        );
+
+        table.enqueue_port_uncharge(41, 1);
+        table.enqueue_port_uncharge(41, 2);
+        assert!(table.port_uncharge_drain_begin().is_some());
+        table.drain_deferred_port_uncharges();
+        assert!(table.port_uncharge_pending.lock().is_empty());
+        assert!(table.port_uncharge_drain_begin().is_none());
+        assert!(
+            drain_returns_while_the_tiers_are_held(&table),
+            "C3: a drain after a complete drain reached for a tier lock"
+        );
+    }
+
+    #[test]
+    fn c3_port_uncharge_stored_during_a_drain_is_drained_by_the_next() {
+        let table = SocketTable::new();
+        table.enqueue_port_uncharge(51, 1);
+
+        // A drain reads the sequence and empties the tiers. An event stored
+        // before it finishes is in neither.
+        let enqueued = table
+            .port_uncharge_drain_begin()
+            .expect("an event is stored");
+        table.drain_port_uncharge_tiers();
+        table.enqueue_port_uncharge(52, 1);
+        table.port_uncharge_drain_finish(enqueued);
+
+        assert_eq!(
+            table.port_uncharge_pending.lock().get(&52).copied(),
+            Some(1)
+        );
+        assert!(
+            table.port_uncharge_drain_begin().is_some(),
+            "C3: an uncharge stored during a drain must leave the next drain due"
+        );
+        table.drain_deferred_port_uncharges();
+        assert!(table.port_uncharge_pending.lock().is_empty());
+        assert!(table.port_uncharge_drain_begin().is_none());
+
+        // Two drains that finish out of order cost one more drain, no event.
+        table.enqueue_port_uncharge(53, 1);
+        let older = table
+            .port_uncharge_drain_begin()
+            .expect("an event is stored");
+        table.enqueue_port_uncharge(54, 1);
+        let newer = table
+            .port_uncharge_drain_begin()
+            .expect("two events are stored");
+        table.drain_port_uncharge_tiers();
+        table.port_uncharge_drain_finish(newer);
+        table.port_uncharge_drain_finish(older);
+        assert!(table.port_uncharge_drain_begin().is_some());
+        table.drain_deferred_port_uncharges();
+        assert!(table.port_uncharge_drain_begin().is_none());
+
+        // The emergency tier counts like the primary one.
+        {
+            let mut primary = table.port_uncharge_pending.lock();
+            for cgid in 1..=DEFERRED_PORT_UNCHARGE_SLOTS as u64 {
+                assert!(primary.enqueue(cgid, 1, &table.port_uncharge_seq));
+            }
+        }
+        let before = table.port_uncharge_seq.load(Ordering::SeqCst);
+        table.enqueue_port_uncharge((DEFERRED_PORT_UNCHARGE_SLOTS + 1) as u64, 1);
+        assert_eq!(table.port_uncharge_seq.load(Ordering::SeqCst), before + 1);
+        table.drain_deferred_port_uncharges();
+        assert!(table.port_uncharge_pending.lock().is_empty());
+        assert!(table.port_uncharge_emergency.lock().is_empty());
+        assert!(table.port_uncharge_drain_begin().is_none());
+    }
+
+    #[test]
+    fn c3_port_uncharge_sequence_moves_only_once_the_event_is_in_its_tier() {
+        use std::sync::atomic::AtomicBool as StdAtomicBool;
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        // A drain that reads the new sequence must find the event when it
+        // gets the tier's lock. So while this test holds that lock, an
+        // enqueue that cannot have stored its event yet must not have moved
+        // the sequence either.
+        let table = StdArc::new(SocketTable::new());
+        let started = StdArc::new(StdAtomicBool::new(false));
+        let primary = table.port_uncharge_pending.lock();
+        let producer = {
+            let table = StdArc::clone(&table);
+            let started = StdArc::clone(&started);
+            thread::spawn(move || {
+                started.store(true, Ordering::SeqCst);
+                table.enqueue_port_uncharge(61, 1);
+            })
+        };
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            table.port_uncharge_seq.load(Ordering::SeqCst),
+            0,
+            "C3: the sequence moved before the event was in its tier"
+        );
+        assert!(table.port_uncharge_drain_begin().is_none());
+        drop(primary);
+        producer.join().expect("enqueue thread");
+
+        assert_eq!(table.port_uncharge_seq.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            table.port_uncharge_pending.lock().get(&61).copied(),
+            Some(1)
+        );
+        table.drain_deferred_port_uncharges();
+        assert!(table.port_uncharge_pending.lock().is_empty());
     }
 
     #[test]
@@ -13459,9 +13679,13 @@ mod tests {
         {
             let mut primary = table.port_uncharge_pending.lock();
             for cgid in 1..=DEFERRED_PORT_UNCHARGE_SLOTS as u64 {
-                assert!(primary.enqueue(cgid, 1));
+                assert!(primary.enqueue(cgid, 1, &table.port_uncharge_seq));
             }
-            assert!(!primary.enqueue((DEFERRED_PORT_UNCHARGE_SLOTS + 1) as u64, 1));
+            assert!(!primary.enqueue(
+                (DEFERRED_PORT_UNCHARGE_SLOTS + 1) as u64,
+                1,
+                &table.port_uncharge_seq
+            ));
         }
 
         table.enqueue_port_uncharge((DEFERRED_PORT_UNCHARGE_SLOTS + 1) as u64, 1);

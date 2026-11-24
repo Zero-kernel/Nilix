@@ -4359,15 +4359,22 @@ impl Process {
     /// A Ready-to-Ready queue move preserves credit. `stopped` and `on_cpu`
     /// are part of runnable readiness, so resuming a Ready-but-stopped task or
     /// preempting a Ready-marked on-CPU task starts a new epoch as well.
+    ///
+    /// C3 (#90): every wake ends here, so this is where a task that is off its
+    /// CPU is published to the work-stealing hint: the state is written, and
+    /// the caller still holds this PCB's lock. A task that is still on a CPU
+    /// cannot be stolen; it is published when it releases the CPU.
     #[inline]
     pub fn enter_ready_at(&mut self, now_tick: u64) {
-        let starts_new_epoch = self.state != ProcessState::Ready
-            || self.stopped
-            || self.on_cpu.load(Ordering::Acquire);
+        let on_cpu = self.on_cpu.load(Ordering::Acquire);
+        let starts_new_epoch = self.state != ProcessState::Ready || self.stopped || on_cpu;
         self.state = ProcessState::Ready;
         if starts_new_epoch {
             self.wait_ticks = 0;
             self.wait_age_tick = now_tick;
+        }
+        if !on_cpu {
+            note_publication(self.pid);
         }
     }
 
@@ -4378,6 +4385,7 @@ impl Process {
         self.state = ProcessState::Ready;
         self.wait_ticks = 0;
         self.wait_age_tick = now_tick;
+        note_publication(self.pid);
     }
 
     /// RF178-33 FIX: Mark a task Running and stop Ready-wait accounting.
@@ -6731,6 +6739,19 @@ pub fn wait_over_wake_count() -> u64 {
 /// the dispatch selector still revalidates whether the candidate can run.
 static IDLE_REARMS: AtomicU64 = AtomicU64::new(0);
 
+/// C3 (#90): the task `pid` may have become dispatchable for some CPU.
+///
+/// Tells the work-stealing hint that the ready queue holding the task has
+/// something new to look at (`steal_hint`). Call it after the change, while
+/// the task's PCB lock is still held, for every event that can turn a queued
+/// task into one some CPU may run: it becomes Ready, a stop is lifted, it
+/// releases its CPU while Ready, or its CPU mask changes. One atomic load
+/// and at most one increment; no lock, so it is safe in the timer interrupt.
+#[inline]
+pub fn note_publication(pid: ProcessId) {
+    crate::steal_hint::hint().publish_pid(pid);
+}
+
 /// Record one idle CPU that armed itself for a local candidate (#92).
 pub fn note_idle_rearm() {
     // Diagnostic counter only; wrap is harmless. lint-fetch-add: allow
@@ -7486,7 +7507,17 @@ fn ready_for_exec_handoff_locked(proc: &mut Process, now_tick: u64) {
     if needs_ready || (proc.state == ProcessState::Ready && proc.stopped) {
         proc.enter_ready_at(now_tick);
     }
-    proc.stopped = false;
+    clear_stopped_locked(proc);
+}
+
+/// Lift a job-control stop. A stop is part of what keeps a queued task from
+/// being dispatched, so lifting one is a publication (C3, `steal_hint`).
+/// Caller holds `proc`'s guard.
+#[inline]
+fn clear_stopped_locked(proc: &mut Process) {
+    if core::mem::replace(&mut proc.stopped, false) {
+        note_publication(proc.pid);
+    }
 }
 
 /// True when `leader` can accept a handoff from a member of `group`.
@@ -7618,6 +7649,10 @@ pub fn take_exec_handoff(process: &ProcessArc) -> Option<TakenExecHandoff> {
         proc.rlimits = thread.rlimits;
         let kick = proc.allowed_cpus != thread.allowed_cpus;
         proc.allowed_cpus = thread.allowed_cpus;
+        if kick {
+            // C3: a CPU the old mask excluded may have to steal this task.
+            note_publication(proc.pid);
+        }
         let old_seccomp = core::mem::replace(&mut proc.seccomp_state, thread.seccomp_state);
         // Strictly newer than either task's, so no saved snapshot of L's old
         // state can match the installed one.
@@ -7853,7 +7888,7 @@ pub(crate) fn request_process_exit_locked(
         // begins a fresh starvation-aging epoch.
         proc.enter_ready_at(now_tick);
     }
-    proc.stopped = false;
+    clear_stopped_locked(proc);
 
     if !was_pending || needs_ready || was_stopped {
         FatalExitPost::Kick
@@ -7975,7 +8010,7 @@ pub fn resume_job_control_locked(
     if make_ready {
         proc.enter_ready_at(crate::get_ticks());
     }
-    proc.stopped = false;
+    clear_stopped_locked(proc);
     make_ready
 }
 
