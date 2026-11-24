@@ -294,9 +294,10 @@ pub fn halt_sequence<const CPUS: usize, H: HaltOps>(
     }
     ops.step();
     ops.enable_interrupts_and_halt();
+    kicks.clear_halted(cpu);
+    ops.step();
     // Statistics only; wrap is harmless. lint-fetch-add: allow
     kicks.exits[cpu].0.fetch_add(1, Ordering::SeqCst);
-    kicks.clear_halted(cpu);
     HaltOutcome::Halted
 }
 
@@ -486,6 +487,16 @@ pub fn kick_published() -> Option<u64> {
         KICKS.count(this, |c| &c.targeted);
     }
     Some(others)
+}
+
+/// Broadcast a reschedule kick after a notifying wake that could not resolve
+/// every target's queue CPU (e.g. a `Provisioning` or transiently migrating
+/// task). Drains this CPU's `published` mask first so stale bits do not linger.
+pub fn kick_broadcast() -> bool {
+    let this = cpu_local::current_cpu_id();
+    let _ = KICKS.take_published(this);
+    KICKS.count(this, |c| &c.notified);
+    crate::signal::kernel_kick_reschedule()
 }
 
 /// The `/proc/schedstat` `wait` line's values.
@@ -854,5 +865,102 @@ mod tests {
         let after = stats();
         assert!(after.notified > before.notified);
         assert!(after.targeted >= before.targeted + 2);
+    }
+
+    #[test]
+    fn wait_kick_halt_clears_halted_before_advancing_exits() {
+        struct Observer<'a> {
+            kicks: &'a WaitKicks<2>,
+            after_hlt: bool,
+            saw_cleared_before_exit: bool,
+            saw_exit_while_halted: bool,
+        }
+        impl HaltOps for Observer<'_> {
+            fn disable_interrupts(&mut self) {}
+            fn enable_interrupts(&mut self) {}
+            fn enable_interrupts_and_halt(&mut self) {
+                assert!(self.kicks.is_halted(0));
+                assert_eq!(self.kicks.halt_exits(0), 0);
+                self.after_hlt = true;
+            }
+            fn work_pending(&mut self) -> bool {
+                false
+            }
+            fn step(&mut self) {
+                if self.after_hlt {
+                    let halted = self.kicks.is_halted(0);
+                    let exits = self.kicks.halt_exits(0);
+                    if !halted && exits == 0 {
+                        self.saw_cleared_before_exit = true;
+                    }
+                    if halted && exits > 0 {
+                        self.saw_exit_while_halted = true;
+                    }
+                }
+            }
+        }
+
+        let kicks = WaitKicks::<2>::new();
+        let seq = kicks.ready_seq(0);
+        let mut obs = Observer {
+            kicks: &kicks,
+            after_hlt: false,
+            saw_cleared_before_exit: false,
+            saw_exit_while_halted: false,
+        };
+        assert_eq!(halt_sequence(&kicks, 0, seq, &mut obs), HaltOutcome::Halted);
+        assert!(
+            obs.saw_cleared_before_exit,
+            "halted must be cleared before exits advances"
+        );
+        assert!(
+            !obs.saw_exit_while_halted,
+            "exits must never advance while halted is still set"
+        );
+        assert!(!kicks.is_halted(0));
+        assert_eq!(kicks.halt_exits(0), 1);
+    }
+
+    #[test]
+    fn wait_kick_fatal_exit_records_running_queue_and_broadcasts_if_unqueued() {
+        use crate::process::{request_process_exit_locked, FatalExitPost, Process, ProcessState};
+        let _serial = KERNEL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        register_cpu_kick(record_kick);
+        KICKED.store(0, Ordering::SeqCst);
+        let _ = kicks().take_published(0);
+
+        // Case 1: Running target on CPU 48 — must record CPU 48 even when
+        // another unrelated CPU (47) is already in `published[0]`.
+        let pid = 4010;
+        crate::steal_hint::hint().note_enqueued(pid, 48, 1);
+        note_ready_on(47);
+        let mut running = Process::new(pid, 1, alloc::string::String::from("run-kill"), 120);
+        running.state = ProcessState::Running;
+        running.on_cpu.store(true, Ordering::Release);
+        let post = request_process_exit_locked(&mut running, 137, 10);
+        assert_eq!(post, FatalExitPost::Kick);
+        let sent = kick_published().expect("the kick is registered");
+        assert_eq!(
+            sent & MINE,
+            bit(47) | bit(48),
+            "running target's queue CPU must be kicked alongside prior wakes"
+        );
+        crate::steal_hint::hint().note_removed(pid, 48, 0, false);
+
+        // Case 2: Unqueued target (e.g. Provisioning or migrating) must request
+        // Broadcast even if merged with a targeted Kick from another sibling.
+        let mut unqueued =
+            Process::new(0x178_3502, 1, alloc::string::String::from("unq-kill"), 120);
+        unqueued.state = ProcessState::Provisioning;
+        let post_unq = request_process_exit_locked(&mut unqueued, 137, 11);
+        assert_eq!(post_unq, FatalExitPost::Broadcast);
+        assert_eq!(
+            FatalExitPost::Kick.merge(post_unq),
+            FatalExitPost::Broadcast
+        );
+        assert_eq!(
+            post_unq.merge(FatalExitPost::Kick),
+            FatalExitPost::Broadcast
+        );
     }
 }

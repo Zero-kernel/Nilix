@@ -229,7 +229,7 @@ impl Shell {
                 kernel_core::wait_kick::halt_until_event(
                     snapshot,
                     kernel_core::wait_kick::HaltSite::Idle,
-                    || arch::current_cpu().need_resched.load(Ordering::Acquire),
+                    || arch::current_cpu().need_resched.load(Ordering::SeqCst),
                 );
             }
         }
@@ -691,7 +691,7 @@ pub fn init_and_run() -> ! {
         kernel_core::wait_kick::halt_until_event(
             snapshot,
             kernel_core::wait_kick::HaltSite::Idle,
-            || arch::current_cpu().need_resched.load(Ordering::Acquire),
+            || arch::current_cpu().need_resched.load(Ordering::SeqCst),
         );
     }
 }

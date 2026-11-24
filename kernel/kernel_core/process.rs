@@ -7388,11 +7388,7 @@ pub fn request_exit_group_atomic(
                 let request = request_process_exit_locked(&mut proc, exit_code, now_tick);
                 if request != FatalExitPost::None {
                     marked += 1;
-                    if request == FatalExitPost::Kick {
-                        post = FatalExitPost::Kick;
-                    } else if post == FatalExitPost::None {
-                        post = FatalExitPost::Posted;
-                    }
+                    post = post.merge(request);
                 }
             }
         }
@@ -7518,16 +7514,25 @@ pub enum HandoffRefusal {
 /// Make a parked leader runnable for its handoff and clear a job-control stop,
 /// the way a fatal post does (the exec'ing thread was running, so the process
 /// it becomes is not stopped). Caller holds `proc`'s guard.
-fn ready_for_exec_handoff_locked(proc: &mut Process, now_tick: u64) {
+fn ready_for_exec_handoff_locked(proc: &mut Process, now_tick: u64) -> FatalExitPost {
     let actively_running = proc.on_cpu.load(Ordering::Acquire)
         && matches!(proc.state, ProcessState::Running | ProcessState::Ready);
     let needs_ready = proc.state != ProcessState::Provisioning
         && !actively_running
         && proc.state != ProcessState::Ready;
-    if needs_ready || (proc.state == ProcessState::Ready && proc.stopped) {
+    let transitioned = needs_ready || (proc.state == ProcessState::Ready && proc.stopped);
+    if transitioned {
         proc.enter_ready_at(now_tick);
     }
     clear_stopped_locked(proc);
+    if let Some(queue) = crate::steal_hint::hint().queue_cpu(proc.pid) {
+        if !transitioned {
+            crate::wait_kick::note_ready_on(queue);
+        }
+        FatalExitPost::Kick
+    } else {
+        FatalExitPost::Broadcast
+    }
 }
 
 /// Lift a job-control stop. A stop is part of what keeps a queued task from
@@ -7577,7 +7582,7 @@ pub fn publish_exec_handoff(
         return Err((handoff, HandoffRefusal::LeaderGone));
     };
     let now_tick = crate::get_ticks();
-    {
+    let mut post = {
         let mut leader = leader_arc.lock();
         if !leader_accepts_exec_handoff(&leader, leader_pid, group) {
             drop(leader);
@@ -7586,8 +7591,8 @@ pub fn publish_exec_handoff(
         leader.exec_handoff = Some(handoff);
         // lint-fetch-add: allow (at most one pending handoff per group)
         EXEC_HANDOFFS_PENDING.fetch_add(1, Ordering::AcqRel);
-        ready_for_exec_handoff_locked(&mut leader, now_tick);
-    }
+        ready_for_exec_handoff_locked(&mut leader, now_tick)
+    };
     for (pid, slot) in table.iter().enumerate() {
         if pid == caller_pid || pid == leader_pid {
             continue;
@@ -7597,13 +7602,13 @@ pub fn publish_exec_handoff(
             if Arc::ptr_eq(&proc.thread_group, group)
                 && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
             {
-                let _ = request_process_exit_locked(&mut proc, exit_code, now_tick);
+                post = post.merge(request_process_exit_locked(&mut proc, exit_code, now_tick));
             }
         }
     }
     // RF178-35: never send an IPI while PROCESS_TABLE or a PCB is held.
     drop(table);
-    let _ = finish_process_exit_request(FatalExitPost::Kick);
+    let _ = finish_process_exit_request(post);
     Ok(leader_arc)
 }
 
@@ -7865,6 +7870,24 @@ pub(crate) enum FatalExitPost {
     None,
     Posted,
     Kick,
+    Broadcast,
+}
+
+impl FatalExitPost {
+    #[inline]
+    pub(crate) fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Broadcast, _) | (_, Self::Broadcast) => Self::Broadcast,
+            (Self::Kick, _) | (_, Self::Kick) => Self::Kick,
+            (Self::Posted, _) | (_, Self::Posted) => Self::Posted,
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn kicks(self) -> bool {
+        matches!(self, Self::Kick | Self::Broadcast)
+    }
 }
 
 /// Atomically publish a fatal exit and make every non-running live task
@@ -7903,7 +7926,8 @@ pub(crate) fn request_process_exit_locked(
     proc.pending_exit_code.store(exit_code, Ordering::Relaxed);
     proc.pending_kill.store(true, Ordering::Release);
 
-    if needs_ready || (proc.state == ProcessState::Ready && was_stopped) {
+    let transitioned = needs_ready || (proc.state == ProcessState::Ready && was_stopped);
+    if transitioned {
         // Keep `stopped` set through this call so a newly runnable residence
         // begins a fresh starvation-aging epoch.
         proc.enter_ready_at(now_tick);
@@ -7911,7 +7935,21 @@ pub(crate) fn request_process_exit_locked(
     clear_stopped_locked(proc);
 
     if !was_pending || needs_ready || was_stopped {
-        FatalExitPost::Kick
+        if let Some(queue) = crate::steal_hint::hint().queue_cpu(proc.pid) {
+            if !transitioned {
+                // C3 repair 3 audit fix (F1): Running / already-Ready targets
+                // skipped `enter_ready_at`; record their queue CPU so
+                // `kick_published` targets them even when another CPU is
+                // already in `published[this]`.
+                crate::wait_kick::note_ready_on(queue);
+            }
+            FatalExitPost::Kick
+        } else {
+            // Queue CPU unknown (Provisioning or transiently migrating): force
+            // a broadcast so unrelated bits in `published[this]` cannot
+            // suppress the kick.
+            FatalExitPost::Broadcast
+        }
     } else {
         FatalExitPost::Posted
     }
@@ -8043,6 +8081,10 @@ pub(crate) fn finish_process_exit_request(post: FatalExitPost) -> bool {
             let _ = crate::signal::kernel_kick_published();
             true
         }
+        FatalExitPost::Broadcast => {
+            let _ = crate::wait_kick::kick_broadcast();
+            true
+        }
     }
 }
 
@@ -8078,10 +8120,7 @@ pub fn run_fatal_exit_publication_self_test() {
             proc.socket_timeout_marker.store(0x3501, Ordering::Release);
             proc.wq_timeout_marker.store(0x3503, Ordering::Release);
             let code = 0x3500 + case as i32;
-            assert_eq!(
-                request_process_exit_locked(&mut proc, code, case as u64),
-                FatalExitPost::Kick,
-            );
+            assert!(request_process_exit_locked(&mut proc, code, case as u64).kicks());
             let actively_running =
                 on_cpu && matches!(state, ProcessState::Running | ProcessState::Ready);
             let expected = if state == ProcessState::Provisioning {
@@ -8110,10 +8149,7 @@ pub fn run_fatal_exit_publication_self_test() {
     proc.stopped = false;
     proc.on_cpu.store(false, Ordering::Release);
     proc.pending_kill.store(false, Ordering::Release);
-    assert_eq!(
-        request_process_exit_locked(&mut proc, 0x35ff, 100),
-        FatalExitPost::Kick,
-    );
+    assert!(request_process_exit_locked(&mut proc, 0x35ff, 100).kicks());
     assert_eq!(
         request_process_exit_locked(&mut proc, 0x35fe, 101),
         FatalExitPost::Posted,
@@ -8122,10 +8158,7 @@ pub fn run_fatal_exit_publication_self_test() {
 
     // A repost repairs a task that was re-parked by stale state and must kick.
     proc.state = ProcessState::Blocked;
-    assert_eq!(
-        request_process_exit_locked(&mut proc, 0x35fd, 102),
-        FatalExitPost::Kick,
-    );
+    assert!(request_process_exit_locked(&mut proc, 0x35fd, 102).kicks());
     assert_eq!(proc.state, ProcessState::Ready);
 
     // Both lock-serialized race orders give fatal exit precedence over stop.
@@ -8133,10 +8166,7 @@ pub fn run_fatal_exit_publication_self_test() {
     proc.stopped = false;
     proc.pending_kill.store(false, Ordering::Release);
     assert!(try_mark_job_control_stopped_locked(&mut proc));
-    assert_eq!(
-        request_process_exit_locked(&mut proc, 0x35fc, 103),
-        FatalExitPost::Kick,
-    );
+    assert!(request_process_exit_locked(&mut proc, 0x35fc, 103).kicks());
     assert!(!proc.stopped);
     assert!(!try_mark_job_control_stopped_locked(&mut proc));
     assert!(!proc.stopped);
@@ -12134,14 +12164,14 @@ pub(crate) fn propagate_group_job_control(pid: ProcessId, resume: bool) -> bool 
 /// the chosen task exits or blocks the signals it was chosen for. A member
 /// inside a handler is not chosen (it cannot take a caught signal until the
 /// handler returns, and takes it then by itself).
-pub(crate) fn retarget_shared_signals(pid: ProcessId, group: &Arc<ThreadGroup>) {
+pub(crate) fn retarget_shared_signals(pid: ProcessId, group: &Arc<ThreadGroup>) -> bool {
     // A lone task has no one to hand to; skip the table scan.
     if group.exiting.load(Ordering::Acquire) || group.members() <= 1 {
-        return;
+        return false;
     }
     let pending = group.shared_pending();
     if pending == 0 {
-        return;
+        return false;
     }
     let mut kick = false;
     {
@@ -12178,6 +12208,7 @@ pub(crate) fn retarget_shared_signals(pid: ProcessId, group: &Arc<ThreadGroup>) 
     if kick {
         let _ = crate::signal::kernel_kick_published();
     }
+    kick
 }
 
 /// GAP-5 slice 4 G1: one bit per PID for exited non-leader threads awaiting

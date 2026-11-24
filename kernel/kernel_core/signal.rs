@@ -1386,7 +1386,11 @@ fn send_signal_inner(
     } // Release process lock before calling scheduler functions
 
     if let Some(group) = retarget_group {
-        process::retarget_shared_signals(pid, &group);
+        if process::retarget_shared_signals(pid, &group) {
+            // C3 repair 3 audit fix (F3): retarget_shared_signals already
+            // drained `published[this]` and kicked all CPUs published so far.
+            needs_kick = false;
+        }
     }
 
     // GAP-5 slice 4 G7: stop or continue the other members before a self-stop
@@ -1416,6 +1420,9 @@ fn send_signal_inner(
         } else {
             // The exact authorized PCB was already posted under its guard.
             let _ = process::finish_process_exit_request(fatal_post);
+            if fatal_post.kicks() {
+                needs_kick = false;
+            }
         }
     }
 
