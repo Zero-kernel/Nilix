@@ -2073,7 +2073,9 @@ impl Scheduler {
             count += 1;
         }
         let sources = &mut sources[..count];
-        sources.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        // DIAGNOSTIC v1: ring order from the CPU after this one, so that
+        // thieves start at different queues.
+        sources.sort_unstable_by_key(|&(_, cpu, _)| (cpu + 64 - local_cpu - 1) % 64);
 
         let mut every_source_examined = true;
         for &(_, source_cpu, seq) in sources.iter() {
