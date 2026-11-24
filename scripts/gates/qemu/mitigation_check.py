@@ -1064,7 +1064,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=900,
                         help="total boot, tracing and workload deadline in seconds (1..900)")
     parser.add_argument("--smp", type=int, choices=(4,), default=4)
-    parser.add_argument("--cpu", default="qemu64,+smep,+smap,+umip,+rdrand")
+    parser.add_argument("--cpu", default="qemu64,+smep,+smap,+umip,+rdrand,+rdtscp")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 900 or (args.input_manifest and not args.revision):
         parser.error("timeout must be 1..900; input manifest requires revision")

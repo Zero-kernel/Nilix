@@ -351,7 +351,7 @@ QEMU_COMMON = -bios $(OVMF_PATH) \
 	-m 256M \
 	-vga std \
 	-no-reboot -no-shutdown \
-	-cpu qemu64,+smep,+smap,+umip,+rdrand
+	-cpu qemu64,+smep,+smap,+umip,+rdrand,+rdtscp
 
 # virtio-blk 块设备配置 (Phase C: Storage Foundation)
 # 默认使用PCI transport（x86 QEMU更可靠），可切换为MMIO

@@ -80,12 +80,35 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
     def test_guest_failure_retries_once_and_recovers(self):
         status, events = self.run_group('runtime', FAIL_GATE='boot', FAIL_ATTEMPTS='1', FAIL_STATUS='1')
         self.assertEqual(status, 0)
-        self.assertEqual(events, ['boot', 'boot (retry 1)', 'runtime', 'smp', 'report'])
+        self.assertEqual(events, ['boot', 'boot (retry 1)', 'runtime', 'smp', 'runtime-rdpid', 'runtime-lapic', 'report'])
 
     def test_guest_failure_after_retry_remains_a_failure(self):
         status, events = self.run_group('runtime', FAIL_GATE='boot', FAIL_ATTEMPTS='2', FAIL_STATUS='1')
         self.assertEqual(status, 1)
-        self.assertEqual(events, ['boot', 'boot (retry 1)', 'runtime', 'smp', 'report'])
+        self.assertEqual(events, ['boot', 'boot (retry 1)', 'runtime', 'smp', 'runtime-rdpid', 'runtime-lapic', 'report'])
+
+    def test_runtime_group_boots_each_cpu_identity_path(self):
+        invocations = self.root / 'invocations.jsonl'
+        status, events = self.run_group('runtime', INVOCATIONS=str(invocations))
+        self.assertEqual(status, 0)
+        self.assertEqual(events, ['boot', 'runtime', 'smp', 'runtime-rdpid', 'runtime-lapic', 'report'])
+        gates = {record['name']: record for record in map(json.loads, invocations.read_text().splitlines())}
+        standard = 'qemu64,+smep,+smap,+umip,+rdrand,+rdtscp'
+        expected = {
+            'runtime-rdpid': (standard + ',+rdpid', 'rdpid'),
+            'runtime-lapic': (standard.replace('+rdtscp', '-rdtscp'), 'lapic'),
+        }
+        for name, (model, method) in expected.items():
+            with self.subTest(gate=name):
+                self.assertIn('--allow-qualified', gates[name]['argv'])
+                command = gates[name]['argv']
+                self.assertEqual(command[command.index('--') + 1:],
+                                 ['env', 'KERNEL_TEST_CPUS=4', f'KERNEL_TEST_CPU_MODEL={model}',
+                                  f'KERNEL_TEST_REQUIRE_CPU_ID={method}',
+                                  'bash', 'scripts/gates/boot/kernel_test.sh', 'esp'])
+        for name in ('boot', 'runtime', 'smp'):
+            with self.subTest(gate=name):
+                self.assertFalse(any('KERNEL_TEST_REQUIRE_CPU_ID' in arg for arg in gates[name]['argv']))
 
     def test_invalid_retry_setting_keeps_report_and_blocks(self):
         status, events = self.run_group('quality', CI_GUEST_RETRIES='2')

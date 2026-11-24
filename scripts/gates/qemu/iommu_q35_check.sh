@@ -64,7 +64,7 @@ run_gate_qemu "$TO" "runtime" "$QEMU" -bios "$OVMF" \
     -device intel-iommu,intremap=on \
     -drive format=raw,file=fat:"$ser.inputs/esp",snapshot=on \
     -m 256M -vga std -no-reboot -no-shutdown \
-    -cpu qemu64,+smep,+smap,+umip,+rdrand \
+    -cpu qemu64,+smep,+smap,+umip,+rdrand,+rdtscp \
     -display none -serial "file:$ser" \
     -d int,cpu_reset -D "$intlog"
 qemu_status=$?

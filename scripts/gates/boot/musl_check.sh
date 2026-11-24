@@ -153,7 +153,7 @@ run_gate_qemu "$TO" "musl" "$QEMU" -bios "$OVMF" \
     -netdev user,id=net0,restrict=on,ipv6=off \
     -device virtio-net-pci,netdev=net0,romfile= \
     -m 256M -smp "$CPUS" -vga std -no-reboot -no-shutdown \
-    -cpu qemu64,+smep,+smap,+umip,+rdrand \
+    -cpu qemu64,+smep,+smap,+umip,+rdrand,+rdtscp \
     -display none -serial "file:$ser" \
     -d int,cpu_reset -D "$intlog"
 qemu_status=$?

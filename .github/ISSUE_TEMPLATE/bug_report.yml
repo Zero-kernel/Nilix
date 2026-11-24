@@ -83,7 +83,7 @@ body:
       description: Include host OS, QEMU or physical hardware, CPU model/features, OVMF version/path, RAM, SMP count, and build features.
       placeholder: |
         Host: Ubuntu 24.04 x86_64
-        Target: QEMU 9.x, qemu64,+smep,+smap,+umip,+rdrand
+        Target: QEMU 9.x, qemu64,+smep,+smap,+umip,+rdrand,+rdtscp
         Firmware: OVMF ...
         Memory/CPUs: 256 MiB / 4 CPUs
         Command: SMP_CPUS=4 make test-smp-4core

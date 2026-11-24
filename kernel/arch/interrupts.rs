@@ -1892,6 +1892,11 @@ extern "C" fn timer_interrupt_body(
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
+    // C3 repair 2 (#90): the id the lookup gives must be the CPU this CPU's
+    // LAPIC names. First, before any per-CPU access: the handler uses the id
+    // to decide whether this CPU is the BSP.
+    cpu_local::check_identity_tick();
+
     // R69-3 FIX: Mark entering IRQ context for preemption tracking
     current_cpu().irq_enter();
 

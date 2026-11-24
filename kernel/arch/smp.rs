@@ -852,6 +852,15 @@ fn lapic_ids_are_unique(lapic_ids: &[u32]) -> bool {
         .all(|(index, lapic_id)| !lapic_ids[..index].contains(lapic_id))
 }
 
+/// End SMP bring-up for `cpu_local`: choose how every CPU finds its id
+/// (C3 repair 2, #90), print the choice, then stop the CPU-0 fallback
+/// (R151-6). Every exit of `start_aps` that ends bring-up goes through here.
+fn finish_cpu_local_smp_init() {
+    let method = cpu_local::select_identity_method();
+    klog_always!("CPU identity lookup: {}", method.name());
+    cpu_local::set_smp_init_done();
+}
+
 /// Start all Application Processors.
 ///
 /// This function:
@@ -899,7 +908,7 @@ pub fn start_aps() -> usize {
     if ap_lapic_ids.is_empty() {
         klog_always!("[SMP] Single-core system detected");
         SMP_INIT_DONE.store(true, Ordering::Release);
-        cpu_local::set_smp_init_done(); // R151-6 FIX
+        finish_cpu_local_smp_init(); // R151-6 FIX
         TOTAL_CPUS.store(1, Ordering::Release);
         return 1;
     }
@@ -1000,7 +1009,7 @@ pub fn start_aps() -> usize {
                 let partial_total = cpu_local::num_online_cpus();
                 TOTAL_CPUS.store(partial_total, Ordering::Release);
                 SMP_INIT_DONE.store(true, Ordering::Release);
-                cpu_local::set_smp_init_done(); // R151-6 FIX
+                finish_cpu_local_smp_init(); // R151-6 FIX
                 make_trampoline_nonexecutable();
                 return partial_total;
             }
@@ -1034,7 +1043,7 @@ pub fn start_aps() -> usize {
                         let partial_total = cpu_local::num_online_cpus();
                         TOTAL_CPUS.store(partial_total, Ordering::Release);
                         SMP_INIT_DONE.store(true, Ordering::Release);
-                        cpu_local::set_smp_init_done();
+                        finish_cpu_local_smp_init();
                         make_trampoline_nonexecutable();
                         return partial_total;
                     }
@@ -1052,7 +1061,7 @@ pub fn start_aps() -> usize {
                         let partial_total = cpu_local::num_online_cpus();
                         TOTAL_CPUS.store(partial_total, Ordering::Release);
                         SMP_INIT_DONE.store(true, Ordering::Release);
-                        cpu_local::set_smp_init_done();
+                        finish_cpu_local_smp_init();
                         make_trampoline_nonexecutable();
                         return partial_total;
                     }
@@ -1078,7 +1087,7 @@ pub fn start_aps() -> usize {
             let partial_total = cpu_local::num_online_cpus();
             TOTAL_CPUS.store(partial_total, Ordering::Release);
             SMP_INIT_DONE.store(true, Ordering::Release);
-            cpu_local::set_smp_init_done();
+            finish_cpu_local_smp_init();
             make_trampoline_nonexecutable();
             return partial_total;
         }
@@ -1095,7 +1104,7 @@ pub fn start_aps() -> usize {
     let total = cpu_local::num_online_cpus();
     TOTAL_CPUS.store(total, Ordering::Release);
     SMP_INIT_DONE.store(true, Ordering::Release);
-    cpu_local::set_smp_init_done(); // R151-6 FIX
+    finish_cpu_local_smp_init(); // R151-6 FIX
 
     // Restore security: make trampoline page non-executable again
     // This is important for W^X policy compliance
@@ -1339,6 +1348,11 @@ pub extern "C" fn ap_rust_entry(
         );
         halt_rejected_ap();
     }
+
+    // C3 repair 2 (#90): publish this CPU's id in IA32_TSC_AUX and check it
+    // against the LAPIC, before READY: the BSP selects the lookup method only
+    // after every admitted CPU has published. A mismatch panics here.
+    cpu_local::publish_identity(cpu_idx);
 
     // RF178-24 FIX: finishing initialization is not permission to publish.
     // The BSP either accepts this exact serialized bring-up attempt or rejects

@@ -28,7 +28,9 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use spin::{Mutex, Once};
 
 /// Maximum number of CPUs supported
@@ -202,6 +204,354 @@ static LAPIC_ID_REVERSE_MAP: [AtomicUsize; LAPIC_ID_REVERSE_MAP_SIZE] = {
 /// bijection while AP topology is being admitted. Registration runs only
 /// during BSP/AP bring-up, before ordinary interrupt traffic begins.
 static CPU_ID_REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
+
+// ============================================================================
+// C3 repair 2 (#90): the current CPU's id from IA32_TSC_AUX
+// ============================================================================
+//
+// Under TCG every MMIO read takes QEMU's global lock, and the LAPIC ID read
+// was the kernel's most frequent one: every per-CPU access made it. Each CPU
+// now writes its logical id plus one to IA32_TSC_AUX once (`publish_identity`),
+// and once every online CPU has, the lookup executes RDPID or RDTSCP instead
+// (`select_identity_method`). CPUID alone decides whether the MSR is touched:
+// no probe may fault. The LAPIC stays the authority: each CPU checks its value
+// against the LAPIC when it publishes and on every timer tick
+// (`check_identity_tick`), and a value that names no registered CPU falls back
+// to the LAPIC read.
+
+/// IA32_TSC_AUX. RDTSCP returns it in ECX, RDPID in its operand.
+#[cfg(not(feature = "host_harness"))]
+const IA32_TSC_AUX: u32 = 0xC000_0103;
+
+/// How [`current_cpu_id`] finds the current CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IdentityMethod {
+    /// Read the LAPIC ID register and map it. The only method until
+    /// [`select_identity_method`], and the fallback of the other two.
+    Lapic = 0,
+    /// RDTSCP, which also reads the time-stamp counter.
+    Rdtscp = 1,
+    /// RDPID.
+    Rdpid = 2,
+}
+
+impl IdentityMethod {
+    /// The name the boot line and `/proc/schedstat` print.
+    pub const fn name(self) -> &'static str {
+        match self {
+            IdentityMethod::Lapic => "lapic",
+            IdentityMethod::Rdtscp => "rdtscp",
+            IdentityMethod::Rdpid => "rdpid",
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => IdentityMethod::Rdtscp,
+            2 => IdentityMethod::Rdpid,
+            _ => IdentityMethod::Lapic,
+        }
+    }
+}
+
+/// CPUID reports RDTSCP (CPUID.80000001H:EDX[27]).
+const REPORTS_RDTSCP: u8 = 1 << 0;
+/// CPUID reports RDPID (CPUID.(EAX=7,ECX=0):ECX[22]).
+const REPORTS_RDPID: u8 = 1 << 1;
+
+/// The method in use. It changes at most once, from `Lapic`, in
+/// [`select_identity_method`], after every online CPU published and verified
+/// its id. There is no CPU hotplug and no resume path; a CPU that came online
+/// after the selection would have to publish before its first lookup.
+static IDENTITY_METHOD: AtomicU8 = AtomicU8::new(IdentityMethod::Lapic as u8);
+
+/// What every CPU that has published so far reports. Each CPU clears the bits
+/// it lacks.
+static IDENTITY_COMMON: AtomicU8 = AtomicU8::new(REPORTS_RDTSCP | REPORTS_RDPID);
+
+/// One bit per CPU that wrote and verified its IA32_TSC_AUX.
+static IDENTITY_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+
+/// Tick cross-checks made by one CPU, on a cache line of its own.
+#[repr(align(64))]
+struct IdentityChecks(AtomicU64);
+
+static IDENTITY_CHECKS: [IdentityChecks; MAX_CPUS] =
+    [const { IdentityChecks(AtomicU64::new(0)) }; MAX_CPUS];
+
+/// The logical CPU an IA32_TSC_AUX value names: the value minus one. Zero,
+/// and a value past `MAX_CPUS`, name none.
+#[cfg_attr(feature = "host_harness", allow(dead_code))]
+const fn identity_value_cpu(value: u64) -> Option<usize> {
+    if value == 0 || value > MAX_CPUS as u64 {
+        None
+    } else {
+        Some(value as usize - 1)
+    }
+}
+
+/// The CPU an IA32_TSC_AUX value names, if that CPU is registered: its two
+/// LAPIC maps agree (R187-7).
+#[cfg_attr(feature = "host_harness", allow(dead_code))]
+fn identity_value_registered_cpu(value: u64) -> Option<usize> {
+    let cpu_id = identity_value_cpu(value)?;
+    lapic_id_for_cpu(cpu_id).map(|_| cpu_id)
+}
+
+/// The method the CPUs allow. RDPID if every CPU reported it, else RDTSCP if
+/// every CPU reported that, else the LAPIC read; and the LAPIC read unless
+/// every online CPU has published.
+const fn identity_method_for(common: u8, published: u64, online: u64) -> IdentityMethod {
+    if online == 0 || published & online != online {
+        IdentityMethod::Lapic
+    } else if common & REPORTS_RDPID != 0 {
+        IdentityMethod::Rdpid
+    } else if common & REPORTS_RDTSCP != 0 {
+        IdentityMethod::Rdtscp
+    } else {
+        IdentityMethod::Lapic
+    }
+}
+
+/// The method [`current_cpu_id`] uses now.
+#[inline]
+pub fn identity_method() -> IdentityMethod {
+    IdentityMethod::from_u8(IDENTITY_METHOD.load(Ordering::Acquire))
+}
+
+/// The CPUs that published their id in IA32_TSC_AUX (bit N = CPU N).
+#[inline]
+pub fn identity_published_mask() -> u64 {
+    IDENTITY_PUBLISHED.load(Ordering::Acquire)
+}
+
+/// Tick cross-checks made by `cpu_id`.
+#[inline]
+pub fn identity_checks(cpu_id: usize) -> u64 {
+    IDENTITY_CHECKS
+        .get(cpu_id)
+        .map_or(0, |checks| checks.0.load(Ordering::Relaxed))
+}
+
+/// Tick cross-checks made by all CPUs.
+pub fn identity_checks_total() -> u64 {
+    IDENTITY_CHECKS.iter().fold(0u64, |sum, checks| {
+        sum.wrapping_add(checks.0.load(Ordering::Relaxed))
+    })
+}
+
+/// What CPUID on this CPU reports of RDTSCP and RDPID.
+#[cfg(not(feature = "host_harness"))]
+#[allow(unused_unsafe)]
+fn cpuid_identity_reports() -> u8 {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+
+    let mut reports = 0;
+    // SAFETY: CPUID exists on every x86-64 CPU; each leaf is read only after
+    // its maximum-leaf check.
+    unsafe {
+        if __cpuid(0).eax >= 7 && __cpuid_count(7, 0).ecx & (1 << 22) != 0 {
+            reports |= REPORTS_RDPID;
+        }
+        if __cpuid(0x8000_0000).eax >= 0x8000_0001 && __cpuid(0x8000_0001).edx & (1 << 27) != 0 {
+            reports |= REPORTS_RDTSCP;
+        }
+    }
+    reports
+}
+
+/// IA32_TSC_AUX through RDTSCP. Not `pure`: every call reads hardware (I7).
+#[cfg(not(feature = "host_harness"))]
+#[inline(always)]
+fn read_tsc_aux_rdtscp() -> u64 {
+    let aux: u32;
+    // SAFETY: executed only when CPUID reported RDTSCP on this CPU
+    // (`publish_identity`) or on every CPU (`select_identity_method`). It
+    // writes EAX, EDX and ECX and touches no memory.
+    unsafe {
+        core::arch::asm!(
+            "rdtscp",
+            out("eax") _,
+            out("edx") _,
+            out("ecx") aux,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    u64::from(aux)
+}
+
+/// IA32_TSC_AUX through RDPID. Not `pure`: every call reads hardware (I7).
+#[cfg(not(feature = "host_harness"))]
+#[inline(always)]
+fn read_tsc_aux_rdpid() -> u64 {
+    let value: u64;
+    // SAFETY: executed only when CPUID reported RDPID on this CPU
+    // (`publish_identity`) or on every CPU (`select_identity_method`). It
+    // writes one register and touches no memory.
+    unsafe {
+        core::arch::asm!(
+            "rdpid {}",
+            out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
+/// Write IA32_TSC_AUX on this CPU.
+///
+/// # Safety
+///
+/// CPUID on this CPU must report RDTSCP or RDPID, so that the MSR exists.
+#[cfg(not(feature = "host_harness"))]
+unsafe fn write_tsc_aux(value: u64) {
+    // SAFETY: the caller established that the MSR exists. WRMSR touches no
+    // memory and leaves the flags alone.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_TSC_AUX,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Publish this CPU's id in IA32_TSC_AUX.
+///
+/// Runs on the CPU itself, after its `register_cpu_id` and with its IDT
+/// loaded: on the BSP after `init_bsp`, on an AP before it reports READY.
+/// A CPU whose CPUID reports neither RDTSCP nor RDPID executes no MSR
+/// instruction and keeps every CPU on the LAPIC read.
+///
+/// # Panics
+///
+/// If the value does not read back through each instruction CPUID reports, or
+/// if it names another CPU than this CPU's LAPIC does.
+#[cfg(not(feature = "host_harness"))]
+pub fn publish_identity(cpu_id: usize) {
+    assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
+    let reports = cpuid_identity_reports();
+    IDENTITY_COMMON.fetch_and(reports, Ordering::AcqRel);
+    if reports == 0 {
+        return;
+    }
+
+    let value = cpu_id as u64 + 1;
+    // SAFETY: CPUID on this CPU reports RDTSCP or RDPID.
+    unsafe { write_tsc_aux(value) };
+    if reports & REPORTS_RDTSCP != 0 {
+        let read = read_tsc_aux_rdtscp();
+        assert_eq!(
+            read, value,
+            "C3 CPU identity: RDTSCP on CPU {} read {:#x} after writing {:#x}",
+            cpu_id, read, value
+        );
+    }
+    if reports & REPORTS_RDPID != 0 {
+        let read = read_tsc_aux_rdpid();
+        assert_eq!(
+            read, value,
+            "C3 CPU identity: RDPID on CPU {} read {:#x} after writing {:#x}",
+            cpu_id, read, value
+        );
+    }
+
+    // The LAPIC stays the authority (I8): the value must name the CPU this
+    // CPU's LAPIC names.
+    let by_value = identity_value_registered_cpu(value);
+    let by_lapic = match lapic_cpu_lookup() {
+        CurrentCpuLookup::Registered(lapic_cpu) => Some(lapic_cpu),
+        CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+    };
+    assert!(
+        by_value.is_some() && by_value == by_lapic,
+        "C3 CPU identity: CPU {} published {:#x}, which names CPU {:?}; its LAPIC names CPU {:?}",
+        cpu_id,
+        value,
+        by_value,
+        by_lapic
+    );
+    IDENTITY_PUBLISHED.fetch_or(1u64 << cpu_id, Ordering::AcqRel);
+}
+
+/// Hosted tests have no IA32_TSC_AUX: nothing is published, so the method
+/// stays `Lapic`.
+#[cfg(feature = "host_harness")]
+pub fn publish_identity(cpu_id: usize) {
+    assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
+}
+
+/// Choose how every CPU finds its id from now on, once, before SMP bring-up is
+/// declared complete. Returns the method in use.
+///
+/// Only CPUs in the online mask count: a CPU that was rejected during
+/// bring-up halts and never looks itself up. Hosted builds publish nothing,
+/// so there it stays `Lapic`.
+pub fn select_identity_method() -> IdentityMethod {
+    let method = identity_method_for(
+        IDENTITY_COMMON.load(Ordering::Acquire),
+        IDENTITY_PUBLISHED.load(Ordering::Acquire),
+        online_cpu_mask(),
+    );
+    let _ = IDENTITY_METHOD.compare_exchange(
+        IdentityMethod::Lapic as u8,
+        method as u8,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    identity_method()
+}
+
+/// The timer tick's cross-check: the id the lookup gives must be the CPU the
+/// LAPIC names. Counts the check.
+///
+/// It runs first in the timer handler, before any per-CPU access, so a wrong
+/// id is found within one tick. It is not part of the lookup itself, because
+/// the panic handler looks the CPU up.
+///
+/// # Panics
+///
+/// On a mismatch.
+#[cfg(not(feature = "host_harness"))]
+pub fn check_identity_tick() {
+    if identity_method() == IdentityMethod::Lapic {
+        return;
+    }
+    let cpu_id = current_cpu_id();
+    let lapic_id = read_lapic_id_register();
+    let expected = lapic_id_for_cpu(cpu_id);
+    assert!(
+        expected == Some(lapic_id),
+        "C3 CPU identity: the lookup names CPU {} (LAPIC ID {:?}), but this CPU's LAPIC ID is {}",
+        cpu_id,
+        expected,
+        lapic_id
+    );
+    IDENTITY_CHECKS[cpu_id].0.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow
+}
+
+/// Hosted tests have no LAPIC and never leave the `Lapic` method.
+#[cfg(feature = "host_harness")]
+pub fn check_identity_tick() {}
+
+/// The current CPU as the LAPIC read and the registration maps give it,
+/// whatever the method. `None` when it is not registered.
+#[cfg(not(feature = "host_harness"))]
+pub fn lapic_registered_cpu_id() -> Option<usize> {
+    match lapic_cpu_lookup() {
+        CurrentCpuLookup::Registered(cpu_id) => Some(cpu_id),
+        CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+    }
+}
+
+/// Hosted tests have one deterministic logical CPU.
+#[cfg(feature = "host_harness")]
+pub fn lapic_registered_cpu_id() -> Option<usize> {
+    Some(0)
+}
 
 // ============================================================================
 // Per-CPU Data Structure for SMP Support (Phase E)
@@ -709,14 +1059,17 @@ impl<T> CpuLocal<T> {
 ///
 /// # Implementation
 ///
-/// 1. Read LAPIC ID from hardware (0xFEE00020, bits 31:24)
-/// 2. O(1) lookup in LAPIC_ID_REVERSE_MAP
-/// 3. Fallback to CPU 0 only during early boot (before registration)
+/// 1. After SMP bring-up, if every CPU published its id (C3 repair 2): read
+///    IA32_TSC_AUX with RDPID or RDTSCP, and accept the CPU it names if that
+///    CPU is registered. No MMIO.
+/// 2. Otherwise read the LAPIC ID from hardware (0xFEE00020, bits 31:24)
+/// 3. O(1) lookup in LAPIC_ID_REVERSE_MAP
+/// 4. Fallback to CPU 0 only during early boot (before registration)
 ///
-/// # Panics (in debug builds)
+/// # Panics
 ///
-/// Once SMP is enabled, falling back to CPU 0 would be a critical bug that
-/// could cause slot aliasing. In debug builds, this generates a warning.
+/// Once SMP bring-up is complete, an unregistered CPU panics in every build:
+/// falling back to CPU 0 would alias its per-CPU slots (R151-6).
 #[inline]
 pub fn current_cpu_id() -> usize {
     current_cpu_id_impl()
@@ -788,14 +1141,45 @@ fn current_cpu_lookup() -> CurrentCpuLookup {
         return CurrentCpuLookup::X2ApicActive;
     }
 
+    // C3 repair 2 (#90): IA32_TSC_AUX, once every CPU has published it. A
+    // value that names no registered CPU falls through to the LAPIC read, so
+    // such a CPU is treated exactly as before.
+    let value = match identity_method() {
+        IdentityMethod::Lapic => None,
+        IdentityMethod::Rdtscp => Some(read_tsc_aux_rdtscp()),
+        IdentityMethod::Rdpid => Some(read_tsc_aux_rdpid()),
+    };
+    if let Some(cpu_id) = value.and_then(identity_value_registered_cpu) {
+        return CurrentCpuLookup::Registered(cpu_id);
+    }
+
+    lapic_cpu_lookup()
+}
+
+/// The LAPIC ID register of this CPU.
+#[cfg(not(feature = "host_harness"))]
+#[inline]
+fn read_lapic_id_register() -> u32 {
     // R169-L7 FIX: read the LAPIC ID register (offset 0x20, bits 31:24) through the
     // single authoritative MMIO base shared with `arch::apic::lapic_read`, not a
     // hard-coded `0xFEE0_0020` literal. After memory initialization this is a
     // supervisor high-half alias inherited by every process's kernel CR3.
-    let apic_id = unsafe {
+    unsafe {
         let id_reg = (lapic_mmio_base() as usize + 0x20) as *const u32;
         core::ptr::read_volatile(id_reg) >> 24
-    };
+    }
+}
+
+/// CPU identification through the LAPIC ID register and the registered
+/// LAPIC-to-logical map, whatever the identity method.
+#[cfg(not(feature = "host_harness"))]
+#[inline]
+fn lapic_cpu_lookup() -> CurrentCpuLookup {
+    if X2APIC_ACTIVE.load(Ordering::Acquire) {
+        return CurrentCpuLookup::X2ApicActive;
+    }
+
+    let apic_id = read_lapic_id_register();
 
     // R67-8 FIX: O(1) reverse lookup instead of linear search
     let cpu_idx = if (apic_id as usize) < LAPIC_ID_REVERSE_MAP_SIZE {
@@ -1582,6 +1966,86 @@ mod host_harness_tests {
         let lapic_id = 249;
         super::register_cpu_id(super::MAX_CPUS - 4, lapic_id);
         super::register_cpu_id(super::MAX_CPUS - 3, lapic_id);
+    }
+
+    #[test]
+    fn identity_value_names_only_a_registered_cpu() {
+        let _serial = TOPOLOGY_TEST_LOCK.lock();
+        let cpu_id = super::MAX_CPUS - 5;
+        assert_eq!(super::identity_value_cpu(0), None);
+        assert_eq!(super::identity_value_cpu(1), Some(0));
+        assert_eq!(
+            super::identity_value_cpu(super::MAX_CPUS as u64),
+            Some(super::MAX_CPUS - 1)
+        );
+        assert_eq!(super::identity_value_cpu(super::MAX_CPUS as u64 + 1), None);
+        assert_eq!(super::identity_value_cpu(u64::MAX), None);
+
+        // A CPU that is not registered is not accepted, whatever the value.
+        assert_eq!(super::lapic_id_for_cpu(cpu_id), None);
+        assert_eq!(
+            super::identity_value_registered_cpu(cpu_id as u64 + 1),
+            None
+        );
+        super::register_cpu_id(cpu_id, 248);
+        assert_eq!(
+            super::identity_value_registered_cpu(cpu_id as u64 + 1),
+            Some(cpu_id)
+        );
+        assert_eq!(super::identity_value_registered_cpu(0), None);
+    }
+
+    #[test]
+    fn identity_method_is_what_every_cpu_reports() {
+        use super::{identity_method_for, IdentityMethod, REPORTS_RDPID, REPORTS_RDTSCP};
+        let both = REPORTS_RDPID | REPORTS_RDTSCP;
+        let online = 0b1011;
+        assert_eq!(
+            identity_method_for(both, online, online),
+            IdentityMethod::Rdpid
+        );
+        assert_eq!(
+            identity_method_for(REPORTS_RDPID, online, online),
+            IdentityMethod::Rdpid
+        );
+        // One CPU without RDPID: the CPUs share what all of them report.
+        assert_eq!(
+            identity_method_for(REPORTS_RDTSCP, online, online),
+            IdentityMethod::Rdtscp
+        );
+        // One CPU with neither.
+        assert_eq!(
+            identity_method_for(0, online, online),
+            IdentityMethod::Lapic
+        );
+        assert_eq!(
+            IdentityMethod::from_u8(IdentityMethod::Rdpid as u8),
+            IdentityMethod::Rdpid
+        );
+        assert_eq!(
+            IdentityMethod::from_u8(IdentityMethod::Rdtscp as u8),
+            IdentityMethod::Rdtscp
+        );
+        assert_eq!(IdentityMethod::from_u8(7), IdentityMethod::Lapic);
+        assert_eq!(IdentityMethod::Rdtscp.name(), "rdtscp");
+    }
+
+    #[test]
+    fn identity_method_needs_every_online_cpu_published() {
+        use super::{identity_method_for, IdentityMethod, REPORTS_RDPID, REPORTS_RDTSCP};
+        let both = REPORTS_RDPID | REPORTS_RDTSCP;
+        let online = 0b1011;
+        assert_eq!(
+            identity_method_for(both, 0b0011, online),
+            IdentityMethod::Lapic
+        );
+        assert_eq!(identity_method_for(both, 0, online), IdentityMethod::Lapic);
+        assert_eq!(identity_method_for(both, 0, 0), IdentityMethod::Lapic);
+        // A published CPU that is not online (rejected in bring-up) does not matter.
+        assert_eq!(
+            identity_method_for(both, 0b1111, online),
+            IdentityMethod::Rdpid
+        );
     }
 
     #[test]

@@ -2109,6 +2109,11 @@ impl Inode for ProcSchedstatInode {
 /// the lock (nothing published since it last looked, or empty), queues it
 /// skipped because their lock was held, tasks it took, and passes that
 /// ignored what had been seen.
+///
+/// The CPU-identity change (C3, #90) appends `identity method= checks=`: how
+/// `current_cpu_id()` finds the CPU (`lapic`, `rdtscp` or `rdpid`) and the
+/// timer tick's cross-checks against the LAPIC, summed over the CPUs. The line
+/// does not start with `cpu` and a digit, which readers take for a per-CPU line.
 fn generate_schedstat() -> Result<AdmittedString, FsError> {
     let mut content = AdmittedString::new(HeapClass::Procfs);
     let online = process::sched_online_cpu_mask();
@@ -2181,6 +2186,13 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
         .write_fmt(format_args!(
             "steal scans={} hint_skips={} lock_skips={} stolen={} full_passes={}\n",
             steal.scans, steal.hint_skips, steal.lock_skips, steal.stolen, steal.full_passes
+        ))
+        .map_err(|_| FsError::NoSpace)?;
+    let (identity_method, identity_checks) = process::cpu_identity_stats();
+    content
+        .write_fmt(format_args!(
+            "identity method={} checks={}\n",
+            identity_method, identity_checks
         ))
         .map_err(|_| FsError::NoSpace)?;
     Ok(content)
