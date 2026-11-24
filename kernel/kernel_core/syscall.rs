@@ -9245,6 +9245,9 @@ where
     }
 
     loop {
+        // C3 repair 3 (#90): this CPU's wait sequence before the pass, for the
+        // halt at the end of it.
+        let snapshot = crate::wait_kick::snapshot();
         // R171-F3 FIX: a pending kill interrupts wait() with EINTR instead of
         // re-blocking on children. Restore Ready + clear the waiting_child marker
         // so the scheduler/teardown sees a runnable task (not a stuck Blocked one).
@@ -9558,6 +9561,13 @@ where
         // A reschedule that bailed (contention / non-preemptible) returns with
         // Blocked still published: that spin is not a wake, so don't count it.
         resumed_from_block = parent.lock().state != ProcessState::Blocked;
+        if !resumed_from_block {
+            // C3 repair 3 (#90): nothing woke this task and nothing else can
+            // run here; halt until an interrupt instead of polling. A child's
+            // exit after the snapshot moves it or kicks this CPU.
+            crate::wait_kick::halt_blocked_wait(snapshot);
+            resumed_from_block = parent.lock().state != ProcessState::Blocked;
+        }
 
         // 被唤醒后继续循环，检查是否有僵尸子进程
         // 如果是被子进程退出唤醒的，循环会找到 zombie 并返回
@@ -9605,6 +9615,8 @@ where
     group.note_child_waiter(true);
     let _waiter = ChildWaiter(group);
     loop {
+        // C3 repair 3 (#90): this CPU's wait sequence before the pass.
+        let snapshot = crate::wait_kick::snapshot();
         if wait_should_abort(pid) || crate::signal::has_deliverable_signal(pid) {
             return Err(SyscallError::EINTR);
         }
@@ -9755,6 +9767,12 @@ where
         selective_wait_tests::group_wait_phase(selective_wait_tests::GroupWaitPhase::Blocked);
 
         crate::force_reschedule();
+        // C3 repair 3 (#90): still Blocked, so nothing woke it and nothing else
+        // runs here. Halt while still Blocked, so that a report wakes and kicks
+        // this CPU, and only then make the task Ready for the next pass.
+        if caller.lock().state == ProcessState::Blocked {
+            crate::wait_kick::halt_blocked_wait(snapshot);
+        }
         // Ready again, whether woken or not switched out at all.
         let mut proc = caller.lock();
         if proc.state == ProcessState::Blocked {

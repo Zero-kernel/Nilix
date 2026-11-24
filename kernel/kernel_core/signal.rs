@@ -71,6 +71,15 @@ pub(crate) fn kernel_kick_reschedule() -> bool {
     true
 }
 
+/// C3 repair 3 (#90): the targeted form of [`kernel_kick_reschedule`] for a
+/// wake that notifies. It sets `need_resched` here and on every CPU whose
+/// queue the wake published for, and sends each of the others one IPI
+/// (`wait_kick::kick_published`), instead of an IPI to every CPU. Called
+/// after every PCB/table guard has been released, as the broadcast was.
+pub(crate) fn kernel_kick_published() -> bool {
+    crate::wait_kick::kick_published().is_some()
+}
+
 /// Resume one exact task identity after its caller has released the PCB lock.
 /// The callback mutates the supplied resident PCB in place; it never re-resolves
 /// `expected_pid`. A successful Ready transition is followed by a cross-CPU kick.
@@ -83,7 +92,7 @@ pub fn kernel_resume_stopped(
         .map(|resume| resume(proc_arc, expected_pid, expected_generation))
         .unwrap_or(false);
     if resumed {
-        kernel_kick_reschedule();
+        kernel_kick_published();
     }
     resumed
 }
@@ -1411,10 +1420,11 @@ fn send_signal_inner(
     }
 
     // M0-5 sub-slice 1b: the EINTR-wake flipped a blocked target Ready on (typically) another
-    // CPU. Broadcast a reschedule IPI so the queue-owning CPU re-selects it promptly rather
-    // than only at its next timer tick. No-op until the scheduler registers the callback.
+    // CPU. Kick the queue-owning CPU so it re-selects it promptly rather than only at its next
+    // timer tick (C3 repair 3: that CPU only, no longer every CPU). No-op until the scheduler
+    // registers its kick.
     if needs_kick {
-        kernel_kick_reschedule();
+        kernel_kick_published();
     }
 
     // A single scheduler attempt can return without a switch. In particular,

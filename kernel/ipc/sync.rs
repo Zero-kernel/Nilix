@@ -667,12 +667,20 @@ impl WaitQueue {
     /// A `killable` wait (GAP-5 PI parity) is not resolved by a pending
     /// handler signal, only by a waker, the timeout, a kill or an exec
     /// handoff.
+    ///
+    /// C3 repair 3 (#90): a pass that finds the wait standing halts the CPU
+    /// until an interrupt instead of polling. The snapshot is read before the
+    /// pass, so a wake after the pass's state check moves it and the halt is
+    /// not taken; a wake that finds the CPU halted kicks it
+    /// (`kernel_core::wait_kick`). The tick ends every halt, so the drains
+    /// still run at least once per tick and a wake is never lost for longer.
     fn block_until_resolved(pid: ProcessId, killable: bool) {
         if !interrupts::are_enabled() {
             kernel_core::force_reschedule();
             return;
         }
         loop {
+            let snapshot = kernel_core::wait_kick::snapshot();
             kernel_core::force_reschedule();
             // A reschedule with nothing else runnable leaves this task on the
             // CPU, so run the idle loop's drains it may be waiting for.
@@ -685,7 +693,7 @@ impl WaitQueue {
             {
                 return;
             }
-            core::hint::spin_loop();
+            kernel_core::wait_kick::halt_blocked_wait(snapshot);
         }
     }
 

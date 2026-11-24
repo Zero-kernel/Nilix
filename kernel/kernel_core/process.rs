@@ -4364,6 +4364,10 @@ impl Process {
     /// CPU is published to the work-stealing hint: the state is written, and
     /// the caller still holds this PCB's lock. A task that is still on a CPU
     /// cannot be stolen; it is published when it releases the CPU.
+    ///
+    /// C3 repair 3: a task that is on its CPU, typically a waiter halted there
+    /// as the current task, is still published to `wait_kick`, so that its
+    /// CPU does not halt through the wake and is kicked if it already has.
     #[inline]
     pub fn enter_ready_at(&mut self, now_tick: u64) {
         let on_cpu = self.on_cpu.load(Ordering::Acquire);
@@ -4375,6 +4379,8 @@ impl Process {
         }
         if !on_cpu {
             note_publication(self.pid);
+        } else {
+            crate::wait_kick::note_ready(self.pid);
         }
     }
 
@@ -6747,9 +6753,14 @@ static IDLE_REARMS: AtomicU64 = AtomicU64::new(0);
 /// task into one some CPU may run: it becomes Ready, a stop is lifted, it
 /// releases its CPU while Ready, or its CPU mask changes. One atomic load
 /// and at most one increment; no lock, so it is safe in the timer interrupt.
+///
+/// C3 repair 3: the same event is published to `wait_kick`, which moves the
+/// queue CPU's wait sequence and records a kick if that CPU is halted. It
+/// sends nothing here.
 #[inline]
 pub fn note_publication(pid: ProcessId) {
     crate::steal_hint::hint().publish_pid(pid);
+    crate::wait_kick::note_ready(pid);
 }
 
 /// Record one idle CPU that armed itself for a local candidate (#92).
@@ -8029,7 +8040,7 @@ pub(crate) fn finish_process_exit_request(post: FatalExitPost) -> bool {
         FatalExitPost::None => false,
         FatalExitPost::Posted => true,
         FatalExitPost::Kick => {
-            let _ = crate::signal::kernel_kick_reschedule();
+            let _ = crate::signal::kernel_kick_published();
             true
         }
     }
@@ -11967,7 +11978,7 @@ fn notify_parent_of_group_exit(
         wake_parent |= wake_group_child_waiters(&group, leader_pid);
     }
     if wake_parent {
-        let _ = crate::signal::kernel_kick_reschedule();
+        let _ = crate::signal::kernel_kick_published();
     }
 }
 
@@ -12165,7 +12176,7 @@ pub(crate) fn retarget_shared_signals(pid: ProcessId, group: &Arc<ThreadGroup>) 
         }
     }
     if kick {
-        let _ = crate::signal::kernel_kick_reschedule();
+        let _ = crate::signal::kernel_kick_published();
     }
 }
 
@@ -12210,6 +12221,14 @@ pub fn is_thread_autoreap_marked(pid: ProcessId) -> bool {
 pub fn run_blocked_wait_drains() {
     drain_deferred_irq_terminates();
     drain_thread_autoreap();
+}
+
+/// C3 repair 3: work for `run_blocked_wait_drains` is flagged. A blocked
+/// waiter does not halt while it is (`wait_kick::halt_blocked_wait`).
+#[inline]
+pub fn blocked_wait_work_pending() -> bool {
+    DEFERRED_IRQ_KILL_PENDING.load(Ordering::Acquire)
+        || THREAD_AUTOREAP_PENDING.load(Ordering::Acquire)
 }
 
 /// GAP-5 slice 4 G1: reap exited non-leader threads. Runs from the

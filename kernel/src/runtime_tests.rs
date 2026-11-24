@@ -1671,6 +1671,222 @@ impl RuntimeTest for CpuIdentityLookupTest {
     }
 }
 
+/// The lowest online CPU other than this one.
+fn other_online_cpu(this: usize) -> Option<usize> {
+    let others = kernel_core::process::sched_online_cpu_mask() & !(1u64 << this);
+    (others != 0).then(|| others.trailing_zeros() as usize)
+}
+
+/// C3 repair 3 (#90): a wake for a task in a halted CPU's queue kicks that
+/// CPU at this CPU's next safe point, and the kick ends its halt well before
+/// its next tick would have.
+///
+/// No task is dispatched: runtime tests run before the scheduler admits work
+/// and the BSP's interrupts are off. The probe uses an AP halted in its idle
+/// loop, the real hook (`note_ready_on`) and the real flush, and times the
+/// AP's halt exits: first those its ticks cause, then the one the kick causes.
+struct WaitKickHaltedCpuTest;
+
+impl WaitKickHaltedCpuTest {
+    /// Bound on each wait for the other CPU, in TSC cycles.
+    const WAIT_TSC: u64 = 10_000_000_000;
+    /// Idle intervals timed to estimate the other CPU's tick.
+    const INTERVALS: usize = 4;
+    /// Attempts; one in which a tick happened to end the halt first can be
+    /// slow without saying anything about the kick.
+    const ATTEMPTS: usize = 3;
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) -> Result<u64, String> {
+        let start = kernel_core::time::read_tsc();
+        loop {
+            if done() {
+                return Ok(kernel_core::time::read_tsc());
+            }
+            if kernel_core::time::read_tsc().saturating_sub(start) > Self::WAIT_TSC {
+                return Err(alloc::format!("{} within the wait", what));
+            }
+            spin_loop();
+        }
+    }
+
+    fn probe(this: usize, target: usize) -> Result<(), String> {
+        use kernel_core::wait_kick::{flush_wake_kicks, kicks, note_ready_on, stats};
+        let kicks = kicks();
+        // Kicks this CPU recorded during boot are not part of the probe.
+        flush_wake_kicks();
+        Self::wait_for("the other CPU did not halt", || kicks.is_halted(target))?;
+
+        // Its idle wake-ups: the longest gap between halt exits is the tick.
+        let mut exits = kicks.halt_exits(target);
+        let mut last = Self::wait_for("the other CPU's halt did not end", || {
+            kicks.halt_exits(target) > exits
+        })?;
+        let mut tick = 0u64;
+        for _ in 0..Self::INTERVALS {
+            exits = kicks.halt_exits(target);
+            let at = Self::wait_for("the other CPU's halt did not end", || {
+                kicks.halt_exits(target) > exits
+            })?;
+            tick = tick.max(at.saturating_sub(last));
+            last = at;
+        }
+
+        let mut slowest = 0u64;
+        for _ in 0..Self::ATTEMPTS {
+            Self::wait_for("the other CPU did not halt again", || {
+                kicks.is_halted(target)
+            })?;
+            let before = stats();
+            let handled = kernel_core::process::cpu_ipi_counters(target).1;
+            let exits = kicks.halt_exits(target);
+            note_ready_on(target);
+            let start = kernel_core::time::read_tsc();
+            flush_wake_kicks();
+            let kicked = stats().kicks.saturating_sub(before.kicks);
+            if kicked == 0 && kicks.halt_exits(target) != exits {
+                // A tick ended the halt before the wake or the flush.
+                continue;
+            }
+            if kicked != 1 {
+                return Err(alloc::format!(
+                    "{} kicks sent for one wake, expected 1",
+                    kicked
+                ));
+            }
+            let woke = Self::wait_for("the kick did not end the halt", || {
+                kicks.halt_exits(target) > exits
+            })?;
+            Self::wait_for("the other CPU handled no IPI", || {
+                kernel_core::process::cpu_ipi_counters(target).1 > handled
+            })?;
+            let latency = woke.saturating_sub(start);
+            if latency.saturating_mul(2) < tick {
+                return Ok(());
+            }
+            slowest = slowest.max(latency);
+        }
+        Err(alloc::format!(
+            "CPU {} woke {} TSC cycles after the kick from CPU {}; its idle interval is {}",
+            target,
+            slowest,
+            this,
+            tick
+        ))
+    }
+}
+
+impl RuntimeTest for WaitKickHaltedCpuTest {
+    fn name(&self) -> &'static str {
+        "wait_kick_halted_cpu"
+    }
+
+    // It needs another CPU to halt.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
+    fn description(&self) -> &'static str {
+        "A wake for a halted CPU's queue kicks it at the next safe point, within half a tick"
+    }
+
+    fn run(&self) -> TestResult {
+        let this = arch::current_cpu_id();
+        let Some(target) = other_online_cpu(this) else {
+            return TestResult::Fail(String::from("no other online CPU"));
+        };
+        match Self::probe(this, target) {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(why),
+        }
+    }
+}
+
+/// C3 repair 3 (#90): a wake that used to broadcast (a child's exit, a
+/// signal) now sends one IPI, to the CPU whose queue it published for.
+///
+/// As above, no task is dispatched: the probe publishes two wakes for an AP's
+/// queue through the real hook and kicks with the real targeted kick.
+struct WaitKickOneIpiTest;
+
+impl RuntimeTest for WaitKickOneIpiTest {
+    fn name(&self) -> &'static str {
+        "wait_kick_one_ipi"
+    }
+
+    // It needs another CPU to kick.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
+    fn description(&self) -> &'static str {
+        "A wake that used to broadcast sends one IPI, to the CPU whose queue it published for"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::process::{cpu_ipi_counters, sched_online_cpu_mask};
+        use kernel_core::wait_kick::{
+            flush_wake_kicks, kick_published, kicks, note_ready_on, stats,
+        };
+        let this = arch::current_cpu_id();
+        let Some(target) = other_online_cpu(this) else {
+            return TestResult::Fail(String::from("no other online CPU"));
+        };
+        let online = sched_online_cpu_mask();
+        flush_wake_kicks();
+        let _ = kicks().take_published(this);
+
+        let mut sent_before = [0u64; 64];
+        for (cpu, slot) in sent_before
+            .iter_mut()
+            .enumerate()
+            .take(arch::max_cpus().min(64))
+        {
+            *slot = cpu_ipi_counters(cpu).0;
+        }
+        let before = stats();
+        // Two tasks of one queue, as a group wake can make Ready.
+        note_ready_on(target);
+        note_ready_on(target);
+        let Some(sent) = kick_published() else {
+            return TestResult::Fail(String::from("the scheduler registered no kick"));
+        };
+        let after = stats();
+
+        if sent != 1u64 << target {
+            return TestResult::Fail(alloc::format!(
+                "IPIs went to CPUs {:#x}, expected only CPU {}",
+                sent,
+                target
+            ));
+        }
+        if after.notified.saturating_sub(before.notified) != 1
+            || after.targeted.saturating_sub(before.targeted) != 1
+        {
+            return TestResult::Fail(alloc::format!(
+                "counted {} notified wakes and {} targeted IPIs, expected 1 and 1",
+                after.notified.saturating_sub(before.notified),
+                after.targeted.saturating_sub(before.targeted)
+            ));
+        }
+        let mut remaining = online;
+        while remaining != 0 {
+            let cpu = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            let delta = cpu_ipi_counters(cpu).0.saturating_sub(sent_before[cpu]);
+            let expected = u64::from(cpu == target);
+            if delta != expected {
+                return TestResult::Fail(alloc::format!(
+                    "CPU {} was sent {} IPIs, expected {}",
+                    cpu,
+                    delta,
+                    expected
+                ));
+            }
+        }
+        TestResult::Pass
+    }
+}
+
 // ============================================================================
 // Process Tests
 // ============================================================================
@@ -2775,6 +2991,8 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &KstackFlushBatchTest,
         &StealHintPinnedWakeTest,
         &CpuIdentityLookupTest,
+        &WaitKickHaltedCpuTest,
+        &WaitKickOneIpiTest,
         &CpusetIsolationTest,
         &SchedulerAffinityTest,
         &SchedulerStarvationTest,

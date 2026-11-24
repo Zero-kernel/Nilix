@@ -313,6 +313,11 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
         "reschedule_if_needed() (full L8 + L5 deferred-work drain) must run with \
          interrupts ENABLED — never from an IRQ-off context (R169-5)"
     );
+    // C3 repair 3 (#90): send the kicks this CPU recorded for halted CPUs
+    // (a futex or pipe wake in the system call that returns here). No lock is
+    // held and this is not an interrupt, as RF178-35 requires. Before the
+    // readiness gate: it needs only the scheduler's registered kick.
+    crate::wait_kick::flush_wake_kicks();
     // RF180-52: APs are online and interrupt-capable before the scheduler and
     // every deferred-work dependency are initialized. Fail closed until the
     // BSP's Release publication; otherwise the first AP idle iteration can
@@ -398,6 +403,10 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
     if let Some(post_drain) = post_drain {
         post_drain();
     }
+
+    // C3 repair 3: the drains above can wake tasks too (stdin, IRQ kills,
+    // thread reaping); send their kicks before the scheduler callback.
+    crate::wait_kick::flush_wake_kicks();
 
     // R160-3 FIX: Copy callback out of lock before invoking. The previous
     // `if let Some(cb) = *RESCHED_CB.lock() { cb(...); }` pattern held the
