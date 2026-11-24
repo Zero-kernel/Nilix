@@ -39,6 +39,10 @@ pub const KSTACK_REGION_END: u64 = 0xffff_ffff_0000_0000;
 const _: () = assert!(KSTACK_REGION_END <= PHYSICAL_MEMORY_OFFSET);
 const _: () = assert!(KSTACK_REGION_END <= APIC_VIRT_ADDR);
 
+/// Cache-line wrapper preventing false sharing between hot lock/counter words.
+#[repr(align(64))]
+struct CacheAligned<T>(T);
+
 /// R67-5 FIX: Global page table lock for cross-CPU serialization.
 ///
 /// This lock ensures that page table modifications from different CPUs are serialized.
@@ -47,26 +51,95 @@ const _: () = assert!(KSTACK_REGION_END <= APIC_VIRT_ADDR);
 /// while another CPU still has a stale TLB entry.
 ///
 /// Long-term solution: Per-address-space locks + TLB shootdown with ACK.
-static PT_LOCK: Mutex<()> = Mutex::new(());
+static PT_LOCK: CacheAligned<Mutex<()>> = CacheAligned(Mutex::new(()));
 const NO_PT_LOCK_OWNER: usize = usize::MAX;
-static PT_LOCK_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_PT_LOCK_OWNER);
+static PT_LOCK_OWNER_CPU: CacheAligned<AtomicUsize> =
+    CacheAligned(AtomicUsize::new(NO_PT_LOCK_OWNER));
 
-/// C3 E1 (#90): `PT_LOCK` statistics for `/proc/schedstat`. Observability
-/// only: Relaxed, and a wrap is harmless. Wait time is measured only for a
-/// contended `lock_pt`; hold time runs from acquisition to guard drop. Both
-/// are raw TSC deltas, since the guest tick clock lags host time under TCG.
-static PT_LOCK_ACQUIRED: AtomicU64 = AtomicU64::new(0);
-static PT_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
-static PT_LOCK_BUSY: AtomicU64 = AtomicU64::new(0);
-static PT_LOCK_WAIT_TSC: AtomicU64 = AtomicU64::new(0);
-static PT_LOCK_WAIT_TSC_MAX: AtomicU64 = AtomicU64::new(0);
-static PT_LOCK_HOLD_TSC: AtomicU64 = AtomicU64::new(0);
-static PT_LOCK_HOLD_TSC_MAX: AtomicU64 = AtomicU64::new(0);
-/// TSC at the current holder's acquisition, written and read only by it.
-static PT_LOCK_SINCE_TSC: AtomicU64 = AtomicU64::new(0);
+/// Per-CPU `PT_LOCK` observability accumulators (#109).
+///
+/// Each CPU writes only to its own 64-byte cache line on `lock_pt`,
+/// `try_lock_pt`, and `PtLockGuard::drop`, eliminating cross-CPU false sharing
+/// between contented waiters, `#PF` busy probes, and the lock holder.
+#[repr(align(64))]
+struct PtLockCpuCounters {
+    acquired: AtomicU64,
+    contended: AtomicU64,
+    busy: AtomicU64,
+    wait_tsc: AtomicU64,
+    wait_tsc_max: AtomicU64,
+    hold_tsc: AtomicU64,
+    hold_tsc_max: AtomicU64,
+}
+
+const _: () = assert!(core::mem::size_of::<PtLockCpuCounters>() == 64);
+const _: () = assert!(core::mem::align_of::<PtLockCpuCounters>() == 64);
+
+impl PtLockCpuCounters {
+    const fn new() -> Self {
+        Self {
+            acquired: AtomicU64::new(0),
+            contended: AtomicU64::new(0),
+            busy: AtomicU64::new(0),
+            wait_tsc: AtomicU64::new(0),
+            wait_tsc_max: AtomicU64::new(0),
+            hold_tsc: AtomicU64::new(0),
+            hold_tsc_max: AtomicU64::new(0),
+        }
+    }
+}
+
+/// C3 E1 (#90) + #109: per-CPU `PT_LOCK` statistics for `/proc/schedstat`.
+/// Observability only: Relaxed, and a wrap is harmless. Wait time is measured
+/// only for a contended `lock_pt`; hold time runs from acquisition to guard
+/// drop. Both are raw TSC deltas, since the guest tick clock lags host time
+/// under TCG.
+static PT_LOCK_COUNTERS: [PtLockCpuCounters; cpu_local::max_cpus()] =
+    [const { PtLockCpuCounters::new() }; cpu_local::max_cpus()];
+
+#[inline]
+fn pt_lock_counters_for(cpu: usize) -> &'static PtLockCpuCounters {
+    PT_LOCK_COUNTERS.get(cpu).unwrap_or(&PT_LOCK_COUNTERS[0])
+}
+
+fn aggregate_pt_lock_stats(per_cpu: &[PtLockCpuCounters]) -> PtLockStats {
+    let mut stats = PtLockStats {
+        acquired: 0,
+        contended: 0,
+        busy: 0,
+        wait_tsc: 0,
+        wait_tsc_max: 0,
+        hold_tsc: 0,
+        hold_tsc_max: 0,
+    };
+    for counters in per_cpu {
+        stats.acquired = stats
+            .acquired
+            .wrapping_add(counters.acquired.load(Ordering::Relaxed));
+        stats.contended = stats
+            .contended
+            .wrapping_add(counters.contended.load(Ordering::Relaxed));
+        stats.busy = stats
+            .busy
+            .wrapping_add(counters.busy.load(Ordering::Relaxed));
+        stats.wait_tsc = stats
+            .wait_tsc
+            .wrapping_add(counters.wait_tsc.load(Ordering::Relaxed));
+        stats.wait_tsc_max = stats
+            .wait_tsc_max
+            .max(counters.wait_tsc_max.load(Ordering::Relaxed));
+        stats.hold_tsc = stats
+            .hold_tsc
+            .wrapping_add(counters.hold_tsc.load(Ordering::Relaxed));
+        stats.hold_tsc_max = stats
+            .hold_tsc_max
+            .max(counters.hold_tsc_max.load(Ordering::Relaxed));
+    }
+    stats
+}
 
 /// Snapshot of the `PT_LOCK` statistics (see [`pt_lock_stats`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtLockStats {
     /// Acquisitions by `lock_pt` and successful `try_lock_pt`.
     pub acquired: u64,
@@ -82,17 +155,10 @@ pub struct PtLockStats {
     pub hold_tsc_max: u64,
 }
 
-/// Current `PT_LOCK` statistics; each field is read independently.
+/// Current `PT_LOCK` statistics aggregated across CPUs; each field is read
+/// independently.
 pub fn pt_lock_stats() -> PtLockStats {
-    PtLockStats {
-        acquired: PT_LOCK_ACQUIRED.load(Ordering::Relaxed),
-        contended: PT_LOCK_CONTENDED.load(Ordering::Relaxed),
-        busy: PT_LOCK_BUSY.load(Ordering::Relaxed),
-        wait_tsc: PT_LOCK_WAIT_TSC.load(Ordering::Relaxed),
-        wait_tsc_max: PT_LOCK_WAIT_TSC_MAX.load(Ordering::Relaxed),
-        hold_tsc: PT_LOCK_HOLD_TSC.load(Ordering::Relaxed),
-        hold_tsc_max: PT_LOCK_HOLD_TSC_MAX.load(Ordering::Relaxed),
-    }
+    aggregate_pt_lock_stats(&PT_LOCK_COUNTERS)
 }
 
 #[inline]
@@ -103,46 +169,65 @@ fn read_tsc() -> u64 {
 
 struct PtLockGuard {
     _guard: spin::MutexGuard<'static, ()>,
+    owner_cpu: usize,
+    since_tsc: u64,
 }
 
 impl PtLockGuard {
     #[inline]
     fn new(guard: spin::MutexGuard<'static, ()>) -> Self {
-        PT_LOCK_OWNER_CPU.store(cpu_local::current_cpu_id(), Ordering::Release);
-        PT_LOCK_ACQUIRED.fetch_add(1, Ordering::Relaxed);
-        PT_LOCK_SINCE_TSC.store(read_tsc(), Ordering::Relaxed);
-        Self { _guard: guard }
+        Self::new_on_cpu(guard, cpu_local::current_cpu_id())
+    }
+
+    #[inline]
+    fn new_on_cpu(guard: spin::MutexGuard<'static, ()>, cpu: usize) -> Self {
+        PT_LOCK_OWNER_CPU.0.store(cpu, Ordering::Release);
+        pt_lock_counters_for(cpu)
+            .acquired
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            _guard: guard,
+            owner_cpu: cpu,
+            since_tsc: read_tsc(),
+        }
     }
 }
 
 impl Drop for PtLockGuard {
     fn drop(&mut self) {
         // Still the holder: `_guard` is released after this body.
-        let held = read_tsc().saturating_sub(PT_LOCK_SINCE_TSC.load(Ordering::Relaxed));
-        PT_LOCK_HOLD_TSC.fetch_add(held, Ordering::Relaxed);
-        PT_LOCK_HOLD_TSC_MAX.fetch_max(held, Ordering::Relaxed);
-        PT_LOCK_OWNER_CPU.store(NO_PT_LOCK_OWNER, Ordering::Release);
+        let held = read_tsc().saturating_sub(self.since_tsc);
+        let counters = pt_lock_counters_for(self.owner_cpu);
+        counters.hold_tsc.fetch_add(held, Ordering::Relaxed);
+        counters.hold_tsc_max.fetch_max(held, Ordering::Relaxed);
+        PT_LOCK_OWNER_CPU
+            .0
+            .store(NO_PT_LOCK_OWNER, Ordering::Release);
     }
 }
 
 #[inline]
 fn lock_pt() -> PtLockGuard {
-    if let Some(guard) = PT_LOCK.try_lock() {
+    if let Some(guard) = PT_LOCK.0.try_lock() {
         return PtLockGuard::new(guard);
     }
-    PT_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+    let cpu = cpu_local::current_cpu_id();
+    let counters = pt_lock_counters_for(cpu);
+    counters.contended.fetch_add(1, Ordering::Relaxed);
     let start = read_tsc();
-    let guard = PT_LOCK.lock();
+    let guard = PT_LOCK.0.lock();
     let waited = read_tsc().saturating_sub(start);
-    PT_LOCK_WAIT_TSC.fetch_add(waited, Ordering::Relaxed);
-    PT_LOCK_WAIT_TSC_MAX.fetch_max(waited, Ordering::Relaxed);
-    PtLockGuard::new(guard)
+    counters.wait_tsc.fetch_add(waited, Ordering::Relaxed);
+    counters.wait_tsc_max.fetch_max(waited, Ordering::Relaxed);
+    PtLockGuard::new_on_cpu(guard, cpu)
 }
 
 #[inline]
 fn try_lock_pt() -> Option<PtLockGuard> {
-    let Some(guard) = PT_LOCK.try_lock() else {
-        PT_LOCK_BUSY.fetch_add(1, Ordering::Relaxed);
+    let Some(guard) = PT_LOCK.0.try_lock() else {
+        pt_lock_counters_for(cpu_local::current_cpu_id())
+            .busy
+            .fetch_add(1, Ordering::Relaxed);
         return None;
     };
     Some(PtLockGuard::new(guard))
@@ -151,7 +236,7 @@ fn try_lock_pt() -> Option<PtLockGuard> {
 /// CPU that currently owns the global page-table lock, if any.
 #[inline]
 pub fn pt_lock_owner_cpu() -> Option<usize> {
-    match PT_LOCK_OWNER_CPU.load(Ordering::Acquire) {
+    match PT_LOCK_OWNER_CPU.0.load(Ordering::Acquire) {
         NO_PT_LOCK_OWNER => None,
         cpu => Some(cpu),
     }
@@ -2231,6 +2316,55 @@ mod pt_lock_stats_tests {
         assert!(after.busy > before.busy);
         assert!(after.wait_tsc > before.wait_tsc && after.wait_tsc_max > 0);
         assert!(after.hold_tsc > before.hold_tsc && after.hold_tsc_max > 0);
+    }
+
+    #[test]
+    fn per_cpu_counters_are_cache_line_isolated() {
+        assert_eq!(core::mem::size_of::<PtLockCpuCounters>(), 64);
+        assert_eq!(core::mem::align_of::<PtLockCpuCounters>(), 64);
+
+        let lock_line = (&PT_LOCK as *const _ as usize) / 64;
+        let owner_line = (&PT_LOCK_OWNER_CPU as *const _ as usize) / 64;
+        let c0_line = (&PT_LOCK_COUNTERS[0] as *const _ as usize) / 64;
+        let c1_line = (&PT_LOCK_COUNTERS[1] as *const _ as usize) / 64;
+        assert_ne!(lock_line, owner_line);
+        assert_ne!(lock_line, c0_line);
+        assert_ne!(owner_line, c0_line);
+        assert_eq!(c1_line, c0_line + 1);
+    }
+
+    #[test]
+    fn per_cpu_aggregation_sums_totals_and_takes_maxima() {
+        let per_cpu = [const { PtLockCpuCounters::new() }; 4];
+        per_cpu[0].acquired.store(10, Ordering::Relaxed);
+        per_cpu[0].contended.store(2, Ordering::Relaxed);
+        per_cpu[0].busy.store(1, Ordering::Relaxed);
+        per_cpu[0].wait_tsc.store(100, Ordering::Relaxed);
+        per_cpu[0].wait_tsc_max.store(75, Ordering::Relaxed);
+        per_cpu[0].hold_tsc.store(500, Ordering::Relaxed);
+        per_cpu[0].hold_tsc_max.store(120, Ordering::Relaxed);
+
+        per_cpu[2].acquired.store(25, Ordering::Relaxed);
+        per_cpu[2].contended.store(4, Ordering::Relaxed);
+        per_cpu[2].busy.store(3, Ordering::Relaxed);
+        per_cpu[2].wait_tsc.store(400, Ordering::Relaxed);
+        per_cpu[2].wait_tsc_max.store(250, Ordering::Relaxed);
+        per_cpu[2].hold_tsc.store(900, Ordering::Relaxed);
+        per_cpu[2].hold_tsc_max.store(80, Ordering::Relaxed);
+
+        let stats = aggregate_pt_lock_stats(&per_cpu);
+        assert_eq!(
+            stats,
+            PtLockStats {
+                acquired: 35,
+                contended: 6,
+                busy: 4,
+                wait_tsc: 500,
+                wait_tsc_max: 250,
+                hold_tsc: 1400,
+                hold_tsc_max: 120,
+            }
+        );
     }
 }
 
