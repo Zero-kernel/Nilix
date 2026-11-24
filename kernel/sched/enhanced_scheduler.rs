@@ -2285,7 +2285,8 @@ impl Scheduler {
         let local_cpu = current_cpu_id();
         let local = Self::current_ready_queue();
         let local_has_candidate = {
-            let Some(queue) = Self::lock_ready_queue_or_defer(local) else {
+            // DIAGNOSTIC v3: a thief holds this queue; skip this pass.
+            let Some(queue) = local.try_lock() else {
                 return false;
             };
             Self::probe_local_candidate_locked(&queue, local_cpu, current_pid)
