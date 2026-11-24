@@ -88,7 +88,8 @@ const SELECT_VISIT_BUDGET: usize = 16;
 /// window more, because a window ends early where the cursor's cycle began,
 /// but never more visits. A longer queue never gives a conclusive scan: it is
 /// examined on every pass.
-const STEAL_WINDOWS_PER_HOLD: usize = 3;
+// DIAGNOSTIC v2: one selector window per hold.
+const STEAL_WINDOWS_PER_HOLD: usize = 1;
 const STEAL_VISITS_PER_HOLD: usize = STEAL_WINDOWS_PER_HOLD * SELECT_VISIT_BUDGET;
 
 /// 调度器调试输出宏
@@ -4117,7 +4118,7 @@ pub fn run_steal_hint_self_test() {
     let reach = STEAL_VISITS_PER_HOLD;
     for (count, expect_conclusive) in [
         (0, true),
-        (SELECT_VISIT_BUDGET + 4, true),
+        (reach - 4, true),
         (reach, true),
         (reach + 1, false),
     ] {
