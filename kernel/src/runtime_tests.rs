@@ -2294,6 +2294,483 @@ impl RuntimeTest for TlbShootdownCoherencyTest {
     }
 }
 
+/// Issue #109 §1.2: SMP targeted TLB shootdown negative, positive, zero-IPI,
+/// and kernel-half fail-closed control test.
+///
+/// Proves four properties on real multi-CPU execution:
+/// - **Phase A (Negative Control):** remapping a shared user-half page without
+///   a shootdown leaves a detectable stale TLB entry (`V1`) on the remote AP
+///   (ruling out a vacuous pass where the environment does not cache TLBs).
+/// - **Phase B (Positive Control):** targeted `flush_current_as_page` sends
+///   exactly 1 IPI to the sharing AP (0 to unrelated APs on 3+ vCPU), triggers
+///   0 broadcast fallbacks, and makes the AP immediately observe `V2`.
+/// - **Phase C (Zero-IPI Control):** once the AP returns to `BOOT_CR3`, a
+///   shootdown on the isolated scratch CR3 sends 0 remote IPIs while still
+///   updating the local CPU's TLB.
+/// - **Phase D (Kernel-Half Guard):** passing a kernel high-half address to
+///   `flush_current_as_range` forces a full broadcast (`broadcast_fallbacks` +1,
+///   `shootdown_ipis >= online - 1`) even from an isolated CR3.
+struct TlbShootdownTargetedNegativeControlTest;
+
+mod tlb_targeted_probe_state {
+    use core::sync::atomic::AtomicU64;
+
+    pub const VA_PROBE: u64 = 0x0000_0080_0000_0000; // PML4[1], strictly < USER_HALF_END
+    pub const VAL_1: u64 = 0x1111_2222_3333_4444;
+    pub const VAL_2: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+
+    // 0 = idle, 1 = AP enter scratch CR3 & prime, 2 = AP primed,
+    // 3 = AP re-read (negative control), 4 = AP negative read done,
+    // 5 = AP re-read after targeted shootdown (positive control),
+    // 6 = AP exit normally, 99 = abort immediately.
+    pub static PHASE: AtomicU64 = AtomicU64::new(0);
+    pub static AP_EXITED: AtomicU64 = AtomicU64::new(0);
+    pub static SCRATCH_CR3_PHYS: AtomicU64 = AtomicU64::new(0);
+    pub static AP_READ_PRIME: AtomicU64 = AtomicU64::new(0);
+    pub static AP_READ_NEG: AtomicU64 = AtomicU64::new(0);
+    pub static AP_READ_POS: AtomicU64 = AtomicU64::new(0);
+}
+
+fn tlb_targeted_ap_worker() {
+    use core::sync::atomic::Ordering;
+    use mm::tlb_shootdown::track_cr3_switch;
+    use tlb_targeted_probe_state::*;
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PhysFrame, Size4KiB};
+    use x86_64::PhysAddr;
+
+    let scratch_phys = SCRATCH_CR3_PHYS.load(Ordering::Acquire);
+    if scratch_phys == 0 {
+        AP_EXITED.store(1, Ordering::Release);
+        return;
+    }
+
+    let (saved_frame, saved_raw) = Cr3::read_raw();
+    let scratch_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(scratch_phys));
+
+    // Switch AP into the shared scratch CR3 with IF=0, then run with IF=1 so
+    // it can immediately service the targeted 0xFE shootdown IPI in Phase B.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        track_cr3_switch(scratch_phys);
+        unsafe {
+            Cr3::write_raw(scratch_frame, saved_raw & 0x0FFF);
+        }
+    });
+
+    // Prime TLB with initial mapping (VA_PROBE -> F1).
+    let prime_val = unsafe { core::ptr::read_volatile(VA_PROBE as *const u64) };
+    AP_READ_PRIME.store(prime_val, Ordering::Release);
+    PHASE.store(2, Ordering::Release);
+
+    // Wait for Phase 3 (negative control read without shootdown) or abort (99).
+    while PHASE.load(Ordering::Acquire) < 3 {
+        spin_loop();
+    }
+    if PHASE.load(Ordering::Acquire) == 3 {
+        let neg_val = unsafe { core::ptr::read_volatile(VA_PROBE as *const u64) };
+        AP_READ_NEG.store(neg_val, Ordering::Release);
+        PHASE.store(4, Ordering::Release);
+    }
+
+    // Wait for Phase 5 (positive control read after targeted shootdown IPI) or abort (99).
+    while PHASE.load(Ordering::Acquire) < 5 {
+        spin_loop();
+    }
+    if PHASE.load(Ordering::Acquire) == 5 {
+        let pos_val = unsafe { core::ptr::read_volatile(VA_PROBE as *const u64) };
+        AP_READ_POS.store(pos_val, Ordering::Release);
+    }
+
+    // Restore BOOT_CR3 before signaling completion so scratch page tables are
+    // never freed while this AP still holds them in CR3.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        track_cr3_switch(saved_frame.start_address().as_u64());
+        unsafe {
+            Cr3::write_raw(saved_frame, saved_raw & 0x0FFF);
+        }
+    });
+    AP_EXITED.store(1, Ordering::Release);
+}
+
+/// Category: Smp
+/// Priority: P0
+/// Status: Implemented
+impl RuntimeTest for TlbShootdownTargetedNegativeControlTest {
+    fn name(&self) -> &'static str {
+        "tlb_shootdown_targeted_negative_control"
+    }
+
+    // STRICT-Q D1: an SMP check, not applicable below two online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
+    fn description(&self) -> &'static str {
+        "Issue #109 §1.2: verify negative control, targeted 1-IPI, zero-IPI, and kernel-half broadcast"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::ipi::{send_ipi, IpiType};
+        use arch::{current_cpu_id, max_cpus, num_online_cpus, set_ap_test_probe, PER_CPU_DATA};
+        use mm::memory::FrameAllocator;
+        use mm::page_table::{phys_to_virt, PHYSICAL_MEMORY_OFFSET};
+        use mm::tlb_shootdown::{
+            flush_current_as_page, flush_current_as_range, get_stats, is_cpu_online,
+            track_cr3_switch,
+        };
+        use tlb_targeted_probe_state::*;
+        use x86_64::registers::control::Cr3;
+        use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
+        use x86_64::VirtAddr;
+
+        let online = num_online_cpus();
+        if online <= 1 {
+            return TestResult::Deferred(String::from(
+                "Single-core system; skipping targeted TLB negative-control test",
+            ));
+        }
+
+        let self_cpu = current_cpu_id();
+        let Some(target) = (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) else {
+            return TestResult::Fail(String::from("No online AP found"));
+        };
+        let bystander =
+            (0..max_cpus()).find(|&id| id != self_cpu && id != target && is_cpu_online(id));
+
+        let mut allocator = FrameAllocator::new();
+        let mut alloc_zeroed = |alloc: &mut FrameAllocator| -> Option<PhysFrame<Size4KiB>> {
+            let frame = alloc.allocate_frame()?;
+            let ptr = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+            unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
+            Some(frame)
+        };
+
+        let Some(f1) = alloc_zeroed(&mut allocator) else {
+            return TestResult::Fail(String::from("Failed to allocate F1 frame"));
+        };
+        let Some(f2) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(f1);
+            return TestResult::Fail(String::from("Failed to allocate F2 frame"));
+        };
+        let Some(pml4_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(f2);
+            allocator.deallocate_frame(f1);
+            return TestResult::Fail(String::from("Failed to allocate scratch PML4"));
+        };
+        let Some(pdpt_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(f2);
+            allocator.deallocate_frame(f1);
+            return TestResult::Fail(String::from("Failed to allocate scratch PDPT"));
+        };
+        let Some(pd_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(pdpt_frame);
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(f2);
+            allocator.deallocate_frame(f1);
+            return TestResult::Fail(String::from("Failed to allocate scratch PD"));
+        };
+        let Some(pt_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(pd_frame);
+            allocator.deallocate_frame(pdpt_frame);
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(f2);
+            allocator.deallocate_frame(f1);
+            return TestResult::Fail(String::from("Failed to allocate scratch PT"));
+        };
+
+        // Write distinct sentinel values into F1 and F2 via the direct map.
+        unsafe {
+            core::ptr::write_volatile(phys_to_virt(f1.start_address()).as_mut_ptr::<u64>(), VAL_1);
+            core::ptr::write_volatile(phys_to_virt(f2.start_address()).as_mut_ptr::<u64>(), VAL_2);
+        }
+
+        let (boot_frame, boot_raw) = Cr3::read_raw();
+        let boot_cr3_phys = boot_frame.start_address().as_u64();
+        let scratch_phys = pml4_frame.start_address().as_u64();
+
+        // Populate scratch PML4 with kernel high-half (256..512) + low entry 0
+        // from BOOT_CR3, plus a supervisor-only non-global mapping at PML4[1]
+        // (VA_PROBE = 0x0000_0080_0000_0000 < USER_HALF_END).
+        let parent_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let leaf_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+        unsafe {
+            let boot_pml4 = &*phys_to_virt(boot_frame.start_address()).as_ptr::<PageTable>();
+            let scratch_pml4 =
+                &mut *phys_to_virt(pml4_frame.start_address()).as_mut_ptr::<PageTable>();
+            scratch_pml4[0] = boot_pml4[0].clone();
+            for i in 256..512 {
+                scratch_pml4[i] = boot_pml4[i].clone();
+            }
+            scratch_pml4[1].set_addr(pdpt_frame.start_address(), parent_flags);
+
+            let pdpt = &mut *phys_to_virt(pdpt_frame.start_address()).as_mut_ptr::<PageTable>();
+            pdpt[0].set_addr(pd_frame.start_address(), parent_flags);
+
+            let pd = &mut *phys_to_virt(pd_frame.start_address()).as_mut_ptr::<PageTable>();
+            pd[0].set_addr(pt_frame.start_address(), parent_flags);
+
+            let pt = &mut *phys_to_virt(pt_frame.start_address()).as_mut_ptr::<PageTable>();
+            pt[0].set_addr(f1.start_address(), leaf_flags);
+        }
+
+        let wait_phase = |want: u64| -> bool {
+            for _ in 0..100_000_000usize {
+                if PHASE.load(Ordering::Acquire) == want {
+                    return true;
+                }
+                spin_loop();
+            }
+            false
+        };
+        let wait_ap_exited = || -> bool {
+            for _ in 0..100_000_000usize {
+                if AP_EXITED.load(Ordering::Acquire) != 0 {
+                    return true;
+                }
+                spin_loop();
+            }
+            false
+        };
+
+        // Switch BSP into scratch CR3 while keeping cleanup guaranteed.
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            track_cr3_switch(scratch_phys);
+            unsafe {
+                Cr3::write_raw(pml4_frame, boot_raw & 0x0FFF);
+            }
+        });
+
+        let mut ap_may_hold_scratch = false;
+        let outcome: Result<(), String> = (|| {
+            // Up to 3 attempts for Phase A+B to guard against a rare stray host
+            // perturbation flushing the soft-TLB before the negative-control read.
+            let mut neg_observed = false;
+            for _attempt in 0..3 {
+                // Reset VA_PROBE -> F1 and flush local TLB before waking AP.
+                unsafe {
+                    let pt = &mut *phys_to_virt(pt_frame.start_address()).as_mut_ptr::<PageTable>();
+                    pt[0].set_addr(f1.start_address(), leaf_flags);
+                }
+                flush_current_as_page(VirtAddr::new(VA_PROBE));
+
+                AP_READ_PRIME.store(0, Ordering::Relaxed);
+                AP_READ_NEG.store(0, Ordering::Relaxed);
+                AP_READ_POS.store(0, Ordering::Relaxed);
+                AP_EXITED.store(0, Ordering::Release);
+                SCRATCH_CR3_PHYS.store(scratch_phys, Ordering::Release);
+                PHASE.store(1, Ordering::Release);
+
+                ap_may_hold_scratch = true;
+                let _ = set_ap_test_probe(target, Some(tlb_targeted_ap_worker));
+                send_ipi(target, IpiType::Reschedule);
+
+                if !wait_phase(2) {
+                    let cancelled = set_ap_test_probe(target, None);
+                    PHASE.store(99, Ordering::Release);
+                    if cancelled || wait_ap_exited() {
+                        ap_may_hold_scratch = false;
+                    }
+                    return Err(alloc::format!(
+                        "AP {} timed out entering scratch CR3 (phase={})",
+                        target,
+                        PHASE.load(Ordering::Acquire)
+                    ));
+                }
+
+                let prime = AP_READ_PRIME.load(Ordering::Acquire);
+                if prime != VAL_1 {
+                    PHASE.store(99, Ordering::Release);
+                    if wait_ap_exited() {
+                        ap_may_hold_scratch = false;
+                    }
+                    return Err(alloc::format!(
+                        "AP {} initial prime read mismatch: got {:#x}, expected {:#x}",
+                        target,
+                        prime,
+                        VAL_1
+                    ));
+                }
+
+                // Phase A (Negative Control): remap VA_PROBE -> F2 WITHOUT shootdown.
+                unsafe {
+                    let pt = &mut *phys_to_virt(pt_frame.start_address()).as_mut_ptr::<PageTable>();
+                    pt[0].set_addr(f2.start_address(), leaf_flags);
+                }
+                core::sync::atomic::fence(Ordering::SeqCst);
+                PHASE.store(3, Ordering::Release);
+
+                if !wait_phase(4) {
+                    PHASE.store(99, Ordering::Release);
+                    if wait_ap_exited() {
+                        ap_may_hold_scratch = false;
+                    }
+                    return Err(alloc::format!(
+                        "AP {} timed out on negative-control read",
+                        target
+                    ));
+                }
+
+                let neg = AP_READ_NEG.load(Ordering::Acquire);
+                if neg != VAL_1 {
+                    // Environment did not retain stale TLB entry on this attempt;
+                    // cleanly exit AP and retry.
+                    PHASE.store(99, Ordering::Release);
+                    if !wait_ap_exited() {
+                        return Err(alloc::format!(
+                            "AP {} timed out exiting scratch CR3 during retry",
+                            target
+                        ));
+                    }
+                    ap_may_hold_scratch = false;
+                    continue;
+                }
+                neg_observed = true;
+
+                // Phase B (Positive Control): issue targeted single-page shootdown.
+                let bystander_ack_before = bystander
+                    .and_then(|cpu| PER_CPU_DATA.get_cpu(cpu))
+                    .map(|pcpu| pcpu.tlb_mailbox.ack_gen.load(Ordering::Acquire));
+                let stats_before = get_stats();
+                flush_current_as_page(VirtAddr::new(VA_PROBE));
+                let stats_after = get_stats();
+                let bystander_ack_after = bystander
+                    .and_then(|cpu| PER_CPU_DATA.get_cpu(cpu))
+                    .map(|pcpu| pcpu.tlb_mailbox.ack_gen.load(Ordering::Acquire));
+
+                // Let AP perform post-shootdown read and return to BOOT_CR3.
+                PHASE.store(5, Ordering::Release);
+                if !wait_ap_exited() {
+                    return Err(alloc::format!(
+                        "AP {} timed out on positive-control read / CR3 restore",
+                        target
+                    ));
+                }
+                ap_may_hold_scratch = false;
+
+                let pos = AP_READ_POS.load(Ordering::Acquire);
+                if pos != VAL_2 {
+                    return Err(alloc::format!(
+                        "Positive control failed: AP {} still read stale {:#x} after targeted shootdown (expected {:#x})",
+                        target,
+                        pos,
+                        VAL_2
+                    ));
+                }
+
+                let targeted_delta =
+                    stats_after.targeted_shootdowns - stats_before.targeted_shootdowns;
+                let broadcast_delta =
+                    stats_after.broadcast_fallbacks - stats_before.broadcast_fallbacks;
+                let ipi_delta = stats_after.shootdown_ipis - stats_before.shootdown_ipis;
+                if targeted_delta != 1 || broadcast_delta != 0 || ipi_delta != 1 {
+                    return Err(alloc::format!(
+                        "Phase B stats mismatch: targeted_delta={} (exp 1), broadcast_delta={} (exp 0), ipi_delta={} (exp 1)",
+                        targeted_delta,
+                        broadcast_delta,
+                        ipi_delta
+                    ));
+                }
+                if let (Some(b_cpu), Some(before), Some(after)) =
+                    (bystander, bystander_ack_before, bystander_ack_after)
+                {
+                    if after != before {
+                        return Err(alloc::format!(
+                            "Bystander AP {} on BOOT_CR3 received unexpected shootdown ACK ({} -> {})",
+                            b_cpu,
+                            before,
+                            after
+                        ));
+                    }
+                }
+                break;
+            }
+
+            if !neg_observed {
+                return Err(String::from(
+                    "Negative control failed across 3 attempts: remote AP never observed stale TLB entry V1 without shootdown",
+                ));
+            }
+
+            // Phase C (Zero-IPI Control): AP is back on BOOT_CR3; BSP is sole CPU
+            // on scratch CR3. Remap VA_PROBE -> F1 and flush.
+            unsafe {
+                let pt = &mut *phys_to_virt(pt_frame.start_address()).as_mut_ptr::<PageTable>();
+                pt[0].set_addr(f1.start_address(), leaf_flags);
+            }
+            let stats_before = get_stats();
+            flush_current_as_page(VirtAddr::new(VA_PROBE));
+            let stats_after = get_stats();
+
+            let zero_delta = stats_after.targeted_zero_ipi - stats_before.targeted_zero_ipi;
+            let broadcast_delta =
+                stats_after.broadcast_fallbacks - stats_before.broadcast_fallbacks;
+            let ipi_delta = stats_after.shootdown_ipis - stats_before.shootdown_ipis;
+            if zero_delta != 1 || broadcast_delta != 0 || ipi_delta != 0 {
+                return Err(alloc::format!(
+                    "Phase C zero-IPI mismatch: zero_delta={} (exp 1), broadcast_delta={} (exp 0), ipi_delta={} (exp 0)",
+                    zero_delta,
+                    broadcast_delta,
+                    ipi_delta
+                ));
+            }
+            let local_val = unsafe { core::ptr::read_volatile(VA_PROBE as *const u64) };
+            if local_val != VAL_1 {
+                return Err(alloc::format!(
+                    "Phase C local TLB flush failed: read {:#x}, expected {:#x}",
+                    local_val,
+                    VAL_1
+                ));
+            }
+
+            // Phase D (Kernel-Half Fail-Closed Control): high-half VA must always
+            // force a broadcast even while BSP is alone on scratch CR3.
+            let stats_before = get_stats();
+            flush_current_as_range(VirtAddr::new(PHYSICAL_MEMORY_OFFSET), 4096);
+            let stats_after = get_stats();
+
+            let broadcast_delta =
+                stats_after.broadcast_fallbacks - stats_before.broadcast_fallbacks;
+            let ipi_delta = stats_after.shootdown_ipis - stats_before.shootdown_ipis;
+            if broadcast_delta < 1 || ipi_delta < (online - 1) as u64 {
+                return Err(alloc::format!(
+                    "Phase D kernel-half guard failed: broadcast_delta={} (exp >=1), ipi_delta={} (exp >={})",
+                    broadcast_delta,
+                    ipi_delta,
+                    online - 1
+                ));
+            }
+
+            Ok(())
+        })();
+
+        // Always restore BSP CR3; free scratch page tables only when the AP is
+        // confirmed off `PML4_TEST` (never risk UAF on an AP timeout path).
+        let _ = set_ap_test_probe(target, None);
+        SCRATCH_CR3_PHYS.store(0, Ordering::Release);
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            track_cr3_switch(boot_cr3_phys);
+            unsafe {
+                Cr3::write_raw(boot_frame, boot_raw & 0x0FFF);
+            }
+        });
+        if !ap_may_hold_scratch {
+            allocator.deallocate_frame(pt_frame);
+            allocator.deallocate_frame(pd_frame);
+            allocator.deallocate_frame(pdpt_frame);
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(f2);
+            allocator.deallocate_frame(f1);
+        }
+
+        match outcome {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(msg),
+        }
+    }
+}
+
 /// C3 repair (#90): a reclaimed kernel stack keeps its frames and its PID
 /// slot until the batched TLB flush, and that flush gives both back.
 ///
@@ -2988,6 +3465,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &IpiPingPongTest,
         &SchedstatEventCountersTest,
         &TlbShootdownCoherencyTest,
+        &TlbShootdownTargetedNegativeControlTest,
         &KstackFlushBatchTest,
         &StealHintPinnedWakeTest,
         &CpuIdentityLookupTest,

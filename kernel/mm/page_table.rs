@@ -2174,7 +2174,14 @@ pub unsafe fn ensure_pte_level(
         // We flush the entire 2MB region because TLB entries for huge pages
         // cover the whole range, not individual 4KB pages.
         let huge_base = page.start_address().as_u64() & !0x1f_ffffu64; // Align to 2MB
-        crate::tlb_shootdown::flush_current_as_range(VirtAddr::new(huge_base), 0x20_0000);
+
+        // Issue #109 §1.2 (H3): kernel high-half huge pages are shared across
+        // every CR3 root and must broadcast to all online CPUs.
+        if huge_base >= USER_HALF_END {
+            crate::tlb_shootdown::flush_all_address_spaces();
+        } else {
+            crate::tlb_shootdown::flush_current_as_range(VirtAddr::new(huge_base), 0x20_0000);
+        }
     } else if pde.is_unused() {
         // Allocate new PT
         let pt_frame = frame_allocator
@@ -2953,7 +2960,9 @@ unsafe fn map_mmio_with_fault(
         frame_allocator.deallocate_frame(frame);
     }
     drop(_pt_guard);
-    crate::tlb_shootdown::flush_current_as_range(virt, mapped_len);
+    // Issue #109 §1.2 (H3): MMIO lives in the shared kernel high-half; match
+    // `unmap_mmio` by broadcasting across all address spaces.
+    crate::tlb_shootdown::flush_all_address_spaces();
     result
 }
 

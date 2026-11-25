@@ -868,6 +868,10 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
 
     klog_always!("[5/8] Initializing kernel core...");
     kernel_core::init(); // 初始化进程管理和 BOOT_CR3 缓存（必须在调度器前）
+
+    // Issue #109 §1.2 (H2): publish the BSP's active BOOT_CR3 before bringing
+    // APs online so targeted shootdowns never see CPU 0 as untracked (0).
+    mm::tlb_shootdown::track_current_cr3();
     klog_always!("      ✓ Process management ready");
     klog_always!("      ✓ System calls framework ready");
     klog_always!("      ✓ Fork/COW implementation compiled");

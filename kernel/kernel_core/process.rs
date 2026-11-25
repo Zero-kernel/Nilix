@@ -10221,39 +10221,40 @@ pub fn activate_memory_space(memory_space: usize, user_memory_space: Option<usiz
         );
     }
 
-    // 只有当目标页表与当前不同时才切换（避免不必要的 TLB 刷新）
-    if need_cr3_switch {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            mm::tlb_shootdown::track_cr3_switch(target_cr3_phys);
-            unsafe { Cr3::write(target_frame, target_flags) };
-        });
-    }
-
-    // H.3 KPTI: Keep per-CPU KPTI context in sync with the active address space.
-    //
-    // R118-6 FIX: Callers now pass user_memory_space directly, eliminating
-    // the O(n) PROCESS_TABLE scan under Mutex inside without_interrupts.
-    // This removes the NMI deadlock risk and improves context switch latency.
-    if should_update_kpti {
+    // Issue #109 §1.2 (H2): publish and serialize whenever CR3 changes OR this
+    // CPU's tracked slot has not yet been initialized to `target_cr3_phys`.
+    // Keep the CR3 switch and KPTI per-CPU metadata update inside one
+    // interrupt-disabled section so no Ring-0 IRQ/fault can observe a torn pair.
+    let need_track_publish = mm::tlb_shootdown::current_cpu_cr3() != target_cr3_phys;
+    if need_cr3_switch || need_track_publish || should_update_kpti {
         let user_cr3 = user_memory_space.unwrap_or(0);
 
         x86_64::instructions::interrupts::without_interrupts(|| {
-            let kpti_ctx = if user_cr3 != 0 {
-                security::KptiContext::dual(user_cr3 as u64, target_cr3_phys, 0)
-            } else {
-                security::KptiContext::single(target_cr3_phys)
-            };
+            let need_switch_or_track = Cr3::read().0 != target_frame
+                || mm::tlb_shootdown::current_cpu_cr3() != target_cr3_phys;
+            if need_switch_or_track {
+                mm::tlb_shootdown::track_cr3_switch(target_cr3_phys);
+                unsafe { Cr3::write(target_frame, target_flags) };
+            }
 
-            security::install_kpti_context(kpti_ctx);
+            if should_update_kpti {
+                let kpti_ctx = if user_cr3 != 0 {
+                    security::KptiContext::dual(user_cr3 as u64, target_cr3_phys, 0)
+                } else {
+                    security::KptiContext::single(target_cr3_phys)
+                };
 
-            // H.3 KPTI: Also update the per-CPU GS-addressable CR3 pair used
-            // by the syscall entry/exit assembly trampoline.
-            let user_cr3_val = if user_cr3 != 0 {
-                user_cr3 as u64
-            } else {
-                target_cr3_phys
-            };
-            notify_kpti_cr3_update(user_cr3_val, target_cr3_phys);
+                security::install_kpti_context(kpti_ctx);
+
+                // H.3 KPTI: Also update the per-CPU GS-addressable CR3 pair used
+                // by the syscall entry/exit assembly trampoline.
+                let user_cr3_val = if user_cr3 != 0 {
+                    user_cr3 as u64
+                } else {
+                    target_cr3_phys
+                };
+                notify_kpti_cr3_update(user_cr3_val, target_cr3_phys);
+            }
         });
     }
 }
