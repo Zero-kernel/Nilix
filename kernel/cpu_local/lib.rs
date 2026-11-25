@@ -627,7 +627,10 @@ impl Clone for TlbShootdownEntry {
 /// - Handler: loads entry.generation with Acquire, reads fields Relaxed, acks via ack_gen Release,
 ///   then clears entry.generation with Release and advances head
 /// - Waiter: loads ack_gen with Acquire to ensure flush completion is visible
-#[repr(C)]
+/// Issue #109 §5: 64-byte aligned so cross-CPU TLB shootdown mailbox writes
+/// (`request_gen`/`tail`/`entries`) never false-share a cache line with the
+/// owning CPU's local `rcu_epoch` or `kpti_*` fields in `PerCpuData`.
+#[repr(C, align(64))]
 pub struct TlbShootdownMailbox {
     /// Monotonic generation number for the most recent request (for compat/fast path)
     pub request_gen: AtomicU64,
@@ -675,7 +678,7 @@ impl Default for TlbShootdownMailbox {
 /// Fields are ordered to minimize padding and optimize cache line usage.
 /// The structure is designed to fit within a single cache line (64 bytes)
 /// for the core fields.
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct PerCpuData {
     /// Logical CPU index in the OS scheduler (0-based)
     pub cpu_id: AtomicUsize,
@@ -926,6 +929,14 @@ impl PerCpuData {
     }
 }
 
+/// Issue #109 §5: 64-byte cache-line wrapper for per-CPU slots.
+///
+/// Prevents adjacent CPUs' `CpuLocal<T>` elements (such as `CURRENT_PID`,
+/// `SMAP_GUARD_DEPTH`, `IRQ_RESCHED_PENDING`, `USER_COPY_STATE`, and
+/// `PER_CPU_DATA`) from sharing a cache line and causing MESI ping-pong.
+#[repr(align(64))]
+struct CacheAligned<T>(T);
+
 /// Per-CPU storage wrapper
 ///
 /// Stores one instance of T per CPU, lazily initialized on first access.
@@ -940,8 +951,8 @@ impl PerCpuData {
 pub struct CpuLocal<T> {
     /// Initialization function for each CPU's slot
     init: fn() -> T,
-    /// Per-CPU slots, heap-allocated and initialized lazily via Once
-    slots: Once<Box<[T]>>,
+    /// Per-CPU slots, cache-line isolated, heap-allocated and initialized lazily via Once
+    slots: Once<Box<[CacheAligned<T>]>>,
 }
 
 impl<T> CpuLocal<T> {
@@ -959,14 +970,14 @@ impl<T> CpuLocal<T> {
     ///
     /// R91-2 FIX: Allocates on the heap instead of the stack to prevent
     /// stack overflow for large per-CPU types (e.g., SampleRing ~41KB * 64 CPUs).
-    fn get_slots(&self) -> &[T] {
+    fn get_slots(&self) -> &[CacheAligned<T>] {
         self.slots.call_once(|| {
             // KSA-017: Vec owns every initialized T, including during a panic.
             // Once publishes only the completed slice. Automatic Send/Sync bounds
             // and owner-scoped borrows enforce ordinary shared-reference rules.
             let mut slots = Vec::with_capacity(MAX_CPUS);
             for _ in 0..MAX_CPUS {
-                slots.push((self.init)());
+                slots.push(CacheAligned((self.init)()));
             }
             slots.into_boxed_slice()
         })
@@ -1045,7 +1056,7 @@ impl<T> CpuLocal<T> {
             return None;
         }
 
-        self.get_slots().get(cpu_id)
+        self.get_slots().get(cpu_id).map(|slot| &slot.0)
     }
 }
 
@@ -2058,6 +2069,42 @@ mod host_harness_tests {
         assert_eq!(
             super::online_mask_after_publish(mask, super::MAX_CPUS),
             None
+        );
+    }
+
+    #[test]
+    fn cpu_local_slots_are_cache_line_isolated() {
+        let local = super::CpuLocal::new(|| core::sync::atomic::AtomicUsize::new(0));
+        let p0 = local.get_cpu(0).unwrap() as *const _ as usize;
+        let p1 = local.get_cpu(1).unwrap() as *const _ as usize;
+        assert_eq!(p0 % 64, 0, "CPU 0 slot must be 64-byte aligned");
+        assert_eq!(p1 % 64, 0, "CPU 1 slot must be 64-byte aligned");
+        assert!(
+            p1.abs_diff(p0) >= 64,
+            "adjacent CPU slots must not share a 64-byte cache line (delta={})",
+            p1.abs_diff(p0)
+        );
+    }
+
+    #[test]
+    fn per_cpu_data_and_tlb_mailbox_are_cache_line_isolated() {
+        assert!(core::mem::align_of::<super::PerCpuData>() >= 64);
+        assert!(core::mem::align_of::<super::TlbShootdownMailbox>() >= 64);
+        let mailbox_off = core::mem::offset_of!(super::PerCpuData, tlb_mailbox);
+        let kpti_off = core::mem::offset_of!(super::PerCpuData, kpti_seq);
+        assert_eq!(
+            mailbox_off % 64,
+            0,
+            "tlb_mailbox must start on a 64-byte boundary"
+        );
+        assert_eq!(
+            kpti_off % 64,
+            0,
+            "kpti_seq must start on a fresh 64-byte cache line after tlb_mailbox"
+        );
+        assert!(
+            kpti_off >= mailbox_off + core::mem::size_of::<super::TlbShootdownMailbox>(),
+            "kpti_seq must not overlap tlb_mailbox"
         );
     }
 }

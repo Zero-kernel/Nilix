@@ -923,7 +923,8 @@ fn audit_reason_from_error(err: &LsmError) -> AuditLsmReason {
 ///
 /// This is called internally by hook dispatchers when a policy denies an operation.
 #[cfg(feature = "lsm")]
-#[inline]
+#[cold]
+#[inline(never)]
 fn emit_denial_audit(
     subject: AuditSubject,
     object: AuditObject,
