@@ -223,17 +223,29 @@ static CPU_ID_REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(not(feature = "host_harness"))]
 const IA32_TSC_AUX: u32 = 0xC000_0103;
 
+/// Issue #109 §2.1: Fixed byte offset inside the Ring-0 `IA32_GS_BASE` per-CPU
+/// record (`arch::syscall::SyscallPerCpu`) where each CPU stores its encoded
+/// logical CPU ID (`cpu_id + 1`, so `0` is always invalid/fail-closed).
+pub const GS_CPU_ID_OFFSET: usize = 80;
+
+/// Issue #109 §2.1: Fixed byte offset inside the Ring-0 `IA32_GS_BASE` per-CPU
+/// record where each CPU stores a direct pointer to its `&'static PerCpuData`
+/// slot (`PER_CPU_DATA[cpu_id]`), enabling single-instruction `current_cpu()`.
+pub const GS_PER_CPU_DATA_PTR_OFFSET: usize = 88;
+
 /// How [`current_cpu_id`] finds the current CPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IdentityMethod {
     /// Read the LAPIC ID register and map it. The only method until
-    /// [`select_identity_method`], and the fallback of the other two.
+    /// [`select_identity_method`], and the fallback of the other methods.
     Lapic = 0,
     /// RDTSCP, which also reads the time-stamp counter.
     Rdtscp = 1,
     /// RDPID.
     Rdpid = 2,
+    /// Issue #109 §2.1: Ring-0 `IA32_GS_BASE` direct per-CPU read (`mov gs:[80]`).
+    GsBase = 3,
 }
 
 impl IdentityMethod {
@@ -243,6 +255,7 @@ impl IdentityMethod {
             IdentityMethod::Lapic => "lapic",
             IdentityMethod::Rdtscp => "rdtscp",
             IdentityMethod::Rdpid => "rdpid",
+            IdentityMethod::GsBase => "gsbase",
         }
     }
 
@@ -250,6 +263,7 @@ impl IdentityMethod {
         match value {
             1 => IdentityMethod::Rdtscp,
             2 => IdentityMethod::Rdpid,
+            3 => IdentityMethod::GsBase,
             _ => IdentityMethod::Lapic,
         }
     }
@@ -272,6 +286,11 @@ static IDENTITY_COMMON: AtomicU8 = AtomicU8::new(REPORTS_RDTSCP | REPORTS_RDPID)
 
 /// One bit per CPU that wrote and verified its IA32_TSC_AUX.
 static IDENTITY_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+
+/// Issue #109 §2.1: One bit per CPU that populated and verified its Ring-0
+/// `IA32_GS_BASE` per-CPU `encoded_cpu_id` (`gs:[80]`) and `per_cpu_data_ptr`
+/// (`gs:[88]`) against hardware LAPIC identity.
+static GS_IDENTITY_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 
 /// Tick cross-checks made by one CPU, on a cache line of its own.
 #[repr(align(64))]
@@ -314,16 +333,35 @@ const fn identity_method_for(common: u8, published: u64, online: u64) -> Identit
     }
 }
 
+/// Issue #109 §2.1: Prefer Ring-0 `GsBase` once every online CPU has published
+/// and LAPIC-verified its `gs:[GS_CPU_ID_OFFSET]` and `gs:[GS_PER_CPU_DATA_PTR_OFFSET]`;
+/// otherwise fall back cleanly to `RDPID` -> `RDTSCP` -> `LAPIC`.
+const fn identity_method_with_gs(
+    gs_published: u64,
+    common: u8,
+    published: u64,
+    online: u64,
+) -> IdentityMethod {
+    if online != 0 && gs_published & online == online {
+        IdentityMethod::GsBase
+    } else {
+        identity_method_for(common, published, online)
+    }
+}
+
 /// The method [`current_cpu_id`] uses now.
 #[inline]
 pub fn identity_method() -> IdentityMethod {
     IdentityMethod::from_u8(IDENTITY_METHOD.load(Ordering::Acquire))
 }
 
-/// The CPUs that published their id in IA32_TSC_AUX (bit N = CPU N).
+/// The CPUs that published their active fast-path identity (bit N = CPU N).
 #[inline]
 pub fn identity_published_mask() -> u64 {
-    IDENTITY_PUBLISHED.load(Ordering::Acquire)
+    match identity_method() {
+        IdentityMethod::GsBase => GS_IDENTITY_PUBLISHED.load(Ordering::Acquire),
+        _ => IDENTITY_PUBLISHED.load(Ordering::Acquire),
+    }
 }
 
 /// Tick cross-checks made by `cpu_id`.
@@ -477,6 +515,98 @@ pub fn publish_identity(cpu_id: usize) {
     IDENTITY_PUBLISHED.fetch_or(1u64 << cpu_id, Ordering::AcqRel);
 }
 
+/// Issue #109 §2.1: Read this CPU's encoded logical ID (`cpu_id + 1`) directly
+/// from Ring-0 `IA32_GS_BASE` (`gs:[GS_CPU_ID_OFFSET]`).
+///
+/// Not `pure`: the executing CPU can change if preemption occurs across calls.
+#[cfg(not(feature = "host_harness"))]
+#[inline(always)]
+fn read_gs_encoded_cpu_id() -> u64 {
+    let value: u64;
+    // SAFETY: invoked only after `publish_gs_identity` verified this CPU's
+    // `IA32_GS_BASE` points to `SYSCALL_PERCPU[cpu_id]` and every Ring-3->Ring-0
+    // entry (SYSCALL, all normal IDT stubs, and all paranoid IST stubs) enforces
+    // kernel `IA32_GS_BASE`.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, qword ptr gs:[{off}]",
+            out(reg) value,
+            off = const GS_CPU_ID_OFFSET,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    value
+}
+
+/// Issue #109 §2.1: Read this CPU's cached `&'static PerCpuData` pointer directly
+/// from Ring-0 `IA32_GS_BASE` (`gs:[GS_PER_CPU_DATA_PTR_OFFSET]`).
+#[cfg(not(feature = "host_harness"))]
+#[inline(always)]
+fn read_gs_per_cpu_data_ptr() -> *const PerCpuData {
+    let ptr: u64;
+    // SAFETY: same GS-base invariant as `read_gs_encoded_cpu_id`; pointer was
+    // written from `PER_CPU_DATA.get_cpu(cpu_id)` (immortal heap slice) and
+    // verified non-null during `publish_gs_identity`.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, qword ptr gs:[{off}]",
+            out(reg) ptr,
+            off = const GS_PER_CPU_DATA_PTR_OFFSET,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    ptr as *const PerCpuData
+}
+
+/// Issue #109 §2.1: Verify this CPU's Ring-0 GS-base per-CPU identity fields
+/// (`gs:[GS_CPU_ID_OFFSET]` and `gs:[GS_PER_CPU_DATA_PTR_OFFSET]`) against the
+/// authoritative LAPIC registration and publish this CPU as GS-ready.
+///
+/// Must be called on the target CPU after `register_cpu_id`, `PER_CPU_DATA`
+/// initialization, and `arch::syscall::init_syscall_percpu(cpu_id)`.
+#[cfg(not(feature = "host_harness"))]
+pub fn publish_gs_identity(cpu_id: usize) {
+    assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
+    let expected_val = cpu_id as u64 + 1;
+    let gs_val = read_gs_encoded_cpu_id();
+    assert_eq!(
+        gs_val, expected_val,
+        "Issue #109 §2.1: CPU {} gs:[{}] read {:#x}, expected {:#x}",
+        cpu_id, GS_CPU_ID_OFFSET, gs_val, expected_val
+    );
+
+    let expected_ptr = PER_CPU_DATA
+        .get_cpu(cpu_id)
+        .expect("PerCpuData slot missing during GS identity publish")
+        as *const PerCpuData;
+    let gs_ptr = read_gs_per_cpu_data_ptr();
+    assert_eq!(
+        gs_ptr, expected_ptr,
+        "Issue #109 §2.1: CPU {} gs:[{}] ptr {:p} != PER_CPU_DATA[{cpu_id}] {:p}",
+        cpu_id, GS_PER_CPU_DATA_PTR_OFFSET, gs_ptr, expected_ptr
+    );
+
+    let by_value = identity_value_registered_cpu(gs_val);
+    let by_lapic = match lapic_cpu_lookup() {
+        CurrentCpuLookup::Registered(lapic_cpu) => Some(lapic_cpu),
+        CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+    };
+    assert!(
+        by_value.is_some() && by_value == by_lapic,
+        "Issue #109 §2.1: CPU {} GS identity names {:?}, LAPIC names {:?}",
+        cpu_id,
+        by_value,
+        by_lapic
+    );
+
+    GS_IDENTITY_PUBLISHED.fetch_or(1u64 << cpu_id, Ordering::AcqRel);
+}
+
+#[cfg(feature = "host_harness")]
+pub fn publish_gs_identity(cpu_id: usize) {
+    assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
+}
+
 /// Hosted tests have no IA32_TSC_AUX: nothing is published, so the method
 /// stays `Lapic`.
 #[cfg(feature = "host_harness")]
@@ -491,7 +621,8 @@ pub fn publish_identity(cpu_id: usize) {
 /// bring-up halts and never looks itself up. Hosted builds publish nothing,
 /// so there it stays `Lapic`.
 pub fn select_identity_method() -> IdentityMethod {
-    let method = identity_method_for(
+    let method = identity_method_with_gs(
+        GS_IDENTITY_PUBLISHED.load(Ordering::Acquire),
         IDENTITY_COMMON.load(Ordering::Acquire),
         IDENTITY_PUBLISHED.load(Ordering::Acquire),
         online_cpu_mask(),
@@ -1152,16 +1283,26 @@ fn current_cpu_lookup() -> CurrentCpuLookup {
         return CurrentCpuLookup::X2ApicActive;
     }
 
-    // C3 repair 2 (#90): IA32_TSC_AUX, once every CPU has published it. A
-    // value that names no registered CPU falls through to the LAPIC read, so
-    // such a CPU is treated exactly as before.
-    let value = match identity_method() {
-        IdentityMethod::Lapic => None,
-        IdentityMethod::Rdtscp => Some(read_tsc_aux_rdtscp()),
-        IdentityMethod::Rdpid => Some(read_tsc_aux_rdpid()),
-    };
-    if let Some(cpu_id) = value.and_then(identity_value_registered_cpu) {
-        return CurrentCpuLookup::Registered(cpu_id);
+    // Issue #109 §2.1: single-instruction Ring-0 GS-base fast path once every
+    // online CPU has published and LAPIC-verified its GS per-CPU record.
+    // Falls through to LAPIC on an invalid/zero encoding (fail-closed).
+    match identity_method() {
+        IdentityMethod::GsBase => {
+            if let Some(cpu_id) = identity_value_cpu(read_gs_encoded_cpu_id()) {
+                return CurrentCpuLookup::Registered(cpu_id);
+            }
+        }
+        IdentityMethod::Rdpid => {
+            if let Some(cpu_id) = identity_value_registered_cpu(read_tsc_aux_rdpid()) {
+                return CurrentCpuLookup::Registered(cpu_id);
+            }
+        }
+        IdentityMethod::Rdtscp => {
+            if let Some(cpu_id) = identity_value_registered_cpu(read_tsc_aux_rdtscp()) {
+                return CurrentCpuLookup::Registered(cpu_id);
+            }
+        }
+        IdentityMethod::Lapic => {}
     }
 
     lapic_cpu_lookup()
@@ -1365,6 +1506,15 @@ pub static PER_CPU_DATA: CpuLocal<PerCpuData> = CpuLocal::new(PerCpuData::new);
 /// ```
 #[inline]
 pub fn current_cpu() -> &'static PerCpuData {
+    #[cfg(not(feature = "host_harness"))]
+    if identity_method() == IdentityMethod::GsBase {
+        let ptr = read_gs_per_cpu_data_ptr();
+        if !ptr.is_null() {
+            // SAFETY: `publish_gs_identity` verified `gs:[GS_PER_CPU_DATA_PTR_OFFSET]`
+            // equals `PER_CPU_DATA.get_cpu(cpu_id)` (immortal heap-allocated slot).
+            return unsafe { &*ptr };
+        }
+    }
     PER_CPU_DATA
         .get_cpu(current_cpu_id())
         .expect("current CPU slot out of range")
@@ -2106,5 +2256,66 @@ mod host_harness_tests {
             kpti_off >= mailbox_off + core::mem::size_of::<super::TlbShootdownMailbox>(),
             "kpti_seq must not overlap tlb_mailbox"
         );
+    }
+
+    #[test]
+    fn issue109_2_1_gs_base_identity_precedence_and_gate() {
+        use super::{
+            identity_method_with_gs, IdentityMethod, GS_CPU_ID_OFFSET, GS_PER_CPU_DATA_PTR_OFFSET,
+            REPORTS_RDPID, REPORTS_RDTSCP,
+        };
+        let both = REPORTS_RDPID | REPORTS_RDTSCP;
+        let online = 0b1011;
+        // GS-base takes precedence over RDPID/RDTSCP/LAPIC once every online CPU published.
+        assert_eq!(
+            identity_method_with_gs(online, both, online, online),
+            IdentityMethod::GsBase
+        );
+        assert_eq!(
+            identity_method_with_gs(online, 0, 0, online),
+            IdentityMethod::GsBase
+        );
+        // Extra published bit for a rejected offline CPU is harmless.
+        assert_eq!(
+            identity_method_with_gs(0b1111, both, online, online),
+            IdentityMethod::GsBase
+        );
+        // Missing even one online CPU falls back to RDPID/RDTSCP/LAPIC.
+        assert_eq!(
+            identity_method_with_gs(0b0011, both, online, online),
+            IdentityMethod::Rdpid
+        );
+        assert_eq!(
+            identity_method_with_gs(0, REPORTS_RDTSCP, online, online),
+            IdentityMethod::Rdtscp
+        );
+        assert_eq!(
+            identity_method_with_gs(online, both, online, 0),
+            IdentityMethod::Lapic
+        );
+        assert_eq!(
+            IdentityMethod::from_u8(IdentityMethod::GsBase as u8),
+            IdentityMethod::GsBase
+        );
+        assert_eq!(IdentityMethod::GsBase.name(), "gsbase");
+        assert_eq!(GS_CPU_ID_OFFSET, 80);
+        assert_eq!(GS_PER_CPU_DATA_PTR_OFFSET, 88);
+
+        // Issue #109 §2.1: mirror the 4-state paranoid MSR bit-63 SWAPGS predicate
+        // used by NMI / #DB / #MC / #DF stubs:
+        //   (gs_base < 0)                          => kernel GS already active (no swap)
+        //   (gs_base >= 0 && kernel_gs_base < 0)   => user GS / swapgs-window (must swap)
+        //   (gs_base >= 0 && kernel_gs_base >= 0)  => early boot before init (no swap)
+        let paranoid_needs_swap = |gs_base: u64, kernel_gs_base: u64| -> bool {
+            (gs_base as i64) >= 0 && (kernel_gs_base as i64) < 0
+        };
+        let user_zero = 0u64;
+        let user_nonzero = 0x0000_7fff_1234_5000u64;
+        let kernel_slot = 0xffff_ffff_8012_3400u64;
+        assert!(!paranoid_needs_swap(user_zero, user_zero)); // early boot
+        assert!(!paranoid_needs_swap(kernel_slot, user_zero)); // normal Ring-0, user GS=0
+        assert!(!paranoid_needs_swap(kernel_slot, user_nonzero)); // normal Ring-0, user GS!=0
+        assert!(paranoid_needs_swap(user_zero, kernel_slot)); // Ring-3 / swapgs window, user GS=0
+        assert!(paranoid_needs_swap(user_nonzero, kernel_slot)); // Ring-3 / swapgs window, user GS!=0
     }
 }

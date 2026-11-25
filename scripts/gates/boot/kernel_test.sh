@@ -13,9 +13,9 @@
 # overrides it; a phased run of this gate's own verdict is diagnostic only.
 # KERNEL_TEST_CPU_MODEL is the QEMU CPU model (default: the gates' standard
 # model); it must be qemu64 followed by +feature or -feature terms.
-# KERNEL_TEST_REQUIRE_CPU_ID=rdpid|rdtscp|lapic requires the boot to print
-# `CPU identity lookup: <method>` exactly once (C3 repair 2, #90): QEMU only
-# warns when it drops a CPU feature, so the line shows which path ran.
+# KERNEL_TEST_REQUIRE_CPU_ID=gsbase|rdpid|rdtscp|lapic requires the boot to print
+# `CPU identity lookup: <method>` exactly once (C3 repair 2, #90; Issue #109 §2.1):
+# QEMU only warns when it drops a CPU feature, so the line shows which path ran.
 set -u
 
 # Resolve the repo root from this script's own location so it runs from any
@@ -58,8 +58,8 @@ if [[ ! "$CPU_MODEL" =~ ^qemu64(,[+-][a-z0-9_.]+)*$ ]]; then
     exit 2
 fi
 REQUIRE_CPU_ID="${KERNEL_TEST_REQUIRE_CPU_ID:-}"
-if [[ -n "$REQUIRE_CPU_ID" && ! "$REQUIRE_CPU_ID" =~ ^(rdpid|rdtscp|lapic)$ ]]; then
-    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_REQUIRE_CPU_ID must be rdpid, rdtscp or lapic"
+if [[ -n "$REQUIRE_CPU_ID" && ! "$REQUIRE_CPU_ID" =~ ^(gsbase|rdpid|rdtscp|lapic)$ ]]; then
+    echo "KERNEL-TEST BLOCKED: KERNEL_TEST_REQUIRE_CPU_ID must be gsbase, rdpid, rdtscp or lapic"
     exit 2
 fi
 for tool in "$QEMU" timeout python3; do

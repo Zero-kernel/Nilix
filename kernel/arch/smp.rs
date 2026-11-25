@@ -1376,6 +1376,9 @@ pub extern "C" fn ap_rust_entry(
     // against the LAPIC, before READY: the BSP selects the lookup method only
     // after every admitted CPU has published. A mismatch panics here.
     cpu_local::publish_identity(cpu_idx);
+    // Issue #109 §2.1: publish this AP's GS-base per-CPU identity (gs:[80] / gs:[88])
+    // after both PER_CPU_DATA[cpu_idx] and SYSCALL_PERCPU[cpu_idx] are live.
+    syscall::publish_gs_percpu_identity(cpu_idx);
 
     // RF178-24 FIX: finishing initialization is not permission to publish.
     // The BSP either accepts this exact serialized bring-up attempt or rejects

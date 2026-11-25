@@ -111,7 +111,7 @@ run_standalone_rust_suite() {
     echo "=== hosted standalone Rust suite: ${name} (expected ${expected_passed} passed; default parallelism) ==="
     if ! (
         cd "${repo_root}/${source_dir}"
-        NILIX_TEST_TOTAL=83 rustc +nightly-2025-12-08 \
+        NILIX_TEST_TOTAL=84 rustc +nightly-2025-12-08 \
             --edition=2021 "${rustc_flags[@]}" --test "${source_file}" -o "${test_binary}"
         "${test_binary}"
     ) 2>&1 | tee "${log_file}"; then
@@ -160,8 +160,8 @@ run_suite lsm-syscall-test 5 0 \
     --features lsm,syscall_test \
     --lib --locked
 
-# Includes the C3 CPU-identity decoding and method selection.
-run_suite cpu-local 16 0 \
+# Includes the C3 CPU-identity decoding and Issue #109 §2.1 GS-base method selection.
+run_suite cpu-local 17 0 \
     --manifest-path kernel/cpu_local/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \

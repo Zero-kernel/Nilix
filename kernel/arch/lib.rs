@@ -53,8 +53,9 @@ pub use gdt::{
 };
 pub use syscall::{
     arch_set_kpti_cr3s, assert_kernel_gs_base, init_syscall_msr,
-    is_initialized as syscall_initialized, register_frame_callback, run_entry_state_gs_self_test,
-    stage_pending_tls_bases, with_current_syscall_frame, SyscallFrame,
+    is_initialized as syscall_initialized, publish_gs_percpu_identity, register_frame_callback,
+    run_entry_state_gs_self_test, stage_pending_tls_bases, with_current_syscall_frame,
+    SyscallFrame,
 };
 
 // Re-export cpu_local from the cpu_local crate for backwards compatibility
@@ -65,10 +66,10 @@ pub use cpu_local::{
     current_cpu, init_bsp, num_online_cpus, register_cpu_id, PerCpuData, RawTaskPtr, PER_CPU_DATA,
 };
 
-// C3 repair 2 (#90): the current CPU's id from IA32_TSC_AUX.
+// C3 repair 2 (#90) + Issue #109 §2.1: fast CPU identity via GS-base / IA32_TSC_AUX.
 pub use cpu_local::{
     check_identity_tick, identity_checks, identity_method, identity_published_mask,
-    lapic_registered_cpu_id, publish_identity, IdentityMethod,
+    lapic_registered_cpu_id, publish_gs_identity, publish_identity, IdentityMethod,
 };
 
 // Re-export SMP bring-up functions

@@ -95,8 +95,8 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
         gates = {record['name']: record for record in map(json.loads, invocations.read_text().splitlines())}
         standard = 'qemu64,+smep,+smap,+umip,+rdrand,+rdtscp'
         expected = {
-            'runtime-rdpid': (standard + ',+rdpid,+movbe', 'rdpid'),
-            'runtime-lapic': (standard.replace('+rdtscp', '-rdtscp'), 'lapic'),
+            'runtime-rdpid': (standard + ',+rdpid,+movbe', 'gsbase'),
+            'runtime-lapic': (standard.replace('+rdtscp', '-rdtscp'), 'gsbase'),
         }
         for name, (model, method) in expected.items():
             with self.subTest(gate=name):

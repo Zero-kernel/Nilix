@@ -357,6 +357,7 @@ pub extern "C" fn _start() -> ! {
 
     test_heap_owner_isolation(&mut results);
     test_brk_cow_shrink(&mut results);
+    test_nonzero_user_gs_across_exceptions(&mut results);
     test_console_input_ownership(&mut results);
 
     // Print summary
@@ -8472,6 +8473,203 @@ fn test_brk_cow_shrink(results: &mut TestResult) {
             results.pass(NAME);
         } else {
             results.fail("brk COW: shrink or peer contents");
+        }
+    }
+}
+
+/// Issue #109 §2.1 negative-control test: set a non-zero Ring-3 `IA32_GS_BASE`
+/// via `arch_prctl(ARCH_SET_GS)` and drive real Ring-3 -> Ring-0 IDT exceptions
+/// and interrupts (CoW `#PF`, lazy FPU `#NM`, cross-CPU TLB shootdown, fatal
+/// child `#UD` / `#PF`) while verifying that:
+/// 1. The kernel never corrupts or leaks user `GS` across any IDT stub;
+/// 2. Fatal Ring-3 faults with non-zero user `GS` terminate cleanly (no double
+///    `SWAPGS`, no kernel panic);
+/// 3. User-space `gs:[0]` / `gs:[8]` reads and `ARCH_GET_GS` return exact
+///    canary values before and after every fault.
+fn test_nonzero_user_gs_across_exceptions(results: &mut TestResult) {
+    const NAME: &str =
+        "non-zero Ring-3 GS base survives CoW #PF, FPU #NM, shootdown, and child #UD/#PF";
+    const SYS_ARCH_PRCTL: u64 = 158;
+    const ARCH_SET_GS: u64 = 0x1001;
+    const ARCH_GET_GS: u64 = 0x1004;
+    const CANARY_LO: u64 = 0x5A5A_CAFE_BABE_1234;
+    const CANARY_HI: u64 = 0xDEAD_BEEF_0123_4567;
+    const SIGILL_EXIT: u64 = 132;
+    const SIGSEGV_EXIT_U64: u64 = 139;
+
+    #[repr(C, align(64))]
+    struct UserGsCanary {
+        lo: u64,
+        hi: u64,
+        pad: [u64; 6],
+    }
+
+    #[inline(never)]
+    unsafe fn check_user_gs(expected_base: u64, expected_lo: u64, expected_hi: u64) -> bool {
+        let mut got_base: u64 = 0;
+        if is_error(syscall2(
+            SYS_ARCH_PRCTL,
+            ARCH_GET_GS,
+            &mut got_base as *mut u64 as u64,
+        )) {
+            return false;
+        }
+        if got_base != expected_base {
+            return false;
+        }
+        let lo: u64;
+        let hi: u64;
+        core::arch::asm!(
+            "mov {lo}, qword ptr gs:[0]",
+            "mov {hi}, qword ptr gs:[8]",
+            lo = out(reg) lo,
+            hi = out(reg) hi,
+            options(nostack, readonly, preserves_flags)
+        );
+        lo == expected_lo && hi == expected_hi
+    }
+
+    unsafe {
+        let mut canary = UserGsCanary {
+            lo: CANARY_LO,
+            hi: CANARY_HI,
+            pad: [0; 6],
+        };
+        let canary_addr = &canary as *const UserGsCanary as u64;
+
+        if is_error(syscall2(SYS_ARCH_PRCTL, ARCH_SET_GS, canary_addr)) {
+            results.fail("nonzero user GS: ARCH_SET_GS failed");
+            return;
+        }
+
+        let mut ok = check_user_gs(canary_addr, CANARY_LO, CANARY_HI);
+
+        // 1. Trigger a real Ring-3 CoW #PF via fork() + write to private mmap page.
+        let cow_page = mmap_anon(PAGE, false);
+        if ok && cow_page >= 0 {
+            let slot = cow_page as *mut u64;
+            core::ptr::write_volatile(slot, 0x1122_3344_5566_7788);
+            let child = sys_fork();
+            if is_error(child) {
+                ok = false;
+            } else if child == 0 {
+                // Child inherits parent's non-zero user GS; verify and exit cleanly.
+                let child_ok = check_user_gs(canary_addr, CANARY_LO, CANARY_HI)
+                    && core::ptr::read_volatile(slot) == 0x1122_3344_5566_7788;
+                raw_exit(SYS_EXIT, if child_ok { 0 } else { 1 });
+            } else {
+                // Parent write triggers Ring-3 CoW #PF while user GS is non-zero.
+                core::ptr::write_volatile(slot, 0x8877_6655_4433_2211);
+                if reap_pid(child) != Some(0)
+                    || core::ptr::read_volatile(slot) != 0x8877_6655_4433_2211
+                    || !check_user_gs(canary_addr, CANARY_LO, CANARY_HI)
+                {
+                    ok = false;
+                }
+            }
+            let _ = munmap(cow_page as usize, PAGE);
+        } else {
+            ok = false;
+        }
+
+        // 2. Yield (so CR0.TS can be armed on reschedule) and execute SSE ops to
+        //    exercise lazy FPU #NM delivery with non-zero user GS active.
+        if ok {
+            for round in 0..4u64 {
+                userspace::syscall::sys_yield();
+                let mut val: u64 = 0x1000 + round;
+                core::arch::asm!(
+                    "movq xmm0, {v}",
+                    "paddq xmm0, xmm0",
+                    "movq {v}, xmm0",
+                    v = inout(reg) val,
+                    out("xmm0") _,
+                    options(nostack, nomem, preserves_flags)
+                );
+                if val != (0x1000 + round) * 2 || !check_user_gs(canary_addr, CANARY_LO, CANARY_HI)
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        // 3. Exercise mprotect + munmap (cross-CPU TLB shootdown IPIs) while
+        //    non-zero user GS is active.
+        if ok {
+            let map = mmap_anon(2 * PAGE, false);
+            if map < 0 {
+                ok = false;
+            } else {
+                core::ptr::write_volatile(map as *mut u64, 0xABCD);
+                let mp = syscall3(SYS_MPROTECT, map as u64, (2 * PAGE) as u64, PROT_READ) as i64;
+                let mu = munmap(map as usize, 2 * PAGE);
+                if mp != 0 || mu != 0 || !check_user_gs(canary_addr, CANARY_LO, CANARY_HI) {
+                    ok = false;
+                }
+            }
+        }
+
+        // 4. Fatal Ring-3 #UD (SIGILL=132) with non-zero user GS in a forked child:
+        //    proves entry stub establishes kernel GS once (no double-swapgs crash).
+        if ok {
+            let child = sys_fork();
+            if is_error(child) {
+                ok = false;
+            } else if child == 0 {
+                let mut child_canary = UserGsCanary {
+                    lo: 0xAAAA_BBBB_CCCC_DDDD,
+                    hi: 0x1111_2222_3333_4444,
+                    pad: [0; 6],
+                };
+                let _ = syscall2(
+                    SYS_ARCH_PRCTL,
+                    ARCH_SET_GS,
+                    &mut child_canary as *mut UserGsCanary as u64,
+                );
+                core::arch::asm!("ud2", options(noreturn));
+            } else if reap_pid(child) != Some(SIGILL_EXIT)
+                || !check_user_gs(canary_addr, CANARY_LO, CANARY_HI)
+            {
+                ok = false;
+            }
+        }
+
+        // 5. Fatal Ring-3 #PF (SIGSEGV=139) with non-zero user GS in a forked child.
+        if ok {
+            let child = sys_fork();
+            if is_error(child) {
+                ok = false;
+            } else if child == 0 {
+                let mut child_canary = UserGsCanary {
+                    lo: 0x5555_6666_7777_8888,
+                    hi: 0x9999_AAAA_BBBB_CCCC,
+                    pad: [0; 6],
+                };
+                let _ = syscall2(
+                    SYS_ARCH_PRCTL,
+                    ARCH_SET_GS,
+                    &mut child_canary as *mut UserGsCanary as u64,
+                );
+                // Read from a permanently unmapped user address to trigger fatal #PF.
+                let _ = core::ptr::read_volatile(0x1000usize as *const u64);
+                raw_exit(SYS_EXIT, 55);
+            } else if reap_pid(child) != Some(SIGSEGV_EXIT_U64)
+                || !check_user_gs(canary_addr, CANARY_LO, CANARY_HI)
+            {
+                ok = false;
+            }
+        }
+
+        // Restore user GS to 0 so subsequent tests see the default state.
+        let reset_ok = !is_error(syscall2(SYS_ARCH_PRCTL, ARCH_SET_GS, 0));
+        canary.lo = 0;
+        let _ = canary.lo;
+
+        if ok && reset_ok {
+            results.pass(NAME);
+        } else {
+            results.fail(NAME);
         }
     }
 }

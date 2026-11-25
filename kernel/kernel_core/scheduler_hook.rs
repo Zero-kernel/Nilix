@@ -437,8 +437,8 @@ pub fn force_reschedule() {
 /// bounded, nonblocking local selector.
 #[inline]
 pub fn force_reschedule_from_irq() {
-    // P1-A: IRQ-return schedule is only legal after CS-RPL-gated swapgs (timer)
-    // or enter_kernel_state_from_user_exception / syscall kernel GS.
+    // P1-A + Issue #109 §2.1: IRQ-return schedule is only legal after the
+    // entry trampoline (IDT stub or SYSCALL) established kernel GS.
     assert_kernel_entry_state();
     if let Some(cb) = RESCHED_CB.get().copied() {
         cb(true, ReschedOrigin::IrqReturn);
