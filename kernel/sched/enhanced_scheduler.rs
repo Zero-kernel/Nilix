@@ -114,7 +114,6 @@ pub type ProcessControlBlock = ProcessArc;
 /// slot. The old representation forced CpuLocal to infallibly allocate at
 /// least 512 KiB of uncharged empty headers across MAX_CPUS before one task was
 /// queued. Runtime backing remains fallibly admitted and detached-prepared.
-const PRIORITY_BUCKETS: usize = u8::MAX as usize + 1;
 type ReadyMapKey = (Priority, Pid);
 type PreparedReadyBacking<T> = PreparedAdmittedMapCapacity<ReadyMapKey, T>;
 type RetiredReadyBacking<T> = RetiredAdmittedMapCapacity<ReadyMapKey, T>;
@@ -236,17 +235,24 @@ impl<T> PriorityQueues<T> {
         }
     }
 
+    /// Iterate only non-empty priority buckets in ascending priority order (#109).
+    ///
+    /// Jumps directly across the underlying sorted `AdmittedMap` so empty or
+    /// sparse queues avoid probing all 256 priority buckets.
     #[inline]
     fn iter(&self) -> impl Iterator<Item = (Priority, PriorityBucketRef<'_, T>)> {
-        (0..PRIORITY_BUCKETS).map(move |priority| {
-            let priority = priority as Priority;
-            (priority, self.bucket(priority))
+        let mut next_priority: Option<Priority> = Some(0);
+        core::iter::from_fn(move || {
+            let start = next_priority?;
+            let (&(priority, _), _) = self.entries.range((start, 0)..).next()?;
+            next_priority = priority.checked_add(1);
+            Some((priority, self.bucket(priority)))
         })
     }
 
     #[inline]
     fn values(&self) -> impl Iterator<Item = PriorityBucketRef<'_, T>> {
-        (0..PRIORITY_BUCKETS).map(move |priority| self.bucket(priority as Priority))
+        self.iter().map(|(_, bucket)| bucket)
     }
 
     #[inline]
@@ -1080,31 +1086,19 @@ impl Scheduler {
     // ========================================================================
 
     /// Return the queue entry immediately after `after`, wrapping at the end.
-    /// Tree lookups are O(log N); the caller imposes the hard PCB-visit bound.
+    /// Single O(log N) lookup on the lexicographically ordered `(priority, pid)`
+    /// map (#109); the caller imposes the hard PCB-visit bound.
     fn next_queue_entry<'a, T>(
         queue: &'a PriorityQueues<T>,
         after: Option<(Priority, Pid)>,
     ) -> Option<((Priority, Pid), &'a T)> {
-        if let Some((priority, pid)) = after {
-            let bucket = queue.bucket(priority);
-            if let Some((&next_pid, pcb)) = bucket.range((Excluded(pid), Unbounded)).next() {
-                return Some(((priority, next_pid), pcb));
-            }
-            for next_priority_raw in (priority as usize + 1)..PRIORITY_BUCKETS {
-                let next_priority = next_priority_raw as Priority;
-                let bucket = queue.bucket(next_priority);
-                if let Some((&next_pid, pcb)) = bucket.iter().next() {
-                    return Some(((next_priority, next_pid), pcb));
-                }
+        if let Some(after_key) = after {
+            if let Some((&key, pcb)) = queue.entries.range((Excluded(after_key), Unbounded)).next()
+            {
+                return Some((key, pcb));
             }
         }
-
-        for (priority, bucket) in queue.iter() {
-            if let Some((&pid, pcb)) = bucket.iter().next() {
-                return Some(((priority, pid), pcb));
-            }
-        }
-        None
+        queue.entries.range(..).next().map(|(&key, pcb)| (key, pcb))
     }
 
     /// Advance one persistent, bounded window over a queue.
@@ -2022,7 +2016,7 @@ impl Scheduler {
             count += 1;
         }
         let sources = &mut sources[..count];
-        sources.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        Self::sort_steal_sources(local_cpu, sources);
 
         let mut every_source_examined = true;
         for &(_, source_cpu, seq) in sources.iter() {
@@ -2037,6 +2031,24 @@ impl Scheduler {
             hint.complete_full_pass(local_cpu);
         }
         None
+    }
+
+    /// Staggered ring distance from `local_cpu` so concurrent idle thieves
+    /// break equal-length ties toward distinct source queues (#109).
+    #[inline]
+    fn steal_source_rank(local_cpu: usize, source_cpu: usize) -> usize {
+        source_cpu.wrapping_sub(local_cpu) & 63
+    }
+
+    /// Sort candidate steal sources: strictly longer queues first, then
+    /// staggered by distance from `local_cpu` to reduce lock collisions.
+    fn sort_steal_sources(local_cpu: usize, sources: &mut [(usize, usize, u64)]) {
+        sources.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0).then_with(|| {
+                Self::steal_source_rank(local_cpu, a.1)
+                    .cmp(&Self::steal_source_rank(local_cpu, b.1))
+            })
+        });
     }
 
     /// Look once at `source_cpu`'s queue for a task that may run on
@@ -3531,6 +3543,73 @@ pub fn run_bounded_selector_self_test() {
             (*saved).rflags = flags;
         }
         assert!(bootstrap.target().is_none());
+    }
+
+    // #109: PriorityQueues::iter() visits only non-empty priorities including
+    // 0 and u8::MAX boundaries, and next_queue_entry wraps cleanly from the
+    // maximum key back to the minimum entry.
+    {
+        let mut queue = ProbeQueues::new();
+        assert_eq!(queue.iter().count(), 0);
+        assert!(Scheduler::next_queue_entry(&queue, None).is_none());
+
+        insert_at(&mut queue, 0, 10, READY);
+        insert_at(&mut queue, 120, 20, READY);
+        insert_at(&mut queue, 120, 25, READY);
+        insert_at(&mut queue, u8::MAX, 30, READY);
+
+        let mut seen_priorities = [0u8; 4];
+        let mut seen_count = 0usize;
+        for (prio, _bucket) in queue.iter() {
+            seen_priorities[seen_count] = prio;
+            seen_count += 1;
+        }
+        assert_eq!(seen_count, 3);
+        assert_eq!(&seen_priorities[..3], &[0, 120, u8::MAX]);
+        assert_eq!(
+            Scheduler::next_queue_entry(&queue, None).map(|(k, _)| k),
+            Some((0, 10))
+        );
+        assert_eq!(
+            Scheduler::next_queue_entry(&queue, Some((0, 10))).map(|(k, _)| k),
+            Some((120, 20))
+        );
+        assert_eq!(
+            Scheduler::next_queue_entry(&queue, Some((120, 20))).map(|(k, _)| k),
+            Some((120, 25))
+        );
+        assert_eq!(
+            Scheduler::next_queue_entry(&queue, Some((120, 25))).map(|(k, _)| k),
+            Some((u8::MAX, 30))
+        );
+        assert_eq!(
+            Scheduler::next_queue_entry(&queue, Some((u8::MAX, 30))).map(|(k, _)| k),
+            Some((0, 10))
+        );
+        assert_eq!(
+            Scheduler::next_queue_entry(&queue, Some((u8::MAX, Pid::MAX))).map(|(k, _)| k),
+            Some((0, 10))
+        );
+    }
+
+    // #109: sort_steal_sources puts strictly busier queues first and staggers
+    // equal-length ties by distance from local_cpu.
+    {
+        let base = [(2usize, 1usize, 0u64), (2, 2, 0), (2, 3, 0), (4, 0, 0)];
+        let mut s_cpu0 = base;
+        Scheduler::sort_steal_sources(0, &mut s_cpu0);
+        assert_eq!(s_cpu0[0].1, 0);
+        assert_eq!([s_cpu0[1].1, s_cpu0[2].1, s_cpu0[3].1], [1, 2, 3]);
+
+        let mut s_cpu2 = base;
+        Scheduler::sort_steal_sources(2, &mut s_cpu2);
+        assert_eq!(s_cpu2[0].1, 0);
+        assert_eq!([s_cpu2[1].1, s_cpu2[2].1, s_cpu2[3].1], [2, 3, 1]);
+
+        let mut s_cpu3 = base;
+        Scheduler::sort_steal_sources(3, &mut s_cpu3);
+        assert_eq!(s_cpu3[0].1, 0);
+        assert_eq!([s_cpu3[1].1, s_cpu3[2].1, s_cpu3[3].1], [3, 1, 2]);
     }
 }
 
