@@ -562,6 +562,7 @@ mod lsm_hook_census_tests {
         ("Self::from_current()", false),
         ("ProcessCtx::current_task()", false),
         ("SyscallCtx::from_current(", false),
+        ("SyscallCtx::from_snapshot(", false),
         ("SocketLabel::from_current(", false),
         ("lsm_current_process_ctx()", false),
         ("lsm_process_ctx_from(", true),

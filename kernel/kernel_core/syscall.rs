@@ -4203,8 +4203,18 @@ pub fn syscall_dispatcher(
     // We use take_pending_process_exit() (which atomically clears the flag) and
     // terminate_self_and_halt() so the thread actually dies rather than looping
     // on EINTR indefinitely.
+    let args = [arg0, arg1, arg2, arg3, arg4, arg5];
     let mut exec_handoff = false;
-    if let Some(pid) = crate::process::current_pid() {
+    let mut entry_pid: Option<ProcessId> = None;
+    let mut entry_tgid: ProcessId = 0;
+    let mut entry_creds: Option<crate::process::CredentialIds> = None;
+    let mut fast_ns_id: Option<Result<usize, ()>> = None;
+
+    // Issue #109 §4.1: Consolidate syscall_entry_safe_point + atomic-gated
+    // seccomp/pledge evaluation + LSM (tgid, credentials) snapshot + read-only
+    // getpid/gettid namespace ID resolution into ONE PROCESS_TABLE + PCB lock.
+    let verdict = if let Some(pid) = crate::process::current_pid() {
+        entry_pid = Some(pid);
         // M0 item 5: record this task as the owner of the current syscall frame, so
         // the MUTABLE frame accessor used by signal-handler delivery at the return
         // tail can reject a stale cross-task `frame_ptr` (defense-in-depth + the
@@ -4233,25 +4243,32 @@ pub fn syscall_dispatcher(
         let binding = is_valid_frame_binding(frame_ptr, owner, pid).then_some((frame_ptr, owner));
         let want_snapshot =
             matches!(syscall_num, 59 | 517) || crate::signal::any_handler_installed();
-        match crate::process::syscall_entry_safe_point(pid, binding, want_snapshot) {
-            crate::process::SyscallSafePoint::Exit(exit_code) => {
+        match crate::process::syscall_entry_prepare(pid, syscall_num, &args, binding, want_snapshot)
+        {
+            crate::process::SyscallEntryState::Exit(exit_code) => {
                 increment_counter(TraceCounter::SyscallExit, 1);
                 terminate_self_and_halt(pid, exit_code);
             }
-            crate::process::SyscallSafePoint::ExecHandoff => exec_handoff = true,
-            crate::process::SyscallSafePoint::Continue => {}
+            crate::process::SyscallEntryState::MissingProcess => {
+                // Fail-closed: matches standalone evaluate_seccomp when PCB is absent.
+                seccomp::SeccompVerdict::kill(0)
+            }
+            crate::process::SyscallEntryState::Ready {
+                exec_handoff: handoff,
+                verdict,
+                tgid,
+                creds,
+                fast_ns_id: ns_id,
+            } => {
+                exec_handoff = handoff;
+                entry_tgid = tgid;
+                entry_creds = creds;
+                fast_ns_id = ns_id;
+                verdict
+            }
         }
-    }
-
-    // Evaluate seccomp/pledge filters before dispatch
-    let args = [arg0, arg1, arg2, arg3, arg4, arg5];
-    // GAP-5 exec step 2: a handed-over exec replaces this call, so the leader's
-    // own filter does not judge the call it skips; the exec'ing thread's seccomp
-    // state is installed with the handoff instead.
-    let verdict = if exec_handoff {
-        seccomp::SeccompVerdict::allow()
     } else {
-        crate::process::evaluate_seccomp(syscall_num, &args)
+        seccomp::SeccompVerdict::kill(0)
     };
 
     match verdict.action {
@@ -4262,7 +4279,7 @@ pub fn syscall_dispatcher(
             // SECURITY: After terminating the process, we must not return to userspace.
             // The process state is now invalid (PCB cleaned up, memory potentially freed).
             // Returning would cause UAF and complete seccomp bypass.
-            let pid = match crate::process::current_pid() {
+            let pid = match entry_pid {
                 Some(pid) => pid,
                 None => {
                     // No current PID is an internal invariant failure.  Do
@@ -4272,7 +4289,7 @@ pub fn syscall_dispatcher(
                 }
             };
 
-            if let Some(creds) = crate::current_credentials() {
+            if let Some(creds) = entry_creds {
                 seccomp::notify_violation(
                     pid as u32,
                     creds.uid,
@@ -4293,14 +4310,14 @@ pub fn syscall_dispatcher(
             // R25-4 + R39-2 FIX: Trap treated as fatal until SIGSYS delivery exists
             //
             // SECURITY: Same rationale as Kill - process is terminated, never return.
-            let pid = match crate::process::current_pid() {
+            let pid = match entry_pid {
                 Some(pid) => pid,
                 None => {
                     panic!("seccomp Trap without a current process");
                 }
             };
 
-            if let Some(creds) = crate::current_credentials() {
+            if let Some(creds) = entry_creds {
                 seccomp::notify_violation(
                     pid as u32,
                     creds.uid,
@@ -4317,8 +4334,8 @@ pub fn syscall_dispatcher(
         seccomp::SeccompAction::Errno(e) => {
             increment_counter(TraceCounter::SyscallDenied, 1);
             // Return the error code - audit the violation
-            if let Some(creds) = crate::current_credentials() {
-                if let Some(pid) = crate::process::current_pid() {
+            if let Some(creds) = entry_creds {
+                if let Some(pid) = entry_pid {
                     seccomp::notify_violation(
                         pid as u32,
                         creds.uid,
@@ -4334,8 +4351,8 @@ pub fn syscall_dispatcher(
         }
         seccomp::SeccompAction::Log => {
             // Log the violation but continue
-            if let Some(creds) = crate::current_credentials() {
-                if let Some(pid) = crate::process::current_pid() {
+            if let Some(creds) = entry_creds {
+                if let Some(pid) = entry_pid {
                     seccomp::notify_violation(
                         pid as u32,
                         creds.uid,
@@ -4354,8 +4371,21 @@ pub fn syscall_dispatcher(
     }
 
     // LSM hook: check syscall entry with security policy
-    // Build context before dispatch; on denial, return EPERM
-    let lsm_ctx = lsm::SyscallCtx::from_current(syscall_num, &args);
+    // Build context from the single-lock entry snapshot; on missing credentials,
+    // fail closed with EPERM (R184-U01-1 / R192-5 / TD-LSM-1).
+    let lsm_creds = entry_creds.map(|c| lsm::Credentials {
+        uid: c.uid,
+        gid: c.gid,
+        euid: c.euid,
+        egid: c.egid,
+    });
+    let lsm_ctx = lsm::SyscallCtx::from_snapshot(
+        entry_pid.unwrap_or(0),
+        entry_tgid,
+        entry_pid.and(lsm_creds),
+        syscall_num,
+        &args,
+    );
     // R192-5 / TD-LSM-1 FIX: the R142-4 `debug_assert!(lsm_ctx.is_some())` that
     // stood here called a missing context a kernel bug, but `from_current`
     // returns None whenever a sibling thread holds the shared credentials for
@@ -4458,8 +4488,8 @@ pub fn syscall_dispatcher(
         // profile, stage=cgroup_child_wait errno=14). rusage (arg3) is
         // accepted and ignored — Linux permits NULL.
         61 => sys_wait4(arg0 as i64, arg1 as *mut i32, arg2 as i32),
-        39 => sys_getpid(),
-        186 => sys_gettid(),
+        39 => sys_getpid_fast(fast_ns_id),
+        186 => sys_gettid_fast(fast_ns_id),
         110 => sys_getppid(),
         102 => sys_getuid(),
         107 => sys_geteuid(),
@@ -4779,32 +4809,38 @@ fn audit_syscall_exit(
     lsm_ctx: &lsm::SyscallCtx,
     result: &SyscallResult,
 ) {
-    // Emit audit event for syscall completion
-    // Note: This is after the syscall so we capture the outcome
-    let (outcome, errno) = match result {
-        Ok(_) => (AuditOutcome::Success, 0),
-        Err(e) => (AuditOutcome::Error, e.as_i64() as i32),
-    };
+    // Issue #109 §4.1: Gate syscall audit emission behind an Acquire check on
+    // AUDIT_ENABLED && AUDIT_INITIALIZED, and reuse the subject identity
+    // already captured in `lsm_ctx` instead of re-locking PROCESS_TABLE + PCB.
+    if audit::is_active() {
+        // Emit audit event for syscall completion
+        // Note: This is after the syscall so we capture the outcome
+        let (outcome, errno) = match result {
+            Ok(_) => (AuditOutcome::Success, 0),
+            Err(e) => (AuditOutcome::Error, e.as_i64() as i32),
+        };
+        let subject = AuditSubject::new(lsm_ctx.pid as u32, lsm_ctx.euid, lsm_ctx.egid, None);
 
-    // Emit audit event (ignore errors - audit should never block syscalls)
-    // Include all 6 arguments for syscalls like mmap that use all of them
-    let _ = audit::emit(
-        AuditKind::Syscall,
-        outcome,
-        get_audit_subject(),
-        AuditObject::None,
-        &[
-            syscall_num,
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[4],
-            args[5],
-        ],
-        errno,
-        timestamp,
-    );
+        // Emit audit event (ignore errors - audit should never block syscalls)
+        // Include all 6 arguments for syscalls like mmap that use all of them
+        let _ = audit::emit(
+            AuditKind::Syscall,
+            outcome,
+            subject,
+            AuditObject::None,
+            &[
+                syscall_num,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+            ],
+            errno,
+            timestamp,
+        );
+    }
 
     // LSM hook: notify security policy of syscall exit
     let ret = match result {
@@ -4816,6 +4852,15 @@ fn audit_syscall_exit(
 
 /// Return safe point, signal delivery and rescheduling for every syscall.
 fn finish_syscall_tail(mut result: SyscallResult) -> i64 {
+    // Compute the syscall's return value (→ RAX). Captured here because signal
+    // delivery saves it into the sigframe (so `rt_sigreturn` restores the
+    // interrupted context's RAX — the EINTR / partial-op short-count contract: the
+    // FINAL `result` is used verbatim, never recomputed).
+    let mut ret_val: i64 = match &result {
+        Ok(val) => *val as i64,
+        Err(err) => err.as_i64(),
+    };
+
     // R115-1 FIX: Honor cross-CPU exit requests at syscall return.
     //
     // exit_group() may request sibling threads to exit while they are running on
@@ -4826,34 +4871,49 @@ fn finish_syscall_tail(mut result: SyscallResult) -> i64 {
     // GAP-5 exec step 2: the same gate runs an exec handed to this leader while
     // it was in this call (its wait returned EINTR for it). The exec's result
     // replaces the call's.
+    //
+    // Issue #109 §4.1: Consolidate syscall_return_safe_point + maybe_deliver_signal
+    // + poll_restore_sigmask_tail into ONE get_process + PCB lock on the common path.
     if let Some(pid) = current_pid() {
-        match crate::process::syscall_return_safe_point(pid) {
-            crate::process::SyscallSafePoint::Exit(exit_code) => {
-                // R117-1 FIX: Use centralized terminate_self_and_halt().
-                terminate_self_and_halt(pid, exit_code);
+        if let Some(proc_arc) = get_process(pid) {
+            let phase1 = {
+                let mut proc = proc_arc.lock();
+                let frame_bound = proc.saved_frame_ptr != 0 && proc.saved_frame_owner == pid as u64;
+                match crate::process::syscall_safe_point_locked(&mut proc, frame_bound) {
+                    crate::process::SyscallSafePoint::Exit(exit_code) => {
+                        SignalTailStep::Exit(exit_code)
+                    }
+                    crate::process::SyscallSafePoint::ExecHandoff => SignalTailStep::ExecHandoff,
+                    crate::process::SyscallSafePoint::Continue => {
+                        maybe_deliver_signal_phase1(pid, &proc_arc, proc)
+                    }
+                }
+            };
+            match phase1 {
+                SignalTailStep::Done => {}
+                SignalTailStep::Exit(exit_code) => {
+                    drop(proc_arc);
+                    // R117-1 FIX: Use centralized terminate_self_and_halt().
+                    terminate_self_and_halt(pid, exit_code);
+                }
+                SignalTailStep::ExecHandoff => {
+                    drop(proc_arc);
+                    result = run_exec_handoff();
+                    ret_val = match &result {
+                        Ok(val) => *val as i64,
+                        Err(err) => err.as_i64(),
+                    };
+                    if let Some(handoff_arc) = get_process(pid) {
+                        let step = {
+                            let handoff_proc = handoff_arc.lock();
+                            maybe_deliver_signal_phase1(pid, &handoff_arc, handoff_proc)
+                        };
+                        finish_signal_tail_step(pid, ret_val, handoff_arc, step);
+                    }
+                }
+                other => finish_signal_tail_step(pid, ret_val, proc_arc, other),
             }
-            crate::process::SyscallSafePoint::ExecHandoff => result = run_exec_handoff(),
-            crate::process::SyscallSafePoint::Continue => {}
         }
-    }
-
-    // Compute the syscall's return value (→ RAX). Captured here because signal
-    // delivery saves it into the sigframe (so `rt_sigreturn` restores the
-    // interrupted context's RAX — the EINTR / partial-op short-count contract: the
-    // FINAL `result` is used verbatim, never recomputed).
-    let ret_val: i64 = match &result {
-        Ok(val) => *val as i64,
-        Err(err) => err.as_i64(),
-    };
-
-    // Deliver an actionable signal after pending-kill handling, including
-    // unblocked defaults in tasks that never registered a handler. May not return.
-    if let Some(pid) = current_pid() {
-        maybe_deliver_signal(pid, ret_val);
-        // M0-6 poll/select: restore a ppoll/pselect6 temporary sigmask on every
-        // no-delivery path (maybe_deliver_signal consumes the stash when it DOES
-        // deliver). This also covers defaults and tasks without caught handlers.
-        poll_restore_sigmask_tail(pid);
     }
 
     // 在返回用户态前检查是否需要调度
@@ -6273,6 +6333,7 @@ fn sys_clone(
         let mut child = child_arc.lock();
         child.seccomp_state = parent_seccomp_state;
         child.pledge_state = parent_pledge_state;
+        child.sync_seccomp_or_pledge_flag();
         // Keep the parent locked until both assignments are visible.  A new
         // installation therefore cannot commit in the snapshot->publish gap.
         drop(parent);
@@ -7942,6 +8003,7 @@ fn exec_from_bytes(
                 pledge.promises = exec_promises;
             }
         }
+        proc.sync_seccomp_or_pledge_flag();
 
         // Seccomp 过滤器在 exec 后保持不变（Linux 语义）
         // no_new_privs 仍然有效，防止特权提升
@@ -9782,6 +9844,32 @@ where
     }
 }
 
+/// Issue #109 §4.1: Read-only `getpid` fast path reusing the namespace ID
+/// already resolved under the single syscall-entry PCB lock.
+#[inline]
+fn sys_getpid_fast(fast_ns_id: Option<Result<usize, ()>>) -> SyscallResult {
+    match fast_ns_id {
+        Some(Ok(ns_pid)) => {
+            #[cfg(feature = "kcov")]
+            {
+                coverage::trace_pc(1110);
+                coverage::trace_pc(1111);
+                coverage::trace_pc(1112);
+            }
+            Ok(ns_pid)
+        }
+        Some(Err(())) => {
+            #[cfg(feature = "kcov")]
+            {
+                coverage::trace_pc(1110);
+                coverage::trace_pc(1111);
+            }
+            Err(SyscallError::EFAULT)
+        }
+        None => sys_getpid(),
+    }
+}
+
 /// sys_getpid - 获取当前进程ID
 ///
 /// F.1 PID Namespace: Returns the PID as seen from the process's owning namespace,
@@ -9899,6 +9987,17 @@ fn sys_getppid() -> SyscallResult {
         #[cfg(feature = "kcov")]
         coverage::trace_pc(1124); // sys_getppid root namespace path
         Ok(parent_global_pid)
+    }
+}
+
+/// Issue #109 §4.1: Read-only `gettid` fast path reusing the namespace TID
+/// already resolved under the single syscall-entry PCB lock.
+#[inline]
+fn sys_gettid_fast(fast_ns_id: Option<Result<usize, ()>>) -> SyscallResult {
+    match fast_ns_id {
+        Some(Ok(ns_tid)) => Ok(ns_tid),
+        Some(Err(())) => Err(SyscallError::EFAULT),
+        None => sys_gettid(),
     }
 }
 
@@ -10852,135 +10951,212 @@ pub fn run_sigframe_stack_locator_self_test() {
     );
 }
 
-fn maybe_deliver_signal(pid: ProcessId, result: i64) {
-    // Unblocked default actions remain deliverable even before any handler exists.
-    let proc_arc = match get_process(pid) {
-        Some(a) => a,
-        None => return,
-    };
+#[inline]
+fn restore_poll_blocked_locked(proc: &mut crate::process::Process) {
+    if let Some(old) = proc.poll_restore_blocked.take() {
+        proc.blocked = old & !crate::signal::uncatchable_mask();
+    }
+}
 
-    // Phase 1 (under the lock): select the lowest-numbered deliverable signal and
-    // snapshot its disposition + the pre-delivery blocked mask.
-    let (sig, handler, restorer, sa_mask, sa_flags, old_blocked, delivered_action) = {
-        let mut proc = proc_arc.lock();
-        // R172-X-F1: EXEC-SIGNAL-SAFEPOINT-CONJUNCTION (leg enforcement, the single delivery
-        // choke point). Delivery here writes a sigframe against the INTERRUPTED user RSP
-        // (ctx.rsp). After an exec that just swapped CR3 to the new image, that RSP is valid
-        // ONLY because exec (a) refused a shared / multithreaded AS [EBUSY tgid/share_count,
-        // EAGAIN migration] and (b) reset every handler + cleared the frame binding under the
-        // commit lock [reset_sigactions_for_exec] BEFORE control could reach this safe point
-        // [exec clears exec_in_progress via ExecInProgressGuard at scope exit, AFTER the
-        // commit and BEFORE the unified syscall-return safe point], and (c) never blocks
-        // mid-exec. On the legitimate post-exec path this guard is a TAUTOLOGY (never fires);
-        // it fires ONLY if a future edit re-exposes this safe point while an exec is genuinely
-        // mid-flight — exactly the sigframe-against-stale-RSP-on-the-new-AS corruption class it
-        // pins. Fail CLOSED in release (DROP the delivery, leave the pending bit set for a
-        // later post-exec attempt) rather than execute the corrupting copy_to_user. Cost: one
-        // bool read on the held PCB lock before signal processing.
-        if proc.exec_in_progress {
-            klog_force!(
-                "FATAL-INVARIANT: maybe_deliver_signal reached with exec_in_progress set \
-                 (pid={}) — EXEC-SIGNAL-SAFEPOINT-CONJUNCTION violated; a sigframe write would \
-                 target a stale pre-exec RSP on the new AS",
-                pid
-            );
-            debug_assert!(
-                !proc.exec_in_progress,
-                "EXEC-SIGNAL-SAFEPOINT-CONJUNCTION: signal delivery in the live exec window"
-            );
-            return;
+enum SignalTailStep {
+    /// Fast path or early exit: `poll_restore_blocked` already restored under lock.
+    Done,
+    /// Posted fatal exit consumed at safe point; terminate with this exit code.
+    Exit(i32),
+    /// Pending exec handoff must run before signal delivery.
+    ExecHandoff,
+    /// Pending kill discovered after retargeting shared signals.
+    PendingKill,
+    /// Default signal action must run outside the PCB lock, then restore poll mask.
+    Default(crate::signal::Signal),
+    /// Handler frame delivery (Phase 2/3) outside the PCB lock.
+    Handler {
+        sig: crate::signal::Signal,
+        handler: u64,
+        restorer: u64,
+        sa_mask: u64,
+        sa_flags: u64,
+        old_blocked: u64,
+        delivered_action: crate::signal::SigAction,
+    },
+}
+
+/// Phase 1 of signal delivery + `poll_restore_blocked` restore, starting from
+/// an already-acquired PCB lock (from `finish_syscall_tail`).
+fn maybe_deliver_signal_phase1<'a>(
+    pid: ProcessId,
+    proc_arc: &'a crate::process::ProcessArc,
+    mut proc: crate::owner_lock::OwnerCpuMutexGuard<'a, crate::process::Process>,
+) -> SignalTailStep {
+    // R172-X-F1: EXEC-SIGNAL-SAFEPOINT-CONJUNCTION (leg enforcement, the single delivery
+    // choke point). Delivery here writes a sigframe against the INTERRUPTED user RSP
+    // (ctx.rsp). After an exec that just swapped CR3 to the new image, that RSP is valid
+    // ONLY because exec (a) refused a shared / multithreaded AS [EBUSY tgid/share_count,
+    // EAGAIN migration] and (b) reset every handler + cleared the frame binding under the
+    // commit lock [reset_sigactions_for_exec] BEFORE control could reach this safe point
+    // [exec clears exec_in_progress via ExecInProgressGuard at scope exit, AFTER the
+    // commit and BEFORE the unified syscall-return safe point], and (c) never blocks
+    // mid-exec. On the legitimate post-exec path this guard is a TAUTOLOGY (never fires);
+    // it fires ONLY if a future edit re-exposes this safe point while an exec is genuinely
+    // mid-flight — exactly the sigframe-against-stale-RSP-on-the-new-AS corruption class it
+    // pins. Fail CLOSED in release (DROP the delivery, leave the pending bit set for a
+    // later post-exec attempt) rather than execute the corrupting copy_to_user. Cost: one
+    // bool read on the held PCB lock before signal processing.
+    if proc.exec_in_progress {
+        klog_force!(
+            "FATAL-INVARIANT: maybe_deliver_signal reached with exec_in_progress set \
+             (pid={}) — EXEC-SIGNAL-SAFEPOINT-CONJUNCTION violated; a sigframe write would \
+             target a stale pre-exec RSP on the new AS",
+            pid
+        );
+        debug_assert!(
+            !proc.exec_in_progress,
+            "EXEC-SIGNAL-SAFEPOINT-CONJUNCTION: signal delivery in the live exec window"
+        );
+        restore_poll_blocked_locked(&mut proc);
+        return SignalTailStep::Done;
+    }
+    // GAP-5 G7 (review D3): a mask change since the last return (sigreturn,
+    // a handler's mask, a ppoll mask) may block group signals this task was
+    // chosen for; another member takes them over.
+    if proc.recalc_shared_signals(false) {
+        let group = Arc::clone(&proc.thread_group);
+        drop(proc);
+        crate::process::retarget_shared_signals(pid, &group);
+        proc = proc_arc.lock();
+    }
+    // GAP-5 G7 (review D3): a task with a posted fatal exit never takes a
+    // group signal; a live member gets it. Checked unconditionally (including
+    // after ExecHandoff where `run_exec_handoff` ran unlocked).
+    if proc.pending_kill.load(AtomicOrdering::Acquire) {
+        return SignalTailStep::PendingKill;
+    }
+    // Fast path: when neither per-task nor shared signals are pending,
+    // skip `discard_inert_pending`, `proc.sigactions.lock()`, and the 2 KiB
+    // `[SigAction; 64]` stack copy, and restore any ppoll/pselect6 temporary
+    // sigmask right under this same held PCB lock.
+    if proc.pending_bits() == 0 {
+        restore_poll_blocked_locked(&mut proc);
+        return SignalTailStep::Done;
+    }
+    crate::signal::discard_inert_pending(&mut proc);
+    // GAP-5: one coherent snapshot of the (possibly shared) table for the
+    // whole Phase-1 decision.
+    let actions = *proc.sigactions.lock();
+    let sig = match crate::signal::select_for_delivery(
+        proc.pending_bits(),
+        proc.blocked,
+        proc.in_signal_handler,
+        &actions,
+        crate::signal::DeliveryMode::AnyActionable,
+    ) {
+        Some(signal) => signal,
+        None => {
+            restore_poll_blocked_locked(&mut proc);
+            return SignalTailStep::Done;
         }
-        // GAP-5 G7 (review D3): a mask change since the last return (sigreturn,
-        // a handler's mask, a ppoll mask) may block group signals this task was
-        // chosen for; another member takes them over.
-        if proc.recalc_shared_signals(false) {
-            let group = Arc::clone(&proc.thread_group);
-            drop(proc);
-            crate::process::retarget_shared_signals(pid, &group);
-            proc = proc_arc.lock();
+    };
+    // GAP-5 G7: a group-wide signal moves into this task's own set before
+    // the frame is built and committed, so no other member delivers it too.
+    if !proc.claim_pending(sig) {
+        restore_poll_blocked_locked(&mut proc);
+        return SignalTailStep::Done;
+    }
+    match crate::signal::resolve_disposition(&actions, sig) {
+        crate::signal::Disposition::Handler {
+            handler,
+            flags,
+            mask,
+        } => {
+            // M0 item 5 (1b-2): if THIS syscall blocked-and-resumed, `switch_context`
+            // zeroed the per-CPU `frame_ptr`, so the mutable accessor used by Phase 2/3
+            // below would fail-closed and DEFER this handler to the next syscall (the
+            // 1b-1 gap). Republish the binding snapshotted at entry — owner-re-validated
+            // by the accessor — so delivery lands at the SAME return as the EINTR wake.
+            // ONE republish (still under this Phase-1 lock) covers BOTH the Phase-2
+            // snapshot and the Phase-3 commit because nothing between here and the commit
+            // reschedules or re-zeroes the slot: `copy_to_user` does not block/switch
+            // (its SMAP windows only briefly re-enable IRQs, and a fault is ex-table
+            // fixed-up to EFAULT), and kernel-mode is not timer-preempted. INVARIANT FOR
+            // FUTURE EDITS: if kernel-mode preemption OR a blocking usercopy path is ever
+            // added, republish again immediately before the Phase-3 commit below.
+            if is_valid_frame_binding(proc.saved_frame_ptr, proc.saved_frame_owner, pid) {
+                publish_syscall_frame_binding(proc.saved_frame_ptr, proc.saved_frame_owner);
+            }
+            // R172-P6-F1: recompute the sigaction index from the selected signal (the
+            // former `bit` local was folded into select_lowest_deliverable).
+            let delivered_action = actions[(sig.as_u8() - 1) as usize];
+            let restorer = delivered_action.restorer;
+            SignalTailStep::Handler {
+                sig,
+                handler,
+                restorer,
+                sa_mask: mask,
+                sa_flags: flags,
+                old_blocked: proc.blocked,
+                delivered_action,
+            }
         }
-        // GAP-5 G7 (review D3): a task with a posted fatal exit never takes a
-        // group signal; a live member gets it. The exit runs here instead.
-        if proc.pending_kill.load(AtomicOrdering::Acquire) {
-            drop(proc);
+        crate::signal::Disposition::Ignored => {
+            // (race: reset to SIG_IGN after queueing.) Drop the bit and stop.
+            proc.consume_own_pending(sig);
+            restore_poll_blocked_locked(&mut proc);
+            SignalTailStep::Done
+        }
+        crate::signal::Disposition::Default(_) => {
+            // (race: reset to SIG_DFL after queueing.) Re-resolve at delivery and
+            // apply the default — NEVER build a frame with a handler of 0.
+            SignalTailStep::Default(sig)
+        }
+    }
+}
+
+/// Complete any unlocked Phase 2/3 signal delivery or pending-kill/default step
+/// returned by [`maybe_deliver_signal_phase1`].
+fn finish_signal_tail_step(
+    pid: ProcessId,
+    result: i64,
+    proc_arc: crate::process::ProcessArc,
+    step: SignalTailStep,
+) {
+    let (sig, handler, restorer, sa_mask, sa_flags, old_blocked, delivered_action) = match step {
+        SignalTailStep::Done | SignalTailStep::ExecHandoff => return,
+        SignalTailStep::Exit(exit_code) => {
+            drop(proc_arc);
+            terminate_self_and_halt(pid, exit_code);
+        }
+        SignalTailStep::PendingKill => {
             // The PCB reference must not outlive the abandoned stack.
             drop(proc_arc);
             if let Some(code) = crate::process::take_pending_process_exit(pid) {
                 terminate_self_and_halt(pid, code);
             }
+            poll_restore_sigmask_tail(pid);
             return;
         }
-        crate::signal::discard_inert_pending(&mut proc);
-        // GAP-5: one coherent snapshot of the (possibly shared) table for the
-        // whole Phase-1 decision.
-        let actions = *proc.sigactions.lock();
-        let sig = match crate::signal::select_for_delivery(
-            proc.pending_bits(),
-            proc.blocked,
-            proc.in_signal_handler,
-            &actions,
-            crate::signal::DeliveryMode::AnyActionable,
-        ) {
-            Some(signal) => signal,
-            None => return,
-        };
-        // GAP-5 G7: a group-wide signal moves into this task's own set before
-        // the frame is built and committed, so no other member delivers it too.
-        if !proc.claim_pending(sig) {
+        SignalTailStep::Default(sig) => {
+            drop(proc_arc);
+            apply_default_at_safepoint(pid, sig); // may not return
+            poll_restore_sigmask_tail(pid);
             return;
         }
-        match crate::signal::resolve_disposition(&actions, sig) {
-            crate::signal::Disposition::Handler {
-                handler,
-                flags,
-                mask,
-            } => {
-                // M0 item 5 (1b-2): if THIS syscall blocked-and-resumed, `switch_context`
-                // zeroed the per-CPU `frame_ptr`, so the mutable accessor used by Phase 2/3
-                // below would fail-closed and DEFER this handler to the next syscall (the
-                // 1b-1 gap). Republish the binding snapshotted at entry — owner-re-validated
-                // by the accessor — so delivery lands at the SAME return as the EINTR wake.
-                // ONE republish (still under this Phase-1 lock) covers BOTH the Phase-2
-                // snapshot and the Phase-3 commit because nothing between here and the commit
-                // reschedules or re-zeroes the slot: `copy_to_user` does not block/switch
-                // (its SMAP windows only briefly re-enable IRQs, and a fault is ex-table
-                // fixed-up to EFAULT), and kernel-mode is not timer-preempted. INVARIANT FOR
-                // FUTURE EDITS: if kernel-mode preemption OR a blocking usercopy path is ever
-                // added, republish again immediately before the Phase-3 commit below.
-                if is_valid_frame_binding(proc.saved_frame_ptr, proc.saved_frame_owner, pid) {
-                    publish_syscall_frame_binding(proc.saved_frame_ptr, proc.saved_frame_owner);
-                }
-                // R172-P6-F1: recompute the sigaction index from the selected signal (the
-                // former `bit` local was folded into select_lowest_deliverable).
-                let delivered_action = actions[(sig.as_u8() - 1) as usize];
-                let restorer = delivered_action.restorer;
-                (
-                    sig,
-                    handler,
-                    restorer,
-                    mask,
-                    flags,
-                    proc.blocked,
-                    delivered_action,
-                )
-            }
-            crate::signal::Disposition::Ignored => {
-                // (race: reset to SIG_IGN after queueing.) Drop the bit and stop.
-                drop(proc);
-                if let Some(a) = get_process(pid) {
-                    a.lock().consume_own_pending(sig);
-                }
-                return;
-            }
-            crate::signal::Disposition::Default(_) => {
-                // (race: reset to SIG_DFL after queueing.) Re-resolve at delivery and
-                // apply the default — NEVER build a frame with a handler of 0.
-                drop(proc);
-                drop(proc_arc);
-                apply_default_at_safepoint(pid, sig); // may not return
-                return;
-            }
-        }
+        SignalTailStep::Handler {
+            sig,
+            handler,
+            restorer,
+            sa_mask,
+            sa_flags,
+            old_blocked,
+            delivered_action,
+        } => (
+            sig,
+            handler,
+            restorer,
+            sa_mask,
+            sa_flags,
+            old_blocked,
+            delivered_action,
+        ),
     };
 
     // Phase 2 (NO lock held — faultable copy_to_user; heap-free in-place staging,
@@ -11016,7 +11192,10 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     // the next non-blocking return; pending bit and blocked mask untouched.
     let (ctx, mut fxcopy) = match snap {
         Some(s) => s,
-        None => return,
+        None => {
+            restore_poll_blocked_locked(&mut proc_arc.lock());
+            return;
+        }
     };
     crate::signal_frame::sanitize_fxsave_for_export(&mut fxcopy);
 
@@ -11097,6 +11276,7 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         // The frame vanished between build and commit (must not happen at the tail):
         // the sigframe bytes are on the user stack but control flow is unchanged, so
         // there is no delivery; the pending bit stays set for a later attempt.
+        restore_poll_blocked_locked(&mut proc_arc.lock());
         return;
     }
 
@@ -19239,6 +19419,9 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             // Installing any filter sets no_new_privs (sticky, one-way)
             proc.seccomp_state.no_new_privs = true;
+            // Issue #109 §4.1: publish active seccomp flag (Release) AFTER the
+            // filter is installed and BEFORE releasing the PCB lock.
+            proc.sync_seccomp_or_pledge_flag();
 
             // RF180-1: publish the new committed filter revision before the
             // installing flag is cleared.
@@ -19364,6 +19547,9 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             if wants_log {
                 proc.seccomp_state.log_violations = true;
             }
+            // Issue #109 §4.1: publish active seccomp flag (Release) AFTER the
+            // filter is installed and BEFORE releasing the PCB lock.
+            proc.sync_seccomp_or_pledge_flag();
 
             // RF180-1: publish the new committed filter revision before the
             // installing flag is cleared.

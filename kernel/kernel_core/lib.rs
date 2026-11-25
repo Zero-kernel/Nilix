@@ -375,6 +375,18 @@ fn lsm_get_credentials() -> Option<lsm::Credentials> {
     })
 }
 
+/// Adapter: Get current subject (pid, tgid, credentials) in one PCB lock for LSM
+fn lsm_get_subject() -> Option<lsm::SubjectSnapshot> {
+    process::current_subject_snapshot().map(|s| lsm::SubjectSnapshot {
+        pid: s.pid,
+        tgid: s.tgid,
+        uid: s.creds.uid,
+        gid: s.creds.gid,
+        euid: s.creds.euid,
+        egid: s.creds.egid,
+    })
+}
+
 /// Adapter: Get current ticks for LSM
 fn lsm_get_ticks() -> u64 {
     get_ticks()
@@ -387,6 +399,7 @@ pub fn init() {
     // Register LSM context providers (must be after process::init)
     lsm::register_context_provider(lsm_get_pid, lsm_get_credentials, lsm_get_ticks);
     lsm::register_tgid_provider(lsm_get_tgid);
+    lsm::register_subject_provider(lsm_get_subject);
 
     // R29-2 FIX: Register seccomp current-process evaluation callbacks
     // This bridges the seccomp module to the process module for filter evaluation

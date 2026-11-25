@@ -477,11 +477,26 @@ pub const PARTIALLY_WIRED_HOOKS: &[PartiallyWiredHook] = &[PartiallyWiredHook {
 // Context Provider Callbacks
 // ============================================================================
 
+/// Single-lock subject identity snapshot returned by `GetSubjectCallback`.
+#[derive(Debug, Clone, Copy)]
+pub struct SubjectSnapshot {
+    pub pid: ProcessId,
+    pub tgid: ProcessId,
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+}
+
 /// Callback type for getting current process ID
 pub type GetPidCallback = fn() -> Option<ProcessId>;
 
 /// Callback type for getting current process credentials
 pub type GetCredentialsCallback = fn() -> Option<Credentials>;
+
+/// Callback type for getting current process subject (pid, tgid, credentials)
+/// in a single PCB lookup.
+pub type GetSubjectCallback = fn() -> Option<SubjectSnapshot>;
 
 /// Callback type for getting current tick count (for timestamps)
 pub type GetTicksCallback = fn() -> u64;
@@ -498,6 +513,15 @@ static CTX_GET_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// GAP-5 G8: current task's thread-group id (registered separately; absent means
 /// "use the pid", the pre-thread behaviour).
 static CTX_GET_TGID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Combined subject provider (pid + tgid + credentials in one PCB lookup).
+static CTX_GET_SUBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Register a combined subject provider that returns `(pid, tgid, creds)` in
+/// one `PROCESS_TABLE` + `PCB` lookup, avoiding duplicate locks in
+/// `ProcessCtx::from_current()` and `SyscallCtx::from_current()`.
+pub fn register_subject_provider(get_subject: GetSubjectCallback) {
+    CTX_GET_SUBJECT.store(get_subject as u64, core::sync::atomic::Ordering::Release);
+}
 
 /// GAP-5 G8: register the callback that reports the current task's thread-group
 /// id, so subjects carry the real tgid instead of the task id.
@@ -519,6 +543,16 @@ pub fn register_context_provider(
         core::sync::atomic::Ordering::Release,
     );
     CTX_GET_TICKS.store(get_ticks as u64, core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn current_subject() -> Option<Option<SubjectSnapshot>> {
+    let ptr = CTX_GET_SUBJECT.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 {
+        return None;
+    }
+    let f: GetSubjectCallback = unsafe { core::mem::transmute(ptr) };
+    Some(f())
 }
 
 #[inline]
@@ -594,14 +628,46 @@ pub struct SyscallCtx {
 impl SyscallCtx {
     /// Create a syscall context from current process state.
     pub fn from_current(syscall_nr: u64, args: &[u64; 6]) -> Option<Self> {
+        if let Some(subject) = current_subject() {
+            let subject = subject?;
+            return Self::from_snapshot(
+                subject.pid,
+                subject.tgid,
+                Some(Credentials {
+                    uid: subject.uid,
+                    gid: subject.gid,
+                    euid: subject.euid,
+                    egid: subject.egid,
+                }),
+                syscall_nr,
+                args,
+            );
+        }
         let creds = current_credentials()?;
         let pid = current_pid()?;
+        Self::from_snapshot(pid, current_tgid(pid), Some(creds), syscall_nr, args)
+    }
+
+    /// Create a syscall context from an already-captured subject snapshot.
+    ///
+    /// Strictly fail-closed (R184-U01-1): returns `None` if `creds` is `None`
+    /// (for example when a sibling thread holds the shared credentials lock for
+    /// writing), and always runs the `syscall_test` entry hook when enabled.
+    #[inline]
+    pub fn from_snapshot(
+        pid: ProcessId,
+        tgid: ProcessId,
+        creds: Option<Credentials>,
+        syscall_nr: u64,
+        args: &[u64; 6],
+    ) -> Option<Self> {
+        let creds = creds?;
         #[cfg(feature = "syscall_test")]
         syscall_test::note_syscall_entry(pid);
 
         Some(Self {
             pid,
-            tgid: current_tgid(pid),
+            tgid,
             uid: creds.uid,
             gid: creds.gid,
             euid: creds.euid,
@@ -639,8 +705,21 @@ pub struct MissingSubject;
 impl ProcessCtx {
     /// Create a process context from current process state.
     pub fn from_current() -> Option<Self> {
-        let creds = current_credentials()?;
-        let pid = current_pid()?;
+        let (pid, tgid, uid, gid, euid, egid) = if let Some(subject) = current_subject() {
+            let s = subject?;
+            (s.pid, s.tgid, s.uid, s.gid, s.euid, s.egid)
+        } else {
+            let creds = current_credentials()?;
+            let pid = current_pid()?;
+            (
+                pid,
+                current_tgid(pid),
+                creds.uid,
+                creds.gid,
+                creds.euid,
+                creds.egid,
+            )
+        };
         // TD-LSM-1: the guest oracle's missing-subject arm.
         #[cfg(feature = "syscall_test")]
         if syscall_test::take_lost_subject(pid) {
@@ -649,11 +728,11 @@ impl ProcessCtx {
 
         Some(Self {
             pid,
-            tgid: current_tgid(pid),
-            uid: creds.uid,
-            gid: creds.gid,
-            euid: creds.euid,
-            egid: creds.egid,
+            tgid,
+            uid,
+            gid,
+            euid,
+            egid,
             cap: None,
         })
     }
@@ -903,6 +982,30 @@ static PERMISSIVE_SLOT: PolicySlot = PolicySlot {
 #[cfg(feature = "lsm")]
 static ACTIVE_POLICY_SLOT: AtomicPtr<PolicySlot> = AtomicPtr::new(core::ptr::null_mut());
 
+/// Fail-closed fast-path flag indicating whether the active policy implements
+/// non-trivial `syscall_enter`/`syscall_exit` hooks.
+///
+/// Initialized `true` (fail-closed). Transitions to `true` publish this flag
+/// *before* updating `ACTIVE_POLICY_SLOT`; transitions to `false` publish
+/// `ACTIVE_POLICY_SLOT` *before* clearing this flag (both `SeqCst`). Readers
+/// check this flag with `Acquire` so an enforcing syscall hook can never be
+/// bypassed across policy transitions.
+#[cfg(feature = "lsm")]
+static ACTIVE_HAS_SYSCALL_HOOKS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "lsm")]
+#[inline]
+fn publish_policy_slot(slot_ptr: *mut PolicySlot, has_syscall_hooks: bool) {
+    if has_syscall_hooks {
+        ACTIVE_HAS_SYSCALL_HOOKS.store(true, Ordering::SeqCst);
+        ACTIVE_POLICY_SLOT.store(slot_ptr, Ordering::SeqCst);
+    } else {
+        ACTIVE_POLICY_SLOT.store(slot_ptr, Ordering::SeqCst);
+        ACTIVE_HAS_SYSCALL_HOOKS.store(false, Ordering::SeqCst);
+    }
+}
+
 /// R103-4 FIX: Replaced `static mut USER_POLICY_SLOT` with a Mutex-guarded
 /// leaked `Box`, eliminating the `static mut` UB that Rust 2024 edition rejects.
 ///
@@ -935,14 +1038,14 @@ pub fn set_policy(policy: &'static dyn LsmPolicy) {
     let slot: &'static PolicySlot =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(PolicySlot { policy }));
     let slot_ptr = slot as *const PolicySlot as *mut PolicySlot;
+    let has_syscall_hooks = policy.has_syscall_hooks();
 
     // Store reference for bookkeeping (previous slot is intentionally leaked)
     {
         let mut guard = USER_POLICY_SLOT.lock();
         *guard = Some(slot);
+        publish_policy_slot(slot_ptr, has_syscall_hooks);
     }
-
-    ACTIVE_POLICY_SLOT.store(slot_ptr, Ordering::Release);
 }
 
 #[cfg(not(feature = "lsm"))]
@@ -990,6 +1093,9 @@ pub fn active_policy_name() -> &'static str {
 pub fn hook_syscall_enter(ctx: &SyscallCtx) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
+        if !ACTIVE_HAS_SYSCALL_HOOKS.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let res = policy().syscall_enter(ctx);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(ctx.pid, ctx.uid, ctx.gid, ctx.cap);
@@ -1009,6 +1115,9 @@ pub fn hook_syscall_enter(ctx: &SyscallCtx) -> LsmResult {
 pub fn hook_syscall_exit(ctx: &SyscallCtx, ret: isize) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
+        if !ACTIVE_HAS_SYSCALL_HOOKS.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let res = policy().syscall_exit(ctx, ret);
         if let Err(ref err) = res {
             // R188-U42-3 FIX: exit-hook denials are security decisions too.
@@ -2334,6 +2443,93 @@ pub fn init() {
         // Initialize the policy registry with the permissive policy
         // This ensures policy() never returns from the null branch after init
         let slot_ptr = &PERMISSIVE_SLOT as *const PolicySlot as *mut PolicySlot;
-        ACTIVE_POLICY_SLOT.store(slot_ptr, Ordering::Release);
+        let _guard = USER_POLICY_SLOT.lock();
+        publish_policy_slot(slot_ptr, PERMISSIVE.has_syscall_hooks());
+    }
+}
+
+#[cfg(all(test, feature = "lsm"))]
+mod syscall_fastpath_tests {
+    use super::*;
+    use crate::policy::{DenyAllPolicy, LsmPolicy, PermissivePolicy, SECURE_BASELINE};
+
+    struct DefaultCustomPolicy;
+    impl LsmPolicy for DefaultCustomPolicy {
+        fn name(&self) -> &'static str {
+            "custom-default"
+        }
+    }
+
+    static DENY_ALL: DenyAllPolicy = DenyAllPolicy;
+    static POLICY_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn syscall_ctx_from_snapshot_fails_closed_on_missing_creds() {
+        let args = [1, 2, 3, 4, 5, 6];
+        assert!(
+            SyscallCtx::from_snapshot(42, 40, None, 39, &args).is_none(),
+            "missing credentials must fail closed (R184-U01-1)"
+        );
+        let ctx = SyscallCtx::from_snapshot(
+            42,
+            40,
+            Some(Credentials {
+                uid: 1000,
+                gid: 1001,
+                euid: 1002,
+                egid: 1003,
+            }),
+            39,
+            &args,
+        )
+        .expect("valid credentials must build SyscallCtx");
+        assert_eq!(ctx.pid, 42);
+        assert_eq!(ctx.tgid, 40);
+        assert_eq!(ctx.uid, 1000);
+        assert_eq!(ctx.gid, 1001);
+        assert_eq!(ctx.euid, 1002);
+        assert_eq!(ctx.egid, 1003);
+        assert_eq!(ctx.syscall_nr, 39);
+        assert_eq!(ctx.args, args);
+    }
+
+    #[test]
+    fn lsm_syscall_hook_fast_path_is_fail_closed_for_enforcing_policies() {
+        let _guard = POLICY_LOCK.lock();
+        assert!(!PermissivePolicy.has_syscall_hooks());
+        assert!(!SECURE_BASELINE.has_syscall_hooks());
+        #[cfg(feature = "syscall_test")]
+        assert!(!SYSCALL_TEST_POLICY.has_syscall_hooks());
+        assert!(
+            DENY_ALL.has_syscall_hooks(),
+            "DenyAllPolicy must keep syscall hooks active"
+        );
+        assert!(
+            DefaultCustomPolicy.has_syscall_hooks(),
+            "trait default must fail closed (true)"
+        );
+
+        let ctx = SyscallCtx::from_snapshot(
+            7,
+            7,
+            Some(Credentials {
+                uid: 0,
+                gid: 0,
+                euid: 0,
+                egid: 0,
+            }),
+            39,
+            &[0; 6],
+        )
+        .unwrap();
+
+        set_policy(&DENY_ALL);
+        assert!(ACTIVE_HAS_SYSCALL_HOOKS.load(Ordering::Acquire));
+        assert_eq!(hook_syscall_enter(&ctx), Err(LsmError::Denied));
+
+        init();
+        assert!(!ACTIVE_HAS_SYSCALL_HOOKS.load(Ordering::Acquire));
+        assert_eq!(hook_syscall_enter(&ctx), Ok(()));
+        assert_eq!(hook_syscall_exit(&ctx, 0), Ok(()));
     }
 }

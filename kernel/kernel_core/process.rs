@@ -3380,6 +3380,15 @@ pub struct Process {
     /// 在安装期间拒绝创建新线程，防止 TSYNC 竞态绕过
     pub seccomp_installing: bool,
 
+    /// Issue #109 §4.1: fail-closed atomic fast-path flag indicating whether
+    /// this process has any seccomp filter or pledge state installed.
+    ///
+    /// Writers install rules under `Process` lock BEFORE publishing `true` with
+    /// `Ordering::Release` (via `sync_seccomp_or_pledge_flag`); readers observe
+    /// with `Ordering::Acquire` so an installed filter/pledge can never be
+    /// skipped.
+    pub has_seccomp_or_pledge: AtomicBool,
+
     /// RF180-1 FIX: monotonic revision of the committed seccomp filter stack.
     ///
     /// Clone snapshots this value with the filter state, then re-validates it
@@ -3986,6 +3995,8 @@ impl Process {
             pledge_state: None,
             // R26-3: seccomp 安装状态标志
             seccomp_installing: false,
+            // Issue #109 §4.1: no seccomp/pledge filters installed at birth.
+            has_seccomp_or_pledge: AtomicBool::new(false),
             // RF180-1: no committed filter installations at process birth.
             seccomp_generation: 0,
             // G.1: Watchdog not registered until process starts running
@@ -7759,6 +7770,7 @@ pub fn take_exec_handoff(process: &ProcessArc) -> Option<TakenExecHandoff> {
             .max(thread.seccomp_generation)
             .wrapping_add(1);
         let old_pledge = core::mem::replace(&mut proc.pledge_state, thread.pledge_state);
+        proc.sync_seccomp_or_pledge_flag();
         let old_pid_ns =
             core::mem::replace(&mut proc.pid_ns_for_children, thread.pid_ns_for_children);
         let (released_fds, old_files) = match thread.files {
@@ -7812,7 +7824,7 @@ pub enum SyscallSafePoint {
 
 /// Decision shared by both syscall safe points; caller holds `proc`'s guard.
 /// A posted fatal exit always wins over a handoff.
-fn syscall_safe_point_locked(proc: &mut Process, frame_bound: bool) -> SyscallSafePoint {
+pub(crate) fn syscall_safe_point_locked(proc: &mut Process, frame_bound: bool) -> SyscallSafePoint {
     if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
         proc.pending_kill.store(false, Ordering::Relaxed);
         return SyscallSafePoint::Continue;
@@ -7825,6 +7837,111 @@ fn syscall_safe_point_locked(proc: &mut Process, frame_bound: bool) -> SyscallSa
     } else {
         SyscallSafePoint::Continue
     }
+}
+
+/// Issue #109 §4.1: Consolidated syscall-entry snapshot captured under one
+/// `PROCESS_TABLE` + `PCB` lock instead of 4 separate lock acquisitions
+/// (`syscall_entry_safe_point` + `evaluate_seccomp` + `current_credentials` +
+/// `current_tgid`, plus read-only `getpid`/`gettid`).
+#[derive(Debug, Clone, Copy)]
+pub enum SyscallEntryState {
+    /// No process-table entry found for `pid` (fail closed like `evaluate_seccomp`).
+    MissingProcess,
+    /// A posted fatal exit was consumed; caller must terminate with this code.
+    Exit(i32),
+    /// Entry checks completed; caller proceeds with seccomp verdict + LSM ctx.
+    Ready {
+        exec_handoff: bool,
+        verdict: SeccompVerdict,
+        tgid: ProcessId,
+        creds: Option<CredentialIds>,
+        /// Pre-resolved namespace ID for `sys_getpid` (39) or `sys_gettid` (186):
+        /// `Some(Ok(id))` or `Some(Err(()))` (EFAULT on missing ns translation).
+        fast_ns_id: Option<Result<usize, ()>>,
+    },
+}
+
+/// Consolidated syscall-entry path: consumes any posted fatal exit, snapshots
+/// the syscall-frame binding when needed, runs the atomic-gated seccomp/pledge
+/// evaluation, snapshots `(tgid, credentials)` for LSM, and resolves read-only
+/// `getpid`/`gettid` namespace IDs — all under a single `get_process` + `PCB` lock.
+pub fn syscall_entry_prepare(
+    pid: ProcessId,
+    syscall_num: u64,
+    args: &[u64; 6],
+    binding: Option<(u64, u64)>,
+    want_snapshot: bool,
+) -> SyscallEntryState {
+    let Some(proc_arc) = get_process(pid) else {
+        return SyscallEntryState::MissingProcess;
+    };
+    let (state, retarget) = {
+        let mut proc = proc_arc.lock();
+        let decision = syscall_safe_point_locked(&mut proc, binding.is_some());
+        if let SyscallSafePoint::Exit(exit_code) = decision {
+            return SyscallEntryState::Exit(exit_code);
+        }
+        let multi_member = proc.thread_group.members() > 1;
+        if want_snapshot || proc.exec_handoff.is_some() || multi_member {
+            let (frame_ptr, owner) = binding.unwrap_or((0, 0));
+            proc.saved_frame_ptr = frame_ptr;
+            proc.saved_frame_owner = owner;
+        }
+        // GAP-5 G7 (review D3): a handler entered from an interrupt raised the
+        // mask without a recalculation (that path cannot take PROCESS_TABLE). Hand
+        // group signals it can no longer take to another member before this call
+        // can block.
+        let retarget = (multi_member && proc.recalc_shared_signals(false))
+            .then(|| Arc::clone(&proc.thread_group));
+
+        let exec_handoff = matches!(decision, SyscallSafePoint::ExecHandoff);
+        let verdict = if exec_handoff {
+            SeccompVerdict::allow()
+        } else {
+            evaluate_seccomp_locked(&proc, syscall_num, args)
+        };
+        let tgid = proc.tgid;
+        let creds = proc.credentials.try_read().map(|c| CredentialIds {
+            uid: c.uid,
+            gid: c.gid,
+            euid: c.euid,
+            egid: c.egid,
+        });
+        let fast_ns_id = match syscall_num {
+            39 => {
+                if proc.tgid != proc.pid {
+                    if proc.ns_tgid == 0 {
+                        Some(Err(()))
+                    } else {
+                        Some(Ok(proc.ns_tgid))
+                    }
+                } else {
+                    Some(
+                        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).ok_or(()),
+                    )
+                }
+            }
+            186 => {
+                Some(crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).ok_or(()))
+            }
+            _ => None,
+        };
+        (
+            SyscallEntryState::Ready {
+                exec_handoff,
+                verdict,
+                tgid,
+                creds,
+                fast_ns_id,
+            },
+            retarget,
+        )
+    };
+    drop(proc_arc);
+    if let Some(group) = retarget {
+        retarget_shared_signals(pid, &group);
+    }
+    state
 }
 
 /// Syscall-entry safe point: consume a posted fatal exit, snapshot the live
@@ -9257,15 +9374,42 @@ pub enum CredentialsError {
     OutOfMemory,
 }
 
+/// Single-lock snapshot of `(pid, tgid, credentials)` for LSM subjects.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessSubjectSnapshot {
+    pub pid: ProcessId,
+    pub tgid: ProcessId,
+    pub creds: CredentialIds,
+}
+
+/// Read `(pid, tgid, credentials)` for the current process under one
+/// `get_process` + `PCB` lock (avoiding holding `PROCESS_TABLE` across `PCB`
+/// and avoiding the double-lookup in `current_credentials` + `current_tgid`).
+pub fn current_subject_snapshot() -> Option<ProcessSubjectSnapshot> {
+    let pid = current_pid()?;
+    let proc_arc = get_process(pid)?;
+    let proc = proc_arc.lock();
+    let creds = proc.credentials.try_read()?;
+    Some(ProcessSubjectSnapshot {
+        pid,
+        tgid: proc.tgid,
+        creds: CredentialIds {
+            uid: creds.uid,
+            gid: creds.gid,
+            euid: creds.euid,
+            egid: creds.egid,
+        },
+    })
+}
+
 /// 获取当前进程的凭证
 ///
 /// R39-3 FIX: 从共享凭证结构读取，线程间共享
 /// 返回 None 如果没有当前进程
 pub fn current_credentials() -> Option<CredentialIds> {
     let pid = current_pid()?;
-    let table = PROCESS_TABLE.lock();
-    let slot = table.get(pid)?;
-    let proc = slot.as_ref()?.lock();
+    let proc_arc = get_process(pid)?;
+    let proc = proc_arc.lock();
     let creds = proc.credentials.try_read()?;
     Some(CredentialIds {
         uid: creds.uid,
@@ -9697,22 +9841,44 @@ use seccomp::SeccompVerdict;
 /// - `SeccompAction::Errno(e)` - 返回错误码
 /// - `SeccompAction::Trap` - 触发 SIGSYS
 /// - `SeccompAction::Log` - 记录日志但允许执行
-pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
-    let pid = match current_pid() {
-        Some(p) => p,
-        None => return SeccompVerdict::kill(0),
-    };
+/// Issue #109 §4.1: Global monotonic fast-path flag set (`Ordering::Release`)
+/// whenever any process installs a seccomp filter or pledge state.
+///
+/// Paired with per-process `Process::has_seccomp_or_pledge` (`Release`/`Acquire`).
+/// Rules are always committed into `seccomp_state` / `pledge_state` under the
+/// PCB lock BEFORE publishing this flag so readers observing `false` with
+/// `Acquire` are guaranteed that no seccomp/pledge filter exists.
+static ANY_SECCOMP_OR_PLEDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    // R148-I1 FIX: Use get_process() instead of holding PROCESS_TABLE lock
-    // for the entire seccomp evaluation.  get_process() briefly locks the
-    // table to clone the Arc, then releases.  Only the per-process Mutex is
-    // held during the O(n) filter evaluation, removing PROCESS_TABLE as a
-    // global contention point on every syscall.
-    let proc_arc = match get_process(pid) {
-        Some(p) => p,
-        None => return SeccompVerdict::kill(0),
-    };
-    let proc = proc_arc.lock();
+impl Process {
+    /// Publish the current `seccomp_state` / `pledge_state` activity into the
+    /// fail-closed atomic fast-path flags.
+    ///
+    /// Must be called by every writer after mutating `seccomp_state` or
+    /// `pledge_state` (before releasing the PCB lock or exposing a new child).
+    #[inline]
+    pub fn sync_seccomp_or_pledge_flag(&self) {
+        let active = self.seccomp_state.has_filters() || self.pledge_state.is_some();
+        if active {
+            ANY_SECCOMP_OR_PLEDGE_ACTIVE.store(true, Ordering::Release);
+        }
+        self.has_seccomp_or_pledge.store(active, Ordering::Release);
+    }
+}
+
+/// Evaluate seccomp/pledge filters for an already-locked `Process`, gated by
+/// the fail-closed `Acquire`/`Release` atomic fast-path flags.
+#[inline]
+pub(crate) fn evaluate_seccomp_locked(
+    proc: &Process,
+    syscall_nr: u64,
+    args: &[u64; 6],
+) -> SeccompVerdict {
+    if !ANY_SECCOMP_OR_PLEDGE_ACTIVE.load(Ordering::Acquire)
+        || !proc.has_seccomp_or_pledge.load(Ordering::Acquire)
+    {
+        return SeccompVerdict::allow();
+    }
 
     // First check pledge if set
     if let Some(ref pledge) = proc.pledge_state {
@@ -9739,24 +9905,40 @@ pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
     }
 }
 
+pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return SeccompVerdict::kill(0),
+    };
+
+    // R148-I1 FIX: Use get_process() instead of holding PROCESS_TABLE lock
+    // for the entire seccomp evaluation.  get_process() briefly locks the
+    // table to clone the Arc, then releases.  Only the per-process Mutex is
+    // held during the O(n) filter evaluation, removing PROCESS_TABLE as a
+    // global contention point on every syscall.
+    let proc_arc = match get_process(pid) {
+        Some(p) => p,
+        None => return SeccompVerdict::kill(0),
+    };
+    let proc = proc_arc.lock();
+    evaluate_seccomp_locked(&proc, syscall_nr, args)
+}
+
 /// 检查当前进程是否启用了 seccomp
 pub fn has_seccomp_enabled() -> bool {
+    if !ANY_SECCOMP_OR_PLEDGE_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
     let pid = match current_pid() {
         Some(p) => p,
         None => return false,
     };
 
-    let table = PROCESS_TABLE.lock();
-    let slot = match table.get(pid) {
-        Some(s) => s,
-        None => return false,
+    let Some(proc_arc) = get_process(pid) else {
+        return false;
     };
-    let proc = match slot.as_ref() {
-        Some(p) => p.lock(),
-        None => return false,
-    };
-
-    proc.seccomp_state.has_filters() || proc.pledge_state.is_some()
+    let proc = proc_arc.lock();
+    proc.has_seccomp_or_pledge.load(Ordering::Acquire)
 }
 
 /// 检查当前进程是否设置了 no_new_privs
@@ -10408,6 +10590,77 @@ mod thread_group_tests {
             assert_eq!(l.return_claimed_signals(u64::MAX), 0);
         }
         assert_eq!(group.shared_pending(), 0);
+    }
+
+    #[test]
+    fn seccomp_fast_path_flag_syncs_and_enforces_strict_filter() {
+        mm::publish_heap_budgets();
+        let proc_arc = pcb(52101, 1);
+        {
+            let mut proc = proc_arc.lock();
+            assert!(!proc.has_seccomp_or_pledge.load(Ordering::Acquire));
+            assert_eq!(
+                evaluate_seccomp_locked(&proc, 57, &[0; 6]).action,
+                seccomp::SeccompAction::Allow
+            );
+
+            proc.seccomp_state
+                .add_filter(seccomp::strict_filter())
+                .expect("strict filter");
+            proc.sync_seccomp_or_pledge_flag();
+
+            assert!(ANY_SECCOMP_OR_PLEDGE_ACTIVE.load(Ordering::Acquire));
+            assert!(proc.has_seccomp_or_pledge.load(Ordering::Acquire));
+            // Strict mode allows read (0) and kills fork (57).
+            assert_eq!(
+                evaluate_seccomp_locked(&proc, 0, &[0; 6]).action,
+                seccomp::SeccompAction::Allow
+            );
+            assert_eq!(
+                evaluate_seccomp_locked(&proc, 57, &[0; 6]).action,
+                seccomp::SeccompAction::Kill
+            );
+        }
+    }
+
+    #[test]
+    fn seccomp_fast_path_flag_enforces_pledge_state() {
+        mm::publish_heap_budgets();
+        let proc_arc = pcb(52102, 1);
+        {
+            let mut proc = proc_arc.lock();
+            assert!(!proc.has_seccomp_or_pledge.load(Ordering::Acquire));
+            proc.pledge_state = Some(PledgeState::new(seccomp::PledgePromises::STDIO));
+            proc.sync_seccomp_or_pledge_flag();
+
+            assert!(ANY_SECCOMP_OR_PLEDGE_ACTIVE.load(Ordering::Acquire));
+            assert!(proc.has_seccomp_or_pledge.load(Ordering::Acquire));
+            // STDIO allows read (0) and denies fork (57).
+            assert_eq!(
+                evaluate_seccomp_locked(&proc, 0, &[0; 6]).action,
+                seccomp::SeccompAction::Allow
+            );
+            assert_eq!(
+                evaluate_seccomp_locked(&proc, 57, &[0; 6]).action,
+                seccomp::SeccompAction::Kill
+            );
+
+            proc.pledge_state = None;
+            proc.sync_seccomp_or_pledge_flag();
+            assert!(!proc.has_seccomp_or_pledge.load(Ordering::Acquire));
+            assert_eq!(
+                evaluate_seccomp_locked(&proc, 57, &[0; 6]).action,
+                seccomp::SeccompAction::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn syscall_entry_prepare_missing_process_fails_closed() {
+        match syscall_entry_prepare(usize::MAX - 1, 39, &[0; 6], None, false) {
+            SyscallEntryState::MissingProcess => {}
+            other => panic!("expected MissingProcess, got {:?}", other),
+        }
     }
 
     #[test]

@@ -82,6 +82,15 @@ pub trait LsmPolicy: Send + Sync {
         100
     }
 
+    /// Whether this policy implements non-trivial `syscall_enter` or
+    /// `syscall_exit` mediation.
+    ///
+    /// Defaults to `true` (fail-closed) so any custom or future policy
+    /// automatically runs syscall hooks unless it explicitly opts out.
+    fn has_syscall_hooks(&self) -> bool {
+        true
+    }
+
     // ========================================================================
     // Syscall Hooks
     // ========================================================================
@@ -550,6 +559,10 @@ impl LsmPolicy for PermissivePolicy {
 
     // R104-6: Trait defaults for kpatch_* now deny.  PermissivePolicy must
     // explicitly allow them to maintain its "allow everything" contract.
+    fn has_syscall_hooks(&self) -> bool {
+        false
+    }
+
     fn kpatch_load(&self, _task: &ProcessCtx, _patch_len: usize) -> LsmResult {
         Ok(())
     }
@@ -936,6 +949,10 @@ impl LsmPolicy for SecureBaselinePolicy {
         10
     }
 
+    fn has_syscall_hooks(&self) -> bool {
+        false
+    }
+
     fn memory_mmap(
         &self,
         _task: &ProcessCtx,
@@ -1096,6 +1113,10 @@ impl LsmPolicy for SyscallTestPolicy {
 
     fn priority(&self) -> u32 {
         PermissivePolicy.priority()
+    }
+
+    fn has_syscall_hooks(&self) -> bool {
+        false
     }
 
     fn task_exec(&self, task: &ProcessCtx, path_hash: u64) -> LsmResult {

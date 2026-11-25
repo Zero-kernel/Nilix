@@ -2160,7 +2160,7 @@ pub fn has_hmac_key() -> bool {
 /// Check if audit subsystem is initialized
 #[inline]
 pub fn is_initialized() -> bool {
-    AUDIT_INITIALIZED.load(Ordering::Relaxed)
+    AUDIT_INITIALIZED.load(Ordering::Acquire)
 }
 
 /// Enable audit event emission
@@ -2185,7 +2185,19 @@ pub fn disable() {
 /// Check if audit is enabled
 #[inline]
 pub fn is_enabled() -> bool {
-    AUDIT_ENABLED.load(Ordering::Relaxed)
+    AUDIT_ENABLED.load(Ordering::Acquire)
+}
+
+/// Fail-closed atomic check for whether audit emission is both enabled and
+/// initialized.
+///
+/// Pairs `Acquire` loads with the `SeqCst` stores in `enable()` and `init()`,
+/// allowing hot paths (such as syscall exit) to skip audit subject/event setup
+/// before audit is initialized or when disabled without missing a published
+/// enablement.
+#[inline]
+pub fn is_active() -> bool {
+    AUDIT_ENABLED.load(Ordering::Acquire) && AUDIT_INITIALIZED.load(Ordering::Acquire)
 }
 
 /// Emit an audit event
@@ -2215,12 +2227,12 @@ pub fn emit(
     errno: i32,
     timestamp: u64,
 ) -> Result<(), AuditError> {
-    // Fast path: check enabled without lock
-    if !AUDIT_ENABLED.load(Ordering::Relaxed) {
+    // Fast path: check enabled/initialized with Acquire ordering without lock
+    if !AUDIT_ENABLED.load(Ordering::Acquire) {
         return Err(AuditError::Disabled);
     }
 
-    if !AUDIT_INITIALIZED.load(Ordering::Relaxed) {
+    if !AUDIT_INITIALIZED.load(Ordering::Acquire) {
         return Err(AuditError::Uninitialized);
     }
 
@@ -3385,5 +3397,25 @@ mod tests {
         assert_ne!(unkeyed, keyed, "Keyed and unkeyed hashes must differ");
         assert_ne!(unkeyed, ZERO_HASH, "Unkeyed hash should be valid");
         assert_ne!(keyed, ZERO_HASH, "Keyed hash should be valid");
+    }
+
+    #[test]
+    fn test_is_active_requires_enabled_and_initialized() {
+        // Default state before audit::init(): AUDIT_ENABLED is true,
+        // AUDIT_INITIALIZED is false, so is_active() must be false and emit()
+        // must reject without touching the ring.
+        assert!(is_enabled());
+        assert!(!is_initialized());
+        assert!(!is_active());
+        let res = emit(
+            AuditKind::Syscall,
+            AuditOutcome::Success,
+            AuditSubject::kernel(),
+            AuditObject::None,
+            &[39],
+            0,
+            1,
+        );
+        assert_eq!(res, Err(AuditError::Uninitialized));
     }
 }
