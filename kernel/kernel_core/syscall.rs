@@ -11113,6 +11113,7 @@ fn maybe_deliver_signal_phase1<'a>(
 
 /// Complete any unlocked Phase 2/3 signal delivery or pending-kill/default step
 /// returned by [`maybe_deliver_signal_phase1`].
+#[cold]
 fn finish_signal_tail_step(
     pid: ProcessId,
     result: i64,

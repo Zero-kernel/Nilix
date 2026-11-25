@@ -1674,6 +1674,7 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     panic!("Allocation error: {:?}", layout);
 }
 #[cfg(not(test))]
+#[cold]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     unsafe {

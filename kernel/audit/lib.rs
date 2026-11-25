@@ -2284,7 +2284,7 @@ pub fn emit(
 /// - `args[0]` = `AuditSecurityClass::Lsm`
 /// - `args[1]` = SHA-256 (truncated to 64 bits) hash of the hook name
 /// - `args[2]` = `AuditLsmReason`
-#[inline]
+#[cold]
 pub fn emit_lsm_denial(
     subject: AuditSubject,
     object: AuditObject,
@@ -2331,7 +2331,7 @@ pub fn emit_lsm_denial(
 /// - Kill/Trap/Errno → Denied
 /// - Log → Info (syscall is allowed but logged)
 /// - Allow → Success (not typically audited)
-#[inline]
+#[cold]
 pub fn emit_seccomp_violation(
     subject: AuditSubject,
     syscall_nr: u64,

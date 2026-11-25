@@ -161,7 +161,7 @@ run_suite lsm-syscall-test 5 0 \
     --lib --locked
 
 # Includes the C3 CPU-identity decoding and method selection.
-run_suite cpu-local 14 0 \
+run_suite cpu-local 16 0 \
     --manifest-path kernel/cpu_local/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
