@@ -16263,9 +16263,10 @@ pub fn try_grow_user_stack(
                         }
                     };
 
-                    // Zero the fresh frame before it becomes user-visible.
-                    let virt = mm::phys_to_virt(frame.start_address());
-                    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+                    // Issue #109 §1.3 (Invariant S2): `allocate_data_frame()` ->
+                    // `mm::buddy_allocator::alloc_physical_pages(1)` guarantees
+                    // a 4 KiB pre-zeroed frame before it can be mapped.
+                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
 
                     if manager
                         .map_page(page, frame, flags, &mut frame_alloc)
@@ -16789,12 +16790,11 @@ impl crate::populate::PopulateBackend for EagerPopulator {
         {
             self.live += 1;
         }
-        // Zero the frame before it becomes reachable, so a page never discloses
-        // another task's data.
-        let virt = mm::phys_to_virt(frame.start_address());
-        // SAFETY: a fresh buddy frame, mapped nowhere yet, reached through the
-        // direct map.
-        unsafe { core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE) };
+        // Issue #109 §1.3 (Invariant S2): `allocate_data_frame()` ->
+        // `mm::buddy_allocator::alloc_physical_pages(1)` returns a frame that
+        // was already scrubbed to all zeros on free or cold buddy refill, so
+        // no second 4 KiB memset is needed before publishing to userspace.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         Some(frame)
     }
 
