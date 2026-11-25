@@ -1395,31 +1395,35 @@ pub struct Context {
     pub fx: FxSaveArea,
 }
 
+impl Context {
+    /// Issue #109 §3.1: Initialize a default `Context` (704 bytes including
+    /// the 512-byte `FxSaveArea`) directly in uninitialized storage without
+    /// staging a `Context` temporary on the caller's stack.
+    ///
+    /// # Safety
+    /// `dst` must point to valid, aligned, writable storage for `Context`.
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        // Zero all general-purpose registers, padding, and the 512-byte FXSAVE area.
+        core::ptr::write_bytes(dst, 0, 1);
+        core::ptr::addr_of_mut!((*dst).rflags).write(0x202); // IF (中断使能) 位设置
+        core::ptr::addr_of_mut!((*dst).cs).write(0x08); // 内核代码段
+        core::ptr::addr_of_mut!((*dst).ss).write(0x10); // 内核数据段
+        let fx_data = core::ptr::addr_of_mut!((*dst).fx.data) as *mut u8;
+        // 默认 FCW（双精度、屏蔽所有异常）与 MXCSR（屏蔽所有 SSE 异常）
+        fx_data.add(0).write(0x7F);
+        fx_data.add(1).write(0x03);
+        fx_data.add(24).write(0x80);
+        fx_data.add(25).write(0x1F);
+    }
+}
+
 impl Default for Context {
     fn default() -> Self {
-        Context {
-            rax: 0,
-            rbx: 0,
-            rcx: 0,
-            rdx: 0,
-            rsi: 0,
-            rdi: 0,
-            rbp: 0,
-            rsp: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rip: 0,
-            rflags: 0x202, // IF (中断使能) 位设置
-            cs: 0x08,      // 内核代码段
-            ss: 0x10,      // 内核数据段
-            _padding: [0; 4],
-            fx: FxSaveArea::default(),
+        let mut ctx = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `ctx` is valid aligned storage and `init_in_place` initializes all fields.
+        unsafe {
+            Self::init_in_place(ctx.as_mut_ptr());
+            ctx.assume_init()
         }
     }
 }
@@ -1997,25 +2001,38 @@ pub const RLIMIT_NOFILE: usize = 7;
 /// NOFILE is enforced when reserving or replacing a numeric descriptor; lowering
 /// it does not close existing descriptors or revoke already acquired reservations.
 /// Other limits retain their existing subsystem-specific/advisory behavior.
-pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
+/// Issue #109 §3.1: Initialize default POSIX rlimits directly into `dst`
+/// without staging `[RLimit; RLIMIT_NLIMITS]` on the caller's stack.
+///
+/// # Safety
+/// `dst` must point to valid, aligned, writable storage for `[RLimit; RLIMIT_NLIMITS]`.
+unsafe fn init_default_rlimits_in_place(dst: *mut [RLimit; RLIMIT_NLIMITS]) {
     let inf = RLimit {
         rlim_cur: RLIM_INFINITY,
         rlim_max: RLIM_INFINITY,
     };
-    let mut r = [inf; RLIMIT_NLIMITS];
-    r[RLIMIT_NOFILE] = RLimit {
+    let elem = dst as *mut RLimit;
+    for i in 0..RLIMIT_NLIMITS {
+        elem.add(i).write(inf);
+    }
+    elem.add(RLIMIT_NOFILE).write(RLimit {
         rlim_cur: MAX_FD as u64,
         rlim_max: MAX_FD as u64,
-    };
-    // M0-7: report the ACTUAL writable stack (reserved window minus the unmapped low
-    // guard page), so getrlimit/prlimit64 do not overstate the mapped extent by a page.
-    // R172-X-F2: derived from the single-sourced mapped floor (TOP - mapped_floor ==
-    // SIZE - GUARD, byte-identical) so the limit tracks any future guard-size change.
-    r[RLIMIT_STACK] = RLimit {
+    });
+    // M0-7 / R172-X-F2: derived from single-sourced mapped floor.
+    elem.add(RLIMIT_STACK).write(RLimit {
         rlim_cur: crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_usable_floor(),
         rlim_max: RLIM_INFINITY,
-    };
-    r
+    });
+}
+
+pub fn default_rlimits() -> [RLimit; RLIMIT_NLIMITS] {
+    let mut r = core::mem::MaybeUninit::<[RLimit; RLIMIT_NLIMITS]>::uninit();
+    // SAFETY: `r` is valid aligned storage and every slot is written.
+    unsafe {
+        init_default_rlimits_in_place(r.as_mut_ptr());
+        r.assume_init()
+    }
 }
 
 #[cfg(feature = "kcov")]
@@ -3669,7 +3686,7 @@ impl Process {
         )
         .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let files = Arc::try_new(FilesTable::new()).map_err(|_| ProcessCreateError::OutOfMemory)?;
-        let sigactions = Arc::try_new(crate::signal::SignalTable::new())
+        let sigactions = crate::signal::SignalTable::try_new_arc()
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let fs = Arc::try_new(crate::fs_context::FsContextHandle::new(
             crate::fs_context::FsContextState::default(),
@@ -3687,20 +3704,6 @@ impl Process {
         let payload_charge = reservation
             .commit()
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
-        let process = Self::new_with_allocations(
-            pid,
-            ppid,
-            owned_name,
-            priority,
-            mm,
-            cap_table,
-            thread_group,
-            files,
-            sigactions,
-            fs,
-            credentials,
-            Some(payload_charge),
-        );
         let process_arc_charge = process_arc_reservation
             .commit()
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
@@ -3708,12 +3711,42 @@ impl Process {
             drop(charge);
             ProcessCreateError::OutOfMemory
         })?;
-        match Arc::try_new_in(OwnerCpuMutex::new(process), allocator) {
-            Ok(process) => Ok(process),
+        // Issue #109 §3.1: Allocate the outer `Arc<MaybeUninit<OwnerCpuMutex<Process>>>`
+        // BEFORE initializing `Process`, then initialize every field directly in
+        // place on the heap. Because every fallible operation has already
+        // succeeded above, the in-place initialization below is strictly
+        // infallible and error paths can never drop uninitialized memory.
+        let mut uninit_arc = match Arc::try_new_uninit_in(allocator) {
+            Ok(arc) => arc,
             Err(_) => {
                 allocator.cancel_failed_allocation();
-                Err(ProcessCreateError::OutOfMemory)
+                return Err(ProcessCreateError::OutOfMemory);
             }
+        };
+        let slot = Arc::get_mut(&mut uninit_arc).expect("freshly allocated ProcessArc is unique");
+        // SAFETY: `slot` points to valid, aligned, uniquely owned uninitialized
+        // storage for `OwnerCpuMutex<Process>`, and both `OwnerCpuMutex::init_in_place`
+        // and `Process::init_with_allocations_in_place` infallibly initialize
+        // every field before `assume_init()`.
+        unsafe {
+            OwnerCpuMutex::init_in_place(slot.as_mut_ptr(), |proc_ptr| {
+                Self::init_with_allocations_in_place(
+                    proc_ptr,
+                    pid,
+                    ppid,
+                    owned_name,
+                    priority,
+                    mm,
+                    cap_table,
+                    thread_group,
+                    files,
+                    sigactions,
+                    fs,
+                    credentials,
+                    Some(payload_charge),
+                );
+            });
+            Ok(uninit_arc.assume_init())
         }
     }
 
@@ -3871,145 +3904,291 @@ impl Process {
         credentials: Arc<SharedCredentials>,
         heap_charge: Option<HeapCharge>,
     ) -> Self {
-        Process {
-            pid,
-            generation: NEXT_GENERATION.fetch_add(1, Ordering::SeqCst), // lint-fetch-add: allow (generation counter)
-            tid: pid,                                                   // tid == pid (Linux 语义)
-            tgid: pid,                                                  // 主线程时 tgid == pid
-            ns_tgid: 0,
-            ppid,
-            is_thread: false,
-            name,
-            state: ProcessState::Ready,
-            stopped: false, // R98-1 FIX: Job-control stop flag starts cleared
-            pending_signals: PendingSignals::new(),
-            // M0 item 5: signal-handler state born clean (no handlers, empty mask,
-            // no live handler frame).
-            blocked: 0,
-            sigactions,
-            saved_blocked: 0,
-            // M0 #5 (1b-2): no live syscall-frame binding at birth.
-            saved_frame_ptr: 0,
-            saved_frame_owner: 0,
-            in_signal_handler: false,
-            // M0-6 poll/select: no pending ppoll/pselect6 sigmask restore at birth.
-            poll_restore_blocked: None,
-            priority,
-            dynamic_priority: priority,
-            base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority
-            socket_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
-            wq_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
-            active_wait_seq: AtomicU64::new(0), // M1-02: born-clean, no active timed wait
-            on_cpu: AtomicBool::new(false),  // R172-03: born off-CPU (context durable)
-            switch_reap_pending: AtomicBool::new(false),
-            pi_boosts: crate::fallible_map::FallibleOrderedMap::new(),
-            pi_boost_reservation: None,
-            waiting_on_futex: None, // E.4 PI: not waiting on any futex
-            time_slice: calculate_time_slice(priority),
-            context: Context::default(),
-            fpu_used: false, // Lazy FPU: process hasn't used FPU yet
-            kernel_stack: VirtAddr::new(0),
-            kernel_stack_top: VirtAddr::new(0),
-            kernel_stack_phys: None,
-            kernel_stack_rcu: None,
-            user_stack: None,
-            memory_space: 0,
-            user_memory_space: 0,
-            mm,
-            files,
-            files_released: false,
-            rlimits: default_rlimits(), // M0-6: POSIX resource limits
-
-            cap_table,
-            exit_code: None,
-            thread_group,
-            group_fatal: false,
-            group_live: true,
-            wait_claimed: AtomicBool::new(false),
-            exec_handoff: None,
-            group_claimed: 0,
-            shared_chosen: 0,
-            pending_kill: AtomicBool::new(false),
-            pending_exit_code: AtomicI32::new(0),
-            waiting_child: None,
-            children: AdmittedVec::new(HeapClass::CoreProcess),
-            children_reserved: 0,
-            children_incomplete: false,
-            cpu_time: 0,
-            // R170-3: no deferred quota debt at birth. `Process::new` is the
-            // sole full constructor (fork builds children through it), so a
-            // child can never inherit its parent's debt.
-            cpu_quota_debt_ns: 0,
-            cpu_quota_debt_cgid: 0,
-            wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
-            wait_age_tick: crate::get_ticks(),
-            allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
-            cpuset_id: 0,                     // Root cpuset (all CPUs)
-            created_at: time::current_timestamp_ms(),
-            // R101-1 FIX: Default to unprivileged nobody (uid=65534) credentials.
-            //
-            // Previously all processes started with uid=0 (root), creating a flat
-            // privilege model with no defense-in-depth. Now Process::new() uses
-            // restricted defaults. Kernel-internal processes (ppid=0) are promoted
-            // to root explicitly by create_process(), and fork()/clone() inherit
-            // credentials from the parent process via independent clone.
-            credentials,
-            fs,
-            // OOM killer 支持 - 默认中立设置
-            nice: 0,
-            oom_score_adj: 0,
-            // 堆管理 — moved to MmState (brk_start/brk initialized to 0 there)
-            // TLS 支持
-            fs_base: 0,
-            gs_base: 0,
-            // 线程支持 (musl 初始化)
-            clear_child_tid: 0,
-            set_child_tid: 0,
-            robust_list_head: 0,
-            robust_list_len: 0,
-            // F.1: PID namespace - default to root namespace
-            // The actual chain will be assigned by create_process after PID allocation
-            pid_ns_chain: AdmittedVec::new(HeapClass::CoreProcess),
-            exit_pid_identity: crate::pid_namespace::ExitPidIdentity::empty(),
-            pid_ns_for_children: crate::pid_namespace::ROOT_PID_NAMESPACE.clone(),
-            // F.1: Mount namespace - default to root mount namespace
-            // The actual namespace will be assigned by create_process from parent
-            mount_ns: crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
-            mount_ns_for_children: crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
-            // F.1: IPC namespace - default to root IPC namespace
-            ipc_ns: crate::ipc_namespace::ROOT_IPC_NAMESPACE.clone(),
-            ipc_ns_for_children: crate::ipc_namespace::ROOT_IPC_NAMESPACE.clone(),
-            // F.1: Network namespace - default to root network namespace
-            net_ns: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
-            net_ns_for_children: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
-            // F.1: User namespace - default to root user namespace
-            // Unlike other namespaces, CLONE_NEWUSER does not require root/CAP_SYS_ADMIN
-            user_ns: crate::user_namespace::ROOT_USER_NAMESPACE.clone(),
-            user_ns_for_children: crate::user_namespace::ROOT_USER_NAMESPACE.clone(),
-            // F.2: Cgroup v2 - default to root cgroup
-            cgroup_id: 0,
-            // R171 M2-1 SLICE-1: not mid-exec at construction.
-            exec_in_progress: false,
-            // Seccomp/Pledge 沙箱 (默认无限制)
-            seccomp_state: SeccompState::new(),
-            pledge_state: None,
-            // R26-3: seccomp 安装状态标志
-            seccomp_installing: false,
-            // Issue #109 §4.1: no seccomp/pledge filters installed at birth.
-            has_seccomp_or_pledge: AtomicBool::new(false),
-            // RF180-1: no committed filter installations at process birth.
-            seccomp_generation: 0,
-            // G.1: Watchdog not registered until process starts running
-            watchdog_handle: None,
-            // R169-9: teardown bookkeeping starts unclaimed / not-done.
-            teardown_claimed: core::sync::atomic::AtomicBool::new(false),
-            teardown_done: core::sync::atomic::AtomicBool::new(false),
-            // KCOV: coverage not initialized at birth
-            #[cfg(feature = "kcov")]
-            kcov: None,
-            _name_heap_charge: None,
-            _heap_charge: heap_charge,
+        let mut slot = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `slot` is valid aligned storage and `init_with_allocations_in_place`
+        // infallibly initializes every field of `Process`.
+        unsafe {
+            Self::init_with_allocations_in_place(
+                slot.as_mut_ptr(),
+                pid,
+                ppid,
+                name,
+                priority,
+                mm,
+                cap_table,
+                thread_group,
+                files,
+                sigactions,
+                fs,
+                credentials,
+                heap_charge,
+            );
+            slot.assume_init()
         }
+    }
+
+    /// Issue #109 §3.1: Infallibly initialize every field of `Process` directly
+    /// into `dst` without staging a `Process` temporary on the caller's stack.
+    ///
+    /// # Safety
+    /// `dst` must point to valid, aligned, writable storage for `Process`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn init_with_allocations_in_place(
+        dst: *mut Self,
+        pid: ProcessId,
+        ppid: ProcessId,
+        name: String,
+        priority: Priority,
+        mm: Arc<OwnerCpuMutex<MmState>>,
+        cap_table: Arc<CapTable>,
+        thread_group: Arc<ThreadGroup>,
+        files: Arc<FilesTable>,
+        sigactions: Arc<crate::signal::SignalTable>,
+        fs: Arc<crate::fs_context::FsContextHandle>,
+        credentials: Arc<SharedCredentials>,
+        heap_charge: Option<HeapCharge>,
+    ) {
+        use core::ptr::addr_of_mut;
+
+        // Compile-time exhaustiveness guard: fails to compile if any field is
+        // added to `Process` without being initialized below. Never called.
+        let _exhaustiveness_guard = |p: Process| {
+            let Process {
+                pid: _,
+                generation: _,
+                tid: _,
+                tgid: _,
+                ns_tgid: _,
+                ppid: _,
+                is_thread: _,
+                name: _,
+                state: _,
+                stopped: _,
+                pending_signals: _,
+                blocked: _,
+                sigactions: _,
+                saved_blocked: _,
+                saved_frame_ptr: _,
+                saved_frame_owner: _,
+                in_signal_handler: _,
+                poll_restore_blocked: _,
+                priority: _,
+                dynamic_priority: _,
+                base_dynamic_priority: _,
+                pi_boosts: _,
+                pi_boost_reservation: _,
+                waiting_on_futex: _,
+                time_slice: _,
+                context: _,
+                fpu_used: _,
+                kernel_stack: _,
+                kernel_stack_top: _,
+                kernel_stack_phys: _,
+                kernel_stack_rcu: _,
+                user_stack: _,
+                memory_space: _,
+                user_memory_space: _,
+                mm: _,
+                files: _,
+                files_released: _,
+                rlimits: _,
+                cap_table: _,
+                exit_code: _,
+                thread_group: _,
+                group_fatal: _,
+                group_live: _,
+                wait_claimed: _,
+                exec_handoff: _,
+                group_claimed: _,
+                shared_chosen: _,
+                pending_kill: _,
+                pending_exit_code: _,
+                waiting_child: _,
+                children: _,
+                children_reserved: _,
+                children_incomplete: _,
+                cpu_time: _,
+                wait_ticks: _,
+                wait_age_tick: _,
+                allowed_cpus: _,
+                cpuset_id: _,
+                created_at: _,
+                credentials: _,
+                fs: _,
+                nice: _,
+                oom_score_adj: _,
+                fs_base: _,
+                gs_base: _,
+                clear_child_tid: _,
+                set_child_tid: _,
+                robust_list_head: _,
+                robust_list_len: _,
+                pid_ns_chain: _,
+                exit_pid_identity: _,
+                pid_ns_for_children: _,
+                mount_ns: _,
+                mount_ns_for_children: _,
+                ipc_ns: _,
+                ipc_ns_for_children: _,
+                net_ns: _,
+                net_ns_for_children: _,
+                user_ns: _,
+                user_ns_for_children: _,
+                cgroup_id: _,
+                exec_in_progress: _,
+                cpu_quota_debt_ns: _,
+                cpu_quota_debt_cgid: _,
+                seccomp_state: _,
+                pledge_state: _,
+                seccomp_installing: _,
+                has_seccomp_or_pledge: _,
+                seccomp_generation: _,
+                watchdog_handle: _,
+                teardown_claimed: _,
+                teardown_done: _,
+                socket_timeout_marker: _,
+                wq_timeout_marker: _,
+                active_wait_seq: _,
+                on_cpu: _,
+                switch_reap_pending: _,
+                #[cfg(feature = "kcov")]
+                    kcov: _,
+                _name_heap_charge: _,
+                _heap_charge: _,
+            } = p;
+        };
+
+        addr_of_mut!((*dst).pid).write(pid);
+        addr_of_mut!((*dst).generation).write(NEXT_GENERATION.fetch_add(1, Ordering::SeqCst)); // lint-fetch-add: allow (generation counter)
+        addr_of_mut!((*dst).tid).write(pid); // tid == pid (Linux 语义)
+        addr_of_mut!((*dst).tgid).write(pid); // 主线程时 tgid == pid
+        addr_of_mut!((*dst).ns_tgid).write(0);
+        addr_of_mut!((*dst).ppid).write(ppid);
+        addr_of_mut!((*dst).is_thread).write(false);
+        addr_of_mut!((*dst).name).write(name);
+        addr_of_mut!((*dst).state).write(ProcessState::Ready);
+        addr_of_mut!((*dst).stopped).write(false); // R98-1 FIX: Job-control stop flag starts cleared
+        addr_of_mut!((*dst).pending_signals).write(PendingSignals::new());
+        // M0 item 5: signal-handler state born clean (no handlers, empty mask,
+        // no live handler frame).
+        addr_of_mut!((*dst).blocked).write(0);
+        addr_of_mut!((*dst).sigactions).write(sigactions);
+        addr_of_mut!((*dst).saved_blocked).write(0);
+        // M0 #5 (1b-2): no live syscall-frame binding at birth.
+        addr_of_mut!((*dst).saved_frame_ptr).write(0);
+        addr_of_mut!((*dst).saved_frame_owner).write(0);
+        addr_of_mut!((*dst).in_signal_handler).write(false);
+        // M0-6 poll/select: no pending ppoll/pselect6 sigmask restore at birth.
+        addr_of_mut!((*dst).poll_restore_blocked).write(None);
+        addr_of_mut!((*dst).priority).write(priority);
+        addr_of_mut!((*dst).dynamic_priority).write(priority);
+        addr_of_mut!((*dst).base_dynamic_priority).write(priority); // E.4 PI: starts same as dynamic_priority
+        addr_of_mut!((*dst).socket_timeout_marker).write(AtomicU64::new(0)); // M4-1b: born-clean
+        addr_of_mut!((*dst).wq_timeout_marker).write(AtomicU64::new(0)); // M4-1b: born-clean
+        addr_of_mut!((*dst).active_wait_seq).write(AtomicU64::new(0)); // M1-02: born-clean
+        addr_of_mut!((*dst).on_cpu).write(AtomicBool::new(false)); // R172-03: born off-CPU
+        addr_of_mut!((*dst).switch_reap_pending).write(AtomicBool::new(false));
+        addr_of_mut!((*dst).pi_boosts).write(crate::fallible_map::FallibleOrderedMap::new());
+        addr_of_mut!((*dst).pi_boost_reservation).write(None);
+        addr_of_mut!((*dst).waiting_on_futex).write(None); // E.4 PI: not waiting on any futex
+        addr_of_mut!((*dst).time_slice).write(calculate_time_slice(priority));
+        Context::init_in_place(addr_of_mut!((*dst).context));
+        addr_of_mut!((*dst).fpu_used).write(false); // Lazy FPU: process hasn't used FPU yet
+        addr_of_mut!((*dst).kernel_stack).write(VirtAddr::new(0));
+        addr_of_mut!((*dst).kernel_stack_top).write(VirtAddr::new(0));
+        addr_of_mut!((*dst).kernel_stack_phys).write(None);
+        addr_of_mut!((*dst).kernel_stack_rcu).write(None);
+        addr_of_mut!((*dst).user_stack).write(None);
+        addr_of_mut!((*dst).memory_space).write(0);
+        addr_of_mut!((*dst).user_memory_space).write(0);
+        addr_of_mut!((*dst).mm).write(mm);
+        addr_of_mut!((*dst).files).write(files);
+        addr_of_mut!((*dst).files_released).write(false);
+        init_default_rlimits_in_place(addr_of_mut!((*dst).rlimits)); // M0-6: POSIX resource limits
+
+        addr_of_mut!((*dst).cap_table).write(cap_table);
+        addr_of_mut!((*dst).exit_code).write(None);
+        addr_of_mut!((*dst).thread_group).write(thread_group);
+        addr_of_mut!((*dst).group_fatal).write(false);
+        addr_of_mut!((*dst).group_live).write(true);
+        addr_of_mut!((*dst).wait_claimed).write(AtomicBool::new(false));
+        addr_of_mut!((*dst).exec_handoff).write(None);
+        addr_of_mut!((*dst).group_claimed).write(0);
+        addr_of_mut!((*dst).shared_chosen).write(0);
+        addr_of_mut!((*dst).pending_kill).write(AtomicBool::new(false));
+        addr_of_mut!((*dst).pending_exit_code).write(AtomicI32::new(0));
+        addr_of_mut!((*dst).waiting_child).write(None);
+        addr_of_mut!((*dst).children).write(AdmittedVec::new(HeapClass::CoreProcess));
+        addr_of_mut!((*dst).children_reserved).write(0);
+        addr_of_mut!((*dst).children_incomplete).write(false);
+        addr_of_mut!((*dst).cpu_time).write(0);
+        // R170-3: no deferred quota debt at birth.
+        addr_of_mut!((*dst).cpu_quota_debt_ns).write(0);
+        addr_of_mut!((*dst).cpu_quota_debt_cgid).write(0);
+        addr_of_mut!((*dst).wait_ticks).write(0); // R65-19 FIX: Initialize starvation counter
+        addr_of_mut!((*dst).wait_age_tick).write(crate::get_ticks());
+        addr_of_mut!((*dst).allowed_cpus).write(0xFFFFFFFFFFFFFFFF); // SMP: Allow on all CPUs
+        addr_of_mut!((*dst).cpuset_id).write(0); // Root cpuset (all CPUs)
+        addr_of_mut!((*dst).created_at).write(time::current_timestamp_ms());
+        // R101-1 FIX: Default to unprivileged nobody (uid=65534) credentials.
+        addr_of_mut!((*dst).credentials).write(credentials);
+        addr_of_mut!((*dst).fs).write(fs);
+        // OOM killer 支持 - 默认中立设置
+        addr_of_mut!((*dst).nice).write(0);
+        addr_of_mut!((*dst).oom_score_adj).write(0);
+        // TLS 支持
+        addr_of_mut!((*dst).fs_base).write(0);
+        addr_of_mut!((*dst).gs_base).write(0);
+        // 线程支持 (musl 初始化)
+        addr_of_mut!((*dst).clear_child_tid).write(0);
+        addr_of_mut!((*dst).set_child_tid).write(0);
+        addr_of_mut!((*dst).robust_list_head).write(0);
+        addr_of_mut!((*dst).robust_list_len).write(0);
+        // F.1: PID namespace - default to root namespace
+        addr_of_mut!((*dst).pid_ns_chain).write(AdmittedVec::new(HeapClass::CoreProcess));
+        addr_of_mut!((*dst).exit_pid_identity)
+            .write(crate::pid_namespace::ExitPidIdentity::empty());
+        addr_of_mut!((*dst).pid_ns_for_children)
+            .write(crate::pid_namespace::ROOT_PID_NAMESPACE.clone());
+        // F.1: Mount namespace - default to root mount namespace
+        addr_of_mut!((*dst).mount_ns).write(crate::mount_namespace::ROOT_MNT_NAMESPACE.clone());
+        addr_of_mut!((*dst).mount_ns_for_children)
+            .write(crate::mount_namespace::ROOT_MNT_NAMESPACE.clone());
+        // F.1: IPC namespace - default to root IPC namespace
+        addr_of_mut!((*dst).ipc_ns).write(crate::ipc_namespace::ROOT_IPC_NAMESPACE.clone());
+        addr_of_mut!((*dst).ipc_ns_for_children)
+            .write(crate::ipc_namespace::ROOT_IPC_NAMESPACE.clone());
+        // F.1: Network namespace - default to root network namespace
+        addr_of_mut!((*dst).net_ns).write(crate::net_namespace::ROOT_NET_NAMESPACE.clone());
+        addr_of_mut!((*dst).net_ns_for_children)
+            .write(crate::net_namespace::ROOT_NET_NAMESPACE.clone());
+        // F.1: User namespace - default to root user namespace
+        addr_of_mut!((*dst).user_ns).write(crate::user_namespace::ROOT_USER_NAMESPACE.clone());
+        addr_of_mut!((*dst).user_ns_for_children)
+            .write(crate::user_namespace::ROOT_USER_NAMESPACE.clone());
+        // F.2: Cgroup v2 - default to root cgroup
+        addr_of_mut!((*dst).cgroup_id).write(0);
+        // R171 M2-1 SLICE-1: not mid-exec at construction.
+        addr_of_mut!((*dst).exec_in_progress).write(false);
+        // Seccomp/Pledge 沙箱 (默认无限制)
+        addr_of_mut!((*dst).seccomp_state).write(SeccompState::new());
+        addr_of_mut!((*dst).pledge_state).write(None);
+        // R26-3: seccomp 安装状态标志
+        addr_of_mut!((*dst).seccomp_installing).write(false);
+        // Issue #109 §4.1: no seccomp/pledge filters installed at birth.
+        addr_of_mut!((*dst).has_seccomp_or_pledge).write(AtomicBool::new(false));
+        // RF180-1: no committed filter installations at process birth.
+        addr_of_mut!((*dst).seccomp_generation).write(0);
+        // G.1: Watchdog not registered until process starts running
+        addr_of_mut!((*dst).watchdog_handle).write(None);
+        // R169-9: teardown bookkeeping starts unclaimed / not-done.
+        addr_of_mut!((*dst).teardown_claimed).write(core::sync::atomic::AtomicBool::new(false));
+        addr_of_mut!((*dst).teardown_done).write(core::sync::atomic::AtomicBool::new(false));
+        // KCOV: coverage not initialized at birth
+        #[cfg(feature = "kcov")]
+        addr_of_mut!((*dst).kcov).write(None);
+        addr_of_mut!((*dst)._name_heap_charge).write(None);
+        addr_of_mut!((*dst)._heap_charge).write(heap_charge);
     }
 
     #[cfg(feature = "kcov")]
@@ -10661,6 +10840,79 @@ mod thread_group_tests {
             SyscallEntryState::MissingProcess => {}
             other => panic!("expected MissingProcess, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn try_new_pcb_in_place_initializes_all_fields_identically() {
+        mm::publish_heap_budgets();
+        let name = ProcessNameSnapshot::from_parts("inplace-pcb-test", "");
+        let proc_arc = Process::try_new_pcb(52201, 42, name, 120).expect("try_new_pcb");
+        {
+            let proc = proc_arc.lock();
+            assert_eq!(proc.pid, 52201);
+            assert_eq!(proc.tid, 52201);
+            assert_eq!(proc.tgid, 52201);
+            assert_eq!(proc.ppid, 42);
+            assert_eq!(proc.name, "inplace-pcb-test");
+            assert_eq!(proc.priority, 120);
+            assert_eq!(proc.dynamic_priority, 120);
+            assert_eq!(proc.base_dynamic_priority, 120);
+            assert_eq!(proc.state, ProcessState::Ready);
+            assert!(!proc.stopped);
+            assert!(!proc.fpu_used);
+            assert!(!proc.has_seccomp_or_pledge.load(Ordering::Acquire));
+            assert!(!proc.pending_kill.load(Ordering::Acquire));
+            assert!(!proc.on_cpu.load(Ordering::Acquire));
+            assert_eq!(proc.allowed_cpus, u64::MAX);
+            // Verify in-place Context + FxSaveArea initialization
+            assert_eq!(proc.context.rax, 0);
+            assert_eq!(proc.context.rip, 0);
+            assert_eq!(proc.context.rflags, 0x202);
+            assert_eq!(proc.context.cs, 0x08);
+            assert_eq!(proc.context.ss, 0x10);
+            assert_eq!(proc.context.fx.data[0], 0x7F);
+            assert_eq!(proc.context.fx.data[1], 0x03);
+            assert_eq!(proc.context.fx.data[24], 0x80);
+            assert_eq!(proc.context.fx.data[25], 0x1F);
+            assert!(proc.context.fx.data[2..24].iter().all(|&b| b == 0));
+            assert!(proc.context.fx.data[26..].iter().all(|&b| b == 0));
+            // Verify in-place rlimits initialization
+            assert_eq!(proc.rlimits[RLIMIT_NOFILE].rlim_cur, MAX_FD as u64);
+            assert_eq!(proc.rlimits[RLIMIT_NOFILE].rlim_max, MAX_FD as u64);
+            assert_eq!(proc.rlimits[RLIMIT_STACK].rlim_max, RLIM_INFINITY);
+            assert_eq!(proc.rlimits[0].rlim_cur, RLIM_INFINITY);
+            // Verify unprivileged nobody default credentials (R101-1)
+            let creds = proc.credentials.try_read().expect("uncontended creds");
+            assert_eq!(creds.uid, 65534);
+            assert_eq!(creds.gid, 65534);
+            assert_eq!(creds.euid, 65534);
+            assert_eq!(creds.egid, 65534);
+        }
+        // Dropping the Arc must cleanly release both payload and outer Arc charges.
+        drop(proc_arc);
+    }
+
+    #[test]
+    fn try_new_pcb_uninit_arc_failure_cancels_charge_without_uninit_drop() {
+        mm::publish_heap_budgets();
+        // Verify that an allocation failure on `Arc::try_new_uninit_in` via a
+        // single-use `ProcessArcAllocator` cleanly cancels its charge without
+        // touching or dropping uninitialized `Process` memory.
+        let charge_bytes = arc_charge_bytes::<OwnerCpuMutex<Process>>().expect("arc bytes");
+        let charge = try_reserve_heap(HeapClass::CoreProcess, charge_bytes)
+            .expect("reserve")
+            .commit()
+            .expect("commit");
+        let allocator = ProcessArcAllocator::try_install(charge).expect("install");
+        // Consume the single-use capability with a tiny allocation, then verify
+        // a second `Arc::try_new_uninit_in(allocator)` fails cleanly without UB.
+        let first = Arc::<u8, _>::try_new_in(1u8, allocator).expect("first alloc");
+        let second = Arc::<OwnerCpuMutex<Process>, _>::try_new_uninit_in(allocator);
+        assert!(
+            second.is_err(),
+            "second allocation on single-use ProcessArcAllocator must fail closed"
+        );
+        drop(first);
     }
 
     #[test]

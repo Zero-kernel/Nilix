@@ -367,6 +367,14 @@ impl SignalTable {
         }
     }
 
+    /// Issue #109 §3.1: Out-of-line fallible heap constructor so the 2 KiB
+    /// `[SigAction; NSIG]` staging buffer does not inflate `Process::try_new_pcb`'s
+    /// stack frame.
+    #[inline(never)]
+    pub fn try_new_arc() -> Result<alloc::sync::Arc<Self>, alloc::alloc::AllocError> {
+        alloc::sync::Arc::try_new(Self::new())
+    }
+
     /// Process-context lock. Callers may hold their own PCB lock.
     #[inline]
     pub fn lock(&self) -> spin::MutexGuard<'_, [SigAction; NSIG]> {
