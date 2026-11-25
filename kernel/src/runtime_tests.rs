@@ -406,6 +406,78 @@ impl RuntimeTest for PcpFrameCacheZeroingAndConservationTest {
     }
 }
 
+/// Issue #109 §4.2 (Invariant S2): verify hardware-assisted usercopy refuses
+/// all accesses when the CPU is running on the boot PML4 root (which retains
+/// the low 0-4 GiB supervisor identity map), failing closed before STAC.
+struct UsercopyBootRootGuardTest;
+
+/// Category: Security
+/// Priority: P0
+/// Status: Implemented
+impl RuntimeTest for UsercopyBootRootGuardTest {
+    fn name(&self) -> &'static str {
+        "usercopy_boot_root_guard"
+    }
+
+    fn description(&self) -> &'static str {
+        "Issue #109 §4.2: verify hardware usercopy fails closed on boot CR3 before STAC"
+    }
+
+    fn run(&self) -> TestResult {
+        use kernel_core::usercopy::UserAddr;
+        use kernel_core::{
+            copy_from_user_safe, copy_to_user_safe, copy_user_cstring, read_user_u32_atomic,
+            write_user_u32_atomic,
+        };
+
+        // Addresses inside the boot root's low supervisor identity map.
+        const BOOT_IDMAP_PROBES: [usize; 2] = [0x10_0000, 0x60_0000];
+        let mut buf = [0xA5u8; 64];
+
+        for addr in BOOT_IDMAP_PROBES {
+            if copy_from_user_safe(&mut buf, addr as *const u8).is_ok() {
+                return TestResult::Fail(alloc::format!(
+                    "copy_from_user_safe succeeded on boot CR3 at {:#x}",
+                    addr
+                ));
+            }
+            if copy_to_user_safe(addr as *mut u8, &buf).is_ok() {
+                return TestResult::Fail(alloc::format!(
+                    "copy_to_user_safe succeeded on boot CR3 at {:#x}",
+                    addr
+                ));
+            }
+            if read_user_u32_atomic(UserAddr::new(addr)).is_ok() {
+                return TestResult::Fail(alloc::format!(
+                    "read_user_u32_atomic succeeded on boot CR3 at {:#x}",
+                    addr
+                ));
+            }
+            if write_user_u32_atomic(UserAddr::new(addr), 0).is_ok() {
+                return TestResult::Fail(alloc::format!(
+                    "write_user_u32_atomic succeeded on boot CR3 at {:#x}",
+                    addr
+                ));
+            }
+            if copy_user_cstring(addr as *const u8).is_ok() {
+                return TestResult::Fail(alloc::format!(
+                    "copy_user_cstring succeeded on boot CR3 at {:#x}",
+                    addr
+                ));
+            }
+        }
+
+        // Verify buffer was untouched on rejected copy_from_user_safe.
+        if !buf.iter().all(|&b| b == 0xA5) {
+            return TestResult::Fail(String::from(
+                "copy_from_user_safe mutated destination buffer on boot CR3",
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
 /// Test R186-4 P0-A: VMA/MM metadata heap admission with CoreProcess coexistence
 fn assert_admission_lanes_at_least(
     baseline: mm::HeapAdmissionSnapshot,
@@ -3569,6 +3641,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &PcpFrameCacheZeroingAndConservationTest,
+        &UsercopyBootRootGuardTest,
         &VmaHeapAdmissionTest,
         &VmaHeapAdmissionPressureTest,
         &VmaForkCombinedLoadTest,

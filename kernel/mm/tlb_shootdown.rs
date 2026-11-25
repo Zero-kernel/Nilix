@@ -550,8 +550,15 @@ pub unsafe fn with_temporary_address_space<R>(
 /// Returns 0 if no CR3 has been tracked for this CPU yet.
 #[inline]
 pub fn current_cpu_cr3() -> u64 {
+    tracked_cr3_for_cpu(current_cpu_id())
+}
+
+/// Issue #109 §4.2: read a specific CPU's tracked canonical CR3 root directly
+/// without re-querying `current_cpu_id()`.
+#[inline]
+pub fn tracked_cr3_for_cpu(cpu_id: usize) -> u64 {
     CPU_ACTIVE_CR3
-        .get(current_cpu_id())
+        .get(cpu_id)
         .map(|slot| slot.0.load(Ordering::Acquire))
         .unwrap_or(0)
 }

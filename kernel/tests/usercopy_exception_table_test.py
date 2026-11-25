@@ -19,6 +19,7 @@ EXPECTED = {
     "put_u8": bytes.fromhex("408837"),
     "put_u32": bytes.fromhex("8937"),
     "cmpxchg_u32": bytes.fromhex("f00fb117"),
+    "copy_bytes": bytes.fromhex("f3a4"),
 }
 def nofault_bindings(source):
     """Read the handler's binding list instead of maintaining a second list."""
@@ -149,6 +150,19 @@ def main():
             print("TD-USERCOPY-1: misplaced no-fault label rejected")
         else:
             raise AssertionError("misplaced no-fault label unexpectedly passed")
+        # Issue #109 §4.2: a copy_bytes label moved before `cld` must be rejected.
+        bad_copy = assembly.replace(
+            "    cld                     // R65-17: guarantee forward copy (DF=0)\n.Lcopy_bytes_access:",
+            ".Lcopy_bytes_access:\n    cld                     // R65-17: guarantee forward copy (DF=0)",
+        )
+        assert bad_copy != assembly, "copy_bytes mutation did not apply"
+        try:
+            verify_table(build_elf(bad_copy, directory, rustc, linker, "bad_copy_bytes"), objdump, nofault_access)
+        except AssertionError as error:
+            assert "copy_bytes: table points to" in str(error), str(error)
+            print("Issue #109 §4.2: misplaced copy_bytes label rejected")
+        else:
+            raise AssertionError("misplaced copy_bytes label unexpectedly passed")
         if options.runtime:
             assert platform.system() == "Linux" and platform.machine() == "x86_64"
             compiler = shutil.which("cc")
@@ -163,7 +177,7 @@ def main():
             run([compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie",
                  str(assembler), str(root / "kernel/tests/usercopy_fault_probe.c"), "-o", str(binary)])
             output = run([str(binary)])
-            assert "4 exact-RIP fault recoveries passed" in output
+            assert "6 exact-RIP fault recoveries passed" in output
             print(output.strip())
         else:
             print("Kernel/hosted runtime fault probe: NOT RUN (use --runtime on Linux)")

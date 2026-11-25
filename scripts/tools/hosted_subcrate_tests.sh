@@ -111,7 +111,7 @@ run_standalone_rust_suite() {
     echo "=== hosted standalone Rust suite: ${name} (expected ${expected_passed} passed; default parallelism) ==="
     if ! (
         cd "${repo_root}/${source_dir}"
-        NILIX_TEST_TOTAL=82 rustc +nightly-2025-12-08 \
+        NILIX_TEST_TOTAL=83 rustc +nightly-2025-12-08 \
             --edition=2021 "${rustc_flags[@]}" --test "${source_file}" -o "${test_binary}"
         "${test_binary}"
     ) 2>&1 | tee "${log_file}"; then
@@ -246,7 +246,7 @@ run_suite cgroup-access 1 0 \
 
 # Includes the C3 aligned TID store and concurrent word tests, and the C3
 # work-stealing hint with its model.
-run_suite kernel-core 182 0 \
+run_suite kernel-core 185 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -279,7 +279,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 182 \
+run_suite mitigation-mappings 5 185 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \
