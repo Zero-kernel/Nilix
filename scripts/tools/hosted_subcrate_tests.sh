@@ -111,7 +111,7 @@ run_standalone_rust_suite() {
     echo "=== hosted standalone Rust suite: ${name} (expected ${expected_passed} passed; default parallelism) ==="
     if ! (
         cd "${repo_root}/${source_dir}"
-        NILIX_TEST_TOTAL=81 rustc +nightly-2025-12-08 \
+        NILIX_TEST_TOTAL=82 rustc +nightly-2025-12-08 \
             --edition=2021 "${rustc_flags[@]}" --test "${source_file}" -o "${test_binary}"
         "${test_binary}"
     ) 2>&1 | tee "${log_file}"; then
@@ -176,7 +176,7 @@ run_suite livepatch 3 0 \
     --manifest-path kernel/livepatch/Cargo.toml \
     --target x86_64-unknown-linux-gnu --lib --locked
 
-run_suite mm 65 0 \
+run_suite mm 73 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \

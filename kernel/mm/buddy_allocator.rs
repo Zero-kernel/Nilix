@@ -4,6 +4,7 @@
 //! 当需要分配内存时，找到最小的能满足需求的块；释放时尝试与相邻的块合并。
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::{structures::paging::PhysFrame, PhysAddr};
 
@@ -17,8 +18,36 @@ const PAGE_SIZE: usize = 4096;
 
 const PAGE_FREE: u8 = 0;
 const PAGE_ALLOC_START_BASE: u8 = 1;
+const PAGE_ALLOC_ORDER0: u8 = PAGE_ALLOC_START_BASE;
 const PAGE_ALLOC_TAIL_BASE: u8 = 0x40;
+/// Issue #109 §1.3: order-0 frame exclusively owned by one CPU's PCP magazine.
+///
+/// Disjoint from `PAGE_FREE` (0), `PAGE_ALLOC_START` (1..=11), `PAGE_ALLOC_TAIL`
+/// (0x40..=0x4A), and `PAGE_RESERVED` (0xFF), allowing lock-free atomic CAS
+/// transitions (`0x01 <-> 0x80`) on the PCP fast path without weakening R74-4
+/// order-mismatch, double-free, or reserved-page checks.
+const PAGE_PCP_CACHED: u8 = 0x80;
+/// Issue #109 §1.3: free page returned from PCP whose 4 KiB contents were
+/// already scrubbed to all zeros before leaving PCP. Cleared to `PAGE_FREE`
+/// (dirty) whenever allocated and later freed through any non-PCP path, so
+/// PCP refill skips redundant 4 KiB memsets without weakening Invariant S2.
+const PAGE_FREE_ZEROED: u8 = 0x81;
 const PAGE_RESERVED: u8 = u8::MAX;
+
+#[inline]
+fn is_free_page_state(state: u8) -> bool {
+    state == PAGE_FREE || state == PAGE_FREE_ZEROED
+}
+
+/// Per-CPU page cache tuning (Issue #109 §1.3).
+///
+/// Hysteresis band (`REFILL=16`, `DRAIN=32`, `HIGH=64`) prevents refill/drain
+/// oscillation while bounding idle per-CPU memory to 256 KiB (reclaimed
+/// synchronously across all CPUs before any allocation fails or enters OOM).
+const PCP_HIGH_WATERMARK: usize = 64;
+const PCP_REFILL_BATCH: usize = 16;
+const PCP_DRAIN_BATCH: usize = 32;
+const _: () = assert!(PCP_REFILL_BATCH <= 32);
 
 #[inline]
 fn allocation_start_state(order: usize) -> Option<u8> {
@@ -76,6 +105,9 @@ pub enum FreeError {
     OrderMismatch,
     PageNotAllocated,
     ReservedPage,
+    /// Issue #109 §1.3: COW/shared-anon `PAGE_REF_COUNT` slot is still non-zero;
+    /// refusing reclamation closes any UAF window before the frame can enter PCP.
+    PageStillReferenced,
     MetadataCorrupt,
     AllocatorPoisoned,
 }
@@ -97,6 +129,87 @@ struct FreeBit {
     mask: u64,
     order: usize,
     block_idx: usize,
+}
+
+/// Fixed-length atomic per-page state storage (Issue #109 §1.3).
+///
+/// Unlike `MetadataStore<T>`, `PageStateStore` intentionally does NOT implement
+/// `DerefMut`: both `BuddyAllocator` and the lock-free PCP fast path access
+/// elements strictly through shared `&[AtomicU8]` references, avoiding any
+/// `&mut` aliasing UB under Stacked/Tree Borrows while keeping exact 1 B/page
+/// storage size (`size_of::<AtomicU8>() == 1`).
+enum PageStateStore {
+    Heap(Vec<AtomicU8>),
+    Boot(&'static [AtomicU8]),
+}
+
+impl PageStateStore {
+    fn try_heap(len: usize, fill: u8) -> Result<Self, BuddyInitError> {
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(len)
+            .map_err(|_| BuddyInitError::MetadataAllocationFailed)?;
+        for _ in 0..len {
+            storage.push(AtomicU8::new(fill));
+        }
+        Ok(Self::Heap(storage))
+    }
+
+    #[inline]
+    fn load(&self, index: usize) -> u8 {
+        self[index].load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn store(&self, index: usize, value: u8) {
+        self[index].store(value, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Heap(storage) => storage.capacity(),
+            Self::Boot(storage) => storage.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot_bytes(&self) -> Vec<u8> {
+        self.iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .collect()
+    }
+}
+
+impl core::ops::Deref for PageStateStore {
+    type Target = [AtomicU8];
+
+    fn deref(&self) -> &[AtomicU8] {
+        match self {
+            Self::Heap(storage) => storage,
+            Self::Boot(storage) => storage,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for PageStateStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|(a, b)| a.load(Ordering::Acquire) == b.load(Ordering::Acquire))
+    }
+}
+
+#[cfg(test)]
+impl core::fmt::Debug for PageStateStore {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list()
+            .entries(self.iter().map(|slot| slot.load(Ordering::Acquire)))
+            .finish()
+    }
 }
 
 /// GAP-6 F8: fixed-length buddy metadata storage. A boot allocator uses
@@ -417,10 +530,10 @@ pub struct BuddyAllocator {
     /// Fixed post-init free-block index. Runtime alloc/free only toggles bits.
     free_map: FixedFreeMap,
 
-    /// Exact per-page ownership state: free, reserved, allocation start(order),
-    /// or allocation tail(order). This makes interior/wrong-order/double frees
-    /// distinguishable without trusting caller-supplied sizes.
-    page_state: MetadataStore<u8>,
+    /// Exact per-page ownership state: free, reserved, PCP-cached, allocation
+    /// start(order), or allocation tail(order). Shared atomic storage allows
+    /// lock-free order-0 PCP CAS transitions alongside buddy metadata checks.
+    page_state: PageStateStore,
 
     /// 内存起始物理地址
     base_addr: PhysAddr,
@@ -474,7 +587,7 @@ impl BuddyAllocator {
     ) -> Result<Self, BuddyInitError> {
         let total_pages = Self::validated_page_count(base_addr, size)?;
         let layout = FreeMapLayout::new(total_pages)?;
-        let page_state = MetadataStore::try_heap(total_pages, PAGE_FREE)?;
+        let page_state = PageStateStore::try_heap(total_pages, PAGE_FREE)?;
         let words = MetadataStore::try_heap(layout.total_words, 0u64)?;
         Self::from_metadata(base_addr, total_pages, reserved, layout, page_state, words)
     }
@@ -513,8 +626,16 @@ impl BuddyAllocator {
         }
 
         let (state_region, word_region) = storage.split_at_mut(state_bytes);
-        let page_state = state_region.split_at_mut(total_pages).0;
-        page_state.fill(PAGE_FREE);
+        let page_state_bytes = state_region.split_at_mut(total_pages).0;
+        page_state_bytes.fill(PAGE_FREE);
+        let page_state_ptr = page_state_bytes.as_ptr().cast::<AtomicU8>();
+        // SAFETY: `page_state_bytes` is exclusively owned `'static` storage of
+        // `total_pages` initialized `PAGE_FREE` bytes; `AtomicU8` has identical
+        // size (1) and alignment (1) to `u8`. Converting immediately to a shared
+        // `&'static [AtomicU8]` drops the `&mut [u8]` borrow so all subsequent
+        // accesses are exclusively shared atomic operations.
+        let page_state: &'static [AtomicU8] =
+            unsafe { core::slice::from_raw_parts(page_state_ptr, total_pages) };
         let word_region = word_region.split_at_mut(word_bytes).0;
         word_region.fill(0);
         let word_ptr = word_region.as_mut_ptr();
@@ -533,7 +654,7 @@ impl BuddyAllocator {
             total_pages,
             reserved,
             layout,
-            MetadataStore::Boot(page_state),
+            PageStateStore::Boot(page_state),
             MetadataStore::Boot(words),
         )
     }
@@ -576,10 +697,14 @@ impl BuddyAllocator {
         total_pages: usize,
         reserved: &[(u64, u64)],
         layout: FreeMapLayout,
-        page_state: MetadataStore<u8>,
+        page_state: PageStateStore,
         words: MetadataStore<u64>,
     ) -> Result<Self, BuddyInitError> {
-        if page_state.len() != total_pages || page_state.iter().any(|state| *state != PAGE_FREE) {
+        if page_state.len() != total_pages
+            || page_state
+                .iter()
+                .any(|state| state.load(Ordering::Acquire) != PAGE_FREE)
+        {
             return Err(BuddyInitError::MetadataCorrupt);
         }
 
@@ -660,8 +785,8 @@ impl BuddyAllocator {
             for page_idx in start_idx..end_idx {
                 // De-duplicate overlapping reservations. Bounds are guaranteed by
                 // construction: start_idx < total_pages and end_idx <= total_pages.
-                if self.page_state[page_idx] == PAGE_FREE {
-                    self.page_state[page_idx] = PAGE_RESERVED;
+                if self.page_state.load(page_idx) == PAGE_FREE {
+                    self.page_state.store(page_idx, PAGE_RESERVED);
                     self.reserved_pages += 1;
                 }
             }
@@ -678,7 +803,7 @@ impl BuddyAllocator {
         let mut run_start: Option<usize> = None;
 
         for page_idx in 0..self.total_pages {
-            if self.page_state[page_idx] == PAGE_RESERVED {
+            if self.page_state.load(page_idx) == PAGE_RESERVED {
                 // Reserved/allocated page: close any open free run before it.
                 if let Some(start) = run_start.take() {
                     self.add_free_run(start, page_idx)?;
@@ -728,6 +853,10 @@ impl BuddyAllocator {
     /// preflighted before the first mutation; the commit phase only toggles
     /// fixed-size metadata and therefore cannot allocate or partially fail.
     pub fn try_alloc_pages(&mut self, order: usize) -> Result<PhysFrame, AllocError> {
+        self.try_alloc_pages_internal(order).map(|(frame, _)| frame)
+    }
+
+    fn try_alloc_pages_internal(&mut self, order: usize) -> Result<(PhysFrame, bool), AllocError> {
         if self.poisoned {
             return Err(AllocError::AllocatorPoisoned);
         }
@@ -818,12 +947,49 @@ impl BuddyAllocator {
         }
         let start_state = allocation_start_state(order).ok_or(AllocError::InvalidOrder)?;
         let tail_state = allocation_tail_state(order).ok_or(AllocError::InvalidOrder)?;
-        self.page_state[source.block_idx] = start_state;
+        let was_zeroed = order == 0 && self.page_state.load(source.block_idx) == PAGE_FREE_ZEROED;
+        self.page_state.store(source.block_idx, start_state);
         for index in source.block_idx + 1..source.block_idx + target_pages {
-            self.page_state[index] = tail_state;
+            self.page_state.store(index, tail_state);
         }
         self.free_pages = new_free_pages;
-        Ok(frame)
+        Ok((frame, was_zeroed))
+    }
+
+    /// Issue #109 §1.3: allocate a batch of up to `out.len()` order-0 frames
+    /// under a single buddy-lock hold for PCP refill.
+    ///
+    /// `out[0]` is marked `PAGE_ALLOC_ORDER0` (returned immediately to the
+    /// caller), while `out[1..count]` are marked `PAGE_PCP_CACHED` (exclusive to
+    /// the refilling CPU's PCP magazine). Returns `(count, zeroed_mask)` where
+    /// bit `i` of `zeroed_mask` is set iff `out[i]` was in `PAGE_FREE_ZEROED`
+    /// (already scrubbed when drained from PCP). Returns `Err(AllocError::Exhausted)`
+    /// only if zero frames could be allocated.
+    fn try_alloc_pcp_batch(&mut self, out: &mut [PhysFrame]) -> Result<(usize, u32), AllocError> {
+        if out.is_empty() || out.len() > 32 {
+            return Err(AllocError::InvalidOrder);
+        }
+        let mut count = 0usize;
+        let mut zeroed_mask = 0u32;
+        while count < out.len() {
+            match self.try_alloc_pages_internal(0) {
+                Ok((frame, was_zeroed)) => {
+                    if was_zeroed {
+                        zeroed_mask |= 1u32 << count;
+                    }
+                    if count > 0 {
+                        let idx = ((frame.start_address().as_u64() - self.base_addr.as_u64())
+                            / PAGE_SIZE as u64) as usize;
+                        self.page_state.store(idx, PAGE_PCP_CACHED);
+                    }
+                    out[count] = frame;
+                    count += 1;
+                }
+                Err(AllocError::Exhausted) if count > 0 => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok((count, zeroed_mask))
     }
 
     /// 释放内存块
@@ -860,6 +1026,21 @@ impl BuddyAllocator {
     /// block really returned to the buddy allocator before releasing related
     /// admission or identity state.
     pub fn try_free_pages(&mut self, frame: PhysFrame, order: usize) -> Result<(), FreeError> {
+        self.try_free_pages_internal(frame, order, false)
+    }
+
+    /// Issue #109 §1.3: return a PCP-cached order-0 frame (`PAGE_PCP_CACHED`)
+    /// back to the global buddy free lists and coalesce buddies.
+    fn try_free_pcp_page(&mut self, frame: PhysFrame) -> Result<(), FreeError> {
+        self.try_free_pages_internal(frame, 0, true)
+    }
+
+    fn try_free_pages_internal(
+        &mut self,
+        frame: PhysFrame,
+        order: usize,
+        from_pcp: bool,
+    ) -> Result<(), FreeError> {
         if self.poisoned {
             return Err(FreeError::AllocatorPoisoned);
         }
@@ -890,27 +1071,41 @@ impl BuddyAllocator {
             return Err(FreeError::RangeOutOfBounds);
         }
 
-        let start_state = *self
+        let start_state = self
             .page_state
             .get(block_idx)
+            .map(|slot| slot.load(Ordering::Acquire))
             .ok_or(FreeError::RangeOutOfBounds)?;
-        if start_state == PAGE_RESERVED {
-            return Err(FreeError::ReservedPage);
-        }
-        if start_state == PAGE_FREE || decode_allocation_tail(start_state).is_some() {
-            return Err(FreeError::NotAllocationStart);
-        }
-        let recorded_order =
-            decode_allocation_start(start_state).ok_or(FreeError::NotAllocationStart)?;
-        if recorded_order != order {
-            return Err(FreeError::OrderMismatch);
-        }
-        let expected_tail = allocation_tail_state(order).ok_or(FreeError::OrderTooLarge)?;
-        if (block_idx + 1..block_idx + pages)
-            .any(|index| self.page_state.get(index).copied() != Some(expected_tail))
-        {
-            self.poisoned = true;
-            return Err(FreeError::MetadataCorrupt);
+        if from_pcp {
+            if order != 0 || start_state != PAGE_PCP_CACHED {
+                self.poisoned = true;
+                return Err(FreeError::MetadataCorrupt);
+            }
+        } else {
+            if start_state == PAGE_RESERVED {
+                return Err(FreeError::ReservedPage);
+            }
+            if is_free_page_state(start_state)
+                || start_state == PAGE_PCP_CACHED
+                || decode_allocation_tail(start_state).is_some()
+            {
+                return Err(FreeError::NotAllocationStart);
+            }
+            let recorded_order =
+                decode_allocation_start(start_state).ok_or(FreeError::NotAllocationStart)?;
+            if recorded_order != order {
+                return Err(FreeError::OrderMismatch);
+            }
+            let expected_tail = allocation_tail_state(order).ok_or(FreeError::OrderTooLarge)?;
+            if (block_idx + 1..block_idx + pages).any(|index| {
+                self.page_state
+                    .get(index)
+                    .map(|slot| slot.load(Ordering::Acquire))
+                    != Some(expected_tail)
+            }) {
+                self.poisoned = true;
+                return Err(FreeError::MetadataCorrupt);
+            }
         }
 
         let no_allowed_bits = [None; ORDER_COUNT];
@@ -991,8 +1186,13 @@ impl BuddyAllocator {
         for bit in merge_bits.iter().take(merge_count).flatten().copied() {
             self.free_map.commit_set(bit, false);
         }
+        let free_state = if from_pcp {
+            PAGE_FREE_ZEROED
+        } else {
+            PAGE_FREE
+        };
         for index in block_idx..block_idx + pages {
-            self.page_state[index] = PAGE_FREE;
+            self.page_state.store(index, free_state);
         }
         self.free_map.commit_set(final_bit, true);
         self.free_pages = new_free_pages;
@@ -1007,7 +1207,7 @@ impl BuddyAllocator {
             .is_some_and(|end| {
                 self.page_state[start_idx..end]
                     .iter()
-                    .all(|state| *state == PAGE_FREE)
+                    .all(|state| is_free_page_state(state.load(Ordering::Acquire)))
             })
     }
 
@@ -1092,7 +1292,7 @@ impl BuddyAllocator {
         let mut reserved = 0usize;
         let mut page = 0usize;
         while page < self.total_pages {
-            let state = self.page_state[page];
+            let state = self.page_state.load(page);
             if state == PAGE_RESERVED {
                 let none = [None; ORDER_COUNT];
                 if self.has_unexpected_free_overlap(page, 1, &none) {
@@ -1102,7 +1302,15 @@ impl BuddyAllocator {
                 page += 1;
                 continue;
             }
-            if state == PAGE_FREE {
+            if state == PAGE_PCP_CACHED {
+                let none = [None; ORDER_COUNT];
+                if self.has_unexpected_free_overlap(page, 1, &none) {
+                    return Err(());
+                }
+                page += 1;
+                continue;
+            }
+            if is_free_page_state(state) {
                 let mut covering = 0usize;
                 for order in 0..ORDER_COUNT {
                     let block_pages = 1usize << order;
@@ -1130,7 +1338,7 @@ impl BuddyAllocator {
                 return Err(());
             }
             let tail = allocation_tail_state(order).ok_or(())?;
-            if (page + 1..page + pages).any(|index| self.page_state[index] != tail) {
+            if (page + 1..page + pages).any(|index| self.page_state.load(index) != tail) {
                 return Err(());
             }
             let none = [None; ORDER_COUNT];
@@ -1206,8 +1414,654 @@ pub struct AllocatorStats {
     pub fragmentation: f32,
 }
 
-/// 全局Buddy分配器实例
-static BUDDY_ALLOCATOR: Mutex<Option<BuddyAllocator>> = Mutex::new(None);
+/// Issue #109 §1.3: observability counters for the Per-CPU Page Cache (PCP).
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct PcpStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub refills: u64,
+    pub drains: u64,
+    pub frees_cached: u64,
+    pub cross_cpu_drains: u64,
+    pub refcount_rejections: u64,
+    pub cached_pages: usize,
+}
+
+#[inline]
+fn with_irqs_disabled<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(not(feature = "host_harness"))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(f)
+    }
+    #[cfg(feature = "host_harness")]
+    {
+        f()
+    }
+}
+
+/// Zero all 4096 bytes of an exclusively owned physical frame before it enters
+/// PCP or is returned to an order-0 caller (Issue #109 §1.3 Invariant S2).
+#[inline]
+fn scrub_frame_phys(frame: PhysFrame) {
+    #[cfg(not(feature = "host_harness"))]
+    {
+        let virt = crate::page_table::phys_to_virt(frame.start_address());
+        // SAFETY: caller proved exclusive ownership (`PAGE_PCP_CACHED` or
+        // `PAGE_ALLOC_ORDER0`, unmapped on all CPUs after TLB shootdown ACK)
+        // and the managed buddy window lies inside the high-half direct map.
+        unsafe {
+            core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+        }
+    }
+    #[cfg(feature = "host_harness")]
+    {
+        let _ = frame;
+    }
+}
+
+#[inline]
+fn read_production_cow_refcount(page_idx: usize) -> u32 {
+    crate::memory::cow_refcount_slot(page_idx)
+        .map(|slot| slot.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
+#[inline]
+fn current_pcp_cpu_id() -> usize {
+    cpu_local::current_cpu_id() % cpu_local::max_cpus()
+}
+
+struct PcpMagazine {
+    frames: [u64; PCP_HIGH_WATERMARK],
+    len: usize,
+}
+
+impl PcpMagazine {
+    const fn new() -> Self {
+        Self {
+            frames: [0; PCP_HIGH_WATERMARK],
+            len: 0,
+        }
+    }
+}
+
+/// Cache-line-isolated per-CPU order-0 page magazine and hot counters (Issue #109 §1.3).
+///
+/// Keeping `cached_count`, `hits`, and `frees_cached` inside the CPU's own
+/// 64-byte-aligned slot guarantees ZERO global atomic RMWs on the PCP alloc/free
+/// hot path, eliminating cross-CPU cache-line bouncing.
+///
+/// Lock ordering rule L1: `pcp[c].lock` and `buddy` are NEVER held simultaneously,
+/// making deadlock impossible even under concurrent cross-CPU drains or nested
+/// `#PF` faults (hot path uses `try_lock` under `IF=0` and falls back to `buddy`
+/// without spinning).
+#[repr(align(64))]
+struct CacheAlignedPcp {
+    lock: Mutex<PcpMagazine>,
+    /// Pages currently owned by this CPU's PCP (cached in `lock` + in-flight
+    /// refill/drain batches accounted under `buddy` lock). Summed across CPUs
+    /// under `buddy` lock in `stats()` for exact `free_pages` conservation.
+    cached_count: AtomicUsize,
+    hits: AtomicU64,
+    frees_cached: AtomicU64,
+}
+
+impl CacheAlignedPcp {
+    const fn new() -> Self {
+        Self {
+            lock: Mutex::new(PcpMagazine::new()),
+            cached_count: AtomicUsize::new(0),
+            hits: AtomicU64::new(0),
+            frees_cached: AtomicU64::new(0),
+        }
+    }
+}
+
+const _: () = assert!(core::mem::align_of::<CacheAlignedPcp>() == 64);
+
+/// Self-contained Buddy + Per-CPU Page Cache pool (Issue #109 §1.3).
+///
+/// Production uses the single static `GLOBAL_BUDDY`; hosted unit tests
+/// instantiate isolated `PcpBuddyPool` values so parallel test execution never
+/// races on global allocator state while still exercising the exact production
+/// fast path, state machine, conservation accounting, and cross-CPU drain.
+struct PcpBuddyPool {
+    buddy: Mutex<Option<BuddyAllocator>>,
+    pcp: [CacheAlignedPcp; cpu_local::max_cpus()],
+    window_base: AtomicU64,
+    window_pages: AtomicUsize,
+    page_state_ptr: AtomicUsize,
+    poisoned: AtomicBool,
+    stat_misses: AtomicU64,
+    stat_refills: AtomicU64,
+    stat_drains: AtomicU64,
+    stat_cross_cpu_drains: AtomicU64,
+    stat_refcount_rejections: AtomicU64,
+}
+
+impl PcpBuddyPool {
+    const fn new() -> Self {
+        Self {
+            buddy: Mutex::new(None),
+            pcp: [const { CacheAlignedPcp::new() }; cpu_local::max_cpus()],
+            window_base: AtomicU64::new(0),
+            window_pages: AtomicUsize::new(0),
+            page_state_ptr: AtomicUsize::new(0),
+            poisoned: AtomicBool::new(false),
+            stat_misses: AtomicU64::new(0),
+            stat_refills: AtomicU64::new(0),
+            stat_drains: AtomicU64::new(0),
+            stat_cross_cpu_drains: AtomicU64::new(0),
+            stat_refcount_rejections: AtomicU64::new(0),
+        }
+    }
+
+    fn publish(&self, allocator: BuddyAllocator) {
+        self.window_pages.store(0, Ordering::Release);
+        for slot in &self.pcp {
+            with_irqs_disabled(|| {
+                slot.lock.lock().len = 0;
+                slot.cached_count.store(0, Ordering::Release);
+            });
+        }
+        self.poisoned.store(allocator.poisoned, Ordering::Release);
+
+        let base = allocator.base_addr.as_u64();
+        let total_pages = allocator.total_pages;
+        let ptr = allocator.page_state.as_ptr() as usize;
+
+        let mut guard = self.buddy.lock();
+        *guard = Some(allocator);
+        self.window_base.store(base, Ordering::Relaxed);
+        self.page_state_ptr.store(ptr, Ordering::Relaxed);
+        self.window_pages.store(total_pages, Ordering::Release);
+    }
+
+    #[inline]
+    fn page_state_view(&self) -> Option<(u64, &[AtomicU8])> {
+        let len = self.window_pages.load(Ordering::Acquire);
+        if len == 0 {
+            return None;
+        }
+        let ptr = self.page_state_ptr.load(Ordering::Relaxed) as *const AtomicU8;
+        if ptr.is_null() {
+            return None;
+        }
+        let base = self.window_base.load(Ordering::Relaxed);
+        // SAFETY: `publish` stores `page_state` (backed by fixed non-moving
+        // boot-reserved frames or fixed-capacity `BuddyAllocator` storage) and
+        // releases `window_pages` after setting `page_state_ptr` and `base`.
+        // The slice is tied to `&self` and accessed exclusively via shared
+        // atomic operations (`&[AtomicU8]`).
+        let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+        Some((base, slice))
+    }
+
+    #[inline]
+    fn mark_poisoned(&self) {
+        self.poisoned.store(true, Ordering::Release);
+        if let Some(allocator) = self.buddy.try_lock().and_then(|mut g| {
+            if let Some(a) = g.as_mut() {
+                a.poisoned = true;
+                Some(())
+            } else {
+                None
+            }
+        }) {
+            let _ = allocator;
+        }
+    }
+
+    fn return_pcp_frames_to_buddy(&self, cpu: usize, frames: &[u64], count_already_in_total: bool) {
+        if frames.is_empty() {
+            return;
+        }
+        let mut guard = self.buddy.lock();
+        if count_already_in_total {
+            self.pcp[cpu]
+                .cached_count
+                .fetch_sub(frames.len(), Ordering::AcqRel);
+        }
+        if let Some(allocator) = guard.as_mut() {
+            for &phys in frames {
+                let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+                if let Err(err) = allocator.try_free_pcp_page(frame) {
+                    if err.is_metadata_corruption() {
+                        allocator.poisoned = true;
+                        self.poisoned.store(true, Ordering::Release);
+                    }
+                    kprintln!("[buddy][pcp] drain return failed: {:?}", err);
+                }
+            }
+        }
+    }
+
+    /// Synchronously drain every CPU's PCP magazine back to the global buddy
+    /// allocator so cached order-0 frames coalesce into higher-order blocks.
+    ///
+    /// Lock ordering: acquires at most one `pcp[cpu]` lock at a time in
+    /// ascending CPU index order, copies frames into a stack buffer, releases
+    /// `pcp[cpu]`, and only then acquires `self.buddy`.
+    fn drain_all_pcp(&self, cpu_limit: usize) -> usize {
+        let mut total_drained = 0usize;
+        let limit = core::cmp::min(cpu_limit, self.pcp.len());
+        let mut buf = [0u64; PCP_HIGH_WATERMARK];
+
+        for cpu in 0..limit {
+            let drained = with_irqs_disabled(|| {
+                let mut mag = self.pcp[cpu].lock.lock();
+                let n = mag.len;
+                if n > 0 {
+                    buf[..n].copy_from_slice(&mag.frames[..n]);
+                    mag.len = 0;
+                }
+                n
+            });
+            if drained > 0 {
+                self.return_pcp_frames_to_buddy(cpu, &buf[..drained], true);
+                total_drained += drained;
+            }
+        }
+        if total_drained > 0 {
+            self.stat_cross_cpu_drains.fetch_add(1, Ordering::Relaxed);
+        }
+        total_drained
+    }
+
+    fn try_alloc_order0_with<FScrub>(
+        &self,
+        cpu_id: usize,
+        cpu_limit: usize,
+        scrub: FScrub,
+        run_oom: bool,
+    ) -> Result<PhysFrame, AllocError>
+    where
+        FScrub: Fn(PhysFrame),
+    {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(AllocError::AllocatorPoisoned);
+        }
+
+        let cpu = cpu_id % self.pcp.len();
+
+        // Fast path: pop one pre-zeroed frame from this CPU's PCP magazine
+        // touching ONLY this CPU's 64B cache line (zero global atomics).
+        if let Some((base, states)) = self.page_state_view() {
+            let popped = with_irqs_disabled(|| {
+                let mut mag = self.pcp[cpu].lock.try_lock()?;
+                if mag.len == 0 {
+                    return None;
+                }
+                mag.len -= 1;
+                let idx = mag.len;
+                let phys = mag.frames[idx];
+                self.pcp[cpu].cached_count.fetch_sub(1, Ordering::AcqRel);
+                let prev_hits = self.pcp[cpu].hits.load(Ordering::Relaxed);
+                self.pcp[cpu]
+                    .hits
+                    .store(prev_hits.wrapping_add(1), Ordering::Relaxed);
+                Some(phys)
+            });
+
+            if let Some(phys) = popped {
+                let idx = ((phys - base) / PAGE_SIZE as u64) as usize;
+                match states[idx].compare_exchange(
+                    PAGE_PCP_CACHED,
+                    PAGE_ALLOC_ORDER0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        return Ok(PhysFrame::containing_address(PhysAddr::new(phys)));
+                    }
+                    Err(_) => {
+                        self.mark_poisoned();
+                        return Err(AllocError::MetadataCorrupt);
+                    }
+                }
+            }
+        }
+
+        // Cold path: refill up to PCP_REFILL_BATCH order-0 frames in a single
+        // buddy-lock acquisition.
+        self.stat_misses.fetch_add(1, Ordering::Relaxed);
+        let mut batch = [PhysFrame::containing_address(PhysAddr::new(0)); PCP_REFILL_BATCH];
+
+        let mut refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
+        if matches!(refill_result, Err(AllocError::Exhausted)) {
+            if self.drain_all_pcp(cpu_limit) > 0 {
+                refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
+            }
+        }
+        if matches!(refill_result, Err(AllocError::Exhausted)) && run_oom {
+            oom_killer::on_allocation_failure(1);
+            oom_killer::poll_and_handle_oom();
+            let _ = self.drain_all_pcp(cpu_limit);
+            refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
+        }
+
+        let (count, zeroed_mask) = refill_result?;
+        self.stat_refills.fetch_add(1, Ordering::Relaxed);
+
+        // Invariant S2: scrub every unzeroed frame pulled from buddy before
+        // reuse or caching in PCP. Frames drained earlier from PCP already carry
+        // `PAGE_FREE_ZEROED` and skip redundant 4 KiB memsets.
+        for (i, &frame) in batch[..count].iter().enumerate() {
+            if (zeroed_mask & (1u32 << i)) == 0 {
+                scrub(frame);
+            }
+        }
+
+        if count > 1 {
+            let extra = count - 1;
+            let mut extra_phys = [0u64; PCP_REFILL_BATCH];
+            for (i, frame) in batch[1..count].iter().enumerate() {
+                extra_phys[i] = frame.start_address().as_u64();
+            }
+
+            let pushed = with_irqs_disabled(|| {
+                let Some(mut mag) = self.pcp[cpu].lock.try_lock() else {
+                    return 0;
+                };
+                let space = PCP_HIGH_WATERMARK.saturating_sub(mag.len);
+                let to_push = core::cmp::min(extra, space);
+                let mut idx = mag.len;
+                for &phys in &extra_phys[..to_push] {
+                    mag.frames[idx] = phys;
+                    idx += 1;
+                }
+                mag.len = idx;
+                to_push
+            });
+
+            if pushed < extra {
+                self.return_pcp_frames_to_buddy(cpu, &extra_phys[pushed..extra], true);
+            }
+        }
+
+        Ok(batch[0])
+    }
+
+    fn refill_batch_from_buddy(
+        &self,
+        cpu: usize,
+        batch: &mut [PhysFrame],
+    ) -> Result<(usize, u32), AllocError> {
+        let mut guard = self.buddy.lock();
+        let allocator = guard.as_mut().ok_or(AllocError::AllocatorUnavailable)?;
+        let res = allocator.try_alloc_pcp_batch(batch);
+        match res {
+            Ok((count, zeroed_mask)) => {
+                // Conserve `buddy.free_pages + sum(pcp[c].cached_count)`
+                // atomically under the buddy lock (Invariant S3).
+                if count > 1 {
+                    self.pcp[cpu]
+                        .cached_count
+                        .fetch_add(count - 1, Ordering::AcqRel);
+                }
+                Ok((count, zeroed_mask))
+            }
+            Err(err) => {
+                if matches!(
+                    err,
+                    AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned
+                ) {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn try_alloc_multi_with(
+        &self,
+        order: usize,
+        pages_needed: usize,
+        cpu_limit: usize,
+        run_oom: bool,
+    ) -> Result<PhysFrame, AllocError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(AllocError::AllocatorPoisoned);
+        }
+        let alloc_once = || -> Result<PhysFrame, AllocError> {
+            let mut guard = self.buddy.lock();
+            let allocator = guard.as_mut().ok_or(AllocError::AllocatorUnavailable)?;
+            let res = allocator.try_alloc_pages(order);
+            if matches!(
+                res,
+                Err(AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned)
+            ) {
+                self.poisoned.store(true, Ordering::Release);
+            }
+            res
+        };
+
+        match alloc_once() {
+            Ok(frame) => return Ok(frame),
+            Err(AllocError::Exhausted) => {}
+            Err(err) => return Err(err),
+        }
+
+        // Drain all CPUs' PCP caches first so cached order-0 halves can coalesce
+        // into the requested higher-order block before triggering OOM.
+        if self.drain_all_pcp(cpu_limit) > 0 {
+            match alloc_once() {
+                Ok(frame) => return Ok(frame),
+                Err(AllocError::Exhausted) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        if !run_oom {
+            return Err(AllocError::Exhausted);
+        }
+
+        oom_killer::on_allocation_failure(pages_needed);
+        // RF178-4: run reclaim only after releasing BUDDY_ALLOCATOR so recovery
+        // cannot recursively acquire the allocator guard.
+        oom_killer::poll_and_handle_oom();
+        let _ = self.drain_all_pcp(cpu_limit);
+
+        alloc_once()
+    }
+
+    fn try_free_order0_with<FRef, FScrub>(
+        &self,
+        frame: PhysFrame,
+        cpu_id: usize,
+        read_refcount: FRef,
+        scrub: FScrub,
+    ) -> Result<(), FreeError>
+    where
+        FRef: Fn(usize) -> u32,
+        FScrub: Fn(PhysFrame),
+    {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(FreeError::AllocatorPoisoned);
+        }
+        let Some((base, states)) = self.page_state_view() else {
+            return Err(FreeError::AllocatorUnavailable);
+        };
+
+        let addr = frame.start_address().as_u64();
+        if addr < base {
+            return Err(FreeError::AddressBelowBase);
+        }
+        let offset = addr - base;
+        if offset % PAGE_SIZE as u64 != 0 {
+            return Err(FreeError::AddressMisaligned);
+        }
+        let idx = (offset / PAGE_SIZE as u64) as usize;
+        if idx >= states.len() {
+            return Err(FreeError::RangeOutOfBounds);
+        }
+
+        // Invariant S1 circuit-breaker: refuse freeing any frame whose COW or
+        // shared-anonymous `PAGE_REF_COUNT` slot is still non-zero.
+        if read_refcount(idx) != 0 {
+            self.stat_refcount_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(FreeError::PageStillReferenced);
+        }
+
+        // Lock-free atomic state claim: proves `frame` is a live order-0 block
+        // (rejecting double-free, partial free of order > 0, interior tails,
+        // and reserved pages without taking the global buddy lock).
+        if let Err(old) = states[idx].compare_exchange(
+            PAGE_ALLOC_ORDER0,
+            PAGE_PCP_CACHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(FreeError::AllocatorPoisoned);
+            }
+            if old == PAGE_RESERVED {
+                return Err(FreeError::ReservedPage);
+            }
+            if is_free_page_state(old)
+                || old == PAGE_PCP_CACHED
+                || decode_allocation_tail(old).is_some()
+            {
+                return Err(FreeError::NotAllocationStart);
+            }
+            if let Some(recorded_order) = decode_allocation_start(old) {
+                if recorded_order != 0 {
+                    return Err(FreeError::OrderMismatch);
+                }
+            }
+            return Err(FreeError::NotAllocationStart);
+        }
+
+        // Invariant S2: zero all 4096 bytes after claiming exclusive ownership
+        // (`PAGE_PCP_CACHED`) and before exposing the frame to PCP or buddy.
+        scrub(frame);
+
+        let cpu = cpu_id % self.pcp.len();
+        let mut drain_buf = [0u64; PCP_DRAIN_BATCH];
+        let mut drained_count = 0usize;
+        let cached = with_irqs_disabled(|| {
+            let Some(mut mag) = self.pcp[cpu].lock.try_lock() else {
+                return false;
+            };
+            if mag.len >= PCP_HIGH_WATERMARK {
+                let start = mag.len - PCP_DRAIN_BATCH;
+                drain_buf.copy_from_slice(&mag.frames[start..mag.len]);
+                mag.len = start;
+                drained_count = PCP_DRAIN_BATCH;
+            }
+            let idx = mag.len;
+            mag.frames[idx] = addr;
+            mag.len = idx + 1;
+            self.pcp[cpu].cached_count.fetch_add(1, Ordering::AcqRel);
+            let prev_frees = self.pcp[cpu].frees_cached.load(Ordering::Relaxed);
+            self.pcp[cpu]
+                .frees_cached
+                .store(prev_frees.wrapping_add(1), Ordering::Relaxed);
+            true
+        });
+
+        if !cached {
+            // Contended with a remote `drain_all_pcp`: return directly to buddy.
+            // `frame` was never added to `cached_count`.
+            let one = [addr];
+            self.return_pcp_frames_to_buddy(cpu, &one, false);
+            return Ok(());
+        }
+
+        if drained_count > 0 {
+            self.stat_drains.fetch_add(1, Ordering::Relaxed);
+            self.return_pcp_frames_to_buddy(cpu, &drain_buf[..drained_count], true);
+        }
+        Ok(())
+    }
+
+    fn try_free_multi_with<FRef>(
+        &self,
+        frame: PhysFrame,
+        order: usize,
+        read_refcount: FRef,
+    ) -> Result<(), FreeError>
+    where
+        FRef: Fn(usize) -> u32,
+    {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(FreeError::AllocatorPoisoned);
+        }
+        if let Some((base, states)) = self.page_state_view() {
+            let addr = frame.start_address().as_u64();
+            let pages = 1usize << order;
+            if addr >= base && (addr - base) % PAGE_SIZE as u64 == 0 {
+                let start_idx = ((addr - base) / PAGE_SIZE as u64) as usize;
+                if start_idx
+                    .checked_add(pages)
+                    .is_some_and(|end| end <= states.len())
+                {
+                    for idx in start_idx..start_idx + pages {
+                        if read_refcount(idx) != 0 {
+                            self.stat_refcount_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(FreeError::PageStillReferenced);
+                        }
+                    }
+                }
+            }
+        }
+        let mut guard = self.buddy.lock();
+        let allocator = guard.as_mut().ok_or(FreeError::AllocatorUnavailable)?;
+        let res = allocator.try_free_pages(frame, order);
+        if let Err(err) = res {
+            if err.is_metadata_corruption() {
+                allocator.poisoned = true;
+                self.poisoned.store(true, Ordering::Release);
+            }
+        }
+        res
+    }
+
+    fn total_cached_pages(&self) -> usize {
+        self.pcp
+            .iter()
+            .map(|slot| slot.cached_count.load(Ordering::Acquire))
+            .sum()
+    }
+
+    fn stats(&self) -> Option<AllocatorStats> {
+        let guard = self.buddy.lock();
+        let allocator = guard.as_ref()?;
+        let cached = self.total_cached_pages();
+        let mut s = allocator.stats();
+        // Invariant S3: `buddy.free_pages + sum(pcp[c].cached_count)` is exact
+        // under the buddy lock (refill and drain update both together inside it).
+        s.free_pages = s.free_pages.saturating_add(cached).min(s.total_pages);
+        s.used_pages = s.total_pages.saturating_sub(s.free_pages);
+        Some(s)
+    }
+
+    fn pcp_stats(&self) -> PcpStats {
+        let mut hits = 0u64;
+        let mut frees_cached = 0u64;
+        let mut cached_pages = 0usize;
+        for slot in &self.pcp {
+            hits = hits.wrapping_add(slot.hits.load(Ordering::Relaxed));
+            frees_cached = frees_cached.wrapping_add(slot.frees_cached.load(Ordering::Relaxed));
+            cached_pages = cached_pages.saturating_add(slot.cached_count.load(Ordering::Acquire));
+        }
+        PcpStats {
+            hits,
+            misses: self.stat_misses.load(Ordering::Relaxed),
+            refills: self.stat_refills.load(Ordering::Relaxed),
+            drains: self.stat_drains.load(Ordering::Relaxed),
+            frees_cached,
+            cross_cpu_drains: self.stat_cross_cpu_drains.load(Ordering::Relaxed),
+            refcount_rejections: self.stat_refcount_rejections.load(Ordering::Relaxed),
+            cached_pages,
+        }
+    }
+}
+
+/// 全局 Buddy + PCP 物理页分配器实例
+static GLOBAL_BUDDY: PcpBuddyPool = PcpBuddyPool::new();
 
 /// RF178-12: borrow the physical allocator without waiting or invoking OOM
 /// recovery. Intended for bounded synchronous exception work that must either
@@ -1218,7 +2072,7 @@ pub fn try_with_allocator<T, F>(f: F) -> Option<T>
 where
     F: FnOnce(&mut BuddyAllocator) -> T,
 {
-    let mut guard = BUDDY_ALLOCATOR.try_lock()?;
+    let mut guard = GLOBAL_BUDDY.buddy.try_lock()?;
     let allocator = guard.as_mut()?;
     Some(f(allocator))
 }
@@ -1262,7 +2116,7 @@ fn publish_buddy_allocator(allocator: BuddyAllocator) -> Result<(), BuddyInitErr
     let total_pages = allocator.total_pages;
     let reserved_pages = allocator.reserved_pages;
     let free_pages = allocator.free_pages;
-    *BUDDY_ALLOCATOR.lock() = Some(allocator);
+    GLOBAL_BUDDY.publish(allocator);
 
     klog_always!("Buddy allocator initialized:");
     // R132-3 FIX: Use kprintln! (debug-only) to avoid leaking physical memory base
@@ -1286,7 +2140,7 @@ fn publish_buddy_allocator(allocator: BuddyAllocator) -> Result<(), BuddyInitErr
 /// 成功返回物理帧，失败返回 None
 ///
 /// # OOM Handling
-/// 如果分配失败，会触发 OOM killer 尝试回收内存，然后重试一次
+/// 如果分配失败，会先排空各核 PCP 缓存，若仍不足再触发 OOM killer 尝试回收内存并重试一次
 pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
     match try_alloc_physical_pages(count) {
         Ok(frame) => Some(frame),
@@ -1298,8 +2152,8 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
 }
 
 /// Fallible physical allocation with error classification. OOM recovery runs
-/// only for genuine free-space exhaustion; invalid orders and poisoned
-/// metadata never masquerade as memory pressure.
+/// only for genuine free-space exhaustion (after draining all CPUs' PCP caches);
+/// invalid orders and poisoned metadata never masquerade as memory pressure.
 pub fn try_alloc_physical_pages(count: usize) -> Result<PhysFrame, AllocError> {
     if count == 0 {
         return Err(AllocError::InvalidOrder);
@@ -1312,37 +2166,23 @@ pub fn try_alloc_physical_pages(count: usize) -> Result<PhysFrame, AllocError> {
         return Err(AllocError::InvalidOrder);
     }
 
-    let first = {
-        let mut guard = BUDDY_ALLOCATOR.lock();
-        let allocator = guard.as_mut().ok_or(AllocError::AllocatorUnavailable)?;
-        allocator.try_alloc_pages(order)
-    };
-    match first {
-        Ok(frame) => return Ok(frame),
-        Err(AllocError::Exhausted) => {}
-        Err(error) => return Err(error),
+    if order == 0 {
+        return GLOBAL_BUDDY.try_alloc_order0_with(
+            current_pcp_cpu_id(),
+            cpu_local::max_cpus(),
+            scrub_frame_phys,
+            true,
+        );
     }
 
-    oom_killer::on_allocation_failure(pages_needed);
-    // RF178-4: run reclaim only after releasing BUDDY_ALLOCATOR so recovery
-    // cannot recursively acquire the allocator guard.
-    oom_killer::poll_and_handle_oom();
-
-    let mut guard = BUDDY_ALLOCATOR.lock();
-    let allocator = guard.as_mut().ok_or(AllocError::AllocatorUnavailable)?;
-    allocator.try_alloc_pages(order)
+    GLOBAL_BUDDY.try_alloc_multi_with(order, pages_needed, cpu_local::max_cpus(), true)
 }
 
-/// 释放物理页面
-///
-/// # 参数
-/// * `frame` - 要释放的物理帧
-/// * `count` - 页面数量
 /// Checked counterpart to `free_physical_pages`.
 ///
-/// The operation validates the exact buddy-relative base, allocation order,
-/// and allocation state of every page. It returns only after the block has
-/// actually re-entered the free lists.
+/// Validates exact buddy-relative base, allocation order, `PAGE_REF_COUNT == 0`,
+/// and allocation state of every page. Order-0 frames are scrubbed and cached in
+/// the local CPU's PCP magazine without touching the global buddy lock.
 pub fn try_free_physical_pages(frame: PhysFrame, count: usize) -> Result<(), FreeError> {
     if count == 0 {
         return Err(FreeError::InvalidCount);
@@ -1354,9 +2194,15 @@ pub fn try_free_physical_pages(frame: PhysFrame, count: usize) -> Result<(), Fre
         return Err(FreeError::InvalidCount);
     }
     let order = pages.trailing_zeros() as usize;
-    let mut guard = BUDDY_ALLOCATOR.lock();
-    let allocator = guard.as_mut().ok_or(FreeError::AllocatorUnavailable)?;
-    allocator.try_free_pages(frame, order)
+    if order == 0 {
+        return GLOBAL_BUDDY.try_free_order0_with(
+            frame,
+            current_pcp_cpu_id(),
+            read_production_cow_refcount,
+            scrub_frame_phys,
+        );
+    }
+    GLOBAL_BUDDY.try_free_multi_with(frame, order, read_production_cow_refcount)
 }
 
 pub fn free_physical_pages(frame: PhysFrame, count: usize) {
@@ -1373,30 +2219,43 @@ pub fn free_physical_pages(frame: PhysFrame, count: usize) {
     };
     let order = pages.trailing_zeros() as usize;
 
-    if let Some(allocator) = BUDDY_ALLOCATOR.lock().as_mut() {
-        if let Err(error) = allocator.try_free_pages(frame, order) {
-            if error.is_metadata_corruption() {
-                allocator.poisoned = true;
+    let result = if order == 0 {
+        GLOBAL_BUDDY.try_free_order0_with(
+            frame,
+            current_pcp_cpu_id(),
+            read_production_cow_refcount,
+            scrub_frame_phys,
+        )
+    } else {
+        GLOBAL_BUDDY.try_free_multi_with(frame, order, read_production_cow_refcount)
+    };
+
+    if let Err(_error) = result {
+        kprintln!(
+            "[buddy] rejected free_physical_pages: {:?}{}",
+            _error,
+            if _error.is_metadata_corruption() {
+                "; allocator quarantined"
+            } else {
+                "; allocator remains available"
             }
-            kprintln!(
-                "[buddy] rejected free_physical_pages: {:?}{}",
-                error,
-                if error.is_metadata_corruption() {
-                    "; allocator quarantined"
-                } else {
-                    "; allocator remains available"
-                }
-            );
-        }
+        );
     }
+}
+
+/// Synchronously drain every CPU's PCP cache back to the global buddy allocator.
+pub fn drain_all_pcp_caches() -> usize {
+    GLOBAL_BUDDY.drain_all_pcp(cpu_local::max_cpus())
+}
+
+/// Snapshot Per-CPU Page Cache statistics.
+pub fn pcp_stats() -> PcpStats {
+    GLOBAL_BUDDY.pcp_stats()
 }
 
 /// 获取分配器统计信息
 pub fn get_allocator_stats() -> Option<AllocatorStats> {
-    BUDDY_ALLOCATOR
-        .lock()
-        .as_ref()
-        .map(|allocator| allocator.stats())
+    GLOBAL_BUDDY.stats()
 }
 
 // 测试代码已移除（no_std环境不支持标准测试框架）
@@ -1524,7 +2383,7 @@ mod tests {
 
     fn metadata_shape(
         allocator: &BuddyAllocator,
-    ) -> (*const u8, usize, usize, *const u64, usize, usize) {
+    ) -> (*const AtomicU8, usize, usize, *const u64, usize, usize) {
         (
             allocator.page_state.as_ptr(),
             allocator.page_state.len(),
@@ -1584,7 +2443,7 @@ mod tests {
             .expect("boot-storage allocator");
         let mut heap =
             BuddyAllocator::new_with_reservations(base, size, &reserved).expect("heap allocator");
-        assert!(matches!(boot.page_state, MetadataStore::Boot(_)));
+        assert!(matches!(boot.page_state, PageStateStore::Boot(_)));
         assert!(matches!(boot.free_map.words, MetadataStore::Boot(_)));
         assert_eq!(boot.page_state, heap.page_state);
         assert_eq!(boot.free_map.words, heap.free_map.words);
@@ -1636,7 +2495,7 @@ mod tests {
         let frame = allocator.try_alloc_pages(2).expect("allocate order 2");
 
         let words = allocator.free_map.words.clone();
-        let states = allocator.page_state.clone();
+        let states = allocator.page_state.snapshot_bytes();
         let counts = allocator.free_map.block_count;
         let cursors = allocator.free_map.search_cursor;
         let free_pages = allocator.free_pages;
@@ -1645,7 +2504,7 @@ mod tests {
             Err(FreeError::OrderMismatch)
         );
         assert_eq!(allocator.free_map.words, words);
-        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.page_state.snapshot_bytes(), states);
         assert_eq!(allocator.free_map.block_count, counts);
         assert_eq!(allocator.free_map.search_cursor, cursors);
         assert_eq!(allocator.free_pages, free_pages);
@@ -1658,12 +2517,12 @@ mod tests {
             Err(FreeError::AddressMisaligned)
         );
         assert_eq!(allocator.free_map.words, words);
-        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.page_state.snapshot_bytes(), states);
         assert_eq!(allocator.free_pages, free_pages);
 
         allocator.try_free_pages(frame, 2).expect("valid free");
         let words = allocator.free_map.words.clone();
-        let states = allocator.page_state.clone();
+        let states = allocator.page_state.snapshot_bytes();
         let counts = allocator.free_map.block_count;
         let free_pages = allocator.free_pages;
         assert_eq!(
@@ -1671,7 +2530,7 @@ mod tests {
             Err(FreeError::NotAllocationStart)
         );
         assert_eq!(allocator.free_map.words, words);
-        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.page_state.snapshot_bytes(), states);
         assert_eq!(allocator.free_map.block_count, counts);
         assert_eq!(allocator.free_pages, free_pages);
         assert!(!allocator.poisoned);
@@ -1691,7 +2550,7 @@ mod tests {
         allocator.free_map.commit_set(injected, true);
 
         let words = allocator.free_map.words.clone();
-        let states = allocator.page_state.clone();
+        let states = allocator.page_state.snapshot_bytes();
         let free_pages = allocator.free_pages;
         assert_eq!(
             allocator.try_free_pages(frame, 0),
@@ -1699,7 +2558,7 @@ mod tests {
         );
         assert!(allocator.poisoned);
         assert_eq!(allocator.free_map.words, words);
-        assert_eq!(allocator.page_state, states);
+        assert_eq!(allocator.page_state.snapshot_bytes(), states);
         assert_eq!(allocator.free_pages, free_pages);
         assert_eq!(
             allocator.try_alloc_pages(0),
@@ -1725,5 +2584,352 @@ mod tests {
         assert_eq!(allocator.reserved_pages, 4);
         assert_eq!(allocator.free_pages, 9);
         assert_eq!(allocator.validate_metadata(), Ok(()));
+    }
+
+    fn make_test_pool(base: u64, size: usize, reserved: &[(u64, u64)]) -> PcpBuddyPool {
+        let pool = PcpBuddyPool::new();
+        let allocator = BuddyAllocator::new_with_reservations(PhysAddr::new(base), size, reserved)
+            .expect("test buddy pool");
+        pool.publish(allocator);
+        pool
+    }
+
+    #[test]
+    fn pcp_hit_and_lifo_reuse_without_buddy_drift() {
+        let pool = make_test_pool(0x4000_0000, 4 * 1024 * 1024, &[]);
+        let initial_free = pool.stats().unwrap().free_pages;
+
+        let f1 = pool
+            .try_alloc_order0_with(0, 4, |_| {}, false)
+            .expect("first order-0 alloc refills PCP");
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free - 1);
+        assert_eq!(pool.pcp_stats().refills, 1);
+
+        pool.try_free_order0_with(f1, 0, |_| 0, |_| {})
+            .expect("free into PCP");
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+
+        let f2 = pool
+            .try_alloc_order0_with(0, 4, |_| {}, false)
+            .expect("LIFO PCP hit");
+        assert_eq!(f2, f1, "PCP must LIFO-reuse the most recently freed frame");
+        assert_eq!(pool.pcp_stats().hits, 1);
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free - 1);
+
+        pool.try_free_order0_with(f2, 0, |_| 0, |_| {})
+            .expect("final free");
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        pool.drain_all_pcp(4);
+        assert_eq!(pool.pcp_stats().cached_pages, 0);
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        assert_eq!(
+            pool.buddy.lock().as_ref().unwrap().validate_metadata(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn pcp_scrub_before_reuse_on_refill_and_free() {
+        let pool = make_test_pool(0x4100_0000, 2 * 1024 * 1024, &[]);
+        let scrubs = AtomicUsize::new(0);
+
+        // Cold miss refills PCP_REFILL_BATCH (16) pages -> all 16 scrubbed.
+        let f1 = pool
+            .try_alloc_order0_with(
+                0,
+                4,
+                |_| {
+                    scrubs.fetch_add(1, Ordering::Relaxed);
+                },
+                false,
+            )
+            .expect("cold alloc");
+        assert_eq!(scrubs.load(Ordering::Relaxed), PCP_REFILL_BATCH);
+
+        // Freeing f1 scrubs before pushing into PCP (+1).
+        pool.try_free_order0_with(
+            f1,
+            0,
+            |_| 0,
+            |_| {
+                scrubs.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .expect("free scrubs");
+        assert_eq!(scrubs.load(Ordering::Relaxed), PCP_REFILL_BATCH + 1);
+
+        // Popping f1 from PCP reuses the already-scrubbed frame (0 extra scrubs).
+        let f2 = pool
+            .try_alloc_order0_with(
+                0,
+                4,
+                |_| {
+                    scrubs.fetch_add(1, Ordering::Relaxed);
+                },
+                false,
+            )
+            .expect("hot hit");
+        assert_eq!(f2, f1);
+        assert_eq!(scrubs.load(Ordering::Relaxed), PCP_REFILL_BATCH + 1);
+
+        // Return f2 to PCP (+1 scrub), drain all 16 zeroed frames back to buddy
+        // (`PAGE_FREE_ZEROED`), then refill again: zero extra scrubs because
+        // buddy remembers every drained PCP frame is already zeroed.
+        pool.try_free_order0_with(
+            f2,
+            0,
+            |_| 0,
+            |_| {
+                scrubs.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .expect("free f2");
+        assert_eq!(scrubs.load(Ordering::Relaxed), PCP_REFILL_BATCH + 2);
+        assert_eq!(pool.drain_all_pcp(4), PCP_REFILL_BATCH);
+        let f3 = pool
+            .try_alloc_order0_with(
+                0,
+                4,
+                |_| {
+                    scrubs.fetch_add(1, Ordering::Relaxed);
+                },
+                false,
+            )
+            .expect("refill of already-zeroed buddy frames");
+        assert_eq!(
+            scrubs.load(Ordering::Relaxed),
+            PCP_REFILL_BATCH + 2,
+            "drained PCP frames marked PAGE_FREE_ZEROED must not be double-scrubbed on refill"
+        );
+        pool.try_free_order0_with(f3, 0, |_| 0, |_| {})
+            .expect("cleanup f3");
+        pool.drain_all_pcp(4);
+
+        // Allocate and free an order-1 block directly via buddy (marks both
+        // frames dirty `PAGE_FREE`); subsequent order-0 refill MUST scrub those
+        // dirty frames again.
+        let dirty_block = pool
+            .try_alloc_multi_with(1, 2, 4, false)
+            .expect("order-1 alloc");
+        pool.try_free_multi_with(dirty_block, 1, |_| 0)
+            .expect("order-1 dirty free");
+        let dirty_scrubs = AtomicUsize::new(0);
+        let _ = pool
+            .try_alloc_order0_with(
+                0,
+                4,
+                |_| {
+                    dirty_scrubs.fetch_add(1, Ordering::Relaxed);
+                },
+                false,
+            )
+            .expect("refill after dirty multi-order free");
+        assert!(
+            dirty_scrubs.load(Ordering::Relaxed) >= 2,
+            "unscrubbed higher-order buddy frames must be scrubbed on order-0 refill"
+        );
+    }
+
+    #[test]
+    fn pcp_rejects_partial_free_of_higher_order_block() {
+        let pool = make_test_pool(0x4200_0000, 2 * 1024 * 1024, &[]);
+        let frame = pool
+            .try_alloc_multi_with(3, 8, 4, false)
+            .expect("order-3 alloc");
+        let free_after_alloc = pool.stats().unwrap().free_pages;
+
+        // Attempting order-0 PCP free on an order-3 block must fail closed with
+        // OrderMismatch without poisoning the allocator or altering free_pages.
+        assert_eq!(
+            pool.try_free_order0_with(frame, 0, |_| 0, |_| {}),
+            Err(FreeError::OrderMismatch)
+        );
+        assert_eq!(pool.stats().unwrap().free_pages, free_after_alloc);
+        assert_eq!(pool.pcp_stats().cached_pages, 0);
+        assert!(!pool.poisoned.load(Ordering::Acquire));
+
+        // Tail page of the order-3 block must also be rejected.
+        let tail = PhysFrame::containing_address(frame.start_address() + PAGE_SIZE as u64);
+        assert_eq!(
+            pool.try_free_order0_with(tail, 0, |_| 0, |_| {}),
+            Err(FreeError::NotAllocationStart)
+        );
+        assert_eq!(pool.stats().unwrap().free_pages, free_after_alloc);
+
+        // Proper order-3 free succeeds.
+        assert_eq!(pool.try_free_multi_with(frame, 3, |_| 0), Ok(()));
+    }
+
+    #[test]
+    fn pcp_rejects_double_free_and_reserved_frame() {
+        let reserved_phys = 0x4300_0000 + 4 * PAGE_SIZE as u64;
+        let pool = make_test_pool(
+            0x4300_0000,
+            2 * 1024 * 1024,
+            &[(reserved_phys, PAGE_SIZE as u64)],
+        );
+        let initial_free = pool.stats().unwrap().free_pages;
+
+        let reserved_frame = PhysFrame::containing_address(PhysAddr::new(reserved_phys));
+        assert_eq!(
+            pool.try_free_order0_with(reserved_frame, 0, |_| 0, |_| {}),
+            Err(FreeError::ReservedPage)
+        );
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+
+        let f = pool
+            .try_alloc_order0_with(0, 4, |_| {}, false)
+            .expect("alloc");
+        assert_eq!(pool.try_free_order0_with(f, 0, |_| 0, |_| {}), Ok(()));
+        let free_after_first = pool.stats().unwrap().free_pages;
+        assert_eq!(free_after_first, initial_free);
+
+        // Second free hits PAGE_PCP_CACHED -> rejected cleanly.
+        assert_eq!(
+            pool.try_free_order0_with(f, 0, |_| 0, |_| {}),
+            Err(FreeError::NotAllocationStart)
+        );
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        assert!(!pool.poisoned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pcp_rejects_frame_with_nonzero_cow_refcount() {
+        let pool = make_test_pool(0x4400_0000, 2 * 1024 * 1024, &[]);
+        let f = pool
+            .try_alloc_order0_with(0, 4, |_| {}, false)
+            .expect("alloc");
+        let free_after_alloc = pool.stats().unwrap().free_pages;
+
+        // Simulate active COW/shared mapping reference (refcount = 2).
+        assert_eq!(
+            pool.try_free_order0_with(f, 0, |_| 2, |_| {}),
+            Err(FreeError::PageStillReferenced)
+        );
+        assert_eq!(pool.pcp_stats().refcount_rejections, 1);
+        assert_eq!(pool.stats().unwrap().free_pages, free_after_alloc);
+
+        // Once refcount drops to 0, reclamation succeeds.
+        assert_eq!(pool.try_free_order0_with(f, 0, |_| 0, |_| {}), Ok(()));
+        assert_eq!(pool.stats().unwrap().free_pages, free_after_alloc + 1);
+    }
+
+    #[test]
+    fn pcp_overflow_drains_batch_and_coalesces() {
+        let pool = make_test_pool(0x4500_0000, 4 * 1024 * 1024, &[]);
+        let initial_free = pool.stats().unwrap().free_pages;
+        let total = PCP_HIGH_WATERMARK + 16;
+
+        let mut frames = Vec::new();
+        for _ in 0..total {
+            frames.push(
+                pool.try_alloc_order0_with(0, 4, |_| {}, false)
+                    .expect("alloc"),
+            );
+        }
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free - total);
+
+        for frame in frames {
+            pool.try_free_order0_with(frame, 0, |_| 0, |_| {})
+                .expect("free");
+        }
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        assert!(
+            pool.pcp_stats().drains >= 1,
+            "overflowing PCP_HIGH_WATERMARK must trigger batch drain to buddy"
+        );
+        assert!(pool.pcp_stats().cached_pages <= PCP_HIGH_WATERMARK);
+
+        pool.drain_all_pcp(4);
+        assert_eq!(pool.pcp_stats().cached_pages, 0);
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        assert_eq!(
+            pool.buddy.lock().as_ref().unwrap().validate_metadata(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn pcp_cross_cpu_drain_prevents_false_exhaustion() {
+        // Tiny 16-page (64 KiB) buddy window: CPU 1 caches all 15 remaining
+        // pages during refill + free, leaving buddy with 0 free pages.
+        let pool = make_test_pool(0x4600_0000, 16 * PAGE_SIZE, &[]);
+        let f = pool
+            .try_alloc_order0_with(1, 4, |_| {}, false)
+            .expect("cpu 1 refill");
+        pool.try_free_order0_with(f, 1, |_| 0, |_| {})
+            .expect("cpu 1 free back to PCP");
+        assert_eq!(pool.pcp_stats().cached_pages, 16);
+        assert_eq!(pool.buddy.lock().as_ref().unwrap().free_pages, 0);
+
+        // CPU 0 requests an order-2 (4 contiguous pages) block: must drain
+        // CPU 1's PCP, coalesce in buddy, and succeed instead of Exhausted.
+        let block = pool
+            .try_alloc_multi_with(2, 4, 4, false)
+            .expect("cross-CPU PCP drain must satisfy higher-order alloc");
+        assert_eq!(pool.pcp_stats().cross_cpu_drains, 1);
+        assert_eq!(pool.stats().unwrap().free_pages, 12);
+
+        assert_eq!(pool.try_free_multi_with(block, 2, |_| 0), Ok(()));
+        assert_eq!(pool.stats().unwrap().free_pages, 16);
+        assert_eq!(
+            pool.buddy.lock().as_ref().unwrap().validate_metadata(),
+            Ok(())
+        );
+    }
+
+    #[cfg(feature = "host_harness")]
+    #[test]
+    fn pcp_multithread_concurrent_alloc_free_stress() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = Arc::new(make_test_pool(0x4700_0000, 16 * 1024 * 1024, &[]));
+        let initial_free = pool.stats().unwrap().free_pages;
+        let threads = 8usize;
+        let iters = 1_500usize;
+
+        let mut handles = Vec::new();
+        for tid in 0..threads {
+            let p = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                let mut held = [None; 8];
+                for iter in 0..iters {
+                    let slot = iter & 7;
+                    if let Some(old) = held[slot].take() {
+                        p.try_free_order0_with(old, tid, |_| 0, |_| {})
+                            .expect("concurrent order-0 free");
+                    }
+                    let f = p
+                        .try_alloc_order0_with(tid, threads, |_| {}, false)
+                        .expect("concurrent order-0 alloc");
+                    held[slot] = Some(f);
+
+                    if iter % 64 == 0 {
+                        if let Ok(multi) = p.try_alloc_multi_with(2, 4, threads, false) {
+                            p.try_free_multi_with(multi, 2, |_| 0)
+                                .expect("concurrent order-2 free");
+                        }
+                    }
+                }
+                for frame in held.into_iter().flatten() {
+                    p.try_free_order0_with(frame, tid, |_| 0, |_| {})
+                        .expect("final thread free");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        pool.drain_all_pcp(threads);
+        assert_eq!(pool.pcp_stats().cached_pages, 0);
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        assert!(pool.pcp_stats().hits > 0, "concurrent stress must hit PCP");
+        assert_eq!(
+            pool.buddy.lock().as_ref().unwrap().validate_metadata(),
+            Ok(())
+        );
     }
 }

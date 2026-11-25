@@ -289,6 +289,123 @@ impl RuntimeTest for BuddyAllocatorTest {
     }
 }
 
+/// Issue #109 §1.3: verify Per-CPU Page Cache (PCP) LIFO reuse, zeroing before
+/// reuse (Invariant S2), and exact `free_pages` conservation (Invariant S3).
+struct PcpFrameCacheZeroingAndConservationTest;
+
+/// Category: Memory
+/// Priority: P0
+/// Status: Implemented
+impl RuntimeTest for PcpFrameCacheZeroingAndConservationTest {
+    fn name(&self) -> &'static str {
+        "pcp_frame_cache_zeroing"
+    }
+
+    fn description(&self) -> &'static str {
+        "Issue #109 §1.3: verify PCP LIFO hit, 4 KiB scrub-on-free zeroing, and free_pages conservation"
+    }
+
+    fn run(&self) -> TestResult {
+        use mm::buddy_allocator::{
+            alloc_physical_pages, free_physical_pages, get_allocator_stats, pcp_stats,
+        };
+        use mm::page_table::phys_to_virt;
+
+        let Some(stats_before) = get_allocator_stats() else {
+            return TestResult::Deferred(String::from("Buddy allocator not initialized"));
+        };
+
+        // Allocate an order-0 frame and fill all 4096 bytes with a non-zero
+        // poison pattern.
+        let Some(f1) = alloc_physical_pages(1) else {
+            return TestResult::Fail(String::from("Failed to allocate first order-0 frame"));
+        };
+        let Some(stats_alloc) = get_allocator_stats() else {
+            free_physical_pages(f1, 1);
+            return TestResult::Fail(String::from("Stats unavailable after alloc"));
+        };
+        if stats_alloc.free_pages + 1 != stats_before.free_pages {
+            free_physical_pages(f1, 1);
+            return TestResult::Fail(alloc::format!(
+                "free_pages conservation violated on alloc: {} -> {}",
+                stats_before.free_pages,
+                stats_alloc.free_pages
+            ));
+        }
+
+        let ptr1 = phys_to_virt(f1.start_address()).as_mut_ptr::<u8>();
+        unsafe {
+            core::ptr::write_bytes(ptr1, 0xA5, 4096);
+        }
+
+        // Free back to local PCP: must scrub all 4096 bytes and restore
+        // `free_pages` exactly.
+        let pcp_before_free = pcp_stats();
+        free_physical_pages(f1, 1);
+        let pcp_after_free = pcp_stats();
+        let Some(stats_freed) = get_allocator_stats() else {
+            return TestResult::Fail(String::from("Stats unavailable after free"));
+        };
+        if stats_freed.free_pages != stats_before.free_pages {
+            return TestResult::Fail(alloc::format!(
+                "free_pages conservation violated on PCP free: expected {}, got {}",
+                stats_before.free_pages,
+                stats_freed.free_pages
+            ));
+        }
+        if pcp_after_free.frees_cached <= pcp_before_free.frees_cached {
+            return TestResult::Fail(String::from("Order-0 free did not enter local PCP cache"));
+        }
+
+        // Re-allocate on the same CPU: must hit PCP LIFO and return a fully
+        // zeroed 4 KiB frame (proving scrub-on-free ran before reuse).
+        let pcp_before_alloc = pcp_stats();
+        let Some(f2) = alloc_physical_pages(1) else {
+            return TestResult::Fail(String::from("Failed to reallocate order-0 frame from PCP"));
+        };
+        let pcp_after_alloc = pcp_stats();
+        if pcp_after_alloc.hits <= pcp_before_alloc.hits {
+            free_physical_pages(f2, 1);
+            return TestResult::Fail(String::from("Second order-0 alloc did not hit PCP"));
+        }
+        if f2 != f1 {
+            free_physical_pages(f2, 1);
+            return TestResult::Fail(alloc::format!(
+                "PCP LIFO mismatch: freed {:#x}, reallocated {:#x}",
+                f1.start_address().as_u64(),
+                f2.start_address().as_u64()
+            ));
+        }
+
+        let ptr2 = phys_to_virt(f2.start_address()).as_ptr::<u64>();
+        for word_idx in 0..(4096 / 8) {
+            let val = unsafe { core::ptr::read_volatile(ptr2.add(word_idx)) };
+            if val != 0 {
+                free_physical_pages(f2, 1);
+                return TestResult::Fail(alloc::format!(
+                    "Invariant S2 violation: PCP reused frame had non-zero word {:#x} at offset {}",
+                    val,
+                    word_idx * 8
+                ));
+            }
+        }
+
+        free_physical_pages(f2, 1);
+        let Some(stats_final) = get_allocator_stats() else {
+            return TestResult::Fail(String::from("Stats unavailable at end"));
+        };
+        if stats_final.free_pages != stats_before.free_pages {
+            return TestResult::Fail(alloc::format!(
+                "free_pages conservation violated at teardown: expected {}, got {}",
+                stats_before.free_pages,
+                stats_final.free_pages
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
 /// Test R186-4 P0-A: VMA/MM metadata heap admission with CoreProcess coexistence
 fn assert_admission_lanes_at_least(
     baseline: mm::HeapAdmissionSnapshot,
@@ -3451,6 +3568,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
     let mut all_tests: Vec<&'static dyn RuntimeTest> = alloc::vec![
         &HeapAllocationTest,
         &BuddyAllocatorTest,
+        &PcpFrameCacheZeroingAndConservationTest,
         &VmaHeapAdmissionTest,
         &VmaHeapAdmissionPressureTest,
         &VmaForkCombinedLoadTest,

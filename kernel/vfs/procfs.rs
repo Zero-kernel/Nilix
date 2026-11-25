@@ -2210,6 +2210,19 @@ fn generate_schedstat() -> Result<AdmittedString, FsError> {
             wait.halts, wait.seq_aborts, wait.kicks, wait.targeted, wait.notified
         ))
         .map_err(|_| FsError::NoSpace)?;
+    let pcp = mm::buddy_allocator::pcp_stats();
+    content
+        .write_fmt(format_args!(
+            "pcp_cache hits={} misses={} cached={} refills={} drains={} frees_cached={} cross_drains={}\n",
+            pcp.hits,
+            pcp.misses,
+            pcp.cached_pages,
+            pcp.refills,
+            pcp.drains,
+            pcp.frees_cached,
+            pcp.cross_cpu_drains
+        ))
+        .map_err(|_| FsError::NoSpace)?;
     Ok(content)
 }
 
