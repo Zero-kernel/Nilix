@@ -45,9 +45,8 @@
 
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 use cpu_local::{current_cpu_id, CpuLocal};
-use x86_64::registers::control::{Cr4, Cr4Flags};
 
 // ============================================================================
 // H-26 FIX: Exception-table assisted user accesses (x86_64)
@@ -194,6 +193,33 @@ __zero_os_usercopy_cmpxchg_u32_access:
 .Lex_cmpxchg_u32_fixup: .long .Lcmpxchg_u32_fixup - .Lex_cmpxchg_u32_fixup
     .popsection
 
+    // Issue #109 §4.2: Hardware-accelerated bulk usercopy (x86_64 ERMS/FSRM).
+    // System V AMD64 ABI:
+    //   rdi = dst (kernel dst for copy_from_user, user dst for copy_to_user)
+    //   rsi = src (user src for copy_from_user, kernel src for copy_to_user)
+    //   rdx = len (bytes to copy)
+    // Returns:
+    //   rax = remaining uncopied byte count (0 = complete success, >0 = faulted)
+    .global __zero_os_usercopy_copy_bytes
+__zero_os_usercopy_copy_bytes:
+    mov rcx, rdx            // rcx = byte count for rep movsb
+    cld                     // R65-17: guarantee forward copy (DF=0)
+.Lcopy_bytes_access:
+    .global __zero_os_usercopy_copy_bytes_access
+__zero_os_usercopy_copy_bytes_access:
+    rep movsb               // Hardware bulk copy; on #PF, RIP stays here and rcx = remaining
+    xor eax, eax            // Return 0 (all bytes copied)
+    ret
+.Lcopy_bytes_fixup:
+    mov rax, rcx            // Return remaining uncopied bytes (> 0)
+    ret
+
+    .pushsection .ex_table,"a"
+    .balign 8
+.Lex_copy_bytes_fault:  .long .Lcopy_bytes_access - .Lex_copy_bytes_fault
+.Lex_copy_bytes_fixup:  .long .Lcopy_bytes_fixup - .Lex_copy_bytes_fixup
+    .popsection
+
 "#
 );
 
@@ -216,10 +242,15 @@ extern "C" {
 
     /// Write one byte to user space.
     /// Returns 0 on success, 1 on fault.
+    #[allow(dead_code)]
     fn __zero_os_usercopy_put_u8(dst: *mut u8, val: u8) -> u32;
 
     /// Store one aligned user u32. Returns 0 on success and 1 on fault.
     fn __zero_os_usercopy_put_u32(dst: *mut u32, val: u32) -> u32;
+
+    /// Issue #109 §4.2: Hardware-accelerated bulk copy between kernel and user memory.
+    /// Returns 0 on complete copy, or remaining uncopied byte count (> 0) on fault.
+    fn __zero_os_usercopy_copy_bytes(dst: *mut u8, src: *const u8, len: usize) -> usize;
 
     /// TD-USERCOPY-1: the user-access instructions of the two helpers the
     /// no-fault readers run (labels inside the helpers; never read or called).
@@ -263,14 +294,23 @@ unsafe fn copy_byte_from_user(dst: *mut u8, src: *const u8) -> Result<(), ()> {
     }
 }
 
-/// H-26 FIX: Exception-safe byte write to user space
+/// Issue #109 §4.2: Boot-latched CR4.SMAP status shared by `UserAccessGuard`.
+///
+/// Published once by the BSP in `enable_protections()` and fail-closed verified
+/// on every AP before online publication. Eliminates per-access `mov rax, cr4`
+/// privileged reads on hot futex/syscall paths while staying safe in `--features kcov`
+/// environments without SMAP.
+static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Publish the BSP's latched CR4.SMAP enablement state for `UserAccessGuard`.
+pub fn publish_smap_enabled(enabled: bool) {
+    SMAP_ENABLED.store(enabled, Ordering::Release);
+}
+
+/// Return the boot-latched CR4.SMAP enablement state.
 #[inline(always)]
-unsafe fn write_byte_to_user(dst: *mut u8, val: u8) -> Result<(), ()> {
-    if __zero_os_usercopy_put_u8(dst, val) == 0 {
-        Ok(())
-    } else {
-        Err(())
-    }
+pub fn smap_enabled_cached() -> bool {
+    SMAP_ENABLED.load(Ordering::Relaxed)
 }
 
 /// User-copy state with PID binding for SMP safety (V-5 fix)
@@ -280,13 +320,14 @@ unsafe fn write_byte_to_user(dst: *mut u8, val: u8) -> Result<(), ()> {
 ///
 /// H-26 FIX: Removed the `faulted` flag. Exception table fixups now handle
 /// fault recovery directly in the assembly helpers.
+/// Issue #109 §4.2: Removed write-only `remaining` field and downgraded per-CPU
+/// stores from `SeqCst` (`LOCK XCHG`) to `Relaxed` payload + `Release`/`Acquire`
+/// `active` gate with `compiler_fence(SeqCst)`.
 struct UserCopyState {
     /// True if currently executing a user copy operation
     active: AtomicBool,
     /// PID that owns the active user copy (0 = none/kernel)
     pid: AtomicUsize,
-    /// Number of bytes remaining to copy (for progress tracking)
-    remaining: AtomicUsize,
     /// Inclusive start address of the current user buffer
     start: AtomicUsize,
     /// Exclusive end address of the current user buffer
@@ -302,7 +343,6 @@ impl UserCopyState {
         Self {
             active: AtomicBool::new(false),
             pid: AtomicUsize::new(0),
-            remaining: AtomicUsize::new(0),
             start: AtomicUsize::new(0),
             end: AtomicUsize::new(0),
             nofault: AtomicBool::new(false),
@@ -323,6 +363,28 @@ static USER_COPY_STATE: CpuLocal<UserCopyState> = CpuLocal::new(UserCopyState::n
 ///
 /// Per-CPU storage ensures correct nesting behavior in SMP environments.
 static SMAP_GUARD_DEPTH: CpuLocal<AtomicUsize> = CpuLocal::new(|| AtomicUsize::new(0));
+
+#[inline(always)]
+fn with_usercopy_state<R>(cpu_id: usize, f: impl FnOnce(&UserCopyState) -> R) -> R {
+    // Fast path: after `force_init_usercopy_locals()`, direct index avoids a
+    // redundant `current_cpu_id()` lookup. Falls back cleanly in hosted tests.
+    let mut f = Some(f);
+    if let Some(res) = USER_COPY_STATE.with_cpu(cpu_id, |s| (f.take().unwrap())(s)) {
+        res
+    } else {
+        USER_COPY_STATE.with(|s| (f.take().unwrap())(s))
+    }
+}
+
+#[inline(always)]
+fn with_smap_depth<R>(cpu_id: usize, f: impl FnOnce(&AtomicUsize) -> R) -> R {
+    let mut f = Some(f);
+    if let Some(res) = SMAP_GUARD_DEPTH.with_cpu(cpu_id, |d| (f.take().unwrap())(d)) {
+        res
+    } else {
+        SMAP_GUARD_DEPTH.with(|d| (f.take().unwrap())(d))
+    }
+}
 
 /// R162-22 FIX: Force-initialize per-CPU usercopy locals before interrupts are
 /// enabled. Without this, the first usercopy call from an IRQ context could
@@ -392,32 +454,85 @@ impl UserAccessGuard {
     /// running with AC=1 (user access allowed).
     #[inline]
     pub fn new() -> Self {
-        let cpu_id = current_cpu_id();
-        let smap_active = Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
-        let mut interrupts_were_enabled = false;
+        let smap_active = smap_enabled_cached();
 
         if smap_active {
+            // R25-10 FIX: Disable interrupts before reading cpu_id or setting AC.
+            let mut interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+            if interrupts_were_enabled {
+                x86_64::instructions::interrupts::disable();
+            }
+            let cpu_id = current_cpu_id();
             // Only execute STAC when this is the outermost guard (depth 0→1)
             // V-5 fix: Use per-CPU depth counter
-            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_add(1, Ordering::Relaxed)); // lint-fetch-add: allow (per-CPU depth counter); R161-I5: Relaxed suffices (per-CPU, IRQ-disabled)
+            let prev_depth = with_smap_depth(cpu_id, |d| d.fetch_add(1, Ordering::Relaxed)); // lint-fetch-add: allow (per-CPU depth counter); R161-I5: Relaxed suffices (per-CPU, IRQ-disabled)
             if prev_depth == 0 {
-                // R25-10 FIX: Disable interrupts before setting AC flag
-                // This prevents interrupt handlers from running with user access allowed
-                interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
-                if interrupts_were_enabled {
-                    x86_64::instructions::interrupts::disable();
-                }
                 // Set AC flag to allow supervisor access to user pages
                 unsafe {
                     core::arch::asm!("stac", options(nostack, nomem));
                 }
+            } else {
+                interrupts_were_enabled = false;
+            }
+            UserAccessGuard {
+                smap_active: true,
+                cpu_id,
+                interrupts_were_enabled,
+            }
+        } else {
+            UserAccessGuard {
+                smap_active: false,
+                cpu_id: current_cpu_id(),
+                interrupts_were_enabled: false,
             }
         }
+    }
 
-        UserAccessGuard {
-            smap_active,
-            cpu_id,
-            interrupts_were_enabled,
+    /// Issue #109 §4.2: Acquire SMAP guard for usercopy only after proving the
+    /// pinned CPU is running on a user address space (`active_cr3 != boot_cr3`).
+    ///
+    /// Interrupts are disabled BEFORE reading `cpu_id` and checking CR3 so no
+    /// task migration can interpose between the check and `STAC`. On failure,
+    /// interrupts are restored and `None` is returned without ever setting `AC`.
+    #[inline]
+    fn try_new_for_usercopy() -> Option<Self> {
+        let smap_active = smap_enabled_cached();
+
+        if smap_active {
+            let mut interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+            if interrupts_were_enabled {
+                x86_64::instructions::interrupts::disable();
+            }
+            let cpu_id = current_cpu_id();
+            if !ensure_user_address_space_active(cpu_id) {
+                if interrupts_were_enabled {
+                    x86_64::instructions::interrupts::enable();
+                }
+                return None;
+            }
+            let prev_depth = with_smap_depth(cpu_id, |d| d.fetch_add(1, Ordering::Relaxed)); // lint-fetch-add: allow (per-CPU depth counter); R161-I5: Relaxed suffices (per-CPU, IRQ-disabled)
+            if prev_depth == 0 {
+                unsafe {
+                    core::arch::asm!("stac", options(nostack, nomem));
+                }
+            } else {
+                interrupts_were_enabled = false;
+            }
+            Some(UserAccessGuard {
+                smap_active: true,
+                cpu_id,
+                interrupts_were_enabled,
+            })
+        } else {
+            let cpu_id = current_cpu_id();
+            if !ensure_user_address_space_active(cpu_id) {
+                return None;
+            }
+            Some(UserAccessGuard {
+                smap_active: false,
+                cpu_id,
+                interrupts_were_enabled: false,
+            })
         }
     }
 }
@@ -481,9 +596,11 @@ impl Drop for UserAccessGuard {
             // R163-I4 FIX: Check BEFORE atomic sub to avoid leaving the counter
             // at usize::MAX on underflow. The assert after fetch_sub would panic
             // anyway, but the counter state would be corrupted.
-            let cur_depth = SMAP_GUARD_DEPTH.with(|d| d.load(Ordering::Relaxed));
-            assert!(cur_depth > 0, "SMAP guard depth underflow");
-            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_sub(1, Ordering::Relaxed));
+            let prev_depth = with_smap_depth(current_cpu, |d| {
+                let cur_depth = d.load(Ordering::Relaxed);
+                assert!(cur_depth > 0, "SMAP guard depth underflow");
+                d.fetch_sub(1, Ordering::Relaxed)
+            });
             if prev_depth == 1 {
                 // Clear AC flag to restore SMAP protection
                 unsafe {
@@ -516,7 +633,8 @@ impl Drop for UserAccessGuard {
 #[inline]
 pub fn is_in_usercopy() -> bool {
     let pid = current_pid_raw();
-    USER_COPY_STATE.with(|s| s.active.load(Ordering::SeqCst) && s.pid.load(Ordering::SeqCst) == pid)
+    USER_COPY_STATE
+        .with(|s| s.active.load(Ordering::Acquire) && s.pid.load(Ordering::Relaxed) == pid)
 }
 
 // H-26 FIX: Removed set_usercopy_fault() and check_and_clear_fault()
@@ -534,32 +652,25 @@ struct UserCopyGuard {
 }
 
 impl UserCopyGuard {
-    /// Create a new UserCopyGuard, registering the current copy operation
+    /// Create a new UserCopyGuard on `cpu_id`, registering the current copy operation.
     ///
-    /// # PID Binding
-    ///
-    /// Stores the current process PID to associate the copy with its owner.
-    ///
-    /// # V-5 fix
-    ///
-    /// Uses per-CPU state for SMP safety.
-    ///
-    /// # H-26 FIX
-    ///
-    /// Removed faulted flag initialization - exception table handles faults.
+    /// Issue #109 §4.2: Uses `Relaxed` stores for payload fields followed by
+    /// `active.store(true, Release)` + `compiler_fence(SeqCst)` — zero `LOCK XCHG`
+    /// hardware fences while preserving strict program-order visibility for
+    /// same-CPU `#PF` and Release/Acquire visibility for cross-CPU cleanup.
     #[inline]
-    fn new(buffer_start: usize, len: usize) -> Self {
-        let cpu_id = current_cpu_id();
+    fn new_on_cpu(cpu_id: usize, buffer_start: usize, len: usize, nofault: bool) -> Self {
         let pid = current_pid_raw();
-        USER_COPY_STATE.with(|s| {
-            s.pid.store(pid, Ordering::SeqCst);
-            s.start.store(buffer_start, Ordering::SeqCst);
+        with_usercopy_state(cpu_id, |s| {
+            s.pid.store(pid, Ordering::Relaxed);
+            s.start.store(buffer_start, Ordering::Relaxed);
             s.end
-                .store(buffer_start.saturating_add(len), Ordering::SeqCst);
+                .store(buffer_start.saturating_add(len), Ordering::Relaxed);
             // GAP-5 PI review D2-1: faults resolve unless the helper opts out.
-            s.nofault.store(false, Ordering::SeqCst);
-            s.active.store(true, Ordering::SeqCst);
+            s.nofault.store(nofault, Ordering::Relaxed);
+            s.active.store(true, Ordering::Release);
         });
+        compiler_fence(Ordering::SeqCst);
         UserCopyGuard { cpu_id, pid }
     }
 }
@@ -567,30 +678,24 @@ impl UserCopyGuard {
 impl Drop for UserCopyGuard {
     #[inline]
     fn drop(&mut self) {
+        compiler_fence(Ordering::SeqCst);
         let current_cpu = current_cpu_id();
 
         // R108-2 FIX: Detect CPU migration and perform best-effort cleanup instead
         // of panicking.  Follows the same pattern as UserAccessGuard (R106-7 FIX).
-        //
-        // If the guard is dropped on a different CPU, the per-CPU usercopy state on
-        // the originating CPU would otherwise remain active, causing false-positive
-        // fault attribution for subsequent usercopy operations on that CPU.
-        //
-        // We clear the originating CPU's state only if it still belongs to the same
-        // PID (to avoid clearing another task's state that may have legitimately
-        // started a usercopy on that CPU).
         if current_cpu != self.cpu_id {
             let cleared = USER_COPY_STATE
                 .with_cpu(self.cpu_id, |s| {
-                    if s.pid.load(Ordering::SeqCst) != self.pid {
+                    if !s.active.load(Ordering::Acquire)
+                        || s.pid.load(Ordering::Relaxed) != self.pid
+                    {
                         return false;
                     }
-                    s.active.store(false, Ordering::SeqCst);
-                    s.pid.store(0, Ordering::SeqCst);
-                    s.remaining.store(0, Ordering::SeqCst);
-                    s.start.store(0, Ordering::SeqCst);
-                    s.end.store(0, Ordering::SeqCst);
-                    s.nofault.store(false, Ordering::SeqCst);
+                    s.active.store(false, Ordering::Release);
+                    s.pid.store(0, Ordering::Relaxed);
+                    s.start.store(0, Ordering::Relaxed);
+                    s.end.store(0, Ordering::Relaxed);
+                    s.nofault.store(false, Ordering::Release);
                     true
                 })
                 .unwrap_or(false);
@@ -610,13 +715,12 @@ impl Drop for UserCopyGuard {
             return;
         }
 
-        USER_COPY_STATE.with(|s| {
-            s.active.store(false, Ordering::SeqCst);
-            s.pid.store(0, Ordering::SeqCst);
-            s.remaining.store(0, Ordering::SeqCst);
-            s.start.store(0, Ordering::SeqCst);
-            s.end.store(0, Ordering::SeqCst);
-            s.nofault.store(false, Ordering::SeqCst);
+        with_usercopy_state(current_cpu, |s| {
+            s.active.store(false, Ordering::Release);
+            s.pid.store(0, Ordering::Relaxed);
+            s.start.store(0, Ordering::Relaxed);
+            s.end.store(0, Ordering::Relaxed);
+            s.nofault.store(false, Ordering::Relaxed);
         });
     }
 }
@@ -725,29 +829,28 @@ fn validate_user_range_aligned(ptr: usize, len: usize, align: usize) -> bool {
     validate_user_range(ptr, len) && is_aligned(ptr, align)
 }
 
-/// R192-1 FIX (D0-ISO-1): may the kernel access the user page holding `addr`
-/// on the caller's behalf?
+/// Issue #109 §4.2 (Invariant S2): pure predicate checking that the active CR3
+/// is a tracked user address space rather than the boot PML4 template (which
+/// retains the 0-4 GiB supervisor identity map in PML4[0]).
+#[inline(always)]
+fn is_user_address_space_active(active_cr3: u64, boot_cr3: u64) -> bool {
+    active_cr3 != 0 && boot_cr3 != 0 && active_cr3 != boot_cr3
+}
+
+/// Issue #109 §4.2 (Invariant S2): O(1) fail-closed non-boot-CR3 guard.
 ///
-/// The range checks above admit any lower-half address. User address spaces
-/// used to hold the boot identity map of physical 0-4 GiB there as
-/// supervisor-only entries (gone since D0-ISO-1 Approach A; the check stays as
-/// defense in depth), which ring 0 reads and writes whatever their U/S
-/// bit (SMAP only guards U/S=1 pages, and the access guard sets AC anyway).
-/// Every helper below therefore checks each page before its first byte: a
-/// kernel-owned page is refused (EFAULT), a page that is not present is left to
-/// the #PF path, and a write to a present user page that is neither writable
-/// nor copy-on-write is refused as its protection fault would be.
-#[inline]
-fn user_page_permits(addr: usize, write: bool) -> bool {
-    use mm::page_table::UserPageAccess;
-    match mm::page_table::user_page_access(x86_64::VirtAddr::new_truncate(addr as u64)) {
-        UserPageAccess::NotPresent => true,
-        UserPageAccess::User {
-            writable,
-            copy_on_write,
-        } => !write || writable || copy_on_write,
-        UserPageAccess::Kernel => false,
-    }
+/// D0-ISO-1 Approach A removed all lower-half supervisor mappings from user
+/// address spaces (verified by `PageTableManager` guards, `mitigation_probe`,
+/// and Ring-3 `test_identity_map_boundary`), and `CR0.WP=1` is enforced on BSP
+/// and every AP (R171-G1-1). Refusing `boot_cr3` (and untracked CR3 `0`) before
+/// `STAC` replaces per-page 4-level software page-table walks on hot usercopy
+/// paths while closing the only address space that retains a lower-half
+/// supervisor identity map.
+#[inline(always)]
+fn ensure_user_address_space_active(cpu_id: usize) -> bool {
+    let active_cr3 = mm::tlb_shootdown::tracked_cr3_for_cpu(cpu_id);
+    let boot_cr3 = crate::process::boot_cr3_phys();
+    is_user_address_space_active(active_cr3, boot_cr3)
 }
 
 // ============================================================================
@@ -902,21 +1005,17 @@ fn read_user_u32_atomic_inner(src: UserAddr, nofault: bool) -> Result<u32, ()> {
         return Err(());
     }
 
-    let _smap_guard = UserAccessGuard::new();
-    if !user_page_permits(addr, false) {
-        return Err(());
-    }
-    let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
-    USER_COPY_STATE.with(|s| {
-        s.remaining
-            .store(core::mem::size_of::<u32>(), Ordering::SeqCst);
-        s.nofault.store(nofault, Ordering::SeqCst);
-    });
+    let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(())?;
+    let _guard = UserCopyGuard::new_on_cpu(
+        smap_guard.cpu_id,
+        addr,
+        core::mem::size_of::<u32>(),
+        nofault,
+    );
 
     let mut value = 0u32;
     let status =
         unsafe { __zero_os_usercopy_get_u32(&mut value, src.as_const_ptr().cast::<u32>()) };
-    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
     if status == 0 {
         Ok(value)
     } else {
@@ -939,20 +1038,13 @@ pub fn read_user_u64_atomic(src: UserAddr) -> Result<u64, ()> {
         return Err(());
     }
 
-    let _smap_guard = UserAccessGuard::new();
-    if !user_page_permits(addr, false) {
-        return Err(());
-    }
-    let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u64>());
-    USER_COPY_STATE.with(|s| {
-        s.remaining
-            .store(core::mem::size_of::<u64>(), Ordering::SeqCst)
-    });
+    let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(())?;
+    let _guard =
+        UserCopyGuard::new_on_cpu(smap_guard.cpu_id, addr, core::mem::size_of::<u64>(), false);
 
     let mut value = 0u64;
     let status =
         unsafe { __zero_os_usercopy_get_u64(&mut value, src.as_const_ptr().cast::<u64>()) };
-    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
     if status == 0 {
         Ok(value)
     } else {
@@ -995,21 +1087,17 @@ fn compare_exchange_user_u32_inner(
         return Err(());
     }
 
-    let _smap_guard = UserAccessGuard::new();
-    if !user_page_permits(addr, true) {
-        return Err(());
-    }
-    let _guard = UserCopyGuard::new(addr, core::mem::size_of::<u32>());
-    USER_COPY_STATE.with(|s| {
-        s.remaining
-            .store(core::mem::size_of::<u32>(), Ordering::SeqCst);
-        s.nofault.store(nofault, Ordering::SeqCst);
-    });
+    let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(())?;
+    let _guard = UserCopyGuard::new_on_cpu(
+        smap_guard.cpu_id,
+        addr,
+        core::mem::size_of::<u32>(),
+        nofault,
+    );
 
     let observed = unsafe {
         __zero_os_usercopy_cmpxchg_u32(dst.as_mut_ptr().cast::<u32>(), expected, desired)
     };
-    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
     if observed & 0x1_0000_0000 != 0 {
         Err(())
     } else {
@@ -1027,16 +1115,11 @@ pub fn write_user_u32_atomic(dst: UserAddr, value: u32) -> Result<(), ()> {
         return Err(());
     }
 
-    let _smap_guard = UserAccessGuard::new();
-    if !user_page_permits(addr, true) {
-        return Err(());
-    }
-    let _guard = UserCopyGuard::new(addr, len);
-    USER_COPY_STATE.with(|s| s.remaining.store(len, Ordering::SeqCst));
+    let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(())?;
+    let _guard = UserCopyGuard::new_on_cpu(smap_guard.cpu_id, addr, len, false);
     // SAFETY: the aligned word fits in one validated user page. The assembly
     // store has an exception-table fixup for a mapping that changes or faults.
     let status = unsafe { __zero_os_usercopy_put_u32(dst.as_mut_ptr().cast(), value) };
-    USER_COPY_STATE.with(|s| s.remaining.store(0, Ordering::SeqCst));
     if status == 0 {
         Ok(())
     } else {
@@ -1105,46 +1188,37 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
     }
 
     // Validate user pointer range
-    if !validate_user_range(src as usize, len) {
+    let src_base = src as usize;
+    if !validate_user_range(src_base, len) {
         return Err(());
     }
 
     let dst_ptr = dst.as_mut_ptr();
 
-    // R65-10 FIX: Copy in chunks to allow interrupt servicing
+    // R65-10 FIX: Copy in chunks to allow interrupt servicing.
+    // Issue #109 §4.2: Each 4 KiB chunk uses hardware-accelerated `rep movsb`
+    // with exact `.ex_table` fault recovery and O(1) non-boot-CR3 verification.
     let mut offset = 0usize;
     while offset < len {
         let chunk_end = (offset + USERCOPY_CHUNK_SIZE).min(len);
+        let chunk_len = chunk_end - offset;
+        let user_chunk_start = src_base.wrapping_add(offset);
 
-        // Allow supervisor access to user pages for this chunk
-        let _smap_guard = UserAccessGuard::new();
+        let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(())?;
+        let _guard =
+            UserCopyGuard::new_on_cpu(smap_guard.cpu_id, user_chunk_start, chunk_len, false);
 
-        // R109-1 FIX: Scope UserCopyGuard to each chunk so per-CPU fault-tracking
-        // state lives only while interrupts are disabled (inside SMAP guard).
-        // Previously, the guard was created once at function entry and spanned
-        // multiple chunks.  Between chunks the SMAP guard is dropped, re-enabling
-        // interrupts and creating a migration window.  If the task migrates, the
-        // destination CPU's per-CPU USER_COPY_STATE is inactive, so the exception-
-        // table fixup would fail and the page-fault handler would panic instead of
-        // returning EFAULT.  By scoping per-CPU state to each chunk, migration
-        // between chunks is harmless — state is always on the executing CPU.
-        let _guard = UserCopyGuard::new((src as usize).wrapping_add(offset), chunk_end - offset);
-        USER_COPY_STATE.with(|s| s.remaining.store(len - offset, Ordering::SeqCst));
-
-        // H-26 FIX: Copy using exception-safe helpers
-        // R102-I4 FIX: Use integer arithmetic for user pointer (src) offset to
-        // avoid pointer provenance UB. dst_ptr is a kernel pointer and safe with .add().
-        for i in offset..chunk_end {
-            // SAFETY: user range validated; dst is a kernel slice
-            let user_src = (src as usize).wrapping_add(i) as *const u8;
-            // R192-1 FIX: check each page before its first byte.
-            if (i == offset || user_src as usize & 0xfff == 0)
-                && !user_page_permits(user_src as usize, false)
-            {
-                return Err(());
-            }
-            unsafe { copy_byte_from_user(dst_ptr.add(i), user_src) }?;
-            USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
+        // SAFETY: user range validated in [MMAP_MIN_ADDR, USER_SPACE_TOP);
+        // dst is a disjoint kernel slice; `.ex_table` recovers any user #PF.
+        let remaining = unsafe {
+            __zero_os_usercopy_copy_bytes(
+                dst_ptr.add(offset),
+                user_chunk_start as *const u8,
+                chunk_len,
+            )
+        };
+        if remaining != 0 {
+            return Err(());
         }
 
         offset = chunk_end;
@@ -1183,34 +1257,38 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
     }
 
     // Validate user pointer range
-    if !validate_user_range(dst as usize, len) {
+    let dst_base = dst as usize;
+    if !validate_user_range(dst_base, len) {
         return Err(());
     }
 
-    // R65-10 FIX: Copy in chunks to allow interrupt servicing
+    let src_ptr = src.as_ptr();
+
+    // R65-10 FIX: Copy in chunks to allow interrupt servicing.
+    // Issue #109 §4.2: Each 4 KiB chunk uses hardware-accelerated `rep movsb`
+    // with CR0.WP=1 write protection, CoW/shared-anon #PF resume, and `.ex_table`
+    // recovery on unmapped or non-COW read-only pages.
     let mut offset = 0usize;
     while offset < len {
         let chunk_end = (offset + USERCOPY_CHUNK_SIZE).min(len);
+        let chunk_len = chunk_end - offset;
+        let user_chunk_start = dst_base.wrapping_add(offset);
 
-        // Allow supervisor access to user pages for this chunk
-        let _smap_guard = UserAccessGuard::new();
+        let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(())?;
+        let _guard =
+            UserCopyGuard::new_on_cpu(smap_guard.cpu_id, user_chunk_start, chunk_len, false);
 
-        // R109-1 FIX: Scope UserCopyGuard to each chunk (see copy_from_user_safe).
-        let _guard = UserCopyGuard::new((dst as usize).wrapping_add(offset), chunk_end - offset);
-        USER_COPY_STATE.with(|s| s.remaining.store(len - offset, Ordering::SeqCst));
-
-        // H-26 FIX: Copy using exception-safe helpers
-        // R102-I4 FIX: Use integer arithmetic for user pointer (dst) offset.
-        for i in offset..chunk_end {
-            let user_dst = (dst as usize).wrapping_add(i) as *mut u8;
-            // R192-1 FIX: check each page before its first byte.
-            if (i == offset || user_dst as usize & 0xfff == 0)
-                && !user_page_permits(user_dst as usize, true)
-            {
-                return Err(());
-            }
-            unsafe { write_byte_to_user(user_dst, src[i]) }?;
-            USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
+        // SAFETY: user range validated in [MMAP_MIN_ADDR, USER_SPACE_TOP);
+        // src is a disjoint kernel slice; `.ex_table` recovers any user #PF.
+        let remaining = unsafe {
+            __zero_os_usercopy_copy_bytes(
+                user_chunk_start as *mut u8,
+                src_ptr.add(offset),
+                chunk_len,
+            )
+        };
+        if remaining != 0 {
+            return Err(());
         }
 
         offset = chunk_end;
@@ -1248,35 +1326,23 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
 /// using the faulting RIP. If a fixup entry is found, rewrite RIP to the fixup and
 /// return so the usercopy helper can return `Err(())` to the syscall layer (EFAULT).
 pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
-    // Only handle if we're in a user copy for the current process
-    // is_in_usercopy() already checks PID binding (H-36 fix)
-    if !is_in_usercopy() {
-        return false;
-    }
-
-    // Double-check PID for defense-in-depth (SMP safety)
-    let current = current_pid_raw();
-    let owner = USER_COPY_STATE.with(|s| s.pid.load(Ordering::SeqCst));
-    if current != owner {
-        return false;
-    }
-
     // Only handle user-space addresses
     if fault_addr >= USER_SPACE_TOP {
         return false;
     }
 
-    // Ensure the fault belongs to the active buffer range to avoid
-    // swallowing unrelated user faults
-    let (start, end) =
-        USER_COPY_STATE.with(|s| (s.start.load(Ordering::SeqCst), s.end.load(Ordering::SeqCst)));
-    if start == 0 || fault_addr < start || fault_addr >= end {
-        return false;
-    }
-
-    // H-26 FIX: No longer set a fault flag.
-    // Exception table fixup in page_fault_handler will rewrite RIP.
-    true
+    let current = current_pid_raw();
+    USER_COPY_STATE.with(|s| {
+        if !s.active.load(Ordering::Acquire) {
+            return false;
+        }
+        if s.pid.load(Ordering::Relaxed) != current {
+            return false;
+        }
+        let start = s.start.load(Ordering::Relaxed);
+        let end = s.end.load(Ordering::Relaxed);
+        start != 0 && fault_addr >= start && fault_addr < end
+    })
 }
 
 /// GAP-5 PI parity (review D2-1): whether a kernel-mode fault at `fault_addr`
@@ -1292,7 +1358,7 @@ pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
 pub fn nofault_usercopy_fault(fault_addr: usize, fault_ip: usize) -> bool {
     nofault_access_ip(fault_ip)
         && try_handle_usercopy_fault(fault_addr)
-        && USER_COPY_STATE.with(|s| s.nofault.load(Ordering::SeqCst))
+        && USER_COPY_STATE.with(|s| s.nofault.load(Ordering::Relaxed))
 }
 
 /// Maximum length for user-space C strings (paths, arguments)
@@ -1376,8 +1442,9 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
         // Scoped: SMAP guard + fault-tracking state live only for this chunk.
         // No heap allocation occurs inside this block.
         {
-            let _smap_guard = UserAccessGuard::new();
-            let _guard = UserCopyGuard::new(chunk_start, chunk_len);
+            let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(())?;
+            let _guard =
+                UserCopyGuard::new_on_cpu(smap_guard.cpu_id, chunk_start, chunk_len, false);
 
             for i in offset..chunk_end {
                 // Validate each byte address is still in user space
@@ -1385,10 +1452,6 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
                     Some(addr) if addr < USER_SPACE_TOP => addr,
                     _ => return Err(()),
                 };
-                // R192-1 FIX: check each page before its first byte.
-                if (i == offset || byte_addr & 0xfff == 0) && !user_page_permits(byte_addr, false) {
-                    return Err(());
-                }
 
                 // H-26 FIX: Read using exception-safe helper
                 let mut byte = 0u8;
@@ -1862,9 +1925,9 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
         };
 
         // Scoped: SMAP guard + fault-tracking state live only for this chunk.
-        let _smap_guard = UserAccessGuard::new();
-        let _guard = UserCopyGuard::new(chunk_start, chunk_end - offset);
-        USER_COPY_STATE.with(|s| s.remaining.store(max_copy - offset, Ordering::SeqCst));
+        let smap_guard = UserAccessGuard::try_new_for_usercopy().ok_or(UsercopyError)?;
+        let _guard =
+            UserCopyGuard::new_on_cpu(smap_guard.cpu_id, chunk_start, chunk_end - offset, false);
 
         for i in offset..chunk_end {
             // Calculate byte address with overflow check
@@ -1872,10 +1935,6 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
                 Some(addr) if addr < USER_SPACE_TOP => addr,
                 _ => return Err(UsercopyError),
             };
-            // R192-1 FIX: check each page before its first byte.
-            if (i == offset || byte_addr & 0xfff == 0) && !user_page_permits(byte_addr, false) {
-                return Err(UsercopyError);
-            }
 
             // H-26 FIX: Read using exception-safe helper
             unsafe { copy_byte_from_user(dst_ptr.add(i), byte_addr as *const u8) }
@@ -1887,11 +1946,6 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
             }
 
             copied += 1;
-
-            USER_COPY_STATE.with(|s| {
-                s.remaining
-                    .store(max_copy.saturating_sub(i + 1), Ordering::SeqCst)
-            });
         }
         // Guards dropped here: CLAC executed, interrupts re-enabled.
         // Migration between chunks is safe (no active per-CPU state).
@@ -2001,5 +2055,67 @@ mod robust_usercopy_tests {
             }
             assert_eq!(reader.join().expect("reader thread"), TID);
         });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue109_4_2_copy_bytes_mapped_sizes_and_alignments() {
+        let mut src = [0u8; 4096 + 31];
+        for (i, byte) in src.iter_mut().enumerate() {
+            *byte = ((i * 73) ^ (i >> 3) ^ 0x5A) as u8;
+        }
+        for &(src_off, dst_off, len) in &[
+            (0usize, 0usize, 0usize),
+            (0, 0, 1),
+            (3, 5, 7),
+            (1, 7, 64),
+            (13, 2, 255),
+            (0, 0, 4096),
+            (7, 11, 4096),
+        ] {
+            let mut dst = [0xCCu8; 4096 + 31];
+            let rem = unsafe {
+                __zero_os_usercopy_copy_bytes(
+                    dst.as_mut_ptr().add(dst_off),
+                    src.as_ptr().add(src_off),
+                    len,
+                )
+            };
+            assert_eq!(rem, 0, "mapped copy_bytes must return 0 remaining");
+            assert_eq!(&dst[dst_off..dst_off + len], &src[src_off..src_off + len]);
+            assert!(dst[..dst_off].iter().all(|&b| b == 0xCC));
+            assert!(dst[dst_off + len..].iter().all(|&b| b == 0xCC));
+        }
+        // Also verify copy_bytes is NOT matched by nofault_access_ip (TD-USERCOPY-1).
+        assert!(!nofault_access_ip(
+            __zero_os_usercopy_copy_bytes as *const () as usize
+        ));
+    }
+
+    #[test]
+    fn issue109_4_2_boot_root_guard_rejects_boot_and_untracked_cr3() {
+        assert!(!is_user_address_space_active(0, 0));
+        assert!(!is_user_address_space_active(0, 0x10_0000));
+        assert!(!is_user_address_space_active(0x10_0000, 0));
+        assert!(!is_user_address_space_active(0x10_0000, 0x10_0000));
+        assert!(is_user_address_space_active(0x20_0000, 0x10_0000));
+        // In hosted tests without a tracked user CR3, bulk copies fail closed
+        // before attempting any memory access.
+        let mut buf = [0u8; 8];
+        assert!(copy_from_user_safe(&mut buf, MMAP_MIN_ADDR as *const u8).is_err());
+        assert!(copy_to_user_safe(MMAP_MIN_ADDR as *mut u8, &buf).is_err());
+    }
+
+    #[test]
+    fn issue109_4_2_validate_user_range_rejects_boundaries_and_overflow() {
+        assert!(!validate_user_range(0, 1));
+        assert!(!validate_user_range(MMAP_MIN_ADDR - 1, 1));
+        assert!(validate_user_range(MMAP_MIN_ADDR, 0));
+        assert!(validate_user_range(MMAP_MIN_ADDR, 4096));
+        assert!(validate_user_range(USER_SPACE_TOP - 1, 0));
+        assert!(!validate_user_range(USER_SPACE_TOP - 1, 1));
+        assert!(!validate_user_range(USER_SPACE_TOP, 1));
+        assert!(!validate_user_range(USER_SPACE_TOP - 8, 16));
+        assert!(!validate_user_range(MMAP_MIN_ADDR, usize::MAX));
     }
 }

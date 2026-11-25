@@ -258,10 +258,13 @@ pub use usercopy::{
     // R163-6 FIX: Export for BSP/AP init to call before interrupts enabled.
     force_init_usercopy_locals,
     is_in_usercopy,
+    publish_smap_enabled,
     read_user_u32_atomic,
     read_user_u64_atomic,
+    smap_enabled_cached,
     strncpy_from_user,
     try_handle_usercopy_fault,
+    write_user_u32_atomic,
     UserAccessGuard,
     UserPtr,
     UserSlice,

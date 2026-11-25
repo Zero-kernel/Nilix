@@ -5281,10 +5281,29 @@ lazy_static::lazy_static! {
 static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
 
+/// Issue #109 §4.2: lock-free cached physical address of the boot PML4 root.
+///
+/// Latched once in `process::init()` (and lazily on first `boot_cr3_template()`
+/// read) so hot `usercopy` paths can reject `boot_cr3` in O(1) without taking
+/// any `lazy_static` initialization fence or walking 4-level page tables.
+static BOOT_CR3_PHYS: AtomicU64 = AtomicU64::new(0);
+
 /// Return the immutable boot page-table template used to construct fresh
 /// address spaces. Callers must copy the pair and never mutate the root.
 pub(crate) fn boot_cr3_template() -> (PhysFrame<Size4KiB>, Cr3Flags) {
-    *BOOT_CR3
+    let pair = *BOOT_CR3;
+    let phys = pair.0.start_address().as_u64() & !0x0FFF;
+    if BOOT_CR3_PHYS.load(Ordering::Relaxed) == 0 {
+        BOOT_CR3_PHYS.store(phys, Ordering::Release);
+    }
+    pair
+}
+
+/// Issue #109 §4.2: return the canonical physical address of the boot PML4
+/// root, or 0 if `process::init()` has not yet latched it.
+#[inline(always)]
+pub(crate) fn boot_cr3_phys() -> u64 {
+    BOOT_CR3_PHYS.load(Ordering::Acquire)
 }
 
 /// Detach the process-table backing when no published PCB remains.
@@ -5709,7 +5728,11 @@ pub fn alloc_wait_seq() -> u64 {
 /// 必须在任何进程创建或调度之前调用，以确保 BOOT_CR3 捕获正确的引导页表值。
 pub fn init() {
     // 强制 BOOT_CR3 lazy_static 初始化，确保捕获当前（引导）CR3
-    let _ = *BOOT_CR3;
+    let (boot_frame, _) = *BOOT_CR3;
+    BOOT_CR3_PHYS.store(
+        boot_frame.start_address().as_u64() & !0x0FFF,
+        Ordering::Release,
+    );
     prepare_kernel_stack_region();
     klog_always!("  Process subsystem initialized (boot CR3 cached)");
 }

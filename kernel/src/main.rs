@@ -762,6 +762,9 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
         // initialization failure, not a warning.  Unsupported CPUs are still
         // handled explicitly by the helper.
         arch::cpu_protection::require_supported_protections(cpu_status);
+        // Issue #109 §4.2: publish the latched CR4.SMAP state once for
+        // `UserAccessGuard` (verified on every AP before online publication).
+        kernel_core::publish_smap_enabled(cpu_status.smap_enabled);
         if cpu_status.smep_enabled {
             klog_always!("        - SMEP: enabled (blocks kernel executing user pages)");
         } else if cpu_status.smep_supported {

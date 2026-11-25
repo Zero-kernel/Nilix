@@ -1302,6 +1302,32 @@ pub extern "C" fn ap_rust_entry(
     // deadlock hazard as the IRQ/resched locals (R163-6 was never wired in).
     kernel_core::force_init_usercopy_locals();
 
+    // Issue #109 §4.2: fail-closed verify this AP matches BSP's latched SMAP
+    // state and enforces CR0.WP=1 before enabling interrupts or accepting user
+    // tasks (hardware usercopy relies on both CR0.WP and CR4.SMAP).
+    {
+        use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+        let smap_hw = Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
+        let wp_hw = Cr0::read().contains(Cr0Flags::WRITE_PROTECT);
+        if smap_hw != kernel_core::smap_enabled_cached() || !wp_hw {
+            klog!(
+                Error,
+                "[SMP] SECURITY: CPU {} CR4.SMAP/CR0.WP mismatch (smap={} expected={}, wp={}) - halting AP",
+                cpu_idx,
+                smap_hw,
+                kernel_core::smap_enabled_cached(),
+                wp_hw
+            );
+            let _ = AP_BOOT_STATE.compare_exchange(
+                AP_BOOT_STARTING,
+                AP_BOOT_REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            halt_rejected_ap();
+        }
+    }
+
     // R171-G1-01 FIX: program this AP's per-CPU SYSCALL/SYSRET MSRs
     // (STAR/LSTAR/SFMASK + EFER.SCE). These are per-CPU MSRs at reset values on a
     // freshly-started AP; the BSP-only call in main.rs never reached this CPU, so
