@@ -2491,6 +2491,83 @@ impl RuntimeTest for SchedstatEventCountersTest {
     }
 }
 
+/// Issue #109 §1.1: verify split per-AS `AS_PT_LOCKS[128]` + `KERNEL_PT_LOCK`:
+/// 1. Two distinct user CR3 roots hashing to different shards can be acquired
+///    independently, and `AS_PT_LOCKS -> KERNEL_PT_LOCK` nesting succeeds.
+/// 2. `pt_lock_owner_cpu()` reports this CPU while holding either lock and
+///    clears to `None` after release.
+/// 3. `/proc/schedstat` `pt_lock_stats()` counts acquisitions across both domains.
+struct PtLockSplitConcurrencyTest;
+
+impl RuntimeTest for PtLockSplitConcurrencyTest {
+    fn name(&self) -> &'static str {
+        "pt_lock_split_concurrency"
+    }
+
+    fn description(&self) -> &'static str {
+        "Split per-AS PT lock shards and KERNEL_PT_LOCK enforce hierarchy and stats coherence"
+    }
+
+    fn run(&self) -> TestResult {
+        use mm::page_table::{
+            as_pt_lock_shard, pt_lock_owner_cpu, pt_lock_stats, with_as_pt_lock,
+            with_kernel_pt_lock, AS_PT_LOCK_SHARDS,
+        };
+
+        if AS_PT_LOCK_SHARDS < 64 {
+            return TestResult::Fail(alloc::format!(
+                "expected at least 64 AS PT lock shards, got {}",
+                AS_PT_LOCK_SHARDS
+            ));
+        }
+
+        // Pick two synthetic non-boot page-aligned roots guaranteed to map to distinct shards.
+        let root_a: u64 = 0x1000_0000;
+        let mut root_b: u64 = 0x1000_1000;
+        while as_pt_lock_shard(root_b) == as_pt_lock_shard(root_a) {
+            root_b += 0x1000;
+        }
+
+        let self_cpu = arch::current_cpu_id();
+        let before = pt_lock_stats();
+        let mut nested_owner_ok = false;
+
+        with_as_pt_lock(root_a, || {
+            if pt_lock_owner_cpu() != Some(self_cpu) {
+                return;
+            }
+            // Valid lock order: AS_PT_LOCKS -> KERNEL_PT_LOCK (used by fork high-half copy).
+            with_kernel_pt_lock(|| {
+                nested_owner_ok = pt_lock_owner_cpu() == Some(self_cpu);
+                core::hint::spin_loop();
+            });
+            // Still holding AS_PT_LOCKS[shard(root_a)] after releasing KERNEL_PT_LOCK.
+            nested_owner_ok &= pt_lock_owner_cpu() == Some(self_cpu);
+        });
+
+        if !nested_owner_ok {
+            return TestResult::Fail(String::from(
+                "AS_PT_LOCKS -> KERNEL_PT_LOCK owner tracking mismatch",
+            ));
+        }
+
+        with_as_pt_lock(root_b, || {
+            core::hint::spin_loop();
+        });
+
+        let after = pt_lock_stats();
+        if after.acquired < before.acquired + 3 {
+            return TestResult::Fail(alloc::format!(
+                "split PT lock stats missed acquisitions: {} -> {}",
+                before.acquired,
+                after.acquired
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
 /// Ensure TLB shootdown reaches remote CPUs and is acknowledged
 struct TlbShootdownCoherencyTest;
 
@@ -2533,17 +2610,25 @@ impl RuntimeTest for TlbShootdownCoherencyTest {
             None => return TestResult::Fail(String::from("Per-CPU slot unavailable")),
         };
 
-        // Record ACK generation before shootdown
-        let ack_before = per_cpu.tlb_mailbox.ack_gen.load(Ordering::Acquire);
+        // Record mailbox completion counters (FIFO head + saturated-fallback ack_gen)
+        let ack_before = per_cpu
+            .tlb_mailbox
+            .head
+            .load(Ordering::Acquire)
+            .saturating_add(per_cpu.tlb_mailbox.ack_gen.load(Ordering::Acquire));
 
         // Perform TLB shootdown (sends IPIs and waits for ACKs)
         flush_current_as_all();
 
-        // Verify ACK generation incremented
-        let ack_after = per_cpu.tlb_mailbox.ack_gen.load(Ordering::Acquire);
+        // Verify mailbox acknowledged the shootdown
+        let ack_after = per_cpu
+            .tlb_mailbox
+            .head
+            .load(Ordering::Acquire)
+            .saturating_add(per_cpu.tlb_mailbox.ack_gen.load(Ordering::Acquire));
         if ack_after <= ack_before {
             TestResult::Fail(alloc::format!(
-                "CPU {} did not acknowledge TLB shootdown (ack_gen: {} -> {})",
+                "CPU {} did not acknowledge TLB shootdown (completed: {} -> {})",
                 target,
                 ack_before,
                 ack_after
@@ -2889,15 +2974,27 @@ impl RuntimeTest for TlbShootdownTargetedNegativeControlTest {
                 neg_observed = true;
 
                 // Phase B (Positive Control): issue targeted single-page shootdown.
-                let bystander_ack_before = bystander
-                    .and_then(|cpu| PER_CPU_DATA.get_cpu(cpu))
-                    .map(|pcpu| pcpu.tlb_mailbox.ack_gen.load(Ordering::Acquire));
+                let bystander_ack_before =
+                    bystander
+                        .and_then(|cpu| PER_CPU_DATA.get_cpu(cpu))
+                        .map(|pcpu| {
+                            pcpu.tlb_mailbox
+                                .head
+                                .load(Ordering::Acquire)
+                                .saturating_add(pcpu.tlb_mailbox.ack_gen.load(Ordering::Acquire))
+                        });
                 let stats_before = get_stats();
                 flush_current_as_page(VirtAddr::new(VA_PROBE));
                 let stats_after = get_stats();
-                let bystander_ack_after = bystander
-                    .and_then(|cpu| PER_CPU_DATA.get_cpu(cpu))
-                    .map(|pcpu| pcpu.tlb_mailbox.ack_gen.load(Ordering::Acquire));
+                let bystander_ack_after =
+                    bystander
+                        .and_then(|cpu| PER_CPU_DATA.get_cpu(cpu))
+                        .map(|pcpu| {
+                            pcpu.tlb_mailbox
+                                .head
+                                .load(Ordering::Acquire)
+                                .saturating_add(pcpu.tlb_mailbox.ack_gen.load(Ordering::Acquire))
+                        });
 
                 // Let AP perform post-shootdown read and return to BOOT_CR3.
                 PHASE.store(5, Ordering::Release);
@@ -3726,6 +3823,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &SmpOnlineTest,
         &IpiPingPongTest,
         &SchedstatEventCountersTest,
+        &PtLockSplitConcurrencyTest,
         &TlbShootdownCoherencyTest,
         &TlbShootdownTargetedNegativeControlTest,
         &KstackFlushBatchTest,

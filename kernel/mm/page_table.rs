@@ -5,7 +5,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::{
     instructions::interrupts,
@@ -39,28 +39,101 @@ pub const KSTACK_REGION_END: u64 = 0xffff_ffff_0000_0000;
 const _: () = assert!(KSTACK_REGION_END <= PHYSICAL_MEMORY_OFFSET);
 const _: () = assert!(KSTACK_REGION_END <= APIC_VIRT_ADDR);
 
-/// Cache-line wrapper preventing false sharing between hot lock/counter words.
+/// Issue #109 §1.1: Cache-line-isolated page-table lock slot.
+///
+/// Each slot holds its spin mutex and holding CPU ID on a dedicated 64-byte
+/// cache line so concurrent operations on disjoint address spaces never false-share.
 #[repr(align(64))]
-struct CacheAligned<T>(T);
+struct PtLockSlot {
+    lock: Mutex<()>,
+    owner_cpu: AtomicUsize,
+}
 
-/// R67-5 FIX: Global page table lock for cross-CPU serialization.
-///
-/// This lock ensures that page table modifications from different CPUs are serialized.
-/// Without this, concurrent calls to map_page/unmap_page from multiple CPUs could
-/// cause torn PTE updates, partially written flags (W^X bypass), or frame reuse
-/// while another CPU still has a stale TLB entry.
-///
-/// Long-term solution: Per-address-space locks + TLB shootdown with ACK.
-static PT_LOCK: CacheAligned<Mutex<()>> = CacheAligned(Mutex::new(()));
+const _: () = assert!(core::mem::size_of::<PtLockSlot>() == 64);
+const _: () = assert!(core::mem::align_of::<PtLockSlot>() == 64);
+
 const NO_PT_LOCK_OWNER: usize = usize::MAX;
-static PT_LOCK_OWNER_CPU: CacheAligned<AtomicUsize> =
-    CacheAligned(AtomicUsize::new(NO_PT_LOCK_OWNER));
 
-/// Per-CPU `PT_LOCK` observability accumulators (#109).
+impl PtLockSlot {
+    const fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            owner_cpu: AtomicUsize::new(NO_PT_LOCK_OWNER),
+        }
+    }
+}
+
+/// Issue #109 §1.1: Number of per-address-space page-table lock shards (8 KiB in `.bss`).
+const AS_PT_LOCK_SHARD_BITS: u32 = 7;
+pub const AS_PT_LOCK_SHARDS: usize = 1 << AS_PT_LOCK_SHARD_BITS;
+
+/// Issue #109 §1.1: Dedicated lock for shared kernel high-half page tables
+/// (`PML4[256..512]`, `KSTACK_REGION`, MMIO, firmware window, IST guards, and
+/// boot-root identity-map/trampoline edits).
 ///
-/// Each CPU writes only to its own 64-byte cache line on `lock_pt`,
-/// `try_lock_pt`, and `PtLockGuard::drop`, eliminating cross-CPU false sharing
-/// between contented waiters, `#PF` busy probes, and the lock holder.
+/// Strict lock order: `AS_PT_LOCKS[shard]` → `KERNEL_PT_LOCK` (never reverse).
+static KERNEL_PT_LOCK: PtLockSlot = PtLockSlot::new();
+
+/// Issue #109 §1.1: Striped per-address-space page-table lock table indexed by
+/// the canonical kernel CR3 root PFN (`as_pt_lock_shard(root)`).
+///
+/// Immortal static storage eliminates teardown/reclaim lock UAF windows and
+/// preserves lock-free `#PF` CoW entry even when `current_pid() == None`.
+static AS_PT_LOCKS: [PtLockSlot; AS_PT_LOCK_SHARDS] =
+    [const { PtLockSlot::new() }; AS_PT_LOCK_SHARDS];
+
+/// Physical address of the boot PML4 root (registered by `process::init()`).
+/// Zero until registered (early boot and hosted unit tests); roots matching
+/// `BOOT_ROOT_PHYS` route to `KERNEL_PT_LOCK`.
+static BOOT_ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Register the canonical physical address of the boot PML4 root so
+/// `with_current_manager` / `try_with_current_manager` distinguish shared
+/// boot-root operations from per-address-space user operations.
+#[inline]
+pub fn register_boot_root(boot_root_phys: u64) {
+    BOOT_ROOT_PHYS.store(boot_root_phys & PTE_ADDR_MASK, Ordering::Release);
+}
+
+#[inline]
+fn is_boot_or_unregistered_root(root_phys: u64) -> bool {
+    let boot = BOOT_ROOT_PHYS.load(Ordering::Acquire);
+    boot == 0 || (root_phys & PTE_ADDR_MASK) == boot || root_phys == 0
+}
+
+/// Issue #109 §1.1: Map a canonical kernel CR3 physical address to its shard
+/// index in `0..AS_PT_LOCK_SHARDS` using mixed Fibonacci hashing on the PFN
+/// so both consecutive and power-of-2-strided buddy PFNs distribute uniformly.
+#[inline]
+pub const fn as_pt_lock_shard(root_phys: u64) -> usize {
+    let pfn = (root_phys & PTE_ADDR_MASK) >> 12;
+    let mixed = (pfn ^ (pfn >> 16)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let folded = mixed ^ (mixed >> 32);
+    ((folded >> (32 - AS_PT_LOCK_SHARD_BITS)) as usize) & (AS_PT_LOCK_SHARDS - 1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtLockKind {
+    UserAs,
+    KernelShared,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtDomain {
+    /// Holds `AS_PT_LOCKS[shard(root)]`: permitted to mutate lower-half user
+    /// entries (`< USER_HALF_END`) only.
+    UserAddressSpace,
+    /// Holds `KERNEL_PT_LOCK`: permitted to mutate shared kernel high-half
+    /// entries (and lower-half entries on the boot root).
+    KernelShared,
+}
+
+/// Per-CPU `PT_LOCK` observability accumulators and lock-hierarchy hold depth (#109).
+///
+/// Each CPU writes only to its own 64-byte cache line on lock acquire/drop,
+/// eliminating cross-CPU false sharing between contented waiters, `#PF` busy
+/// probes, and lock holders. `as_lock_held` and `kernel_lock_held` occupy the
+/// final 8 bytes of the same cache line (zero extra memory).
 #[repr(align(64))]
 struct PtLockCpuCounters {
     acquired: AtomicU64,
@@ -70,6 +143,10 @@ struct PtLockCpuCounters {
     wait_tsc_max: AtomicU64,
     hold_tsc: AtomicU64,
     hold_tsc_max: AtomicU64,
+    #[cfg_attr(test, allow(dead_code))]
+    as_lock_held: AtomicU32,
+    #[cfg_attr(test, allow(dead_code))]
+    kernel_lock_held: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<PtLockCpuCounters>() == 64);
@@ -85,15 +162,13 @@ impl PtLockCpuCounters {
             wait_tsc_max: AtomicU64::new(0),
             hold_tsc: AtomicU64::new(0),
             hold_tsc_max: AtomicU64::new(0),
+            as_lock_held: AtomicU32::new(0),
+            kernel_lock_held: AtomicU32::new(0),
         }
     }
 }
 
 /// C3 E1 (#90) + #109: per-CPU `PT_LOCK` statistics for `/proc/schedstat`.
-/// Observability only: Relaxed, and a wrap is harmless. Wait time is measured
-/// only for a contended `lock_pt`; hold time runs from acquisition to guard
-/// drop. Both are raw TSC deltas, since the guest tick clock lags host time
-/// under TCG.
 static PT_LOCK_COUNTERS: [PtLockCpuCounters; cpu_local::max_cpus()] =
     [const { PtLockCpuCounters::new() }; cpu_local::max_cpus()];
 
@@ -141,13 +216,13 @@ fn aggregate_pt_lock_stats(per_cpu: &[PtLockCpuCounters]) -> PtLockStats {
 /// Snapshot of the `PT_LOCK` statistics (see [`pt_lock_stats`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtLockStats {
-    /// Acquisitions by `lock_pt` and successful `try_lock_pt`.
+    /// Acquisitions by blocking and non-blocking PT lock entrypoints.
     pub acquired: u64,
-    /// `lock_pt` calls that found the lock held (counted before they spin).
+    /// Blocking lock calls that found the target slot held (counted before spinning).
     pub contended: u64,
-    /// `try_lock_pt` calls that found the lock held (the #PF Busy path).
+    /// Non-blocking `try_lock` calls that found the target slot held (the #PF Busy path).
     pub busy: u64,
-    /// Sum and maximum of contended `lock_pt` spin time, in TSC cycles.
+    /// Sum and maximum of contended wait time, in TSC cycles.
     pub wait_tsc: u64,
     pub wait_tsc_max: u64,
     /// Sum and maximum of hold time, in TSC cycles.
@@ -168,25 +243,114 @@ fn read_tsc() -> u64 {
 }
 
 struct PtLockGuard {
+    slot: &'static PtLockSlot,
     _guard: spin::MutexGuard<'static, ()>,
+    kind: PtLockKind,
     owner_cpu: usize,
     since_tsc: u64,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_AS_LOCK_HELD: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    static TEST_KERNEL_LOCK_HELD: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+#[inline]
+fn pt_hold_depths(cpu: usize) -> (u32, u32) {
+    #[cfg(not(test))]
+    {
+        let counters = pt_lock_counters_for(cpu);
+        (
+            counters.as_lock_held.load(Ordering::Relaxed),
+            counters.kernel_lock_held.load(Ordering::Relaxed),
+        )
+    }
+    #[cfg(test)]
+    {
+        let _ = cpu;
+        (
+            TEST_AS_LOCK_HELD.with(|c| c.get()),
+            TEST_KERNEL_LOCK_HELD.with(|c| c.get()),
+        )
+    }
+}
+
+#[inline]
+fn inc_pt_hold_depth(kind: PtLockKind, cpu: usize) {
+    #[cfg(not(test))]
+    {
+        let counters = pt_lock_counters_for(cpu);
+        match kind {
+            PtLockKind::UserAs => {
+                counters.as_lock_held.fetch_add(1, Ordering::Relaxed);
+            }
+            PtLockKind::KernelShared => {
+                counters.kernel_lock_held.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = cpu;
+        match kind {
+            PtLockKind::UserAs => TEST_AS_LOCK_HELD.with(|c| c.set(c.get() + 1)),
+            PtLockKind::KernelShared => TEST_KERNEL_LOCK_HELD.with(|c| c.set(c.get() + 1)),
+        }
+    }
+}
+
+#[inline]
+fn dec_pt_hold_depth(kind: PtLockKind, cpu: usize) {
+    #[cfg(not(test))]
+    {
+        let counters = pt_lock_counters_for(cpu);
+        match kind {
+            PtLockKind::UserAs => {
+                let prev = counters.as_lock_held.fetch_sub(1, Ordering::Relaxed);
+                debug_assert!(prev > 0, "as_lock_held underflow");
+            }
+            PtLockKind::KernelShared => {
+                let prev = counters.kernel_lock_held.fetch_sub(1, Ordering::Relaxed);
+                debug_assert!(prev > 0, "kernel_lock_held underflow");
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = cpu;
+        match kind {
+            PtLockKind::UserAs => TEST_AS_LOCK_HELD.with(|c| {
+                let prev = c.get();
+                debug_assert!(prev > 0, "as_lock_held underflow");
+                c.set(prev.saturating_sub(1));
+            }),
+            PtLockKind::KernelShared => TEST_KERNEL_LOCK_HELD.with(|c| {
+                let prev = c.get();
+                debug_assert!(prev > 0, "kernel_lock_held underflow");
+                c.set(prev.saturating_sub(1));
+            }),
+        }
+    }
+}
+
 impl PtLockGuard {
     #[inline]
-    fn new(guard: spin::MutexGuard<'static, ()>) -> Self {
-        Self::new_on_cpu(guard, cpu_local::current_cpu_id())
-    }
-
-    #[inline]
-    fn new_on_cpu(guard: spin::MutexGuard<'static, ()>, cpu: usize) -> Self {
-        PT_LOCK_OWNER_CPU.0.store(cpu, Ordering::Release);
+    fn new_on_cpu(
+        slot: &'static PtLockSlot,
+        guard: spin::MutexGuard<'static, ()>,
+        kind: PtLockKind,
+        cpu: usize,
+    ) -> Self {
+        slot.owner_cpu.store(cpu, Ordering::Release);
+        inc_pt_hold_depth(kind, cpu);
         pt_lock_counters_for(cpu)
             .acquired
             .fetch_add(1, Ordering::Relaxed);
         Self {
+            slot,
             _guard: guard,
+            kind,
             owner_cpu: cpu,
             since_tsc: read_tsc(),
         }
@@ -200,69 +364,187 @@ impl Drop for PtLockGuard {
         let counters = pt_lock_counters_for(self.owner_cpu);
         counters.hold_tsc.fetch_add(held, Ordering::Relaxed);
         counters.hold_tsc_max.fetch_max(held, Ordering::Relaxed);
-        PT_LOCK_OWNER_CPU
-            .0
+        dec_pt_hold_depth(self.kind, self.owner_cpu);
+        self.slot
+            .owner_cpu
             .store(NO_PT_LOCK_OWNER, Ordering::Release);
     }
 }
 
 #[inline]
-fn lock_pt() -> PtLockGuard {
-    if let Some(guard) = PT_LOCK.0.try_lock() {
-        return PtLockGuard::new(guard);
+fn assert_lock_order_before_acquire(kind: PtLockKind, cpu: usize) {
+    let (as_held, kernel_held) = pt_hold_depths(cpu);
+    match kind {
+        PtLockKind::UserAs => {
+            assert_eq!(
+                as_held, 0,
+                "Issue #109 §1.1: nested AS_PT_LOCKS acquisition forbidden on CPU {}",
+                cpu
+            );
+            assert_eq!(
+                kernel_held, 0,
+                "Issue #109 §1.1: lock-order violation KERNEL_PT_LOCK -> AS_PT_LOCKS on CPU {}",
+                cpu
+            );
+        }
+        PtLockKind::KernelShared => {
+            // AS_PT_LOCKS -> KERNEL_PT_LOCK is permitted (e.g. fork high-half copy);
+            // KERNEL_PT_LOCK -> KERNEL_PT_LOCK is forbidden.
+            assert_eq!(
+                kernel_held, 0,
+                "Issue #109 §1.1: nested KERNEL_PT_LOCK acquisition forbidden on CPU {}",
+                cpu
+            );
+        }
     }
+}
+
+#[inline]
+fn lock_slot(slot: &'static PtLockSlot, kind: PtLockKind) -> PtLockGuard {
     let cpu = cpu_local::current_cpu_id();
+    assert_lock_order_before_acquire(kind, cpu);
+    if let Some(guard) = slot.lock.try_lock() {
+        return PtLockGuard::new_on_cpu(slot, guard, kind, cpu);
+    }
     let counters = pt_lock_counters_for(cpu);
     counters.contended.fetch_add(1, Ordering::Relaxed);
     let start = read_tsc();
-    let guard = PT_LOCK.0.lock();
+    let guard = slot.lock.lock();
     let waited = read_tsc().saturating_sub(start);
     counters.wait_tsc.fetch_add(waited, Ordering::Relaxed);
     counters.wait_tsc_max.fetch_max(waited, Ordering::Relaxed);
-    PtLockGuard::new_on_cpu(guard, cpu)
+    PtLockGuard::new_on_cpu(slot, guard, kind, cpu)
 }
 
 #[inline]
-fn try_lock_pt() -> Option<PtLockGuard> {
-    let Some(guard) = PT_LOCK.0.try_lock() else {
-        pt_lock_counters_for(cpu_local::current_cpu_id())
-            .busy
-            .fetch_add(1, Ordering::Relaxed);
+fn try_lock_slot(slot: &'static PtLockSlot, kind: PtLockKind) -> Option<PtLockGuard> {
+    let cpu = cpu_local::current_cpu_id();
+    let counters = pt_lock_counters_for(cpu);
+    // Reject same-CPU reentry fail-closed before touching the mutex (also guards
+    // against KERNEL_PT_LOCK -> try_lock(AS) or cross-shard reentry in #PF).
+    let (as_held, kernel_held) = pt_hold_depths(cpu);
+    let already_held = match kind {
+        PtLockKind::UserAs => as_held != 0 || kernel_held != 0,
+        PtLockKind::KernelShared => kernel_held != 0,
+    };
+    if already_held {
+        counters.busy.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Some(guard) = slot.lock.try_lock() else {
+        counters.busy.fetch_add(1, Ordering::Relaxed);
         return None;
     };
-    Some(PtLockGuard::new(guard))
+    Some(PtLockGuard::new_on_cpu(slot, guard, kind, cpu))
 }
 
-/// CPU that currently owns the global page-table lock, if any.
+#[inline]
+fn lock_kernel_pt() -> PtLockGuard {
+    lock_slot(&KERNEL_PT_LOCK, PtLockKind::KernelShared)
+}
+
+#[inline]
+fn try_lock_kernel_pt() -> Option<PtLockGuard> {
+    try_lock_slot(&KERNEL_PT_LOCK, PtLockKind::KernelShared)
+}
+
+#[inline]
+fn lock_as_pt(root_phys: u64) -> PtLockGuard {
+    if is_boot_or_unregistered_root(root_phys) {
+        lock_kernel_pt()
+    } else {
+        let slot = &AS_PT_LOCKS[as_pt_lock_shard(root_phys)];
+        lock_slot(slot, PtLockKind::UserAs)
+    }
+}
+
+#[inline]
+fn try_lock_as_pt(root_phys: u64) -> Option<PtLockGuard> {
+    if is_boot_or_unregistered_root(root_phys) {
+        try_lock_kernel_pt()
+    } else {
+        let slot = &AS_PT_LOCKS[as_pt_lock_shard(root_phys)];
+        try_lock_slot(slot, PtLockKind::UserAs)
+    }
+}
+
+/// Kept as an internal alias for `lock_kernel_pt()` for `mmio_access.rs` and tests.
+#[inline]
+fn lock_pt() -> PtLockGuard {
+    lock_kernel_pt()
+}
+
+#[cfg(test)]
+#[inline]
+fn try_lock_pt() -> Option<PtLockGuard> {
+    try_lock_kernel_pt()
+}
+
+#[inline]
+fn current_cpu_holds_any_pt_lock(cpu: usize) -> bool {
+    let (as_held, kernel_held) = pt_hold_depths(cpu);
+    as_held != 0 || kernel_held != 0
+}
+
+/// CPU that currently owns the relevant page-table lock, if any.
+///
+/// 1. If the executing CPU holds **any** page-table lock (`AS_PT_LOCKS` or
+///    `KERNEL_PT_LOCK`), returns `Some(self_cpu)` immediately — preserving
+///    RF186-6, ST-K2-P2(a), and `usercopy` same-CPU reentry assertions.
+/// 2. Otherwise returns the owner of the active address space's lock shard
+///    (preserving ST-K2-P2(b) cross-CPU remote-holder detection in `#PF`).
 #[inline]
 pub fn pt_lock_owner_cpu() -> Option<usize> {
-    match PT_LOCK_OWNER_CPU.0.load(Ordering::Acquire) {
+    let self_cpu = cpu_local::current_cpu_id();
+    if current_cpu_holds_any_pt_lock(self_cpu) {
+        return Some(self_cpu);
+    }
+    #[cfg(not(test))]
+    let slot = {
+        let root = interrupts::without_interrupts(|| edit_root(kpti_root_pair()));
+        if is_boot_or_unregistered_root(root) {
+            &KERNEL_PT_LOCK
+        } else {
+            &AS_PT_LOCKS[as_pt_lock_shard(root)]
+        }
+    };
+    #[cfg(test)]
+    let slot = &KERNEL_PT_LOCK;
+    match slot.owner_cpu.load(Ordering::Acquire) {
         NO_PT_LOCK_OWNER => None,
         cpu => Some(cpu),
     }
 }
 
-/// R67-5 FIX: Public helper to acquire the global page table lock.
-///
-/// Use this when touching page tables directly (not via `with_current_manager`)
-/// to ensure modifications remain serialized across CPUs.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use mm::page_table::with_pt_lock;
-///
-/// with_pt_lock(|| {
-///     // Safe to modify page tables here
-///     recursive_pd(0, 0)[0].set_flags(...);
-/// });
-/// ```
+/// Issue #109 §1.1: Acquire the dedicated shared kernel page-table lock
+/// (`KERNEL_PT_LOCK`) for high-half or boot-root page-table mutations.
+#[inline]
+pub fn with_kernel_pt_lock<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let _guard = lock_kernel_pt();
+    f()
+}
+
+/// Compatibility alias for [`with_kernel_pt_lock`].
 #[inline]
 pub fn with_pt_lock<T, F>(f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    let _guard = lock_pt();
+    with_kernel_pt_lock(f)
+}
+
+/// Issue #109 §1.1: Acquire the per-address-space page-table lock shard for an
+/// explicit canonical kernel CR3 physical root `root_phys` (e.g., `fork` CoW
+/// cloning of `parent_page_table`).
+#[inline]
+pub fn with_as_pt_lock<T, F>(root_phys: u64, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let _guard = lock_as_pt(root_phys);
     f()
 }
 
@@ -618,7 +900,7 @@ pub unsafe fn run_kernel_owned_guard_self_test() -> bool {
             None
         }
     }
-    let (mapped, unmapped, updated) = with_current_manager(VirtAddr::new(0), |manager| {
+    let (mapped, unmapped, updated) = with_kernel_manager(VirtAddr::new(0), |manager| {
         let mapped = manager.map_page(
             Page::containing_address(VirtAddr::new(IDENTITY)),
             PhysFrame::containing_address(PhysAddr::new(IDENTITY)),
@@ -648,6 +930,8 @@ pub unsafe fn run_kernel_owned_guard_self_test() -> bool {
 /// 页表管理器
 pub struct PageTableManager {
     mapper: OffsetPageTable<'static>,
+    domain: PtDomain,
+    root_phys: u64,
 }
 
 /// LEAD-PT-ZERO-LINK-1: the page-table frame source `map_page` hands to
@@ -691,42 +975,70 @@ pub struct TrackedTableRollback {
     pub all_accounted: bool,
 }
 
-/// 基于当前活动的 CR3 构建临时页表管理器
+/// 基于当前活动的 CR3 构建临时页表管理器（用户地址空间分片锁）。
 ///
-/// 此函数在每次调用时从当前 CR3 读取页表根地址，确保始终操作正确的地址空间。
-/// 这对于 COW 故障处理和 mmap/munmap 在多进程环境下正确工作至关重要。
-///
-/// # Safety
-///
-/// 调用者必须提供正确的物理内存偏移量。
-/// 在回调函数执行期间，不得发生导致 CR3 切换的上下文切换。
-///
-/// # Security (R32-MM-1 fix)
-///
-/// 此函数在执行期间禁用中断，防止上下文切换导致操作错误的地址空间。
-/// 这可以避免跨进程内存破坏漏洞。
-///
-/// # Security (R67-5 fix)
-///
-/// 此函数获取全局页表锁，防止多 CPU 并发修改页表导致的数据竞争。
+/// Issue #109 §1.1: Resolves the canonical kernel CR3 root via `edit_root(kpti_root_pair())`,
+/// acquires `AS_PT_LOCKS[as_pt_lock_shard(root)]` (or `KERNEL_PT_LOCK` for the boot root)
+/// with the caller's original interrupt state intact (so incoming TLB shootdown IPIs from
+/// the current holder are serviced while spinning), and executes `f` with interrupts disabled.
 pub unsafe fn with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> T
 where
     F: FnOnce(&mut PageTableManager) -> T,
 {
-    // R67-5 FIX: Acquire global page table lock to serialize cross-CPU modifications
-    let _pt_guard = lock_pt();
+    // Sample canonical kernel root coherently before spinning on the lock with
+    // the caller's original IF state (preserving shootdown IPI responsiveness).
+    let root = interrupts::without_interrupts(|| edit_root(kpti_root_pair()));
+    let _pt_guard = lock_as_pt(root);
+    let domain = if is_boot_or_unregistered_root(root) {
+        PtDomain::KernelShared
+    } else {
+        PtDomain::UserAddressSpace
+    };
 
     // R32-MM-1 FIX: Disable interrupts to prevent CR3 switch during page table operations
     interrupts::without_interrupts(|| {
-        let _ = physical_memory_offset; // 调用方参数保持兼容，实际使用固定偏移
-                                        // LEAD-KPTI-PML4-1 FIX: edit the kernel root, then mirror it.
+        let _ = physical_memory_offset;
+        // LEAD-KPTI-PML4-1 FIX: edit the kernel root, then mirror it.
+        let pair = kpti_root_pair();
+        let live_root = edit_root(pair);
+        debug_assert_eq!(
+            live_root, root,
+            "Issue #109 §1.1: CR3 changed while non-preemptible Ring-0 acquired AS PT lock"
+        );
+        let mapper = OffsetPageTable::new(table_at(live_root), get_phys_offset());
+        let mut manager = PageTableManager {
+            mapper,
+            domain,
+            root_phys: live_root,
+        };
+        let result = f(&mut manager);
+        sync_kpti_user_root(live_root, pair);
+        result
+    })
+}
+
+/// Issue #109 §1.1 (H3): Build a [`PageTableManager`] under the dedicated shared
+/// kernel high-half lock (`KERNEL_PT_LOCK`), regardless of which user CR3 is
+/// currently loaded on this CPU.
+///
+/// Mandatory for all shared high-half mutations (`KSTACK_REGION`, MMIO, firmware
+/// window, IST guard pages, boot probes).
+pub unsafe fn with_kernel_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> T
+where
+    F: FnOnce(&mut PageTableManager) -> T,
+{
+    let _pt_guard = lock_kernel_pt();
+    interrupts::without_interrupts(|| {
+        let _ = physical_memory_offset;
         let pair = kpti_root_pair();
         let root = edit_root(pair);
         let mapper = OffsetPageTable::new(table_at(root), get_phys_offset());
-        let mut manager = PageTableManager { mapper };
-        let result = f(&mut manager);
-        sync_kpti_user_root(root, pair);
-        result
+        let mut manager = PageTableManager {
+            mapper,
+            domain: PtDomain::KernelShared,
+            root_phys: root,
+        };
+        f(&mut manager)
     })
 }
 
@@ -734,26 +1046,45 @@ where
 ///
 /// # Safety
 ///
-/// Caller must ensure `physical_memory_offset` is valid. A contended global PT
-/// lock—including same-CPU re-entry—returns `None`; the exception dispatcher
-/// distinguishes proven same-CPU ownership from ordinary cross-CPU contention.
-/// This function itself never spins on a holder that may need the faulting CPU
-/// to make forward progress.
+/// Caller must ensure `physical_memory_offset` is valid. A contended PT lock—
+/// including same-CPU re-entry on any shard or `KERNEL_PT_LOCK`—returns `None`;
+/// the exception dispatcher distinguishes proven same-CPU ownership from
+/// ordinary cross-CPU contention via [`pt_lock_owner_cpu`].
 pub unsafe fn try_with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> Option<T>
 where
     F: FnOnce(&mut PageTableManager) -> T,
 {
-    let _pt_guard = try_lock_pt()?;
+    let self_cpu = cpu_local::current_cpu_id();
+    // Fail closed before touching CR3 if this CPU already holds any PT lock
+    // (preserves hosted reentry tests and forbids cross-shard/#PF self-reentry).
+    if current_cpu_holds_any_pt_lock(self_cpu) {
+        pt_lock_counters_for(self_cpu)
+            .busy
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+
+    let root = interrupts::without_interrupts(|| edit_root(kpti_root_pair()));
+    let _pt_guard = try_lock_as_pt(root)?;
+    let domain = if is_boot_or_unregistered_root(root) {
+        PtDomain::KernelShared
+    } else {
+        PtDomain::UserAddressSpace
+    };
     Some(interrupts::without_interrupts(|| {
         let _ = physical_memory_offset;
         // LEAD-KPTI-PML4-1 FIX: a ring-3 fault runs on the user root; edit the
         // kernel root, then mirror it.
         let pair = kpti_root_pair();
-        let root = edit_root(pair);
-        let mapper = OffsetPageTable::new(table_at(root), get_phys_offset());
-        let mut manager = PageTableManager { mapper };
+        let live_root = edit_root(pair);
+        let mapper = OffsetPageTable::new(table_at(live_root), get_phys_offset());
+        let mut manager = PageTableManager {
+            mapper,
+            domain,
+            root_phys: live_root,
+        };
         let result = f(&mut manager);
-        sync_kpti_user_root(root, pair);
+        sync_kpti_user_root(live_root, pair);
         result
     }))
 }
@@ -767,10 +1098,39 @@ impl PageTableManager {
     pub unsafe fn new(physical_memory_offset: VirtAddr) -> Self {
         let _ = physical_memory_offset; // 保持接口兼容
         let phys_offset = get_phys_offset();
+        let root_phys = active_root();
         let level_4_table = active_level_4_table(phys_offset);
         let mapper = OffsetPageTable::new(level_4_table, phys_offset);
 
-        PageTableManager { mapper }
+        PageTableManager {
+            mapper,
+            domain: PtDomain::KernelShared,
+            root_phys,
+        }
+    }
+
+    /// Issue #109 §1.1 (H3): Enforce lock-domain isolation on every page-table
+    /// mutation so a caller holding only a per-AS shard can never mutate shared
+    /// kernel high-half mappings (and a `KERNEL_PT_LOCK`-only holder cannot
+    /// mutate a live user address space's private lower half).
+    #[inline]
+    fn assert_domain_allows_mutation(&self, page: Page) {
+        let addr = page.start_address().as_u64();
+        if addr >= USER_HALF_END {
+            assert_eq!(
+                self.domain,
+                PtDomain::KernelShared,
+                "Issue #109 §1.1: high-half page-table mutation ({:#x}) requires KERNEL_PT_LOCK (use with_kernel_manager)",
+                addr
+            );
+        } else if self.domain == PtDomain::KernelShared
+            && !is_boot_or_unregistered_root(self.root_phys)
+        {
+            panic!(
+                "Issue #109 §1.1: lower-half user page-table mutation ({:#x}) on root {:#x} requires per-AS lock (use with_current_manager)",
+                addr, self.root_phys
+            );
+        }
     }
 
     /// R192-2 FIX (D0-ISO-1): whether `page` is in the lower half and owned by
@@ -910,6 +1270,8 @@ impl PageTableManager {
     ) -> Result<(), MapError> {
         use x86_64::structures::paging::mapper::MapToError;
 
+        self.assert_domain_allows_mutation(page);
+
         // R192-2 FIX: `map_to` ORs the leaf's flags into every existing parent
         // entry before it checks for a huge page, so a map under the identity
         // map would make its supervisor entries (or a 2 MiB leaf) user-accessible
@@ -968,9 +1330,9 @@ impl PageTableManager {
     /// Validate the entire walk first, then publish frame and flags with one
     /// aligned atomic store. No allocation or fallible work follows the store.
     ///
-    /// The caller holds PT_LOCK, owns `new_frame`, and must synchronously flush
-    /// all CPUs sharing this address space BEFORE releasing `expected_frame`.
-    /// On error the old mapping and both frames' ownership are unchanged.
+    /// The caller holds the address-space PT lock, owns `new_frame`, and must
+    /// synchronously flush all CPUs sharing this address space BEFORE releasing
+    /// `expected_frame`. On error the old mapping and both frames' ownership are unchanged.
     pub fn replace_page(
         &mut self,
         page: Page<Size4KiB>,
@@ -978,6 +1340,7 @@ impl PageTableManager {
         new_frame: PhysFrame<Size4KiB>,
         flags: PageTableFlags,
     ) -> Result<(), ReplacePageError> {
+        self.assert_domain_allows_mutation(page);
         if self.lower_half_kernel_owned(page) {
             return Err(ReplacePageError::KernelOwned);
         }
@@ -994,7 +1357,7 @@ impl PageTableManager {
             if !page_table_frame_address_valid(entry.addr().as_u64()) {
                 return Err(ReplacePageError::InvalidFrameAddress);
             }
-            // SAFETY: PT_LOCK protects this present, direct-mapped table.
+            // SAFETY: AS PT lock protects this present, direct-mapped table.
             table = unsafe { &mut *phys_to_virt(entry.addr()).as_mut_ptr::<PageTable>() };
         }
         replace_present_leaf(
@@ -1008,6 +1371,8 @@ impl PageTableManager {
     /// 取消映射虚拟页
     pub fn unmap_page(&mut self, page: Page) -> Result<PhysFrame, UnmapError> {
         use x86_64::structures::paging::mapper::UnmapError as X64UnmapError;
+
+        self.assert_domain_allows_mutation(page);
 
         // R192-2 FIX: never clear an identity-map or split-MMIO leaf.
         if self.lower_half_kernel_owned(page) {
@@ -1036,8 +1401,9 @@ impl PageTableManager {
     /// non-present but contains a non-zero physical address, extracts the
     /// frame, clears the PTE, and returns it.
     ///
-    /// Must be called while PT_LOCK is held (i.e. inside `with_current_manager`).
+    /// Must be called while the address-space PT lock is held (inside `with_current_manager`).
     pub fn take_nonpresent_leaf_frame(&mut self, page: Page) -> Option<PhysFrame> {
+        self.assert_domain_allows_mutation(page);
         // R192-2 FIX: a non-present entry under a supervisor parent is kernel
         // state, not a frame a user mapping left behind.
         if self.lower_half_kernel_owned(page) {
@@ -1582,6 +1948,8 @@ impl PageTableManager {
         flags: PageTableFlags,
     ) -> Result<(), UpdateFlagsError> {
         use x86_64::structures::paging::mapper::FlagUpdateError;
+
+        self.assert_domain_allows_mutation(page);
 
         // R192-2 FIX: never reprotect an identity-map or split-MMIO leaf.
         if self.lower_half_kernel_owned(page) {
@@ -2329,15 +2697,160 @@ mod pt_lock_stats_tests {
     fn per_cpu_counters_are_cache_line_isolated() {
         assert_eq!(core::mem::size_of::<PtLockCpuCounters>(), 64);
         assert_eq!(core::mem::align_of::<PtLockCpuCounters>(), 64);
+        assert_eq!(core::mem::size_of::<PtLockSlot>(), 64);
+        assert_eq!(core::mem::align_of::<PtLockSlot>(), 64);
 
-        let lock_line = (&PT_LOCK as *const _ as usize) / 64;
-        let owner_line = (&PT_LOCK_OWNER_CPU as *const _ as usize) / 64;
+        let kernel_line = (&KERNEL_PT_LOCK as *const _ as usize) / 64;
+        let shard0_line = (&AS_PT_LOCKS[0] as *const _ as usize) / 64;
+        let shard1_line = (&AS_PT_LOCKS[1] as *const _ as usize) / 64;
         let c0_line = (&PT_LOCK_COUNTERS[0] as *const _ as usize) / 64;
         let c1_line = (&PT_LOCK_COUNTERS[1] as *const _ as usize) / 64;
-        assert_ne!(lock_line, owner_line);
-        assert_ne!(lock_line, c0_line);
-        assert_ne!(owner_line, c0_line);
+        assert_ne!(kernel_line, shard0_line);
+        assert_ne!(kernel_line, c0_line);
+        assert_ne!(shard0_line, c0_line);
+        assert_eq!(shard1_line, shard0_line + 1);
         assert_eq!(c1_line, c0_line + 1);
+    }
+
+    struct TestBootRootGuard(u64);
+    impl TestBootRootGuard {
+        fn set(root: u64) -> Self {
+            let prev = BOOT_ROOT_PHYS.swap(root, Ordering::AcqRel);
+            Self(prev)
+        }
+    }
+    impl Drop for TestBootRootGuard {
+        fn drop(&mut self) {
+            BOOT_ROOT_PHYS.store(self.0, Ordering::Release);
+        }
+    }
+
+    /// Issue #109 §1.1: holding one per-AS shard must NOT block another disjoint shard.
+    #[test]
+    fn split_pt_lock_disjoint_shards_do_not_block() {
+        let _serial = PT_LOCK_TEST_SERIAL.lock();
+        let _boot = TestBootRootGuard::set(0x1000);
+
+        let root_a = 0x20_0000u64;
+        let mut root_b = 0x20_1000u64;
+        while as_pt_lock_shard(root_b) == as_pt_lock_shard(root_a) {
+            root_b += 0x1000;
+        }
+        assert_ne!(as_pt_lock_shard(root_a), as_pt_lock_shard(root_b));
+
+        let before = pt_lock_stats();
+        let guard_a = lock_as_pt(root_a);
+        // A second thread acquiring a disjoint shard must succeed without spinning.
+        let acquired_b = thread::spawn(move || {
+            let g = try_lock_as_pt(root_b);
+            g.is_some()
+        })
+        .join()
+        .unwrap();
+        assert!(acquired_b, "disjoint AS shards must not block each other");
+
+        // Same-thread cross-shard reentry is still rejected by try_lock_as_pt.
+        assert!(try_lock_as_pt(root_b).is_none());
+        drop(guard_a);
+
+        let after = pt_lock_stats();
+        assert!(after.acquired >= before.acquired + 2);
+        assert!(after.busy >= before.busy + 1);
+    }
+
+    /// Issue #109 §1.1: two threads targeting the same AS root serialize cleanly and
+    /// record owner/busy/contention statistics.
+    #[test]
+    fn split_pt_lock_same_shard_serializes_and_records_owner() {
+        let _serial = PT_LOCK_TEST_SERIAL.lock();
+        let _boot = TestBootRootGuard::set(0x1000);
+
+        let root = 0x30_0000u64;
+        let shard = as_pt_lock_shard(root);
+        let before = pt_lock_stats();
+
+        let holder = lock_as_pt(root);
+        assert_eq!(
+            AS_PT_LOCKS[shard].owner_cpu.load(Ordering::Acquire),
+            cpu_local::current_cpu_id()
+        );
+        assert!(thread::spawn(move || try_lock_as_pt(root).is_none())
+            .join()
+            .unwrap());
+
+        let waiter = thread::spawn(move || drop(lock_as_pt(root)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pt_lock_stats().contended == before.contended && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(2));
+        drop(holder);
+        waiter.join().unwrap();
+
+        assert_eq!(
+            AS_PT_LOCKS[shard].owner_cpu.load(Ordering::Acquire),
+            NO_PT_LOCK_OWNER
+        );
+        let after = pt_lock_stats();
+        assert!(after.acquired >= before.acquired + 2);
+        assert!(after.contended > before.contended);
+        assert!(after.busy > before.busy);
+    }
+
+    /// Issue #109 §1.1: Fibonacci shard hash spreads consecutive and power-of-2-stride
+    /// CR3 physical roots across the 128-shard table without degenerate clustering.
+    #[test]
+    fn split_pt_lock_hash_distribution_and_alignment() {
+        let mut seen_consecutive = [false; AS_PT_LOCK_SHARDS];
+        for i in 0..AS_PT_LOCK_SHARDS {
+            let root = ((i as u64) + 1) << 12;
+            seen_consecutive[as_pt_lock_shard(root)] = true;
+        }
+        let distinct_consecutive = seen_consecutive.iter().filter(|&&b| b).count();
+        assert!(
+            distinct_consecutive >= AS_PT_LOCK_SHARDS / 2,
+            "consecutive PFNs clustered into only {distinct_consecutive}/{AS_PT_LOCK_SHARDS} shards"
+        );
+
+        let mut seen_stride = [false; AS_PT_LOCK_SHARDS];
+        for i in 0..AS_PT_LOCK_SHARDS {
+            // 2 MiB stride (common buddy/large allocation alignment)
+            let root = ((i as u64) + 1) << 21;
+            seen_stride[as_pt_lock_shard(root)] = true;
+        }
+        let distinct_stride = seen_stride.iter().filter(|&&b| b).count();
+        assert!(
+            distinct_stride >= AS_PT_LOCK_SHARDS / 2,
+            "2MiB-strided PFNs clustered into only {distinct_stride}/{AS_PT_LOCK_SHARDS} shards"
+        );
+    }
+
+    /// Issue #109 §1.1: valid hierarchy `AS_PT_LOCKS -> KERNEL_PT_LOCK` succeeds
+    /// (fork high-half PML4 copy path) and leaves hold depths balanced at zero;
+    /// reverse `KERNEL_PT_LOCK -> try_lock_as_pt` is rejected fail-closed.
+    #[test]
+    fn split_pt_lock_hierarchy_allows_as_to_kernel() {
+        let _serial = PT_LOCK_TEST_SERIAL.lock();
+        let _boot = TestBootRootGuard::set(0x1000);
+
+        let root = 0x40_0000u64;
+        let nested_ok = with_as_pt_lock(root, || {
+            let (as_d, k_d) = pt_hold_depths(cpu_local::current_cpu_id());
+            assert_eq!((as_d, k_d), (1, 0));
+            with_kernel_pt_lock(|| {
+                let (as_d2, k_d2) = pt_hold_depths(cpu_local::current_cpu_id());
+                assert_eq!((as_d2, k_d2), (1, 1));
+                true
+            })
+        });
+        assert!(nested_ok);
+        assert_eq!(pt_hold_depths(cpu_local::current_cpu_id()), (0, 0));
+
+        // Reverse order (KERNEL_PT_LOCK -> AS_PT_LOCKS) must be rejected by try_lock_as_pt.
+        with_kernel_pt_lock(|| {
+            assert!(try_lock_as_pt(root).is_none());
+        });
+        assert_eq!(pt_hold_depths(cpu_local::current_cpu_id()), (0, 0));
     }
 
     #[test]
@@ -2881,9 +3394,14 @@ unsafe fn map_mmio_with_fault(
 
     let result = interrupts::without_interrupts(|| {
         let phys_offset = get_phys_offset();
+        let root_phys = active_root();
         let level_4_table = active_level_4_table(phys_offset);
         let mapper = OffsetPageTable::new(level_4_table, phys_offset);
-        let mut mgr = PageTableManager { mapper };
+        let mut mgr = PageTableManager {
+            mapper,
+            domain: PtDomain::KernelShared,
+            root_phys,
+        };
 
         // Preflight the complete virtual reservation before allocating a single
         // paging structure. Hidden non-present PTE ownership and huge parents
@@ -2991,9 +3509,14 @@ pub unsafe fn unmap_mmio(
 
     interrupts::without_interrupts(|| {
         let phys_offset = get_phys_offset();
+        let root_phys = active_root();
         let level_4_table = active_level_4_table(phys_offset);
         let mapper = OffsetPageTable::new(level_4_table, phys_offset);
-        let mut mgr = PageTableManager { mapper };
+        let mut mgr = PageTableManager {
+            mapper,
+            domain: PtDomain::KernelShared,
+            root_phys,
+        };
         for index in 0..pages {
             let address = VirtAddr::new(virt.as_u64() + (index * MMIO_PAGE_BYTES) as u64);
             let Some((_, flags)) = mgr.translate_with_flags(address) else {

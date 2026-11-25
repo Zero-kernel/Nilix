@@ -92,9 +92,10 @@ pub use page_cache::{
     PAGE_SIZE, PRESSURE_HANDLER,
 };
 pub use page_table::{
-    checked_physical_range, map_mmio, phys_to_virt, pt_lock_owner_cpu, unmap_mmio,
-    with_current_manager, MapError, PageTableManager, UnmapError, UpdateFlagsError,
-    KSTACK_REGION_BASE, KSTACK_REGION_END, PHYSICAL_MEMORY_OFFSET,
+    as_pt_lock_shard, checked_physical_range, map_mmio, phys_to_virt, pt_lock_owner_cpu,
+    register_boot_root, unmap_mmio, with_as_pt_lock, with_current_manager, with_kernel_manager,
+    with_kernel_pt_lock, MapError, PageTableManager, UnmapError, UpdateFlagsError,
+    AS_PT_LOCK_SHARDS, KSTACK_REGION_BASE, KSTACK_REGION_END, PHYSICAL_MEMORY_OFFSET,
 };
 pub use tlb_shootdown::{
     flush_all_address_spaces, flush_current_as_all, flush_current_as_page, flush_current_as_range,
