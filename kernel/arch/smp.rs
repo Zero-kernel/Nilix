@@ -809,13 +809,10 @@ fn make_trampoline_nonexecutable() {
             }
         }
 
-        // R68-2 FIX: Use cross-CPU TLB shootdown instead of local-only flush.
-        //
-        // After restoring NX on the trampoline page, ALL CPUs must invalidate
-        // their TLB entries for this page. Using local flush_all() leaves remote
-        // CPUs with stale executable mappings, creating a code injection vector
-        // where an attacker could place shellcode in the trampoline area.
-        mm::flush_current_as_all();
+        // R68-2 + Issue #109 §1.2 (H3): restoring NX on the boot trampoline
+        // affects a shared low-identity mapping; broadcast unconditionally to
+        // every online CPU regardless of its active CR3 (one-time boot path).
+        mm::flush_all_address_spaces();
     });
 }
 
@@ -1385,6 +1382,12 @@ pub extern "C" fn ap_rust_entry(
         }
     }
 
+    // Issue #109 §1.2 (H2): publish this AP's active BOOT_CR3 with IF=0
+    // strictly before enabling interrupts and publishing the CPU in the
+    // authoritative online mask. Combined with the SeqCst target scan, no
+    // online AP starts in the untracked `0` state.
+    mm::tlb_shootdown::track_current_cr3();
+
     // R68-1 FIX: Enable interrupts BEFORE advertising this CPU as online.
     //
     // Critical for TLB shootdown correctness: If we mark ourselves online while
@@ -1437,6 +1440,50 @@ pub extern "C" fn ap_rust_entry(
 ///
 /// This enables true SMP scheduling where all CPUs participate in running
 /// user processes, not just the BSP.
+/// Issue #109 §1.2: one-shot AP test probe rendezvous for SMP runtime tests.
+static AP_TEST_PROBE_TARGET_CPU: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+static AP_TEST_PROBE_FN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register (or clear) a one-shot probe closure to run on `target_cpu` in
+/// `ap_idle_loop` with interrupts enabled. Intended exclusively for boot-time
+/// SMP runtime tests (e.g., targeted TLB shootdown negative control).
+///
+/// When clearing (`func == None`), returns `true` if the pending probe for
+/// `target_cpu` was cancelled before the AP claimed it (and `false` if the AP
+/// had already claimed it or none was pending).
+pub fn set_ap_test_probe(target_cpu: usize, func: Option<fn()>) -> bool {
+    match func {
+        Some(f) => {
+            AP_TEST_PROBE_FN.store(f as usize, Ordering::Release);
+            AP_TEST_PROBE_TARGET_CPU.store(target_cpu, Ordering::Release);
+            true
+        }
+        None => {
+            let cancelled = AP_TEST_PROBE_TARGET_CPU
+                .compare_exchange(target_cpu, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            AP_TEST_PROBE_FN.store(0, Ordering::Release);
+            cancelled
+        }
+    }
+}
+
+fn run_ap_test_probe_if_targeted(this_cpu: usize) {
+    if AP_TEST_PROBE_TARGET_CPU.load(Ordering::Acquire) == this_cpu {
+        let fn_addr = AP_TEST_PROBE_FN.load(Ordering::Acquire);
+        if fn_addr != 0
+            && AP_TEST_PROBE_TARGET_CPU
+                .compare_exchange(this_cpu, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            // SAFETY: `fn_addr` was stored from a real `fn()` in `set_ap_test_probe`.
+            let probe: fn() = unsafe { core::mem::transmute(fn_addr) };
+            probe();
+        }
+    }
+}
+
 fn ap_idle_loop() -> ! {
     let mut process_deferred_ready_acknowledged = false;
     loop {
@@ -1461,6 +1508,9 @@ fn ap_idle_loop() -> ! {
         // enable() also covers the `continue` branch so the loop never re-enters
         // with IRQs left disabled.
         x86_64::instructions::interrupts::enable();
+
+        let this_cpu = cpu_local::current_cpu_id();
+        run_ap_test_probe_if_targeted(this_cpu);
 
         // C3 repair 3 (#90): this CPU's wait sequence before the pass. A wake
         // of a task in this CPU's queue after this point either moves it, so
@@ -1505,7 +1555,10 @@ fn ap_idle_loop() -> ! {
             kernel_core::wait_kick::halt_until_event(
                 snapshot,
                 kernel_core::wait_kick::HaltSite::Idle,
-                || cpu_local::current_cpu().need_resched.load(Ordering::SeqCst),
+                || {
+                    cpu_local::current_cpu().need_resched.load(Ordering::SeqCst)
+                        || AP_TEST_PROBE_TARGET_CPU.load(Ordering::SeqCst) == this_cpu
+                },
             );
         } else {
             // RF180-52: close the publication-to-halt race. If readiness
@@ -1516,7 +1569,10 @@ fn ap_idle_loop() -> ! {
             kernel_core::wait_kick::halt_until_event(
                 snapshot,
                 kernel_core::wait_kick::HaltSite::Idle,
-                kernel_core::process_deferred_work_ready,
+                || {
+                    kernel_core::process_deferred_work_ready()
+                        || AP_TEST_PROBE_TARGET_CPU.load(Ordering::SeqCst) == this_cpu
+                },
             );
         }
     }

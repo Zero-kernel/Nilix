@@ -55,9 +55,14 @@ pub struct TlbShootdownStats {
     /// R106-5: Number of times mailbox saturation forced a full-flush fallback
     pub coalesced_fallbacks: u64,
     /// C3 E1 (#90): target scans that found a CPU running the modified CR3
+    /// (Issue #109 §1.2: also counts targeted scans that proved 0 remote CPUs
+    /// hold the modified CR3 and therefore skipped all remote IPIs).
     pub targeted_shootdowns: u64,
-    /// C3 E1: target scans that fell back to every other online CPU (also
-    /// counted when there is none)
+    /// Issue #109 §1.2: subset of `targeted_shootdowns` where every other online
+    /// CPU was tracked on a different CR3, so 0 remote IPIs were sent.
+    pub targeted_zero_ipi: u64,
+    /// C3 E1: target scans that fell back to every other online CPU (CR3=0,
+    /// kernel-half VA, unresolved KPTI/CR3 mismatch, or non-zero PCID active).
     pub broadcast_fallbacks: u64,
     /// C3 E1: shootdown IPIs sent, including ACK-timeout resends
     pub shootdown_ipis: u64,
@@ -94,17 +99,51 @@ fn next_shootdown_generation() -> u64 {
 // Per-Address-Space TLB Tracking (R68 Architecture Improvement)
 // ============================================================================
 
-/// RF178-33: allocation-free record of the CR3 currently loaded on each CPU.
+/// Issue #109 §1.2: cache-line-isolated active CR3 slot for one CPU.
+///
+/// Packing 8 CPUs per 64-byte line caused cross-CPU false sharing on every
+/// context switch (`SeqCst` store emits `xchg` on x86-64). Giving each CPU its
+/// own 64-byte line keeps remote `CPU_ACTIVE_CR3` lines clean when idle CPUs
+/// are scanned by `collect_target_cpus`.
+#[repr(align(64))]
+struct AlignedActiveCr3(AtomicU64);
+
+impl AlignedActiveCr3 {
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+/// RF178-33: allocation-free record of the canonical kernel CR3 root currently
+/// active on each CPU.
 ///
 /// A fixed array avoids `CpuLocal` first-touch initialization in IRQ-return
-/// context. Context switch publishes with Release after CR3 is loaded;
-/// shootdown scans with Acquire. This replaces the global CR3->mask BTreeMap,
-/// whose write lock and insertion were illegal on the timer-return path.
-static CPU_ACTIVE_CR3: [AtomicU64; cpu_local::max_cpus()] =
-    [const { AtomicU64::new(0) }; cpu_local::max_cpus()];
+/// context. Context switch publishes with `SeqCst` BEFORE loading CR3 (with
+/// `IF=0`), and shootdown scans with a preceding `SeqCst` fence plus `SeqCst`
+/// loads. This replaces the global CR3->mask BTreeMap, whose write lock and
+/// insertion were illegal on the timer-return path.
+static CPU_ACTIVE_CR3: [AlignedActiveCr3; cpu_local::max_cpus()] =
+    [const { AlignedActiveCr3::new() }; cpu_local::max_cpus()];
+
+/// H4 fail-closed guard (Issue #109 §1.2): latched true if any non-zero PCID
+/// (1..=4095) is ever allocated or observed in hardware CR3.
+///
+/// Under `CR4.PCIDE == 1`, skipping a remote CPU whose `CPU_ACTIVE_CR3` differs
+/// from `target_cr3` is sound only while every address space uses PCID 0
+/// (`NOFLUSH == 0`), so switching CR3 flushes all non-global TLB entries on
+/// that CPU. If non-zero PCIDs are ever activated without per-PCID residency
+/// tracking, this latch forces broadcast fallback.
+static NONZERO_PCID_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Exclusive upper bound of the canonical x86-64 user address space.
+///
+/// High-half mappings (and the non-canonical hole / overflow) are shared across
+/// all kernel CR3 roots and must always broadcast rather than target one CR3.
+const USER_HALF_END: u64 = 0x0000_8000_0000_0000;
 
 /// Statistics for optimized TLB shootdowns
 static STATS_TARGETED_SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
+static STATS_TARGETED_ZERO_IPI: AtomicU64 = AtomicU64::new(0);
 static STATS_BROADCAST_FALLBACK: AtomicU64 = AtomicU64::new(0);
 /// C3 E1 (#90): shootdown IPIs sent; divided by the two counters above, the
 /// mean fanout of a remote dispatch.
@@ -401,16 +440,72 @@ pub fn online_cpu_count() -> u64 {
 // CR3 Tracking for Optimized TLB Shootdown
 // ============================================================================
 
+/// Record that a non-zero PCID (1..=4095) has been allocated or loaded.
+///
+/// Fail-closed H4 gate: once latched, `collect_target_cpus` falls back to
+/// broadcast shootdowns so stale TLB entries retained under another PCID on a
+/// remote CPU can never be skipped.
+#[inline]
+pub fn note_nonzero_pcid_in_use() {
+    NONZERO_PCID_ACTIVE.store(true, Ordering::Release);
+}
+
+#[inline]
+fn is_nonzero_pcid_active() -> bool {
+    NONZERO_PCID_ACTIVE.load(Ordering::Acquire)
+}
+
+#[inline]
+fn current_cr3_pcid() -> u16 {
+    if is_pcid_enabled() {
+        Cr3::read_raw().1 & 0x0FFF
+    } else {
+        0
+    }
+}
+
 /// Publish the next CR3 BEFORE loading it, with interrupts disabled. The
 /// serializing CR3 write flushes translations after publication; until then no
 /// user address may be accessed. Paired with the target scan's fence, either
 /// the requester sees this CPU or the new root load sees its PTE changes.
 /// No lock, allocation, or lazy initialization is reachable here.
 pub fn track_cr3_switch(new_cr3: u64) {
+    if (new_cr3 & 0x0FFF) != 0 {
+        note_nonzero_pcid_in_use();
+    }
+    let canonical = new_cr3 & !0x0FFF;
     let cpu_id = current_cpu_id();
     if let Some(slot) = CPU_ACTIVE_CR3.get(cpu_id) {
-        slot.store(new_cr3, Ordering::SeqCst);
+        slot.0.store(canonical, Ordering::SeqCst);
     }
+}
+
+/// Publish this CPU's currently active CR3 root and serialize with a local
+/// CR3 reload (flushing any pre-publication non-global TLB entries).
+///
+/// Must be called on the BSP before SMP bring-up and on each AP with `IF=0`
+/// strictly before `register_cpu_online()` so no online CPU lingers in the
+/// untracked `0` state.
+pub fn track_current_cr3() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if is_pcid_enabled() {
+            let (frame, raw) = Cr3::read_raw();
+            let pcid = raw & 0x0FFF;
+            if pcid != 0 {
+                note_nonzero_pcid_in_use();
+            }
+            track_cr3_switch(frame.start_address().as_u64());
+            unsafe {
+                Cr3::write_raw(frame, pcid);
+            }
+        } else {
+            let (frame, flags) = Cr3::read();
+            track_cr3_switch(frame.start_address().as_u64());
+            unsafe {
+                Cr3::write(frame, flags);
+            }
+        }
+    });
 }
 
 /// Run bounded usercopy in a retained foreign address space, tracking both
@@ -457,7 +552,7 @@ pub unsafe fn with_temporary_address_space<R>(
 pub fn current_cpu_cr3() -> u64 {
     CPU_ACTIVE_CR3
         .get(current_cpu_id())
-        .map(|slot| slot.load(Ordering::Acquire))
+        .map(|slot| slot.0.load(Ordering::Acquire))
         .unwrap_or(0)
 }
 
@@ -531,67 +626,206 @@ pub fn force_init_tlb_shootdown_locals() {
     PER_CPU_DATA.force_init();
 }
 
-/// Collect target CPUs for TLB shootdown based on address space tracking.
+/// H1 (Issue #109 §1.2): resolve the canonical address-space root (`kernel_cr3`)
+/// for a shootdown initiated on `self_id`.
 ///
-/// RF178-33: Uses a bounded scan of fixed per-CPU atomic CR3 snapshots. This
-/// preserves targeted shootdowns without a context-switch-side global map.
-///
-/// # Arguments
-///
-/// * `target_cr3` - The CR3 of the address space being modified (0 = broadcast to all)
-///
-/// # Returns
-///
-/// Bitmask of CPU IDs that need to receive the TLB shootdown IPI.
-///
-/// # Fallback Behavior
-///
-/// If tracking indicates no CPUs,
-/// we fall back to broadcasting to all online CPUs (except self). This ensures
-/// correctness even if tracking becomes out of sync.
-fn collect_target_cpus(target_cr3: u64) -> CpuMask {
-    core::sync::atomic::fence(Ordering::SeqCst);
-    let mut targets = CpuMask::empty();
-    let self_id = current_cpu_id();
-
-    // Try to use the per-CPU snapshots when CR3 is valid. A CPU switching
-    // into this address space after our Acquire scan observes page-table
-    // mutations in its serializing CR3 load. A CPU publishing a replacement
-    // root must not touch user memory until that CR3 load has flushed the old
-    // translations; publishing early therefore cannot expose a stale access.
-    if target_cr3 != 0 {
-        let online = cpu_local::online_cpu_mask();
-        let max_tracked = core::cmp::min(max_cpus(), 64);
-        for (cpu, _) in CPU_ACTIVE_CR3.iter().enumerate().take(max_tracked) {
-            if cpu == self_id || (online & (1u64 << cpu)) == 0 {
-                continue;
+/// Returns `0` (forcing a fail-closed broadcast) if hardware CR3 disagrees with
+/// `CPU_ACTIVE_CR3[self_id]` in any way other than a consistent KPTI dual-root
+/// Ring-3 `#PF` (where hardware CR3 is `kpti_user_cr3` while the tracked
+/// canonical root is `kpti_kernel_cr3`).
+#[inline]
+fn resolve_canonical_shootdown_cr3(
+    hw_cr3: u64,
+    tracked_cr3: u64,
+    kpti_snapshot: Option<(u64, u64)>,
+) -> u64 {
+    let hw = hw_cr3 & !0x0FFF;
+    let tracked = tracked_cr3 & !0x0FFF;
+    if hw == 0 {
+        return 0;
+    }
+    if hw == tracked {
+        return hw;
+    }
+    if tracked != 0 {
+        if let Some((user_cr3, kernel_cr3)) = kpti_snapshot {
+            if hw == (user_cr3 & !0x0FFF) && tracked == (kernel_cr3 & !0x0FFF) {
+                return tracked;
             }
-            if CPU_ACTIVE_CR3[cpu].load(Ordering::Acquire) == target_cr3
-                && lapic_id_for_cpu(cpu).is_some()
-            {
+        }
+    }
+    0
+}
+
+/// Resolve the canonical shootdown CR3 on the pinned current CPU `self_id`.
+///
+/// Fast path (`hw_cr3 == tracked_cr3 != 0`) avoids touching `PER_CPU_DATA`.
+/// On mismatch (e.g. Ring-3 `#PF` CoW running on KPTI `user_cr3`), takes a
+/// single non-blocking seqlock snapshot of `(kpti_user_cr3, kpti_kernel_cr3)`;
+/// any concurrent update or unexpected mismatch fails closed to `0` (broadcast).
+#[inline]
+fn canonical_shootdown_cr3(self_id: usize) -> u64 {
+    let hw_cr3 = current_cr3_value();
+    let tracked_cr3 = CPU_ACTIVE_CR3
+        .get(self_id)
+        .map(|slot| slot.0.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    if hw_cr3 != 0 && hw_cr3 == tracked_cr3 {
+        return hw_cr3;
+    }
+    let kpti_snapshot = PER_CPU_DATA.get_cpu(self_id).and_then(|pcpu| {
+        let seq1 = pcpu.kpti_seq.load(Ordering::Acquire);
+        if (seq1 & 1) != 0 {
+            return None;
+        }
+        let user_cr3 = pcpu.kpti_user_cr3.load(Ordering::Acquire);
+        let kernel_cr3 = pcpu.kpti_kernel_cr3.load(Ordering::Acquire);
+        let seq2 = pcpu.kpti_seq.load(Ordering::Acquire);
+        if seq1 == seq2 {
+            Some((user_cr3, kernel_cr3))
+        } else {
+            None
+        }
+    });
+    resolve_canonical_shootdown_cr3(hw_cr3, tracked_cr3, kpti_snapshot)
+}
+
+/// H3 (Issue #109 §1.2): return true if `[start, start + len)` touches the
+/// non-canonical hole, overflows, or overlaps the shared kernel high-half.
+#[inline]
+fn range_touches_kernel_half(start: VirtAddr, len: usize) -> bool {
+    let s = start.as_u64();
+    if s >= USER_HALF_END {
+        return true;
+    }
+    match s.checked_add(len as u64) {
+        Some(end) => end > USER_HALF_END,
+        None => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TargetSelectionKind {
+    TargetedIpi,
+    TargetedZeroIpi,
+    BroadcastFallback,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct TargetSelection {
+    targets: CpuMask,
+    kind: TargetSelectionKind,
+}
+
+/// Pure target-CPU selection logic shared by production shootdowns and hosted
+/// unit tests (Issue #109 §1.2).
+///
+/// # Safety Contract (RF178-33)
+///
+/// Caller must have issued `fence(Ordering::SeqCst)` after mutating PTEs and
+/// before invoking `read_active_cr3` (which must load with `Ordering::SeqCst`).
+fn select_target_cpus_from_state(
+    target_cr3: u64,
+    self_id: usize,
+    online_mask: u64,
+    max_tracked: usize,
+    nonzero_pcid_active: bool,
+    mut has_lapic: impl FnMut(usize) -> bool,
+    mut read_active_cr3: impl FnMut(usize) -> u64,
+) -> TargetSelection {
+    let mut targets = CpuMask::empty();
+    let remote_online = if self_id < u64::BITS as usize {
+        online_mask & !(1u64 << self_id)
+    } else {
+        online_mask
+    };
+
+    // Broadcast when requested explicitly (CR3=0, e.g. shared kernel mappings
+    // or fail-closed canonical CR3 resolution) or when non-zero PCIDs are in
+    // use (H4 fail-closed guard).
+    if target_cr3 == 0 || nonzero_pcid_active {
+        let mut remaining = remote_online;
+        while remaining != 0 {
+            let cpu = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            if cpu < max_tracked && has_lapic(cpu) {
                 targets.insert(cpu);
             }
         }
-        if !targets.is_empty() {
-            STATS_TARGETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
-            return targets;
-        }
+        return TargetSelection {
+            targets,
+            kind: TargetSelectionKind::BroadcastFallback,
+        };
     }
 
-    // Fallback: broadcast to all online CPUs except self
-    // This handles: CR3=0, CR3 not tracked, or empty tracked mask
-    STATS_BROADCAST_FALLBACK.fetch_add(1, Ordering::Relaxed);
-
-    for cpu in 0..max_cpus() {
-        if cpu == self_id {
+    // Targeted sparse scan over online remote CPUs only.
+    // Fail-closed (H2): any online remote CPU with tracked CR3 == 0 (untracked)
+    // is conservatively included. Only CPUs proven to hold a different non-zero
+    // CR3 (`seen != 0 && seen != target_cr3`) are skipped.
+    let mut remaining = remote_online;
+    while remaining != 0 {
+        let cpu = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
+        if cpu >= max_tracked || !has_lapic(cpu) {
             continue;
         }
-        // Check both: LAPIC ID is registered AND CPU is marked online
-        if lapic_id_for_cpu(cpu).is_some() && is_cpu_online(cpu) {
+        let seen = read_active_cr3(cpu);
+        if seen == 0 || seen == target_cr3 {
             targets.insert(cpu);
         }
     }
-    targets
+
+    let kind = if targets.is_empty() {
+        TargetSelectionKind::TargetedZeroIpi
+    } else {
+        TargetSelectionKind::TargetedIpi
+    };
+    TargetSelection { targets, kind }
+}
+
+/// Collect target CPUs for TLB shootdown based on address space tracking.
+///
+/// RF178-33 + Issue #109 §1.2: Uses a sparse scan over `online_cpu_mask()` of
+/// 64B-aligned per-CPU `SeqCst` CR3 snapshots. When every remote online CPU is
+/// tracked on a different non-zero CR3 (and PCID=0/NOFLUSH=0 holds), returns an
+/// empty `CpuMask` (0 remote IPIs) instead of broadcasting. Untracked (`0`)
+/// remote CPUs, `target_cr3 == 0`, and non-zero PCIDs all fail closed.
+fn collect_target_cpus(target_cr3: u64) -> CpuMask {
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let self_id = current_cpu_id();
+    let online = cpu_local::online_cpu_mask();
+    let max_tracked = core::cmp::min(max_cpus(), 64);
+
+    let mut nonzero_pcid = is_nonzero_pcid_active();
+    if !nonzero_pcid && current_cr3_pcid() != 0 {
+        note_nonzero_pcid_in_use();
+        nonzero_pcid = true;
+    }
+
+    let selection = select_target_cpus_from_state(
+        target_cr3,
+        self_id,
+        online,
+        max_tracked,
+        nonzero_pcid,
+        |cpu| lapic_id_for_cpu(cpu).is_some(),
+        |cpu| CPU_ACTIVE_CR3[cpu].0.load(Ordering::SeqCst),
+    );
+
+    match selection.kind {
+        TargetSelectionKind::TargetedIpi => {
+            STATS_TARGETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+        }
+        TargetSelectionKind::TargetedZeroIpi => {
+            STATS_TARGETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+            STATS_TARGETED_ZERO_IPI.fetch_add(1, Ordering::Relaxed);
+        }
+        TargetSelectionKind::BroadcastFallback => {
+            STATS_BROADCAST_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    selection.targets
 }
 
 /// Enqueue a TLB shootdown request into a CPU's mailbox queue.
@@ -921,8 +1155,8 @@ fn dispatch_shootdown_for_cr3(target_cr3: u64, start: u64, len: u64) -> Option<S
 }
 
 #[inline]
-fn dispatch_shootdown(start: u64, len: u64) -> Option<ShootdownDispatch> {
-    dispatch_shootdown_for_cr3(current_cr3_value(), start, len)
+fn dispatch_shootdown(self_id: usize, start: u64, len: u64) -> Option<ShootdownDispatch> {
+    dispatch_shootdown_for_cr3(canonical_shootdown_cr3(self_id), start, len)
 }
 
 /// Range operation type for flush optimization
@@ -1098,8 +1332,14 @@ fn flush_all_impl(broadcast: bool) {
     assert_single_core_mode();
 
     // Dispatch to remote CPUs (if any). Shared kernel mappings use CR3=0 to
-    // force a true broadcast; ordinary callers retain targeted CR3 behavior.
-    let target_cr3 = if broadcast { 0 } else { current_cr3_value() };
+    // force a true broadcast; ordinary callers resolve their canonical kernel
+    // CR3 root (handling KPTI Ring-3 #PF dual roots and failing closed to 0 on
+    // any unexpected mismatch).
+    let target_cr3 = if broadcast {
+        0
+    } else {
+        canonical_shootdown_cr3(_pin.cpu_id())
+    };
     let shoot = dispatch_shootdown_for_cr3(target_cr3, 0, 0);
 
     // Flush local TLB immediately using INVPCID if available
@@ -1171,6 +1411,15 @@ fn flush_all_impl(broadcast: bool) {
 pub fn flush_current_as_range(start: VirtAddr, len: usize) {
     assert_single_core_mode();
 
+    // Issue #109 §1.2 (H3 defense-in-depth): shared kernel high-half mappings
+    // (as well as non-canonical or overflowing ranges) are reachable through
+    // every CR3 root and must always broadcast across all online CPUs, even
+    // before `normalize_range` decides between page-range and full flush.
+    if range_touches_kernel_half(start, len) {
+        flush_all_address_spaces();
+        return;
+    }
+
     match normalize_range(start, len) {
         RangeOp::Full => {
             flush_current_as_all();
@@ -1184,7 +1433,7 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
             let _pin = ShootdownCpuPin::new();
 
             // Dispatch to remote CPUs
-            let shoot = dispatch_shootdown(aligned_start, aligned_len);
+            let shoot = dispatch_shootdown(_pin.cpu_id(), aligned_start, aligned_len);
 
             // R106-5: Check if any target CPU's mailbox was saturated
             let needs_full_flush_fallback = shoot
@@ -1268,6 +1517,7 @@ pub fn get_stats() -> TlbShootdownStats {
         pages_flushed: STATS_PAGES_FLUSHED.load(Ordering::Relaxed),
         coalesced_fallbacks: STATS_COALESCED_FALLBACKS.load(Ordering::Relaxed),
         targeted_shootdowns: STATS_TARGETED_SHOOTDOWNS.load(Ordering::Relaxed),
+        targeted_zero_ipi: STATS_TARGETED_ZERO_IPI.load(Ordering::Relaxed),
         broadcast_fallbacks: STATS_BROADCAST_FALLBACK.load(Ordering::Relaxed),
         shootdown_ipis: STATS_SHOOTDOWN_IPIS.load(Ordering::Relaxed),
     }
@@ -1395,4 +1645,125 @@ pub fn drain_from_fault() {
 #[cfg(feature = "syscall_test")]
 pub fn acks_from_fault_drain() -> u64 {
     ACKS_FROM_FAULT_DRAIN.load(Ordering::Acquire)
+}
+
+const _: () = assert!(core::mem::align_of::<AlignedActiveCr3>() == 64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targeted_hits_only_matching_cr3() {
+        let active = [0x1000u64, 0x1000, 0x2000, 0x3000];
+        let sel =
+            select_target_cpus_from_state(0x1000, 0, 0b1111, 4, false, |_| true, |cpu| active[cpu]);
+        assert_eq!(sel.kind, TargetSelectionKind::TargetedIpi);
+        assert_eq!(sel.targets.0, 1u64 << 1);
+    }
+
+    #[test]
+    fn targeted_zero_ipi_when_no_remote_matches() {
+        let active = [0x1000u64, 0x2000, 0x3000, 0x4000];
+        let sel =
+            select_target_cpus_from_state(0x1000, 0, 0b1111, 4, false, |_| true, |cpu| active[cpu]);
+        assert_eq!(sel.kind, TargetSelectionKind::TargetedZeroIpi);
+        assert!(sel.targets.is_empty());
+    }
+
+    #[test]
+    fn untracked_zero_slot_fails_closed_included() {
+        // CPU 1 matches, CPU 2 is untracked (0 -> must be included), CPU 3 is on
+        // another tracked CR3 (safely skipped).
+        let active = [0x1000u64, 0x1000, 0, 0x3000];
+        let sel =
+            select_target_cpus_from_state(0x1000, 0, 0b1111, 4, false, |_| true, |cpu| active[cpu]);
+        assert_eq!(sel.kind, TargetSelectionKind::TargetedIpi);
+        assert_eq!(sel.targets.0, (1u64 << 1) | (1u64 << 2));
+    }
+
+    #[test]
+    fn all_untracked_zero_slots_fails_closed() {
+        let active = [0x1000u64, 0, 0, 0];
+        let sel =
+            select_target_cpus_from_state(0x1000, 0, 0b1111, 4, false, |_| true, |cpu| active[cpu]);
+        assert_eq!(sel.kind, TargetSelectionKind::TargetedIpi);
+        assert_eq!(sel.targets.0, 0b1110);
+    }
+
+    #[test]
+    fn target_cr3_zero_forces_broadcast() {
+        let active = [0x1000u64, 0x2000, 0x3000, 0x4000];
+        let sel =
+            select_target_cpus_from_state(0, 0, 0b1111, 4, false, |_| true, |cpu| active[cpu]);
+        assert_eq!(sel.kind, TargetSelectionKind::BroadcastFallback);
+        assert_eq!(sel.targets.0, 0b1110);
+    }
+
+    #[test]
+    fn kernel_half_range_forces_broadcast() {
+        assert!(!range_touches_kernel_half(VirtAddr::new(0x1000), 4096));
+        assert!(!range_touches_kernel_half(
+            VirtAddr::new(USER_HALF_END - 4096),
+            4096
+        ));
+        // Crossing into the non-canonical hole / kernel half fails closed.
+        assert!(range_touches_kernel_half(
+            VirtAddr::new(USER_HALF_END - 4096),
+            8192
+        ));
+        // Non-canonical boundary and canonical high-half start both fail closed.
+        assert!(range_touches_kernel_half(
+            unsafe { VirtAddr::new_unsafe(USER_HALF_END) },
+            4096
+        ));
+        assert!(range_touches_kernel_half(
+            VirtAddr::new(0xFFFF_8000_0000_0000),
+            4096
+        ));
+        assert!(range_touches_kernel_half(
+            VirtAddr::new(crate::page_table::PHYSICAL_MEMORY_OFFSET),
+            4096
+        ));
+        // Address arithmetic overflow fails closed.
+        assert!(range_touches_kernel_half(
+            VirtAddr::new(u64::MAX - 4095),
+            8192
+        ));
+    }
+
+    #[test]
+    fn nonzero_pcid_active_forces_broadcast() {
+        let active = [0x1000u64, 0x2000, 0x3000, 0x4000];
+        let sel =
+            select_target_cpus_from_state(0x1000, 0, 0b1111, 4, true, |_| true, |cpu| active[cpu]);
+        assert_eq!(sel.kind, TargetSelectionKind::BroadcastFallback);
+        assert_eq!(sel.targets.0, 0b1110);
+    }
+
+    #[test]
+    fn canonical_cr3_kpti_dual_root_resolution() {
+        // Normal Ring-0 fast path: hw == tracked != 0.
+        assert_eq!(
+            resolve_canonical_shootdown_cr3(0xA000, 0xA000, None),
+            0xA000
+        );
+        // KPTI Ring-3 #PF CoW path: hw == user_cr3, tracked == kernel_cr3.
+        assert_eq!(
+            resolve_canonical_shootdown_cr3(0xB000, 0xA000, Some((0xB000, 0xA000))),
+            0xA000
+        );
+        // Unexpected CR3 mismatch fails closed to 0 (broadcast).
+        assert_eq!(
+            resolve_canonical_shootdown_cr3(0xC000, 0xA000, Some((0xB000, 0xA000))),
+            0
+        );
+        // Torn/odd seqlock snapshot (None) with hw != tracked fails closed to 0.
+        assert_eq!(resolve_canonical_shootdown_cr3(0xB000, 0xA000, None), 0);
+        // Untracked local slot (0) fails closed to 0.
+        assert_eq!(
+            resolve_canonical_shootdown_cr3(0xA000, 0, Some((0xA000, 0xA000))),
+            0
+        );
+    }
 }

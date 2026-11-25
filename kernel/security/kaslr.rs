@@ -1260,6 +1260,9 @@ pub fn allocate_pcid() -> Option<u16> {
         if bitmap[idx] & mask == 0 {
             // Mark as allocated
             bitmap[idx] |= mask;
+            // Issue #109 §1.2 (H4): latch fail-closed broadcast mode if any
+            // non-zero PCID is ever allocated without per-PCID residency maps.
+            mm::tlb_shootdown::note_nonzero_pcid_in_use();
             return Some(pcid);
         }
     }

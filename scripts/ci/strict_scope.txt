@@ -30,6 +30,9 @@ RUNTIME steal_hint_pinned_wake not_applicable needs_cpus:2
 RUNTIME wait_kick_halted_cpu not_applicable needs_cpus:2
 RUNTIME wait_kick_one_ipi not_applicable needs_cpus:2
 
+# Issue #109 §1.2: targeted TLB shootdown negative/positive/zero-IPI control needs 2+ CPUs.
+RUNTIME tlb_shootdown_targeted_negative_control not_applicable needs_cpus:2
+
 # D3: Spectre hardware mitigations and retpoline are N6.
 SECURITY spectre_mitigation_status out_of_scope out_of_scope:N6
 SECURITY spectre_v2_retpoline out_of_scope out_of_scope:N6
