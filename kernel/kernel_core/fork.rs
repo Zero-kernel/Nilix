@@ -1098,6 +1098,7 @@ fn fork_inner(
         .try_clone()
         .map_err(|_| ForkError::MemoryAllocationFailed)?;
     child.pledge_state = parent.pledge_state.clone();
+    child.sync_seccomp_or_pledge_flag();
 
     // Finish every infallible PCB field before scheduler admission. The
     // reserved queue entry is non-runnable until its permit is committed.
