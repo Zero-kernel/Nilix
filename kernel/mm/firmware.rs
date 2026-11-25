@@ -38,7 +38,7 @@ use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::memory::FrameAllocator;
-use crate::page_table::{with_current_manager, PHYSICAL_MEMORY_OFFSET};
+use crate::page_table::{with_kernel_manager, PHYSICAL_MEMORY_OFFSET};
 
 /// Physical bytes the high-half direct map covers.
 const DIRECT_MAP_LIMIT: u64 = 1 << 30;
@@ -166,7 +166,7 @@ pub fn read_firmware_bytes(phys: u64, len: usize) -> Option<&'static [u8]> {
         // A window that cannot be unmapped stays mapped; every later map then
         // fails and reads outside the direct map return None.
         unsafe {
-            with_current_manager(VirtAddr::new(PHYSICAL_MEMORY_OFFSET), |manager| {
+            with_kernel_manager(VirtAddr::new(PHYSICAL_MEMORY_OFFSET), |manager| {
                 manager.map_page(window, frame, flags, &mut frames)
             })
             .ok()?;
@@ -175,7 +175,7 @@ pub fn read_firmware_bytes(phys: u64, len: usize) -> Option<&'static [u8]> {
                 dst.add(copied),
                 chunk,
             );
-            with_current_manager(VirtAddr::new(PHYSICAL_MEMORY_OFFSET), |manager| {
+            with_kernel_manager(VirtAddr::new(PHYSICAL_MEMORY_OFFSET), |manager| {
                 manager.unmap_page(window)
             })
             .ok()?;

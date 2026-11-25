@@ -47,7 +47,7 @@ unsafe fn fixture_tables(
 
 unsafe fn cleanup_fixture(root: VirtAddr, allocator: &mut crate::memory::FrameAllocator) {
     let mut reclaimed = [None; FIXTURE_TABLES];
-    crate::with_current_manager(VirtAddr::new(0), |manager| {
+    crate::with_kernel_manager(VirtAddr::new(0), |manager| {
         let (tracked, count) = fixture_tables(manager, root);
         let result = manager.rollback_tracked_leaf_tables(
             root,
@@ -79,7 +79,7 @@ unsafe fn retention_rejections(
     let before = free_pages();
     let virt = root + 0x1000u64;
     map_mmio(virt, backing.start_address(), 4096, allocator).unwrap();
-    crate::with_current_manager(VirtAddr::new(0), |manager| {
+    crate::with_kernel_manager(VirtAddr::new(0), |manager| {
         let (tracked, count) = fixture_tables(manager, root);
         assert_eq!(count, 3);
         let mut no_output = [];
@@ -180,7 +180,7 @@ unsafe fn retention_rejections(
 /// Every scratch frame is retained until all aliases and paging frames retire.
 pub unsafe fn run_mmio_rollback_self_test() {
     crate::force_init_tlb_shootdown_locals();
-    let root = crate::with_current_manager(VirtAddr::new(0), |manager| {
+    let root = crate::with_kernel_manager(VirtAddr::new(0), |manager| {
         (480u64..=509)
             .rev()
             .map(|index| 0xffff_0000_0000_0000 | (index << 39))
@@ -215,7 +215,7 @@ pub unsafe fn run_mmio_rollback_self_test() {
         assert!(rollback.all_accounted);
         assert_eq!(rollback.retained_count, fail_after.min(2));
         assert_eq!(rollback.reclaimed_count, usize::from(fail_after == 3));
-        crate::with_current_manager(VirtAddr::new(0), |manager| {
+        crate::with_kernel_manager(VirtAddr::new(0), |manager| {
             assert_eq!(manager.pml4_slot_is_unused(root), fail_after == 0);
             assert!(manager.translate_with_flags(virt).is_none());
             assert!(manager.translate_with_flags(virt + 4096u64).is_none());
@@ -236,7 +236,7 @@ pub unsafe fn run_mmio_rollback_self_test() {
     ));
     map_mmio(virt, backing.start_address(), 8192, &mut allocator).expect("vacant MMIO mapping");
     let readonly = mmio_flags() & !PageTableFlags::WRITABLE;
-    crate::with_current_manager(VirtAddr::new(0), |manager| {
+    crate::with_kernel_manager(VirtAddr::new(0), |manager| {
         let (phys, flags) = manager.translate_with_flags(virt).unwrap();
         assert_eq!(phys, backing.start_address());
         assert!(flags.contains(mmio_flags()));
@@ -254,7 +254,7 @@ pub unsafe fn run_mmio_rollback_self_test() {
         unmap_mmio(virt, 8192, &mut allocator),
         Err(UnmapError::InvalidRange)
     ));
-    crate::with_current_manager(VirtAddr::new(0), |manager| {
+    crate::with_kernel_manager(VirtAddr::new(0), |manager| {
         let (phys, flags) = manager.translate_with_flags(virt).unwrap();
         assert_eq!(phys, backing.start_address());
         assert_eq!(flags, readonly);

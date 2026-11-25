@@ -15543,9 +15543,14 @@ fn sys_brk(addr: usize) -> SyscallResult {
             use x86_64::structures::paging::PhysFrame;
             with_current_manager(VirtAddr::new(0), |manager| -> alloc::vec::Vec<PhysFrame> {
                 let mut frame_alloc = FrameAllocator::new();
-                // R159-2 FIX: Fallible frames_to_free (same pattern as R159-1/R158-7).
-                let mut frames_to_free = Vec::new();
-                let _ = frames_to_free.try_reserve(shrink_size / PAGE_SIZE);
+                // R159-2 + Issue #109 §1.1 (H1): collect ALL unmapped leaf frames first,
+                // complete the cross-CPU TLB shootdown BEFORE releasing PAGE_REF_COUNT,
+                // and only then decrement refcounts and free last-reference frames.
+                // Releasing before flush under split PT_LOCK would allow a peer AS to
+                // claim unique COW ownership or free a frame while a sibling CPU still
+                // holds a stale TLB entry.
+                let mut unmapped_frames = Vec::new();
+                let _ = unmapped_frames.try_reserve(shrink_size / PAGE_SIZE);
 
                 #[cfg(feature = "syscall_test")]
                 let flushes_before = mm::tlb_shootdown::get_stats();
@@ -15565,28 +15570,30 @@ fn sys_brk(addr: usize) -> SyscallResult {
 
                     if let Some(frame) = frame_opt {
                         removed_leaf = true;
-                        let phys_addr = frame.start_address().as_u64() as usize;
-
-                        let should_free = PAGE_REF_COUNT.release(phys_addr).should_free_unmapped();
-
-                        if should_free {
-                            if frames_to_free.try_reserve(1).is_ok() {
-                                frames_to_free.push(frame);
-                            } else {
-                                mm::flush_current_as_page(page.start_address());
+                        if unmapped_frames.try_reserve(1).is_ok() {
+                            unmapped_frames.push(frame);
+                        } else {
+                            // OOM fallback: flush this page FIRST, then release & free.
+                            mm::flush_current_as_page(page.start_address());
+                            let phys_addr = frame.start_address().as_u64() as usize;
+                            if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
                                 frame_alloc.deallocate_frame(frame);
                             }
                         }
                     }
                 }
 
-                // Every removed translation must be invalidated, including COW
-                // leaves retained by another address space. PT_LOCK serializes
-                // release with peer COW/teardown until the shootdown completes.
+                // Every removed translation must be invalidated before PAGE_REF_COUNT
+                // release, including COW leaves retained by another address space.
                 if removed_leaf {
-                    mm::flush_current_as_range(VirtAddr::new(new_top as u64), shrink_size);
-                    for frame in frames_to_free {
-                        frame_alloc.deallocate_frame(frame);
+                    if !unmapped_frames.is_empty() {
+                        mm::flush_current_as_range(VirtAddr::new(new_top as u64), shrink_size);
+                        for frame in unmapped_frames {
+                            let phys_addr = frame.start_address().as_u64() as usize;
+                            if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
+                                frame_alloc.deallocate_frame(frame);
+                            }
+                        }
                     }
                 }
 
@@ -18076,11 +18083,11 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             use x86_64::structures::paging::PhysFrame;
 
             let mut frame_alloc = FrameAllocator::new();
-            // R159-1 FIX: Fallible frames_to_free with per-page inline-free fallback.
-            // Same pattern as R158-7 (mprotect Path B). Prevents kernel panic
-            // when munmap runs under OOM — the paradox of needing memory to free memory.
-            let mut frames_to_free: Vec<PhysFrame> = Vec::new();
-            let _ = frames_to_free.try_reserve(length_aligned / 0x1000);
+            // R159-1 + Issue #109 §1.1 (H1): collect ALL unmapped leaf frames first,
+            // complete the cross-CPU TLB shootdown BEFORE calling PAGE_REF_COUNT.release(),
+            // and only then release refcounts and free last-reference frames.
+            let mut unmapped_frames: Vec<PhysFrame> = Vec::new();
+            let _ = unmapped_frames.try_reserve(length_aligned / 0x1000);
 
             let mut removed_leaf = false;
 
@@ -18100,37 +18107,36 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
                 if let Some(frame) = frame_opt {
                     removed_leaf = true;
-                    let phys_addr = frame.start_address().as_u64() as usize;
-
-                    let should_free = PAGE_REF_COUNT
-                        .release(phys_addr)
-                        .should_free_unmapped();
-
-                    if should_free {
-                        if frames_to_free.try_reserve(1).is_ok() {
-                            frames_to_free.push(frame);
-                        } else {
-                            mm::flush_current_as_page(page.start_address());
+                    if unmapped_frames.try_reserve(1).is_ok() {
+                        unmapped_frames.push(frame);
+                    } else {
+                        // OOM fallback: flush this page FIRST, then release & free.
+                        mm::flush_current_as_page(page.start_address());
+                        let phys_addr = frame.start_address().as_u64() as usize;
+                        if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
                             frame_alloc.deallocate_frame(frame);
                         }
                     }
                 }
             }
 
-            // Shared leaves retain a region pin, so frames_to_free can be empty
-            // even though a peer CPU still caches a removed leaf. Flush before
-            // Phase 3 can drop that pin and reclaim the DATA frame.
+            // Shared and COW leaves retain peer references, so every removed leaf
+            // must be invalidated across all participating CPUs BEFORE releasing
+            // PAGE_REF_COUNT or dropping any Phase-3 shared-region pin.
             if removed_leaf {
                 // ST-K2-P2(b): the remote-holder oracle pauses here, holding
-                // PT_LOCK, until a sibling's IF=0 shared fault is spinning.
+                // the AS PT lock, until a sibling's IF=0 shared fault is spinning.
                 #[cfg(feature = "syscall_test")]
                 crate::fork::shared_fault_test::before_unmap_flush(pid, addr);
                 mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
                 #[cfg(feature = "syscall_test")]
                 crate::fork::shared_fault_test::after_unmap_flush(pid, addr);
             }
-            for frame in frames_to_free {
-                frame_alloc.deallocate_frame(frame);
+            for frame in unmapped_frames {
+                let phys_addr = frame.start_address().as_u64() as usize;
+                if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
+                    frame_alloc.deallocate_frame(frame);
+                }
             }
 
             // R171-CG1x0 FIX (M2-1 SLICE-0): reclaim the now-empty intermediate
@@ -18900,7 +18906,11 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             // Step-3 Process+MmState hold — migration-atomicity is untouched.
             // ---------------------------------------------------------------
             // Step 2: Unmap pages and free frames (COW-aware).
-            // R158-7 FIX: fallible frames_to_free with immediate free on OOM.
+            // R158-7 FIX: fallible deferred frame collection with immediate flush+free on OOM.
+            // Issue #109 §1.1 (H1): Always complete TLB shootdown BEFORE calling
+            // `PAGE_REF_COUNT.release` so a concurrent process on another PT lock
+            // shard cannot observe refcount 2->1 and perform an in-place writable
+            // CoW upgrade (or frame reuse) while a sibling CPU still holds a stale TLB.
             unsafe {
                 use mm::memory::FrameAllocator;
 
@@ -18909,8 +18919,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     use x86_64::structures::paging::PhysFrame;
 
                     let mut frame_alloc = FrameAllocator::new();
-                    let mut frames_to_free: Vec<PhysFrame> = Vec::new();
-                    let _ = frames_to_free.try_reserve(region_len / 0x1000);
+                    let mut unmapped_frames: Vec<PhysFrame> = Vec::new();
+                    let _ = unmapped_frames.try_reserve(region_len / 0x1000);
 
                     for offset in (0..region_len).step_by(0x1000) {
                         let page =
@@ -18925,25 +18935,27 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         };
 
                         if let Some(frame) = frame_opt {
-                            let phys_addr = frame.start_address().as_u64() as usize;
-                            let should_free =
-                                PAGE_REF_COUNT.release(phys_addr).should_free_unmapped();
-                            if should_free {
-                                if frames_to_free.try_reserve(1).is_ok() {
-                                    frames_to_free.push(frame);
-                                } else {
-                                    mm::flush_current_as_page(page.start_address());
+                            if unmapped_frames.try_reserve(1).is_ok() {
+                                unmapped_frames.push(frame);
+                            } else {
+                                // OOM fallback: flush this page before releasing refcount.
+                                mm::flush_current_as_page(page.start_address());
+                                let phys_addr = frame.start_address().as_u64() as usize;
+                                if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
                                     frame_alloc.deallocate_frame(frame);
                                 }
                             }
                         }
                     }
 
-                    // Batch TLB shootdown then deallocate deferred frames
-                    if !frames_to_free.is_empty() {
+                    // Batch TLB shootdown BEFORE releasing any refcount or freeing frames.
+                    if !unmapped_frames.is_empty() {
                         mm::flush_current_as_range(VirtAddr::new(region_base as u64), region_len);
-                        for frame in frames_to_free {
-                            frame_alloc.deallocate_frame(frame);
+                        for frame in unmapped_frames {
+                            let phys_addr = frame.start_address().as_u64() as usize;
+                            if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
+                                frame_alloc.deallocate_frame(frame);
+                            }
                         }
                     }
                 })

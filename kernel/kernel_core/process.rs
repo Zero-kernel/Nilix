@@ -1133,7 +1133,7 @@ pub fn allocate_kernel_stack(
     let mut rollback_quarantine = false;
 
     let mapped_result = unsafe {
-        page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+        page_table::with_kernel_manager(VirtAddr::new(0), |mgr| {
             // 检查整个 slot（守护页 + 栈页）是否已被映射
             let total_pages = KSTACK_PAGES + KSTACK_GUARD_PAGES;
             for i in 0..total_pages {
@@ -5729,10 +5729,9 @@ pub fn alloc_wait_seq() -> u64 {
 pub fn init() {
     // 强制 BOOT_CR3 lazy_static 初始化，确保捕获当前（引导）CR3
     let (boot_frame, _) = *BOOT_CR3;
-    BOOT_CR3_PHYS.store(
-        boot_frame.start_address().as_u64() & !0x0FFF,
-        Ordering::Release,
-    );
+    let boot_phys = boot_frame.start_address().as_u64() & !0x0FFF;
+    BOOT_CR3_PHYS.store(boot_phys, Ordering::Release);
+    mm::register_boot_root(boot_phys);
     prepare_kernel_stack_region();
     klog_always!("  Process subsystem initialized (boot CR3 cached)");
 }
@@ -14107,7 +14106,7 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
     // Prevalidate every leaf against the immutable original buddy-block
     // identity before mutating any PTE. A mismatch is quarantined in place.
     let reclaim_ready = unsafe {
-        page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+        page_table::with_kernel_manager(VirtAddr::new(0), |mgr| {
             for index in 0..KSTACK_PAGES {
                 let page = Page::containing_address(stack_base + (index as u64 * PAGE_SIZE));
                 let expected = PhysFrame::containing_address(

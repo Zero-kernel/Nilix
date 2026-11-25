@@ -26,7 +26,8 @@
 //! ├── SCHEDULER_STATS
 //! │
 //! Level 4 (Memory Management)
-//! ├── PT_LOCK (page_table.rs) - global page table and COW operations
+//! ├── AS_PT_LOCKS[128] (page_table.rs) - per-address-space page-table lock shards (at most 1 held; never AS -> AS)
+//! ├── KERNEL_PT_LOCK (page_table.rs) - shared kernel high-half & boot-root page tables (strictly AS_PT_LOCKS -> KERNEL_PT_LOCK; never reverse)
 //! ├── PAGE_TABLE_MANAGER
 //! ├── BUDDY_ALLOCATOR / FRAME_ALLOCATOR
 //! ├── HEAP_ALLOCATOR (global_alloc)
@@ -79,7 +80,8 @@
 //! |------|--------|-------|------|-------|
 //! | READY_QUEUE | sched/enhanced_scheduler.rs | 3 | Mutex<BTreeMap> | Per-CPU in SMP |
 //! | CURRENT_PROCESS | sched/enhanced_scheduler.rs | 3 | Mutex<Option<Pid>> | Per-CPU in SMP |
-//! | PT_LOCK | mm/page_table.rs | 4 | Mutex<()> | Global page table and COW ops |
+//! | AS_PT_LOCKS[128] | mm/page_table.rs | 4 | [PtLockSlot; 128] | Per-address-space user page-table & CoW locks (keyed by canonical kernel CR3 PFN) |
+//! | KERNEL_PT_LOCK | mm/page_table.rs | 4 | PtLockSlot | Shared kernel high-half & boot-root page-table lock (`AS_PT_LOCKS -> KERNEL_PT_LOCK` order) |
 //! | PAGE_TABLE_MANAGER | mm/page_table.rs | 4 | Once<Mutex> | Global |
 //! | BUDDY_ALLOCATOR | mm/buddy_allocator.rs | 4 | Mutex | Global |
 //! | ALLOCATOR | mm/memory.rs | 4 | LockedHeap | Global |

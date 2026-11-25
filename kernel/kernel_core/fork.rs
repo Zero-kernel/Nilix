@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU32, Ordering};
 use mm::memory::FrameAllocator;
-use mm::page_table::with_pt_lock;
+use mm::page_table::{with_as_pt_lock, with_kernel_pt_lock};
 use mm::{arc_charge_bytes, try_reserve_heap, vec_charge_bytes, AdmittedMap, HeapClass};
 use spin::Mutex;
 // G.1 Observability: Watchdog handle type for cleanup_partial_child
@@ -1371,9 +1371,11 @@ pub unsafe fn copy_page_table_cow_with_shared(
     child_page_table: usize,
     shared_ranges: &[(usize, usize)],
 ) -> Result<usize, ForkError> {
-    // R67-6 FIX: Hold PT_LOCK during entire COW setup to prevent concurrent
-    // mmap/munmap/pagefault from racing with parent PTE modifications.
-    with_pt_lock(|| {
+    // R67-6 + Issue #109 §1.1: Hold only the parent address space's PT lock shard
+    // during COW cloning so unrelated processes fork concurrently. The child PML4
+    // is unpublished until this function returns. High-half PML4[256..512] copy
+    // briefly nests KERNEL_PT_LOCK (strict order: AS_PT_LOCKS -> KERNEL_PT_LOCK).
+    with_as_pt_lock(parent_page_table as u64, || {
         let mut frame_alloc = FrameAllocator::new();
         let parent_root: PhysFrame<Size4KiB> =
             PhysFrame::containing_address(PhysAddr::new(parent_page_table as u64));
@@ -1383,10 +1385,12 @@ pub unsafe fn copy_page_table_cow_with_shared(
         let parent_pml4 = phys_to_virt_table(parent_root.start_address());
         let child_pml4 = phys_to_virt_table(child_root.start_address());
 
-        // 复制内核高半区映射（索引 256-511）
-        for i in 256..512 {
-            child_pml4[i] = parent_pml4[i].clone();
-        }
+        // Issue #109 §1.1 (H4): snapshot shared kernel high-half (256..512) under KERNEL_PT_LOCK.
+        with_kernel_pt_lock(|| {
+            for i in 256..512 {
+                child_pml4[i] = parent_pml4[i].clone();
+            }
+        });
         // The recursive slot names its own root, as in
         // `create_fresh_address_space`; the copy above named the parent's root,
         // a frame freed and reused once the parent exits or execs.
@@ -3599,18 +3603,19 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
 
         // 复制内核高半区映射（索引 256-511）
         // 这些映射在所有进程间共享
-        // R94-5 FIX: Explicitly clear USER_ACCESSIBLE on kernel high-half entries.
-        // Defense-in-depth: even if parent entries are corrupted with U/S bit,
-        // child address space must not inherit user-accessibility to kernel space.
-        for i in 256..512 {
-            new_pml4[i] = current_pml4[i].clone();
-            if !new_pml4[i].is_unused() {
-                let addr = new_pml4[i].addr();
-                let mut flags = new_pml4[i].flags();
-                flags.remove(PageTableFlags::USER_ACCESSIBLE);
-                new_pml4[i].set_addr(addr, flags);
+        // R94-5 + Issue #109 §1.1 (H4): snapshot shared high-half under KERNEL_PT_LOCK
+        // and explicitly clear USER_ACCESSIBLE on kernel high-half entries.
+        with_kernel_pt_lock(|| {
+            for i in 256..512 {
+                new_pml4[i] = current_pml4[i].clone();
+                if !new_pml4[i].is_unused() {
+                    let addr = new_pml4[i].addr();
+                    let mut flags = new_pml4[i].flags();
+                    flags.remove(PageTableFlags::USER_ACCESSIBLE);
+                    new_pml4[i].set_addr(addr, flags);
+                }
             }
-        }
+        });
 
         // 【关键修复】设置新页表的递归映射
         // PML4[510] 必须指向新的 PML4 帧自身，而不是从 boot 页表复制的旧值

@@ -57,7 +57,7 @@ pub unsafe fn run_register_mapping_probes() {
     ));
     assert_eq!(mapping.mapped_bytes, 4096);
     drop(mapping);
-    mm::with_current_manager(VirtAddr::new(0), |manager| {
+    mm::with_kernel_manager(VirtAddr::new(0), |manager| {
         assert!(manager.translate_with_flags(prefix).is_none());
         assert_eq!(
             manager.translate_with_flags(suffix).unwrap().0,
@@ -146,7 +146,7 @@ pub fn run_init_failure_probe(rsdp_phys: u64) -> ! {
         let mut allocator = mm::FrameAllocator::new();
         unsafe {
             mm::map_mmio(blocker, PhysAddr::new(phys), 4096, &mut allocator).unwrap();
-            mm::with_current_manager(VirtAddr::new(0), |manager| {
+            mm::with_kernel_manager(VirtAddr::new(0), |manager| {
                 let (_, flags) = manager.translate_with_flags(blocker).unwrap();
                 manager
                     .update_flags(
@@ -174,7 +174,7 @@ pub fn run_init_failure_probe(rsdp_phys: u64) -> ! {
             assert_eq!(REJECTIONS.load(Ordering::Acquire), 0);
             assert!(VTD_MMIO_SLOTS.lock().iter().all(Option::is_none));
             unsafe {
-                mm::with_current_manager(VirtAddr::new(0), |manager| {
+                mm::with_kernel_manager(VirtAddr::new(0), |manager| {
                     let (mapped, flags) = manager.translate_with_flags(blocker).unwrap();
                     assert_eq!(mapped.as_u64(), phys);
                     assert!(!flags.contains(PageTableFlags::WRITABLE));

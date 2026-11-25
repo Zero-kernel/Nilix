@@ -406,7 +406,7 @@ pub fn install_ist_guard_pages_before_smp(
     }
 
     unsafe {
-        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+        mm::page_table::with_kernel_manager(VirtAddr::new(0), |manager| {
             unmap_guard_page(manager, bsp_double_fault_guard_page(), 0, "double-fault");
             unmap_guard_page(manager, bsp_nmi_guard_page(), 0, "NMI");
             for cpu_id in 1..MAX_CPUS {
@@ -492,7 +492,7 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
     // RF180-53: APs never mutate the shared kernel page tables. Verify the
     // BSP-prepared guards before loading a TSS that depends on those stacks.
     unsafe {
-        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+        mm::page_table::with_kernel_manager(VirtAddr::new(0), |manager| {
             verify_guard_page(
                 manager,
                 ap_double_fault_guard_page(cpu_id),

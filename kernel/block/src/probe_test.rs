@@ -6,7 +6,7 @@ use x86_64::{PhysAddr, VirtAddr};
 /// Exercise the real probe with an absent PML4 slot, a mismatched translation,
 /// and a present non-device page. No live direct-map mapping is removed.
 pub unsafe fn run_mmio_access_self_test() {
-    let absent = mm::with_current_manager(VirtAddr::new(0), |manager| {
+    let absent = mm::with_kernel_manager(VirtAddr::new(0), |manager| {
         (480u64..=509)
             .map(|index| 0xffff_0000_0000_0000 | (index << 39))
             .find(|address| manager.pml4_slot_is_unused(VirtAddr::new(*address)))

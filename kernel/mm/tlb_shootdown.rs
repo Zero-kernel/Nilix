@@ -843,22 +843,20 @@ fn collect_target_cpus(target_cr3: u64) -> CpuMask {
 /// this enqueues the request into a bounded ring buffer. The queue allows multiple
 /// requests to be batched, reducing serialization and IPI overhead.
 ///
+/// # Issue #109 §1.1 (H2): Per-Mailbox FIFO Completion Ticket
+///
+/// Under split per-address-space page-table locks, multiple CPUs can enqueue
+/// shootdowns to the same target mailbox concurrently. Returning the target
+/// mailbox's strictly monotonic FIFO ticket (`tail + 1`) from the CAS ensures
+/// `wait_for_acks` waits until `mailbox.head >= ticket`, preventing an
+/// out-of-order global generation from prematurely acknowledging an entry
+/// that the consumer has not yet flushed.
+///
 /// # R106-5 FIX: Graceful Fallback on Saturation
 ///
-/// Previously panicked when the queue was full after MAILBOX_WAIT_SPINS.
-/// Now returns `false` to signal the caller to fall back to a full TLB flush,
-/// which is safe (though less efficient). Panicking on runtime queue pressure
-/// was a user-triggerable DoS vector via rapid mmap/munmap churn.
-///
-/// Returns `true` if the request was successfully enqueued, `false` if the
-/// queue is saturated and the caller should use a full-flush fallback.
-fn enqueue_mailbox(
-    mailbox: &TlbShootdownMailbox,
-    cr3: u64,
-    start: u64,
-    len: u64,
-    generation: u64,
-) -> bool {
+/// Returns `Some(ticket)` on enqueue, or `None` when the queue is saturated so
+/// the caller falls back to a full-flush `request_gen` epoch.
+fn enqueue_mailbox(mailbox: &TlbShootdownMailbox, cr3: u64, start: u64, len: u64) -> Option<u64> {
     const MAILBOX_WAIT_SPINS: usize = 500_000;
     let mut spins = 0usize;
 
@@ -874,6 +872,8 @@ fn enqueue_mailbox(
                 .compare_exchange_weak(tail, tail + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                let ticket = tail.wrapping_add(1);
+                let pub_marker = if ticket == 0 { 1 } else { ticket };
                 // Successfully claimed slot, write entry
                 let slot = (tail as usize) % TLB_SHOOTDOWN_QUEUE_LEN;
                 let entry = &mailbox.entries[slot];
@@ -883,13 +883,9 @@ fn enqueue_mailbox(
                 entry.start.store(start, Ordering::Relaxed);
                 entry.len.store(len, Ordering::Relaxed);
 
-                // Publish entry by storing generation with Release
-                entry.generation.store(generation, Ordering::Release);
-
-                // Also update request_gen for compatibility with ACK waiting.
-                // Use fetch_max to keep it monotonic under concurrent posters.
-                mailbox.request_gen.fetch_max(generation, Ordering::Release);
-                return true;
+                // Publish entry by storing non-zero marker with Release
+                entry.generation.store(pub_marker, Ordering::Release);
+                return Some(ticket);
             }
             // CAS failed, retry
         } else {
@@ -914,7 +910,7 @@ fn enqueue_mailbox(
                     tail,
                     MAILBOX_WAIT_SPINS
                 );
-                return false;
+                return None;
             }
         }
 
@@ -922,32 +918,17 @@ fn enqueue_mailbox(
     }
 }
 
-/// Post shootdown requests to all target CPUs' mailboxes
+/// Post shootdown requests to all target CPUs' mailboxes.
 ///
-/// # R72: Queue-Based Approach
-///
-/// Uses `enqueue_mailbox` to add requests to each CPU's queue, allowing
-/// multiple requests to be batched without full serialization.
-///
-/// # R94-8 FIX: Fail-Fast on Missing Mailbox
-///
-/// Previously silently skipped CPUs with missing mailboxes. This created an
-/// inconsistent security gap: no request was posted, so no ACK was expected,
-/// making the shootdown appear to succeed without actually flushing that CPU's
-/// TLB. Stale TLB entries could then point to freed memory → use-after-free.
-///
-/// Now panics if a target CPU's mailbox is missing, since:
-/// 1. Target CPUs are collected from per-address-space tracking (only active CPUs)
-/// 2. Every active CPU must have been initialized with a mailbox
-/// 3. A missing mailbox for an active CPU indicates a critical initialization bug
-///
-/// # R106-5 FIX: Returns a mask of CPUs whose mailboxes were saturated
-///
-/// CPUs set in this mask need a full-flush fallback via the IPI handler.
-/// For these CPUs, request_gen is advanced without a queue entry so the IPI
-/// handler performs an implicit full flush when it sees request_gen > ack_gen.
-fn post_requests(targets: CpuMask, cr3: u64, start: u64, len: u64, generation: u64) -> CpuMask {
+/// Returns `(fallback_cpus, target_tickets)` where `target_tickets[cpu]` holds:
+/// - for normal queued entries (`cpu` not in `fallback_cpus`): the per-mailbox
+///   FIFO completion ticket (`tail + 1`), completed when `head >= ticket`;
+/// - for saturated-mailbox fallbacks (`cpu` in `fallback_cpus`): the per-mailbox
+///   atomic fallback epoch (`request_gen.fetch_add(1) + 1`), completed when
+///   `ack_gen >= ticket`.
+fn post_requests(targets: CpuMask, cr3: u64, start: u64, len: u64) -> (CpuMask, [u64; 64]) {
     let mut fallback_cpus = CpuMask::empty();
+    let mut target_tickets = [0u64; 64];
     for cpu in targets.iter() {
         // R94-8 FIX: A target CPU MUST have an initialized mailbox. If it doesn't,
         // this is a critical per-CPU initialization failure that would silently skip
@@ -959,15 +940,20 @@ fn post_requests(targets: CpuMask, cr3: u64, start: u64, len: u64, generation: u
                 cpu
             )
         });
-        if !enqueue_mailbox(mailbox, cr3, start, len, generation) {
-            // R106-5 FIX: Queue saturated for this CPU. Advance request_gen so
-            // the IPI handler performs a full flush when it sees the generation gap.
-            mailbox.request_gen.fetch_max(generation, Ordering::Release);
+        if let Some(ticket) = enqueue_mailbox(mailbox, cr3, start, len) {
+            target_tickets[cpu] = ticket;
+        } else {
+            // R106-5 + Issue #109 §1.1 (H2): Queue saturated for this CPU.
+            // Atomically mint a strictly-increasing per-mailbox fallback epoch
+            // so concurrent MPSC saturated senders can never suffer an
+            // out-of-order global generation race on `ack_gen`.
+            let fallback_ticket = mailbox.request_gen.fetch_add(1, Ordering::AcqRel) + 1;
+            target_tickets[cpu] = fallback_ticket;
             STATS_COALESCED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             fallback_cpus.insert(cpu);
         }
     }
-    fallback_cpus
+    (fallback_cpus, target_tickets)
 }
 
 /// Send TLB shootdown IPIs to all target CPUs
@@ -981,26 +967,31 @@ fn send_ipis(targets: CpuMask, sender: TlbIpiSender) {
 /// Number of retry attempts for ACK timeout before panicking
 const ACK_TIMEOUT_RETRIES: usize = 3;
 
+/// Issue #109 §1.1 (H2): Check whether `mailbox` has completed this sender's
+/// shootdown request. Normal queued requests complete strictly when `head >= ticket`;
+/// saturated-mailbox fallbacks complete strictly when `ack_gen >= ticket`.
+#[inline]
+fn target_mailbox_completed(mailbox: &TlbShootdownMailbox, ticket: u64, is_fallback: bool) -> bool {
+    if is_fallback {
+        mailbox.ack_gen.load(Ordering::Acquire) >= ticket
+    } else {
+        mailbox.head.load(Ordering::Acquire) >= ticket
+    }
+}
+
 /// Wait for all target CPUs to acknowledge the shootdown request
 ///
 /// Returns true if all ACKs received, false on timeout.
 ///
 /// # R93-9 FIX: Fail-Closed ACK Handling
 ///
-/// Previously used `.unwrap_or(true)` which treated missing CPU mailboxes as ACKed.
-/// This was a security vulnerability: if a CPU's per-CPU data was not properly
-/// initialized (race condition, memory corruption, etc.), the TLB shootdown would
-/// consider it "done" without actually flushing that CPU's TLB. This could leave
-/// stale TLB entries pointing to freed memory → use-after-free.
-///
-/// Now uses `.unwrap_or(false)` (fail-closed): if we cannot verify a CPU's ACK,
-/// we assume it has NOT acked. Combined with the retry/panic logic in callers,
-/// this ensures we never silently skip a CPU's TLB flush.
-fn wait_for_acks(targets: CpuMask, generation: u64) -> bool {
+/// Missing mailboxes return `false` (fail-closed) so no target CPU is ever skipped.
+fn wait_for_acks(dispatch: &ShootdownDispatch) -> bool {
     for _ in 0..IPI_ACK_TIMEOUT_SPINS {
-        let all_acked = targets.iter().all(|cpu| {
+        let all_acked = dispatch.targets.iter().all(|cpu| {
+            let is_fallback = (dispatch.fallback_cpus.0 & (1u64 << cpu)) != 0;
             mailbox_for_cpu(cpu)
-                .map(|m| m.ack_gen.load(Ordering::Acquire) >= generation)
+                .map(|m| target_mailbox_completed(m, dispatch.target_tickets[cpu], is_fallback))
                 // R93-9 FIX: Fail-closed - missing mailbox means NOT acked
                 .unwrap_or(false)
         });
@@ -1019,28 +1010,15 @@ fn wait_for_acks(targets: CpuMask, generation: u64) -> bool {
 }
 
 /// Get a mask of CPUs that haven't ACKed yet
-///
-/// # R93-9 FIX: Fail-Closed Missing Mailbox
-///
-/// Previously used `.unwrap_or(false)` which excluded CPUs with missing mailboxes
-/// from the unacked list. This was a security bug that complemented the fail-open
-/// bug in `wait_for_acks`:
-///
-/// 1. wait_for_acks treats missing mailbox as acked (returns early "success")
-/// 2. get_unacked_cpus excludes missing CPUs from unacked list (no retry/warning)
-/// 3. Result: CPU with missing mailbox silently skipped, stale TLB remains
-///
-/// Now uses `.unwrap_or(true)` (fail-closed): if we cannot verify a CPU's ACK
-/// status, we assume it has NOT acked and include it in the unacked list.
-/// This ensures the retry logic and panic path catch the problem.
-fn get_unacked_cpus(targets: CpuMask, generation: u64) -> CpuMask {
+fn get_unacked_cpus(dispatch: &ShootdownDispatch) -> CpuMask {
     let mut unacked = CpuMask::empty();
-    for cpu in targets.iter() {
-        if mailbox_for_cpu(cpu)
-            .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
+    for cpu in dispatch.targets.iter() {
+        let is_fallback = (dispatch.fallback_cpus.0 & (1u64 << cpu)) != 0;
+        let done = mailbox_for_cpu(cpu)
+            .map(|m| target_mailbox_completed(m, dispatch.target_tickets[cpu], is_fallback))
             // R93-9 FIX: Fail-closed - missing mailbox means NOT acked
-            .unwrap_or(true)
-        {
+            .unwrap_or(false);
+        if !done {
             unacked.insert(cpu);
         }
     }
@@ -1051,14 +1029,14 @@ fn get_unacked_cpus(targets: CpuMask, generation: u64) -> CpuMask {
 ///
 /// Codex review fix: On timeout, resends IPIs and retries before failing.
 /// After ACK_TIMEOUT_RETRIES attempts, panics in debug builds or warns in release.
-fn wait_for_acks_with_retry(targets: CpuMask, generation: u64, sender: TlbIpiSender) -> bool {
+fn wait_for_acks_with_retry(dispatch: &ShootdownDispatch, sender: TlbIpiSender) -> bool {
     for attempt in 0..=ACK_TIMEOUT_RETRIES {
-        if wait_for_acks(targets, generation) {
+        if wait_for_acks(dispatch) {
             return true;
         }
 
         // Get unacked CPUs for retry/logging
-        let unacked = get_unacked_cpus(targets, generation);
+        let unacked = get_unacked_cpus(dispatch);
         if unacked.is_empty() {
             return true; // All acked now
         }
@@ -1070,7 +1048,7 @@ fn wait_for_acks_with_retry(targets: CpuMask, generation: u64, sender: TlbIpiSen
             // Final timeout - this is a critical error
             kprintln!(
                 "[CRITICAL] TLB shootdown gen {} failed after {} retries. CPUs not responding: {:?}",
-                generation,
+                dispatch.generation,
                 ACK_TIMEOUT_RETRIES,
                 unacked
             );
@@ -1094,39 +1072,26 @@ fn wait_for_acks_with_retry(targets: CpuMask, generation: u64, sender: TlbIpiSen
 
 #[allow(dead_code)]
 /// Warn about timeout waiting for ACKs (non-fatal, for debugging)
-fn warn_timeout(targets: CpuMask, generation: u64) {
-    // Find which CPUs didn't ACK
-    // R163-I7 FIX: Use unwrap_or(true) for consistency with get_unacked_cpus —
-    // a missing mailbox means we cannot confirm ACK, so assume NOT acked.
-    let missing = get_unacked_cpus(targets, generation);
+fn warn_timeout(dispatch: &ShootdownDispatch) {
+    #[allow(unused_variables)]
+    let missing = get_unacked_cpus(dispatch);
 
     kprintln!(
         "[WARN] TLB shootdown gen {} timed out waiting for ACK from CPUs {:?}",
-        generation,
+        dispatch.generation,
         missing
     );
 }
 
 /// Dispatch a TLB shootdown to remote CPUs
-///
-/// Returns dispatch metadata if there are remote CPUs to notify,
-/// None if this is the only CPU.
-///
-/// # R68 Architecture Improvement
-///
-/// Now uses per-address-space tracking to target only CPUs that might have
-/// TLB entries for the current CR3, reducing unnecessary IPI traffic.
-///
-/// # R106-5 FIX: Propagates mailbox saturation info
-///
-/// The returned `ShootdownDispatch` includes a mask of CPUs whose mailboxes
-/// were saturated. Callers should perform a full local flush when this mask
-/// is non-empty to ensure correctness.
 struct ShootdownDispatch {
     targets: CpuMask,
     generation: u64,
     /// R106-5: CPUs that couldn't be enqueued (mailbox full); need full-flush fallback
     fallback_cpus: CpuMask,
+    /// Issue #109 §1.1 (H2): per-target completion ticket (`head >= ticket` for
+    /// queued entries, `ack_gen >= ticket` for saturated fallbacks).
+    target_tickets: [u64; 64],
 }
 
 fn dispatch_shootdown_for_cr3(target_cr3: u64, start: u64, len: u64) -> Option<ShootdownDispatch> {
@@ -1149,7 +1114,7 @@ fn dispatch_shootdown_for_cr3(target_cr3: u64, start: u64, len: u64) -> Option<S
 
     // Post requests to all target mailboxes. Under mailbox saturation this may
     // return a list of CPUs that need a full-flush fallback (R106-5).
-    let fallback_cpus = post_requests(targets, target_cr3, start, len, generation);
+    let (fallback_cpus, target_tickets) = post_requests(targets, target_cr3, start, len);
 
     // Send IPIs to wake up targets
     send_ipis(targets, sender);
@@ -1158,6 +1123,7 @@ fn dispatch_shootdown_for_cr3(target_cr3: u64, start: u64, len: u64) -> Option<S
         targets,
         generation,
         fallback_cpus,
+        target_tickets,
     })
 }
 
@@ -1353,41 +1319,16 @@ fn flush_all_impl(broadcast: bool) {
     flush_all_local();
 
     // Wait for remote ACKs with retry support
-    if let Some(ShootdownDispatch {
-        targets,
-        generation,
-        ..
-    }) = shoot
-    {
-        // P2-7 FIX: Use mailbox_for_cpu() with pinned CPU ID instead of
-        // current_cpu().tlb_mailbox() to prevent stale reference on migration.
-        let local_mailbox = mailbox_for_cpu(_pin.cpu_id()).unwrap_or_else(|| {
-            panic!(
-                "TLB shootdown: missing local mailbox for CPU {}",
-                _pin.cpu_id()
-            )
-        });
-        if local_mailbox.request_gen.load(Ordering::Acquire) == generation {
-            local_mailbox.ack_gen.store(generation, Ordering::Release);
-        }
-
+    if let Some(ref dispatch) = shoot {
         // Get sender for retry
         if let Some(sender) = tlb_ipi_sender() {
             // R68-5 FIX: TLB shootdown failure is FATAL - stale TLB entries are unacceptable.
-            //
-            // If any CPU fails to ACK, it may have stale TLB entries that point to:
-            // - Freed frames (use-after-free)
-            // - Wrong permissions (W^X bypass)
-            // - Other process's pages (isolation breach)
-            //
-            // We cannot safely continue. Previous behavior (warn + continue) allowed
-            // silent memory corruption in release builds.
-            if !wait_for_acks_with_retry(targets, generation, sender) {
-                let unacked = get_unacked_cpus(targets, generation);
+            if !wait_for_acks_with_retry(dispatch, sender) {
+                let unacked = get_unacked_cpus(dispatch);
                 panic!(
                     "CRITICAL: TLB shootdown gen {} failed! CPUs {:?} did not ACK. \
                      Cannot continue - stale TLB entries would cause memory corruption.",
-                    generation, unacked
+                    dispatch.generation, unacked
                 );
             }
         }
@@ -1456,36 +1397,17 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
             }
 
             // Wait for remote ACKs with retry support
-            if let Some(ShootdownDispatch {
-                targets,
-                generation,
-                ..
-            }) = shoot
-            {
-                // R71-4 FIX: Same self-ACK protection as flush_current_as_all.
-                // Only ACK if the request_gen matches to avoid accidentally
-                // acknowledging a foreign request.
-                // P2-7 FIX: Use mailbox_for_cpu() with pinned CPU ID.
-                let local_mailbox = mailbox_for_cpu(_pin.cpu_id()).unwrap_or_else(|| {
-                    panic!(
-                        "TLB shootdown: missing local mailbox for CPU {}",
-                        _pin.cpu_id()
-                    )
-                });
-                if local_mailbox.request_gen.load(Ordering::Acquire) == generation {
-                    local_mailbox.ack_gen.store(generation, Ordering::Release);
-                }
-
+            if let Some(ref dispatch) = shoot {
                 // Get sender for retry
                 if let Some(sender) = tlb_ipi_sender() {
                     // R68-5 FIX: Range flush ACK failure is also fatal.
                     // Same reasoning as flush_current_as_all - cannot allow stale TLB.
-                    if !wait_for_acks_with_retry(targets, generation, sender) {
-                        let unacked = get_unacked_cpus(targets, generation);
+                    if !wait_for_acks_with_retry(dispatch, sender) {
+                        let unacked = get_unacked_cpus(dispatch);
                         panic!(
                             "CRITICAL: TLB shootdown gen {} (range 0x{:x}+0x{:x}) failed! \
                              CPUs {:?} did not ACK. Cannot continue.",
-                            generation, aligned_start, aligned_len, unacked
+                            dispatch.generation, aligned_start, aligned_len, unacked
                         );
                     }
                 }
@@ -1603,15 +1525,10 @@ pub fn handle_shootdown_ipi() {
             flush_all_local();
         }
 
-        // ACK this generation (only if it advances ack_gen - ensures monotonicity)
-        // This prevents race where out-of-order processing could cause ack_gen
-        // to decrease, confusing waiters.
-        let current_ack = mailbox.ack_gen.load(Ordering::Acquire);
-        if generation > current_ack {
-            mailbox.ack_gen.store(generation, Ordering::Release);
-        }
-
-        // Clear entry and advance head
+        // Issue #109 §1.1 (H2): clear entry and advance head (Release) so senders
+        // waiting on `mailbox.head >= ticket` unblock strictly AFTER this slot's
+        // TLB invalidation has completed. `ack_gen` is reserved for R106-5
+        // saturated-mailbox fallback epochs (global generation space).
         entry.generation.store(0, Ordering::Release);
         mailbox.head.store(head + 1, Ordering::Release);
     }
@@ -1640,11 +1557,22 @@ static ACKS_FROM_FAULT_DRAIN: AtomicU64 = AtomicU64::new(0);
 /// disabled, which satisfies [`handle_shootdown_ipi`]'s single-consumer rule.
 pub fn drain_from_fault() {
     #[cfg(feature = "syscall_test")]
-    let acked = current_cpu().tlb_mailbox().ack_gen.load(Ordering::Acquire);
+    let (head_before, acked_before) = {
+        let mailbox = current_cpu().tlb_mailbox();
+        (
+            mailbox.head.load(Ordering::Acquire),
+            mailbox.ack_gen.load(Ordering::Acquire),
+        )
+    };
     handle_shootdown_ipi();
     #[cfg(feature = "syscall_test")]
-    if current_cpu().tlb_mailbox().ack_gen.load(Ordering::Acquire) != acked {
-        ACKS_FROM_FAULT_DRAIN.fetch_add(1, Ordering::AcqRel);
+    {
+        let mailbox = current_cpu().tlb_mailbox();
+        if mailbox.head.load(Ordering::Acquire) != head_before
+            || mailbox.ack_gen.load(Ordering::Acquire) != acked_before
+        {
+            ACKS_FROM_FAULT_DRAIN.fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1772,5 +1700,61 @@ mod tests {
             resolve_canonical_shootdown_cr3(0xA000, 0, Some((0xA000, 0xA000))),
             0
         );
+    }
+
+    /// Issue #109 §1.1 (H2) negative-control test: reproduce the MPSC out-of-order
+    /// global-generation race where Sender B (global gen=11) wins `mailbox.tail`
+    /// slot 0 and is drained BEFORE Sender A (global gen=10) enqueues slot 1.
+    ///
+    /// Under the old `ack_gen >= global_gen` check, Sender A would falsely observe
+    /// `11 >= 10` and free frames before the target CPU ever flushed slot 1.
+    /// Under the per-mailbox FIFO `head >= ticket` contract, Sender A stays blocked
+    /// until the consumer actually processes slot 1 and advances `head` to 2.
+    #[test]
+    fn mpsc_out_of_order_enqueue_ticket_prevents_premature_ack() {
+        let mailbox = TlbShootdownMailbox::new();
+
+        // Sender B (global gen=11) claims slot 0 first -> ticket 1.
+        let ticket_b = enqueue_mailbox(&mailbox, 0x2000, 0x4000, 4096).expect("slot 0");
+        assert_eq!(ticket_b, 1);
+
+        // Target CPU drains slot 0 (head: 0 -> 1). Suppose a fallback also
+        // advanced ack_gen to 11 (higher than Sender A's global gen=10).
+        let slot0 = &mailbox.entries[0];
+        assert_ne!(slot0.generation.load(Ordering::Acquire), 0);
+        slot0.generation.store(0, Ordering::Release);
+        mailbox.head.store(1, Ordering::Release);
+        mailbox.ack_gen.store(11, Ordering::Release);
+
+        // Sender B (ticket 1) is now genuinely complete.
+        assert!(target_mailbox_completed(&mailbox, ticket_b, false));
+
+        // Now Sender A (global gen=10 < ack_gen=11) claims slot 1 -> ticket 2.
+        let ticket_a = enqueue_mailbox(&mailbox, 0x1000, 0x8000, 4096).expect("slot 1");
+        assert_eq!(ticket_a, 2);
+
+        // Old buggy check (`ack_gen >= 10`) would falsely return true here!
+        assert!(mailbox.ack_gen.load(Ordering::Acquire) >= 10);
+        // New FIFO ticket check (`head >= 2`) MUST remain false until slot 1 is drained.
+        assert!(
+            !target_mailbox_completed(&mailbox, ticket_a, false),
+            "H2: out-of-order MPSC sender must NOT observe completion before its slot is drained"
+        );
+
+        // Consumer drains slot 1 (head: 1 -> 2): NOW Sender A completes.
+        let slot1 = &mailbox.entries[1];
+        assert_ne!(slot1.generation.load(Ordering::Acquire), 0);
+        slot1.generation.store(0, Ordering::Release);
+        mailbox.head.store(2, Ordering::Release);
+        assert!(target_mailbox_completed(&mailbox, ticket_a, false));
+
+        // Saturated-mailbox fallback path mints an atomic per-mailbox epoch and
+        // waits strictly on `ack_gen >= fallback_ticket`.
+        mailbox.request_gen.store(11, Ordering::Release);
+        let fallback_ticket = mailbox.request_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        assert_eq!(fallback_ticket, 12);
+        assert!(!target_mailbox_completed(&mailbox, fallback_ticket, true));
+        mailbox.ack_gen.store(12, Ordering::Release);
+        assert!(target_mailbox_completed(&mailbox, fallback_ticket, true));
     }
 }

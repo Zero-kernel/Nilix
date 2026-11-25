@@ -184,7 +184,7 @@ pub unsafe fn run_rollback_self_test() {
     mm::force_init_tlb_shootdown_locals();
 
     let probe_roots = unsafe {
-        mm::with_current_manager(VirtAddr::new(0), |mgr| {
+        mm::with_kernel_manager(VirtAddr::new(0), |mgr| {
             let mut roots = [None; CASES.len()];
             let mut found = 0usize;
             for p4_index in (FIRST_PROBE_PML4..=LAST_PROBE_PML4).rev() {
@@ -216,7 +216,7 @@ pub unsafe fn run_rollback_self_test() {
             .free_pages;
         let mut observation = GuardStackFaultObservation::default();
         let result = unsafe {
-            mm::with_current_manager(VirtAddr::new(0), |mgr| {
+            mm::with_kernel_manager(VirtAddr::new(0), |mgr| {
                 assert!(
                     mgr.pml4_slot_is_unused(VirtAddr::new(probe_root)),
                     "RF180-24 probe PML4 slot became occupied before injection"
@@ -286,7 +286,7 @@ pub unsafe fn install() -> Result<(), GuardPageError> {
     mm::force_init_tlb_shootdown_locals();
 
     // 使用当前页表管理器分配和映射栈
-    mm::with_current_manager(VirtAddr::new(0), |mgr| {
+    mm::with_kernel_manager(VirtAddr::new(0), |mgr| {
         let mut frame_alloc = mm::FrameAllocator::new();
 
         // 1. 安装内核栈（RSP0）
@@ -367,7 +367,7 @@ pub unsafe fn install() -> Result<(), GuardPageError> {
 ///
 /// Called once, on the BSP, before SMP bring-up and before `sti`.
 pub unsafe fn install_bsp_stack() -> Result<VirtAddr, GuardPageError> {
-    mm::with_current_manager(VirtAddr::new(0), |mgr| {
+    mm::with_kernel_manager(VirtAddr::new(0), |mgr| {
         let mut frame_alloc = mm::FrameAllocator::new();
         map_guarded_stack(
             mgr,
