@@ -18,8 +18,9 @@
 //! such read serializes on QEMU's global lock, which slowed 16-vCPU guests
 //! enough to change their behavior.
 
+use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const NO_OWNER: usize = usize::MAX;
 
@@ -58,47 +59,93 @@ fn cpu_token() -> usize {
     }
 }
 
-/// `spin::Mutex` with the holding CPU's token recorded while a guard is live.
+/// Spin mutex with the holding CPU's token recorded while a guard is live.
+///
+/// Issue #109 §3.1: owns `locked: AtomicBool` and `data: UnsafeCell<T>`
+/// directly so callers can construct large payloads (such as `Process`) in
+/// place inside `MaybeUninit<OwnerCpuMutex<T>>` via [`Self::init_in_place`]
+/// without staging a `T` temporary on the kernel stack.
 pub struct OwnerCpuMutex<T: ?Sized> {
     owner: AtomicUsize,
-    inner: spin::Mutex<T>,
+    locked: AtomicBool,
+    data: UnsafeCell<T>,
 }
+
+// SAFETY: Synchronizes mutable access to `T` via `locked` with Acquire/Release
+// ordering, identical to `spin::Mutex<T>`.
+unsafe impl<T: ?Sized + Send> Send for OwnerCpuMutex<T> {}
+unsafe impl<T: ?Sized + Send> Sync for OwnerCpuMutex<T> {}
 
 /// Guard of an [`OwnerCpuMutex`]; dropping it clears the owner record before
 /// the lock is released.
 pub struct OwnerCpuMutexGuard<'a, T: ?Sized + 'a> {
-    owner: &'a AtomicUsize,
-    guard: spin::MutexGuard<'a, T>,
+    lock: &'a OwnerCpuMutex<T>,
 }
+
+// Guards must be released on the same CPU/thread that acquired them.
+impl<T: ?Sized> !Send for OwnerCpuMutexGuard<'_, T> {}
+unsafe impl<T: ?Sized + Sync> Sync for OwnerCpuMutexGuard<'_, T> {}
 
 impl<T> OwnerCpuMutex<T> {
     pub const fn new(value: T) -> Self {
         Self {
             owner: AtomicUsize::new(NO_OWNER),
-            inner: spin::Mutex::new(value),
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(value),
         }
+    }
+
+    /// Initialize an `OwnerCpuMutex<T>` directly in uninitialized storage
+    /// without staging a `T` value on the caller's stack.
+    ///
+    /// # Safety
+    ///
+    /// - `slot` must point to valid, aligned, writable storage for
+    ///   `OwnerCpuMutex<T>`.
+    /// - `init_data` must completely initialize the `T` at the pointer it
+    ///   receives (and must not unwind leaving partial state unless the caller
+    ///   never assumes initialization).
+    #[inline]
+    pub unsafe fn init_in_place(slot: *mut Self, init_data: impl FnOnce(*mut T)) {
+        core::ptr::addr_of_mut!((*slot).owner).write(AtomicUsize::new(NO_OWNER));
+        core::ptr::addr_of_mut!((*slot).locked).write(AtomicBool::new(false));
+        let data_ptr = UnsafeCell::raw_get(core::ptr::addr_of!((*slot).data));
+        init_data(data_ptr);
     }
 }
 
 impl<T: ?Sized> OwnerCpuMutex<T> {
     #[inline]
     pub fn lock(&self) -> OwnerCpuMutexGuard<'_, T> {
-        let guard = self.inner.lock();
-        self.owner.store(cpu_token(), Ordering::Release);
-        OwnerCpuMutexGuard {
-            owner: &self.owner,
-            guard,
+        // Test-and-test-and-set spin loop avoids dirtying the lock cache line
+        // while contended.
+        loop {
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.owner.store(cpu_token(), Ordering::Release);
+                return OwnerCpuMutexGuard { lock: self };
+            }
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
         }
     }
 
     #[inline]
     pub fn try_lock(&self) -> Option<OwnerCpuMutexGuard<'_, T>> {
-        let guard = self.inner.try_lock()?;
-        self.owner.store(cpu_token(), Ordering::Release);
-        Some(OwnerCpuMutexGuard {
-            owner: &self.owner,
-            guard,
-        })
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.owner.store(cpu_token(), Ordering::Release);
+            Some(OwnerCpuMutexGuard { lock: self })
+        } else {
+            None
+        }
     }
 
     /// Whether the calling CPU holds this lock: a try-lock failure the caller
@@ -113,26 +160,37 @@ impl<T: ?Sized> OwnerCpuMutex<T> {
 
     #[inline]
     pub fn is_locked(&self) -> bool {
-        self.inner.is_locked()
+        self.locked.load(Ordering::Relaxed)
     }
 
     #[inline]
     pub fn get_mut(&mut self) -> &mut T {
-        self.inner.get_mut()
+        self.data.get_mut()
     }
 }
 
 impl<T: ?Sized + core::fmt::Debug> core::fmt::Debug for OwnerCpuMutex<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.inner.fmt(f)
+        match self.try_lock() {
+            Some(guard) => f
+                .debug_struct("OwnerCpuMutex")
+                .field("data", &&*guard)
+                .finish(),
+            None => f
+                .debug_struct("OwnerCpuMutex")
+                .field("data", &"<locked>")
+                .finish(),
+        }
     }
 }
 
 impl<T: ?Sized> Drop for OwnerCpuMutexGuard<'_, T> {
+    #[inline]
     fn drop(&mut self) {
-        // Runs before `guard` is dropped, so the record never names a CPU that
-        // has already released the lock.
-        self.owner.store(NO_OWNER, Ordering::Release);
+        // Clear owner record strictly before releasing the lock, so the record
+        // never names a CPU that has already released the lock.
+        self.lock.owner.store(NO_OWNER, Ordering::Release);
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 
@@ -141,20 +199,23 @@ impl<T: ?Sized> Deref for OwnerCpuMutexGuard<'_, T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        &self.guard
+        // SAFETY: Guard holds exclusive access to `self.lock.data`.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for OwnerCpuMutexGuard<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
+        // SAFETY: Guard holds exclusive access to `self.lock.data`.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem::MaybeUninit;
 
     #[test]
     fn st_k2_p2_owner_is_recorded_while_held_and_cleared_on_release() {
@@ -185,5 +246,31 @@ mod tests {
         assert!(lock.try_lock().is_some());
         assert!(!lock.held_by_current_cpu());
         assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn init_in_place_initializes_mutex_without_staging_payload() {
+        let mut storage: MaybeUninit<OwnerCpuMutex<[u64; 16]>> = MaybeUninit::uninit();
+        unsafe {
+            OwnerCpuMutex::init_in_place(storage.as_mut_ptr(), |arr_ptr| {
+                let elem = arr_ptr as *mut u64;
+                for i in 0..16usize {
+                    elem.add(i).write((i as u64) * 3 + 1);
+                }
+            });
+            let mutex = storage.assume_init();
+            assert!(!mutex.is_locked());
+            assert!(!mutex.held_by_current_cpu());
+            {
+                let mut g = mutex.lock();
+                assert!(mutex.held_by_current_cpu());
+                assert_eq!(g[0], 1);
+                assert_eq!(g[15], 46);
+                g[3] = 99;
+            }
+            assert!(!mutex.is_locked());
+            assert!(!mutex.held_by_current_cpu());
+            assert_eq!(mutex.lock()[3], 99);
+        }
     }
 }
