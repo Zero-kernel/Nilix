@@ -32,7 +32,9 @@ use lazy_static::lazy_static;
 use mm::tlb_shootdown;
 use x86_64::instructions::interrupts as x86_interrupts;
 use x86_64::registers::control::{Cr0, Cr0Flags};
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::idt::{
+    InterruptDescriptorTable, InterruptStackFrameValue, PageFaultErrorCode,
+};
 
 // G.1 Observability: Per-CPU counter integration
 use trace::counters::{increment_counter, TraceCounter};
@@ -430,78 +432,482 @@ pub fn iommu_probe_irq_count() -> u64 {
 }
 
 #[cfg(feature = "iommu_device_probe")]
-extern "x86-interrupt" fn iommu_probe_irq(_frame: InterruptStackFrame) {
+extern "C" fn iommu_probe_irq(_frame: &mut InterruptStackFrameValue) {
     IOMMU_PROBE_IRQS.fetch_add(1, Ordering::Release);
     unsafe { crate::apic::lapic_eoi() };
 }
+
+// ============================================================================
+// Issue #109 §2.1: Unified full-IDT SWAPGS + KPTI naked entry/exit stubs
+// ============================================================================
+//
+// Ring-0 GS-base per-CPU addressing (`gs:[80]` = cpu_id+1, `gs:[88]` = &PerCpuData)
+// requires `IA32_GS_BASE == &SYSCALL_PERCPU[cpu]` on EVERY Ring-0 instruction in
+// EVERY IDT vector, not just SYSCALL and the timer IRQ.
+//
+// Two stub families cover all 26 non-timer IDT vectors:
+// 1. Normal vectors (CS-RPL-gated): when `CS & 3 != 0` (came from Ring 3), execute
+//    `swapgs; lfence` and switch `kpti_user_cr3 -> kpti_kernel_cr3` on entry, and
+//    reverse (`kpti_kernel_cr3 -> kpti_user_cr3; swapgs`) before `iretq`. Ring-0
+//    entries skip both. Mirrors `timer_interrupt_stub`.
+// 2. Paranoid vectors (`#NMI`, `#DB`, `#MC`, `#DF`): can fire inside a `swapgs` or
+//    KPTI-switch window where `CS.RPL == 0` while user `GS_BASE` or `user_cr3` is
+//    still loaded. Check `IA32_GS_BASE` bit 63 (kernel canonical high-half) and
+//    `IA32_KERNEL_GS_BASE` bit 63 via `rdmsr`, saving swap/CR3 state in callee-saved
+//    `r12`/`r13`/`r14` across the Rust body call and restoring on exit.
+//
+// Preconditions:
+// - User `IA32_GS_BASE` is enforced `< 0x0000_8000_0000_0000` (bit 63 == 0) by
+//   `arch_prctl(ARCH_SET_GS)` and `CR4.FSGSBASE == 0` on BSP and every AP.
+// - Kernel `&SYSCALL_PERCPU[cpu]` is always in canonical high-half (bit 63 == 1).
+
+macro_rules! define_idt_stub_no_err {
+    ($(#[$meta:meta])* $stub:ident, $body:ident) => {
+        $(#[$meta])*
+        #[unsafe(naked)]
+        unsafe extern "C" fn $stub() -> ! {
+            core::arch::naked_asm!(
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                // CS sits at [rsp + IRQ_GPR_FRAME_BYTES + 8] (no hardware error code).
+                "mov rax, [rsp + {gpr_bytes} + 8]",
+                "test al, 3",
+                "jz 1f",
+                "swapgs",
+                "lfence",
+                "mov rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+                "test rax, rax",
+                "jz 1f",
+                "cmp rax, qword ptr gs:[{percpu_kpti_user_cr3}]",
+                "je 1f",
+                "mov cr3, rax",
+                "1:",
+                // rdi = &mut InterruptStackFrameValue
+                "lea rdi, [rsp + {gpr_bytes}]",
+                "mov rbp, rsp",
+                "and rsp, -16",
+                "call {body}",
+                "mov rsp, rbp",
+                "mov rax, [rsp + {gpr_bytes} + 8]",
+                "test al, 3",
+                "jz 2f",
+                "mov rax, qword ptr gs:[{percpu_kpti_user_cr3}]",
+                "test rax, rax",
+                "jz 3f",
+                "cmp rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+                "je 3f",
+                "mov cr3, rax",
+                "3:",
+                "swapgs",
+                "2:",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "iretq",
+                gpr_bytes = const IRQ_GPR_FRAME_BYTES,
+                percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+                percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
+                body = sym $body,
+            );
+        }
+    };
+}
+
+macro_rules! define_idt_stub_err {
+    ($(#[$meta:meta])* $stub:ident, $body:ident) => {
+        $(#[$meta])*
+        #[unsafe(naked)]
+        unsafe extern "C" fn $stub() -> ! {
+            core::arch::naked_asm!(
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                // Hardware error code is at [rsp + IRQ_GPR_FRAME_BYTES],
+                // InterruptStackFrameValue starts at [rsp + IRQ_GPR_FRAME_BYTES + 8],
+                // and CS sits at [rsp + IRQ_GPR_FRAME_BYTES + 16].
+                "mov rax, [rsp + {gpr_bytes} + 16]",
+                "test al, 3",
+                "jz 1f",
+                "swapgs",
+                "lfence",
+                "mov rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+                "test rax, rax",
+                "jz 1f",
+                "cmp rax, qword ptr gs:[{percpu_kpti_user_cr3}]",
+                "je 1f",
+                "mov cr3, rax",
+                "1:",
+                // rdi = &mut InterruptStackFrameValue, rsi = error_code
+                "lea rdi, [rsp + {gpr_bytes} + 8]",
+                "mov rsi, [rsp + {gpr_bytes}]",
+                "mov rbp, rsp",
+                "and rsp, -16",
+                "call {body}",
+                "mov rsp, rbp",
+                "mov rax, [rsp + {gpr_bytes} + 16]",
+                "test al, 3",
+                "jz 2f",
+                "mov rax, qword ptr gs:[{percpu_kpti_user_cr3}]",
+                "test rax, rax",
+                "jz 3f",
+                "cmp rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+                "je 3f",
+                "mov cr3, rax",
+                "3:",
+                "swapgs",
+                "2:",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                // Discard CPU-pushed error code before IRETQ.
+                "add rsp, 8",
+                "iretq",
+                gpr_bytes = const IRQ_GPR_FRAME_BYTES,
+                percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+                percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
+                body = sym $body,
+            );
+        }
+    };
+}
+
+macro_rules! define_paranoid_idt_stub_no_err {
+    ($(#[$meta:meta])* $stub:ident, $body:ident) => {
+        $(#[$meta])*
+        #[unsafe(naked)]
+        unsafe extern "C" fn $stub() -> ! {
+            core::arch::naked_asm!(
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                // r12d = 1 iff entry executed swapgs; r14d = 1 iff entry switched CR3 (saved in r13).
+                "xor r12d, r12d",
+                "xor r14d, r14d",
+                // Inspect IA32_GS_BASE (0xC0000101) bit 63 (edx bit 31).
+                "mov ecx, 0xC0000101",
+                "rdmsr",
+                "test edx, edx",
+                "js 1f",
+                // Low-half GS_BASE: check if IA32_KERNEL_GS_BASE (0xC0000102) holds kernel pointer.
+                "mov ecx, 0xC0000102",
+                "rdmsr",
+                "test edx, edx",
+                "jns 2f",
+                "swapgs",
+                "lfence",
+                "mov r12d, 1",
+                "1:",
+                // Kernel GS is active; ensure kernel KPTI CR3 is loaded.
+                "mov rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+                "test rax, rax",
+                "jz 2f",
+                "mov r13, cr3",
+                "cmp r13, rax",
+                "je 2f",
+                "mov cr3, rax",
+                "mov r14d, 1",
+                "2:",
+                "lea rdi, [rsp + {gpr_bytes}]",
+                "mov rbp, rsp",
+                "and rsp, -16",
+                "call {body}",
+                "mov rsp, rbp",
+                // Paranoid exit: restore CR3 first, then swapgs if entry swapped.
+                "test r14d, r14d",
+                "jz 3f",
+                "mov cr3, r13",
+                "3:",
+                "test r12d, r12d",
+                "jz 4f",
+                "swapgs",
+                "lfence",
+                "4:",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "iretq",
+                gpr_bytes = const IRQ_GPR_FRAME_BYTES,
+                percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+                body = sym $body,
+            );
+        }
+    };
+}
+
+macro_rules! define_paranoid_idt_stub_err {
+    ($(#[$meta:meta])* $stub:ident, $body:ident) => {
+        $(#[$meta])*
+        #[unsafe(naked)]
+        unsafe extern "C" fn $stub() -> ! {
+            core::arch::naked_asm!(
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "xor r12d, r12d",
+                "xor r14d, r14d",
+                "mov ecx, 0xC0000101",
+                "rdmsr",
+                "test edx, edx",
+                "js 1f",
+                "mov ecx, 0xC0000102",
+                "rdmsr",
+                "test edx, edx",
+                "jns 2f",
+                "swapgs",
+                "lfence",
+                "mov r12d, 1",
+                "1:",
+                "mov rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+                "test rax, rax",
+                "jz 2f",
+                "mov r13, cr3",
+                "cmp r13, rax",
+                "je 2f",
+                "mov cr3, rax",
+                "mov r14d, 1",
+                "2:",
+                "lea rdi, [rsp + {gpr_bytes} + 8]",
+                "mov rsi, [rsp + {gpr_bytes}]",
+                "mov rbp, rsp",
+                "and rsp, -16",
+                "call {body}",
+                "mov rsp, rbp",
+                "test r14d, r14d",
+                "jz 3f",
+                "mov cr3, r13",
+                "3:",
+                "test r12d, r12d",
+                "jz 4f",
+                "swapgs",
+                "lfence",
+                "4:",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "add rsp, 8",
+                "iretq",
+                gpr_bytes = const IRQ_GPR_FRAME_BYTES,
+                percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+                body = sym $body,
+            );
+        }
+    };
+}
+
+// Normal exceptions without hardware error code (9 vectors)
+define_idt_stub_no_err!(divide_error_stub, divide_error_handler);
+define_idt_stub_no_err!(breakpoint_stub, breakpoint_handler);
+define_idt_stub_no_err!(overflow_stub, overflow_handler);
+define_idt_stub_no_err!(bound_range_exceeded_stub, bound_range_exceeded_handler);
+define_idt_stub_no_err!(invalid_opcode_stub, invalid_opcode_handler);
+define_idt_stub_no_err!(device_not_available_stub, device_not_available_handler);
+define_idt_stub_no_err!(x87_floating_point_stub, x87_floating_point_handler);
+define_idt_stub_no_err!(simd_floating_point_stub, simd_floating_point_handler);
+define_idt_stub_no_err!(virtualization_stub, virtualization_handler);
+
+// Normal exceptions with hardware error code (6 vectors)
+define_idt_stub_err!(invalid_tss_stub, invalid_tss_handler);
+define_idt_stub_err!(segment_not_present_stub, segment_not_present_handler);
+define_idt_stub_err!(stack_segment_fault_stub, stack_segment_fault_handler);
+define_idt_stub_err!(
+    general_protection_fault_stub,
+    general_protection_fault_handler
+);
+define_idt_stub_err!(page_fault_stub, page_fault_handler);
+define_idt_stub_err!(alignment_check_stub, alignment_check_handler);
+
+// Paranoid exceptions: NMI, #DB, #MC (no error code) and #DF (with error code)
+define_paranoid_idt_stub_no_err!(debug_stub, debug_handler);
+define_paranoid_idt_stub_no_err!(nmi_stub, nmi_handler);
+define_paranoid_idt_stub_no_err!(machine_check_stub, machine_check_handler);
+define_paranoid_idt_stub_err!(double_fault_stub, double_fault_handler);
+
+// Hardware IRQs & IPIs (all without hardware error code; timer uses timer_interrupt_stub)
+define_idt_stub_no_err!(keyboard_interrupt_stub, keyboard_interrupt_handler);
+define_idt_stub_no_err!(
+    #[cfg(feature = "iommu_device_probe")]
+    iommu_probe_irq_stub,
+    iommu_probe_irq
+);
+define_idt_stub_no_err!(serial_interrupt_stub, serial_interrupt_handler);
+define_idt_stub_no_err!(reschedule_ipi_stub, reschedule_ipi_handler);
+define_idt_stub_no_err!(tlb_shootdown_ipi_stub, tlb_shootdown_ipi_handler);
+define_idt_stub_no_err!(panic_ipi_stub, panic_ipi_handler);
+define_idt_stub_no_err!(spurious_interrupt_stub, spurious_interrupt_handler);
 
 lazy_static! {
     /// 全局中断描述符表
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
 
-        // CPU异常处理器 (0-31)
-        idt.divide_error.set_handler_fn(divide_error_handler);
-        idt.debug.set_handler_fn(debug_handler);
-        // R148-I5 FIX: NMI uses a dedicated IST stack to prevent stack corruption
-        // when NMI fires during other exception handlers with a near-full kernel stack.
+        // Issue #109 §2.1: ALL 27 IDT entries target naked SWAPGS/KPTI stubs so
+        // `IA32_GS_BASE == &SYSCALL_PERCPU[cpu]` holds across every Ring-0 vector.
+        // SAFETY: Every stub is a valid naked interrupt/exception entry in kernel .text
+        // that saves/restores all 15 GPRs, establishes kernel GS/KPTI CR3 on entry,
+        // pops any hardware error code, and exits via IRETQ (or diverges for #DF/#MC).
         unsafe {
+            // CPU异常处理器 (0-31)
+            idt.divide_error.set_handler_addr(x86_64::VirtAddr::new(divide_error_stub as u64));
+            idt.debug.set_handler_addr(x86_64::VirtAddr::new(debug_stub as u64));
+            // R148-I5 FIX: NMI uses a dedicated IST stack to prevent stack corruption
+            // when NMI fires during other exception handlers with a near-full kernel stack.
             idt.non_maskable_interrupt
-                .set_handler_fn(nmi_handler)
+                .set_handler_addr(x86_64::VirtAddr::new(nmi_stub as u64))
                 .set_stack_index(gdt::NMI_IST_INDEX);
-        }
-        idt.breakpoint.set_handler_fn(breakpoint_handler);
-        idt.overflow.set_handler_fn(overflow_handler);
-        idt.bound_range_exceeded.set_handler_fn(bound_range_exceeded_handler);
-        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-        idt.device_not_available.set_handler_fn(device_not_available_handler);
+            idt.breakpoint.set_handler_addr(x86_64::VirtAddr::new(breakpoint_stub as u64));
+            idt.overflow.set_handler_addr(x86_64::VirtAddr::new(overflow_stub as u64));
+            idt.bound_range_exceeded
+                .set_handler_addr(x86_64::VirtAddr::new(bound_range_exceeded_stub as u64));
+            idt.invalid_opcode
+                .set_handler_addr(x86_64::VirtAddr::new(invalid_opcode_stub as u64));
+            idt.device_not_available
+                .set_handler_addr(x86_64::VirtAddr::new(device_not_available_stub as u64));
 
-        // 双重错误使用 IST 栈，防止栈溢出导致三重错误
-        unsafe {
+            // 双重错误使用 IST 栈，防止栈溢出导致三重错误
             idt.double_fault
-                .set_handler_fn(double_fault_handler)
+                .set_handler_addr(x86_64::VirtAddr::new(double_fault_stub as u64))
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
-        }
 
-        idt.invalid_tss.set_handler_fn(invalid_tss_handler);
-        idt.segment_not_present.set_handler_fn(segment_not_present_handler);
-        idt.stack_segment_fault.set_handler_fn(stack_segment_fault_handler);
-        idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
-        idt.page_fault.set_handler_fn(page_fault_handler);
-        idt.x87_floating_point.set_handler_fn(x87_floating_point_handler);
-        idt.alignment_check.set_handler_fn(alignment_check_handler);
-        idt.machine_check.set_handler_fn(machine_check_handler);
-        idt.simd_floating_point.set_handler_fn(simd_floating_point_handler);
-        idt.virtualization.set_handler_fn(virtualization_handler);
+            idt.invalid_tss.set_handler_addr(x86_64::VirtAddr::new(invalid_tss_stub as u64));
+            idt.segment_not_present
+                .set_handler_addr(x86_64::VirtAddr::new(segment_not_present_stub as u64));
+            idt.stack_segment_fault
+                .set_handler_addr(x86_64::VirtAddr::new(stack_segment_fault_stub as u64));
+            idt.general_protection_fault
+                .set_handler_addr(x86_64::VirtAddr::new(general_protection_fault_stub as u64));
+            idt.page_fault.set_handler_addr(x86_64::VirtAddr::new(page_fault_stub as u64));
+            idt.x87_floating_point
+                .set_handler_addr(x86_64::VirtAddr::new(x87_floating_point_stub as u64));
+            idt.alignment_check
+                .set_handler_addr(x86_64::VirtAddr::new(alignment_check_stub as u64));
+            idt.machine_check
+                .set_handler_addr(x86_64::VirtAddr::new(machine_check_stub as u64));
+            idt.simd_floating_point
+                .set_handler_addr(x86_64::VirtAddr::new(simd_floating_point_stub as u64));
+            idt.virtualization
+                .set_handler_addr(x86_64::VirtAddr::new(virtualization_stub as u64));
 
-        // 硬件中断处理器 (32-255)
-        // M0-7 SLICE 3a: the timer vector targets the naked GPR-saving stub (NOT an
-        // extern "x86-interrupt" fn) so the full user GPR set is captured for SLICE 3b's
-        // preemptive signal delivery. set_handler_addr installs the raw stub address; the
-        // gate type/DPL/present default to an interrupt gate (DPL 0), matching the other
-        // IRQ vectors. The stub does NO swapgs (the body is GS-independent — see the stub
-        // doc). All OTHER vectors + IST entries (NMI/#DF/page_fault) keep set_handler_fn.
-        // SAFETY: timer_interrupt_stub is a valid naked interrupt entry that saves/restores
-        // all GPRs and iretqs; its address is a real fn pointer in kernel .text.
-        unsafe {
+            // 硬件中断处理器 (32-255)
+            // IRQ 0: Timer (also passes &mut IrqGprFrame for preemptive signal delivery)
             idt[32].set_handler_addr(x86_64::VirtAddr::new(timer_interrupt_stub as u64));
-            // IRQ 0: Timer
+            // IRQ 1: Keyboard
+            idt[33].set_handler_addr(x86_64::VirtAddr::new(keyboard_interrupt_stub as u64));
+            #[cfg(feature = "iommu_device_probe")]
+            idt[0x31].set_handler_addr(x86_64::VirtAddr::new(iommu_probe_irq_stub as u64));
+            // IRQ 4: Serial COM1
+            idt[36].set_handler_addr(x86_64::VirtAddr::new(serial_interrupt_stub as u64));
+
+            // IPI handlers (high vectors)
+            idt[ipi::IPI_VECTOR_RESCHEDULE]
+                .set_handler_addr(x86_64::VirtAddr::new(reschedule_ipi_stub as u64));
+            idt[ipi::IPI_VECTOR_TLB_SHOOTDOWN]
+                .set_handler_addr(x86_64::VirtAddr::new(tlb_shootdown_ipi_stub as u64));
+            // R120-3 FIX: Register panic IPI handler (vector 0xFD, moved from 0xFF)
+            idt[ipi::IPI_VECTOR_PANIC]
+                .set_handler_addr(x86_64::VirtAddr::new(panic_ipi_stub as u64));
+
+            // R120-3 FIX: LAPIC Spurious Interrupt Vector (SIVR = 0xFF).
+            // Per Intel SDM Vol. 3A Section 10.9, spurious interrupts must NOT
+            // receive EOI. This handler is intentionally a no-op.
+            idt[0xFF].set_handler_addr(x86_64::VirtAddr::new(spurious_interrupt_stub as u64));
         }
-        idt[33].set_handler_fn(keyboard_interrupt_handler);   // IRQ 1: Keyboard
-        #[cfg(feature = "iommu_device_probe")]
-        idt[0x31].set_handler_fn(iommu_probe_irq);
-        idt[36].set_handler_fn(serial_interrupt_handler);     // IRQ 4: Serial COM1
-
-        // IPI handlers (high vectors)
-        idt[ipi::IPI_VECTOR_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
-        idt[ipi::IPI_VECTOR_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
-        // R120-3 FIX: Register panic IPI handler (vector 0xFD, moved from 0xFF)
-        idt[ipi::IPI_VECTOR_PANIC].set_handler_fn(panic_ipi_handler);
-
-        // R120-3 FIX: LAPIC Spurious Interrupt Vector (SIVR = 0xFF).
-        // Per Intel SDM Vol. 3A Section 10.9, spurious interrupts must NOT
-        // receive EOI. This handler is intentionally a no-op.
-        idt[0xFF].set_handler_fn(spurious_interrupt_handler);
 
         idt
     };
@@ -623,39 +1029,6 @@ pub fn get_stats() -> InterruptStatsSnapshot {
 // CPU异常处理器 (0-31)
 // ============================================================================
 
-/// RF178-1 / P1-A FIX: Fatal Ring-3 exception paths do not return through a
-/// normal epilogue, so establish kernel GS and the kernel KPTI root before they
-/// enter process teardown or the scheduler.
-///
-/// # Contract (D1-ARC-ENTRY-STATE)
-///
-/// - Call **only** when the exception/IRQ originated from CPL3 (CS.RPL==3) **or**
-///   when the path is known no-return and kernel GS is required for
-///   `force_reschedule_from_irq` / KPTI loads.
-/// - **Do not** call on recoverable paths that return via IRET to user: the
-///   `x86-interrupt` ABI does **not** auto-swapgs, so an unpaired swap leaves
-///   user IRET with kernel GS (or double-swaps on next entry).
-/// - Idempotent w.r.t. CR3 when already on the kernel root.
-#[inline]
-pub unsafe fn enter_kernel_state_from_user_exception() {
-    core::arch::asm!(
-        "swapgs",
-        "lfence",
-        "mov rax, qword ptr gs:[{kernel_cr3}]",
-        "test rax, rax",
-        "jz 2f",
-        "mov rcx, cr3",
-        "cmp rcx, rax",
-        "je 2f",
-        "mov cr3, rax",
-        "2:",
-        kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
-        out("rax") _,
-        out("rcx") _,
-        options(nostack)
-    );
-}
-
 /// R107-1 FIX: Shared helper for user-mode exception discrimination.
 ///
 /// Checks whether the CPU exception originated from Ring 3 (user-mode) by
@@ -681,7 +1054,7 @@ pub unsafe fn enter_kernel_state_from_user_exception() {
 /// | SIGFPE | 8 | 136 | #DE, #OF, #MF, #XM |
 /// | SIGSEGV | 11 | 139 | #BR, #GP |
 #[inline]
-fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> bool {
+fn handle_user_exception(stack_frame: &InterruptStackFrameValue, exit_code: i32) -> bool {
     // CS selector low 2 bits = RPL (Ring Privilege Level).
     // RPL == 3 indicates the exception occurred in user-mode (Ring 3).
     let is_user_mode = (stack_frame.code_segment.0 & 0x3) == 3;
@@ -689,8 +1062,9 @@ fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> b
         return false;
     }
 
-    // SAFETY: CS.RPL above proves this exception crossed from Ring 3.
-    unsafe { enter_kernel_state_from_user_exception() };
+    // Issue #109 §2.1: the naked IDT entry stub already established kernel GS
+    // and the kernel KPTI root on Ring-3 entry; assert rather than double-swapping.
+    crate::syscall::assert_kernel_gs_base();
     if let Some(pid) = current_pid() {
         // R116-1 FIX: After terminate_process(), we MUST NOT return to the caller.
         // The x86-interrupt ABI will IRET back to the faulting user instruction,
@@ -718,7 +1092,7 @@ fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> b
 /// Must be called at the end of the handler, after all exception-specific work
 /// (e.g., FPU state management for #NM) is complete.
 #[inline]
-fn check_pending_kill_on_exception_return(stack_frame: &InterruptStackFrame) {
+fn check_pending_kill_on_exception_return(stack_frame: &InterruptStackFrameValue) {
     // Only check if returning to user-mode (CS.RPL == 3).
     let returning_to_user = (stack_frame.code_segment.0 & 0x3) == 3;
     if !returning_to_user {
@@ -727,8 +1101,8 @@ fn check_pending_kill_on_exception_return(stack_frame: &InterruptStackFrame) {
 
     if let Some(pid) = current_pid() {
         if let Some(exit_code) = kernel_core::process::take_pending_process_exit(pid) {
-            // SAFETY: returning_to_user proves the handler entered from Ring 3.
-            unsafe { enter_kernel_state_from_user_exception() };
+            // Issue #109 §2.1: entry stub already established kernel GS + KPTI root.
+            crate::syscall::assert_kernel_gs_base();
             kernel_core::process::terminate_self_and_halt(pid, exit_code);
         }
     }
@@ -738,11 +1112,11 @@ fn check_pending_kill_on_exception_return(stack_frame: &InterruptStackFrame) {
 ///
 /// R107-1 FIX: Check user-mode origin before panicking. User-mode divide-by-zero
 /// terminates the process with SIGFPE (exit code 136) instead of crashing the kernel.
-extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn divide_error_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     INTERRUPT_STATS.divide_error.fetch_add(1, Ordering::Relaxed);
     // R107-1 FIX: User-mode #DE → terminate process with SIGFPE (128 + 8 = 136)
-    if handle_user_exception(&stack_frame, 136) {
+    if handle_user_exception(stack_frame, 136) {
         return;
     }
     panic!("Divide by zero or division overflow");
@@ -753,7 +1127,7 @@ extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame)
 /// R174-A3 FIX: Clear debug registers before returning to user mode to prevent
 /// KASLR bypass. User processes can set DR0-DR3 to kernel addresses; when #DB
 /// fires, those addresses would leak if not cleared.
-extern "x86-interrupt" fn debug_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn debug_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
 
     // R174-A3 FIX: Clear debug registers if returning to user mode (CS.RPL == 3)
@@ -787,11 +1161,11 @@ extern "x86-interrupt" fn debug_handler(stack_frame: InterruptStackFrame) {
 
     // 调试异常：静默处理
     // R117-4 FIX: Check pending_kill before returning to user-mode.
-    check_pending_kill_on_exception_return(&stack_frame);
+    check_pending_kill_on_exception_return(stack_frame);
 }
 
 /// #NMI - Non-Maskable Interrupt (不可屏蔽中断)
-extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn nmi_handler(_stack_frame: &mut InterruptStackFrameValue) {
     // R187-2 FIX: NMI delivery does not reliably clear RFLAGS.IF and bypasses
     // the ordinary IRQ nesting counter. Account it explicitly so KCOV's
     // task-context admission rejects every NMI before a CPU pin or mutex probe.
@@ -802,22 +1176,22 @@ extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
 }
 
 /// #BP - Breakpoint (断点)
-extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn breakpoint_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     INTERRUPT_STATS.breakpoint.fetch_add(1, Ordering::Relaxed);
     // 断点异常：通常用于调试，静默处理
     // R117-4 FIX: Check pending_kill before returning to user-mode.
-    check_pending_kill_on_exception_return(&stack_frame);
+    check_pending_kill_on_exception_return(stack_frame);
 }
 
 /// #OF - Overflow (溢出)
 ///
 /// R107-1 FIX: User-mode overflow terminates process with SIGFPE instead of kernel panic.
-extern "x86-interrupt" fn overflow_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn overflow_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     INTERRUPT_STATS.overflow.fetch_add(1, Ordering::Relaxed);
     // R107-1 FIX: User-mode #OF → terminate process with SIGFPE (128 + 8 = 136)
-    if handle_user_exception(&stack_frame, 136) {
+    if handle_user_exception(stack_frame, 136) {
         return;
     }
     panic!("Arithmetic overflow");
@@ -826,13 +1200,13 @@ extern "x86-interrupt" fn overflow_handler(stack_frame: InterruptStackFrame) {
 /// #BR - Bound Range Exceeded (边界范围超出)
 ///
 /// R107-1 FIX: User-mode bound violation terminates process with SIGSEGV instead of kernel panic.
-extern "x86-interrupt" fn bound_range_exceeded_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn bound_range_exceeded_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     INTERRUPT_STATS
         .bound_range_exceeded
         .fetch_add(1, Ordering::Relaxed);
     // R107-1 FIX: User-mode #BR → terminate process with SIGSEGV (128 + 11 = 139)
-    if handle_user_exception(&stack_frame, 139) {
+    if handle_user_exception(stack_frame, 139) {
         return;
     }
     panic!("Bound range exceeded");
@@ -842,13 +1216,13 @@ extern "x86-interrupt" fn bound_range_exceeded_handler(stack_frame: InterruptSta
 ///
 /// R107-1 FIX: User-mode invalid opcode terminates process with SIGILL instead of kernel panic.
 /// R107-4 FIX: Serial output guarded by `#[cfg(debug_assertions)]` to prevent KASLR bypass.
-extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn invalid_opcode_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     INTERRUPT_STATS
         .invalid_opcode
         .fetch_add(1, Ordering::Relaxed);
     // R107-1 FIX: User-mode #UD → terminate process with SIGILL (128 + 4 = 132)
-    if handle_user_exception(&stack_frame, 132) {
+    if handle_user_exception(stack_frame, 132) {
         return;
     }
     // R107-4 FIX: Only output RIP/RSP in debug builds to avoid leaking kernel addresses
@@ -883,7 +1257,7 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
 ///
 /// This is more efficient than eager save/restore because many processes
 /// never use FPU between context switches.
-extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn device_not_available_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
 
     // Clear CR0.TS to allow FPU instructions in the handler
@@ -930,7 +1304,7 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
         if prev_owner == current {
             per_cpu.set_fpu_owner(current);
             // R117-4 FIX: Check pending_kill after FPU state is settled.
-            check_pending_kill_on_exception_return(&stack_frame);
+            check_pending_kill_on_exception_return(stack_frame);
             return;
         }
 
@@ -1011,24 +1385,21 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
 
         // R117-4 FIX: Check pending_kill after FPU state is settled.
         // R174-A1: This check is now IRQ-masked (was previously unmasked).
-        check_pending_kill_on_exception_return(&stack_frame);
+        check_pending_kill_on_exception_return(stack_frame);
     });
 }
 
 /// #DF - Double Fault (双重错误)
-extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: InterruptStackFrame,
+extern "C" fn double_fault_handler(
+    stack_frame: &mut InterruptStackFrameValue,
     _error_code: u64,
 ) -> ! {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
-    // P1-A D1-ARC-ENTRY-STATE: #DF uses IST and can originate from Ring-3 (e.g.
-    // bad user RSP + nested fault). Establish kernel GS/CR3 before diagnostics
-    // or any gs:[percpu_*] access. No-return path — unpaired swapgs is fine.
-    if (stack_frame.code_segment.0 & 0x3) == 3 {
-        unsafe { enter_kernel_state_from_user_exception() };
-    }
+    // Issue #109 §2.1: paranoid #DF stub already established kernel GS + KPTI root
+    // regardless of whether #DF originated from Ring 3, Ring 0, or a swapgs window.
+    crate::syscall::assert_kernel_gs_base();
 
     // L-7 fix: Only output detailed state in debug builds to avoid
     // leaking kernel addresses (KASLR bypass prevention)
@@ -1053,10 +1424,10 @@ extern "x86-interrupt" fn double_fault_handler(
 ///
 /// R151-4 FIX: User-mode #TS terminates the process with SIGSEGV instead of
 /// crashing the kernel (mirrors the #GP handler pattern).
-extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, _error_code: u64) {
+extern "C" fn invalid_tss_handler(stack_frame: &mut InterruptStackFrameValue, _error_code: u64) {
     clac_if_smap();
     INTERRUPT_STATS.invalid_tss.fetch_add(1, Ordering::Relaxed);
-    if handle_user_exception(&stack_frame, 139) {
+    if handle_user_exception(stack_frame, 139) {
         return;
     }
     panic!("Invalid Task State Segment");
@@ -1066,15 +1437,15 @@ extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, 
 ///
 /// R151-4 FIX: User-mode #NP terminates the process with SIGSEGV instead of
 /// crashing the kernel (mirrors the #GP handler pattern).
-extern "x86-interrupt" fn segment_not_present_handler(
-    stack_frame: InterruptStackFrame,
+extern "C" fn segment_not_present_handler(
+    stack_frame: &mut InterruptStackFrameValue,
     _error_code: u64,
 ) {
     clac_if_smap();
     INTERRUPT_STATS
         .segment_not_present
         .fetch_add(1, Ordering::Relaxed);
-    if handle_user_exception(&stack_frame, 139) {
+    if handle_user_exception(stack_frame, 139) {
         return;
     }
     panic!("Segment not present");
@@ -1084,15 +1455,15 @@ extern "x86-interrupt" fn segment_not_present_handler(
 ///
 /// R151-4 FIX: User-mode #SS terminates the process with SIGSEGV instead of
 /// crashing the kernel (mirrors the #GP handler pattern).
-extern "x86-interrupt" fn stack_segment_fault_handler(
-    stack_frame: InterruptStackFrame,
+extern "C" fn stack_segment_fault_handler(
+    stack_frame: &mut InterruptStackFrameValue,
     _error_code: u64,
 ) {
     clac_if_smap();
     INTERRUPT_STATS
         .stack_segment_fault
         .fetch_add(1, Ordering::Relaxed);
-    if handle_user_exception(&stack_frame, 139) {
+    if handle_user_exception(stack_frame, 139) {
         return;
     }
     panic!("Stack segment fault");
@@ -1103,8 +1474,8 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
 /// R107-1 FIX: User-mode #GP (e.g., `cli`/`hlt` in Ring 3) terminates the process
 /// with SIGSEGV instead of crashing the kernel.
 /// R107-4 FIX: Serial output guarded by `#[cfg(debug_assertions)]` to prevent KASLR bypass.
-extern "x86-interrupt" fn general_protection_fault_handler(
-    stack_frame: InterruptStackFrame,
+extern "C" fn general_protection_fault_handler(
+    stack_frame: &mut InterruptStackFrameValue,
     error_code: u64,
 ) {
     // S-6 fix: Immediately restore SMAP protection
@@ -1114,7 +1485,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         .general_protection_fault
         .fetch_add(1, Ordering::Relaxed);
     // R107-1 FIX: User-mode #GP → terminate process with SIGSEGV (128 + 11 = 139)
-    if handle_user_exception(&stack_frame, 139) {
+    if handle_user_exception(stack_frame, 139) {
         return;
     }
 
@@ -1171,14 +1542,12 @@ fn trace_unresolved_page_fault(error_code: PageFaultErrorCode) {
 /// - USER_MODE 标志表示 CPU 在 Ring 3 时触发
 /// - 内核态访问用户内存的缺页如果在 usercopy 中会被优雅处理
 /// - 其他内核态缺页仍会 panic（内核 bug）
-extern "x86-interrupt" fn page_fault_handler(
-    mut stack_frame: InterruptStackFrame,
-    error_code: PageFaultErrorCode,
-) {
+extern "C" fn page_fault_handler(stack_frame: &mut InterruptStackFrameValue, raw_error_code: u64) {
     // S-6 fix: Immediately restore SMAP protection
     // If this interrupt occurred during a STAC region, AC is set and SMAP is bypassed.
     // We must clear AC before doing anything else to prevent SMAP bypass attacks.
     clac_if_smap();
+    let error_code = PageFaultErrorCode::from_bits_truncate(raw_error_code);
 
     use kernel_core::{exception_table, usercopy};
 
@@ -1219,11 +1588,7 @@ extern "x86-interrupt" fn page_fault_handler(
         && usercopy::nofault_usercopy_fault(fault_addr, fault_ip)
     {
         if let Some(fixup_ip) = exception_table::lookup(fault_ip) {
-            unsafe {
-                stack_frame.as_mut().update(|frame| {
-                    frame.instruction_pointer = x86_64::VirtAddr::new(fixup_ip as u64);
-                });
-            }
+            stack_frame.instruction_pointer = x86_64::VirtAddr::new(fixup_ip as u64);
             return;
         }
     }
@@ -1357,11 +1722,7 @@ extern "x86-interrupt" fn page_fault_handler(
         let fault_ip = stack_frame.instruction_pointer.as_u64() as usize;
         if let Some(fixup_ip) = exception_table::lookup(fault_ip) {
             // H-26 FIX: Rewrite RIP to the fixup address
-            unsafe {
-                stack_frame.as_mut().update(|frame| {
-                    frame.instruction_pointer = x86_64::VirtAddr::new(fixup_ip as u64);
-                });
-            }
+            stack_frame.instruction_pointer = x86_64::VirtAddr::new(fixup_ip as u64);
             return;
         }
 
@@ -1370,13 +1731,8 @@ extern "x86-interrupt" fn page_fault_handler(
         // Keep old kill behavior to avoid a user-triggerable kernel panic
         // if a non-annotated access slips in.
         //
-        // P1-A D1-ARC-ENTRY-STATE: Usercopy faults are almost always CPL0
-        // (kernel accessing user memory) so GS is already kernel. If CS.RPL==3
-        // somehow reaches this fallback (mis-annotated path), establish kernel
-        // GS/CR3 before no-return terminate → force_reschedule_from_irq.
-        if (stack_frame.code_segment.0 & 0x3) == 3 {
-            unsafe { enter_kernel_state_from_user_exception() };
-        }
+        // Issue #109 §2.1: page_fault_stub already established kernel GS + KPTI root.
+        crate::syscall::assert_kernel_gs_base();
         if let Some(pid) = kernel_core::process::current_pid() {
             // SIGSEGV 的退出码为 128 + 11 = 139
             // R116-1 FIX: Do NOT return after terminate — IRET would resume the
@@ -1450,8 +1806,8 @@ extern "x86-interrupt" fn page_fault_handler(
             // zombie on freed page tables. On SMP, parent can concurrently reap
             // via waitpid, freeing CR3 while this CPU is on the IRET path.
             // R117-1 FIX: Use centralized terminate_self_and_halt().
-            // SAFETY: USER_MODE proves this page fault crossed from Ring 3.
-            unsafe { enter_kernel_state_from_user_exception() };
+            // Issue #109 §2.1: page_fault_stub already established kernel GS + KPTI root.
+            crate::syscall::assert_kernel_gs_base();
             // GAP-5 slice 4 G2: SIGSEGV ends the whole thread group.
             kernel_core::process::terminate_group_self_and_halt(pid, 139);
         }
@@ -1523,10 +1879,10 @@ extern "x86-interrupt" fn page_fault_handler(
 /// #MF - x87 Floating-Point Exception (x87浮点异常)
 ///
 /// R107-1 FIX: User-mode FP exception terminates process with SIGFPE instead of kernel panic.
-extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn x87_floating_point_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     // R107-1 FIX: User-mode #MF → terminate process with SIGFPE (128 + 8 = 136)
-    if handle_user_exception(&stack_frame, 136) {
+    if handle_user_exception(stack_frame, 136) {
         return;
     }
     panic!("x87 floating-point exception");
@@ -1535,8 +1891,8 @@ extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStack
 /// #AC - Alignment Check (对齐检查)
 ///
 /// R107-1 FIX: User-mode alignment check terminates process with SIGBUS instead of kernel panic.
-extern "x86-interrupt" fn alignment_check_handler(
-    stack_frame: InterruptStackFrame,
+extern "C" fn alignment_check_handler(
+    stack_frame: &mut InterruptStackFrameValue,
     _error_code: u64,
 ) {
     clac_if_smap();
@@ -1544,14 +1900,14 @@ extern "x86-interrupt" fn alignment_check_handler(
         .alignment_check
         .fetch_add(1, Ordering::Relaxed);
     // R107-1 FIX: User-mode #AC → terminate process with SIGBUS (128 + 7 = 135)
-    if handle_user_exception(&stack_frame, 135) {
+    if handle_user_exception(stack_frame, 135) {
         return;
     }
     panic!("Alignment check failed");
 }
 
 /// #MC - Machine Check (机器检查)
-extern "x86-interrupt" fn machine_check_handler(_stack_frame: InterruptStackFrame) -> ! {
+extern "C" fn machine_check_handler(_stack_frame: &mut InterruptStackFrameValue) -> ! {
     clac_if_smap();
     INTERRUPT_STATS
         .machine_check
@@ -1562,20 +1918,20 @@ extern "x86-interrupt" fn machine_check_handler(_stack_frame: InterruptStackFram
 /// #XM - SIMD Floating-Point Exception (SIMD浮点异常)
 ///
 /// R107-1 FIX: User-mode SIMD FP exception terminates process with SIGFPE instead of kernel panic.
-extern "x86-interrupt" fn simd_floating_point_handler(stack_frame: InterruptStackFrame) {
+extern "C" fn simd_floating_point_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     INTERRUPT_STATS
         .simd_floating_point
         .fetch_add(1, Ordering::Relaxed);
     // R107-1 FIX: User-mode #XM → terminate process with SIGFPE (128 + 8 = 136)
-    if handle_user_exception(&stack_frame, 136) {
+    if handle_user_exception(stack_frame, 136) {
         return;
     }
     panic!("SIMD floating-point exception");
 }
 
 /// #VE - Virtualization Exception (虚拟化异常)
-extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn virtualization_handler(_stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
     INTERRUPT_STATS
         .virtualization
@@ -2200,7 +2556,7 @@ pub fn run_irq_gpr_frame_layout_self_test() {
 ///
 /// R65-18 FIX: Saves/restores FPU state to prevent corruption.
 /// R69-3 FIX: Uses irq_enter/irq_exit for proper IRQ context tracking on SMP.
-extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn keyboard_interrupt_handler(_stack_frame: &mut InterruptStackFrameValue) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
@@ -2257,7 +2613,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 ///
 /// R65-18 FIX: Saves/restores FPU state to prevent corruption.
 /// R69-3 FIX: Uses irq_enter/irq_exit for proper IRQ context tracking on SMP.
-extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn serial_interrupt_handler(_stack_frame: &mut InterruptStackFrameValue) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
@@ -2446,7 +2802,7 @@ pub unsafe fn pic_send_eoi(irq: u8) {
 ///
 /// - Must be called with interrupts disabled (x86-interrupt calling convention)
 /// - Uses LAPIC EOI (not PIC) since this is an IPI
-extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn reschedule_ipi_handler(_stack_frame: &mut InterruptStackFrameValue) {
     // S-6 fix: Clear SMAP to prevent user-page access during handler
     clac_if_smap();
 
@@ -2497,7 +2853,7 @@ extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFra
 ///
 /// - Must be called with interrupts disabled (x86-interrupt calling convention)
 /// - Uses LAPIC EOI (not PIC) since this is an IPI
-extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn tlb_shootdown_ipi_handler(_stack_frame: &mut InterruptStackFrameValue) {
     // S-6 fix: Clear SMAP to prevent user-page access during handler
     clac_if_smap();
 
@@ -2548,7 +2904,7 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
 /// - Must be called with interrupts disabled (x86-interrupt calling convention)
 /// - Uses LAPIC EOI (not PIC) since this is an IPI
 /// - After EOI, disables interrupts permanently and halts
-extern "x86-interrupt" fn panic_ipi_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn panic_ipi_handler(_stack_frame: &mut InterruptStackFrameValue) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
@@ -2582,7 +2938,7 @@ extern "x86-interrupt" fn panic_ipi_handler(_stack_frame: InterruptStackFrame) {
 ///
 /// - Must be called with interrupts disabled (x86-interrupt calling convention)
 /// - Must NOT send EOI per Intel SDM specification
-extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "C" fn spurious_interrupt_handler(_stack_frame: &mut InterruptStackFrameValue) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 

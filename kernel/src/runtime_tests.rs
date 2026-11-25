@@ -1860,6 +1860,77 @@ impl RuntimeTest for CpuIdentityLookupTest {
     }
 }
 
+/// Issue #109 §2.1: verify Ring-0 GS-base per-CPU addressing (`gs:[80]` / `gs:[88]`)
+/// is active, matches the LAPIC-registered CPU ID, holds the exact kernel GS slot,
+/// and returns the exact `&'static PerCpuData` address for this CPU.
+struct GsBasePerCpuIdentityTest;
+
+impl RuntimeTest for GsBasePerCpuIdentityTest {
+    fn name(&self) -> &'static str {
+        "gs_base_percpu_identity"
+    }
+
+    fn description(&self) -> &'static str {
+        "Ring-0 GS-base per-CPU identity and direct PerCpuData pointer match LAPIC and SYSCALL_PERCPU"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::{
+            assert_kernel_gs_base, current_cpu, current_cpu_id, identity_method,
+            identity_published_mask, lapic_registered_cpu_id, IdentityMethod, PER_CPU_DATA,
+        };
+        use kernel_core::process::sched_online_cpu_mask as online_cpu_mask;
+
+        let method = identity_method();
+        if method != IdentityMethod::GsBase {
+            return TestResult::Fail(alloc::format!(
+                "expected IdentityMethod::GsBase after SMP bring-up, got {}",
+                method.name()
+            ));
+        }
+
+        // Exact-slot IA32_GS_BASE check (panics on foreign slot or user GS).
+        assert_kernel_gs_base();
+
+        let online = online_cpu_mask();
+        let published = identity_published_mask();
+        if published & online != online {
+            return TestResult::Fail(alloc::format!(
+                "gsbase published mask {:#x} does not cover online CPUs {:#x}",
+                published,
+                online
+            ));
+        }
+
+        let cpu = current_cpu_id();
+        let Some(by_lapic) = lapic_registered_cpu_id() else {
+            return TestResult::Fail(String::from("LAPIC returned no registered CPU id"));
+        };
+        if cpu != by_lapic {
+            return TestResult::Fail(alloc::format!(
+                "GS-base CPU id {} disagrees with LAPIC CPU id {}",
+                cpu,
+                by_lapic
+            ));
+        }
+
+        let Some(expected_per_cpu) = PER_CPU_DATA.get_cpu(cpu) else {
+            return TestResult::Fail(alloc::format!("PER_CPU_DATA missing slot for CPU {}", cpu));
+        };
+        let fast_per_cpu = current_cpu();
+        if !core::ptr::eq(fast_per_cpu, expected_per_cpu) {
+            return TestResult::Fail(alloc::format!(
+                "GS-base current_cpu() {:p} != PER_CPU_DATA.get_cpu({}) {:p}",
+                fast_per_cpu as *const _,
+                cpu,
+                expected_per_cpu as *const _
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
 /// The lowest online CPU other than this one.
 fn other_online_cpu(this: usize) -> Option<usize> {
     let others = kernel_core::process::sched_online_cpu_mask() & !(1u64 << this);
@@ -3660,6 +3731,7 @@ fn runtime_test_registry() -> Vec<&'static dyn RuntimeTest> {
         &KstackFlushBatchTest,
         &StealHintPinnedWakeTest,
         &CpuIdentityLookupTest,
+        &GsBasePerCpuIdentityTest,
         &WaitKickHaltedCpuTest,
         &WaitKickOneIpiTest,
         &CpusetIsolationTest,

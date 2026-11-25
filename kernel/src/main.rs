@@ -989,6 +989,9 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
         }
         // P1-A: confirm kernel GS is live after boot SWAPGS (Gate #5 self-test).
         arch::run_entry_state_gs_self_test();
+        // Issue #109 §2.1: publish BSP's GS-base per-CPU identity (gs:[80] / gs:[88])
+        // after both PER_CPU_DATA[0] and SYSCALL_PERCPU[0] are live.
+        arch::publish_gs_percpu_identity(0);
         klog_always!("      ✓ BSP syscall per-CPU state initialized (P1-A GS self-test OK)");
 
         // Attempt to bring up Application Processors (APs)

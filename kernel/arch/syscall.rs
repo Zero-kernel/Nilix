@@ -292,6 +292,14 @@ pub struct SyscallPerCpu {
     /// R172-04 FIX: companion to `pending_fs_base` (the user GS base, programmed into
     /// IA32_KERNEL_GS_BASE so the epilogue SWAPGS makes it the active user GS).
     pub pending_gs_base: u64,
+    /// Issue #109 §2.1: 1-based logical CPU ID (`cpu_id + 1`) read via `gs:[80]`.
+    /// Stored in the struct's existing trailing 64-byte alignment padding (offset 80),
+    /// keeping `size_of::<SyscallPerCpu>() == 128` unchanged. Zero means uninitialized.
+    pub encoded_cpu_id: u64,
+    /// Issue #109 §2.1: direct `&'static PerCpuData` pointer for this CPU read via `gs:[88]`.
+    /// Eliminates both the CPU-ID lookup and the `PER_CPU_DATA.cpus[cpu_id]` index in
+    /// `cpu_local::current_cpu()`.
+    pub per_cpu_data_ptr: u64,
 }
 
 impl SyscallPerCpu {
@@ -307,6 +315,8 @@ impl SyscallPerCpu {
             frame_owner_pid: 0,
             pending_fs_base: 0,
             pending_gs_base: 0,
+            encoded_cpu_id: 0,
+            per_cpu_data_ptr: 0,
         }
     }
 }
@@ -370,6 +380,10 @@ pub const PERCPU_FRAME_OWNER_OFFSET: usize = 56;
 pub const PERCPU_PENDING_FS_BASE_OFFSET: usize = 64;
 /// R172-04: Offset of pending_gs_base (GS-relative; read by the SYSRET epilogue wrmsr).
 pub const PERCPU_PENDING_GS_BASE_OFFSET: usize = 72;
+/// Issue #109 §2.1: Offset of encoded_cpu_id (`cpu_id + 1`) in SyscallPerCpu.
+pub const PERCPU_ENCODED_CPU_ID_OFFSET: usize = 80;
+/// Issue #109 §2.1: Offset of per_cpu_data_ptr (`&'static PerCpuData`) in SyscallPerCpu.
+pub const PERCPU_PER_CPU_DATA_PTR_OFFSET: usize = 88;
 
 // R103-3 FIX: Compile-time assertions that the offsets match the struct layout.
 // If SyscallPerCpu is reordered, these will produce a build error.
@@ -413,6 +427,26 @@ const _: () = {
     assert!(
         core::mem::offset_of!(SyscallPerCpu, pending_gs_base) == PERCPU_PENDING_GS_BASE_OFFSET,
         "PERCPU_PENDING_GS_BASE_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, encoded_cpu_id) == PERCPU_ENCODED_CPU_ID_OFFSET,
+        "PERCPU_ENCODED_CPU_ID_OFFSET does not match struct layout"
+    );
+    assert!(
+        PERCPU_ENCODED_CPU_ID_OFFSET == cpu_local::GS_CPU_ID_OFFSET,
+        "PERCPU_ENCODED_CPU_ID_OFFSET must match cpu_local::GS_CPU_ID_OFFSET"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, per_cpu_data_ptr) == PERCPU_PER_CPU_DATA_PTR_OFFSET,
+        "PERCPU_PER_CPU_DATA_PTR_OFFSET does not match struct layout"
+    );
+    assert!(
+        PERCPU_PER_CPU_DATA_PTR_OFFSET == cpu_local::GS_PER_CPU_DATA_PTR_OFFSET,
+        "PERCPU_PER_CPU_DATA_PTR_OFFSET must match cpu_local::GS_PER_CPU_DATA_PTR_OFFSET"
+    );
+    assert!(
+        core::mem::size_of::<SyscallPerCpu>() == 128,
+        "SyscallPerCpu must stay within its existing two cache lines (128 bytes)"
     );
 };
 
@@ -943,6 +977,13 @@ pub unsafe fn init_syscall_percpu(cpu_id: usize) {
     // R172-04: no staged TLS at init (kernel has FS/GS base 0 until a user task runs).
     SYSCALL_PERCPU[cpu_id].pending_fs_base = 0;
     SYSCALL_PERCPU[cpu_id].pending_gs_base = 0;
+    // Issue #109 §2.1: store 1-based CPU ID and direct PerCpuData pointer in the
+    // trailing alignment padding so current_cpu_id() / current_cpu() become a single
+    // `mov rax, qword ptr gs:[offset]` once every online CPU has published.
+    SYSCALL_PERCPU[cpu_id].encoded_cpu_id = (cpu_id + 1) as u64;
+    SYSCALL_PERCPU[cpu_id].per_cpu_data_ptr = cpu_local::PER_CPU_DATA
+        .get_cpu(cpu_id)
+        .map_or(0, |per_cpu| per_cpu as *const cpu_local::PerCpuData as u64);
 
     // Program kernel GS base to point to this CPU's SyscallPerCpu
     // After SWAPGS, GS:0 will point to SYSCALL_PERCPU[cpu_id]
@@ -969,6 +1010,32 @@ pub unsafe fn init_syscall_percpu(cpu_id: usize) {
     // Wire the checker into kernel_core schedule entry (kernel_core holds a fn
     // pointer; arch registers it here — Once is idempotent across BSP/APs).
     kernel_core::scheduler_hook::register_kernel_gs_assert(assert_kernel_gs_base);
+}
+
+/// Issue #109 §2.1: populate and verify this CPU's GS-base per-CPU identity fields
+/// (`gs:[80]` = `cpu_id + 1`, `gs:[88]` = `&PER_CPU_DATA.cpus[cpu_id]`), then set
+/// this CPU's bit in `cpu_local`'s GS identity publication mask.
+///
+/// Must be called on CPU `cpu_id` after both `PER_CPU_DATA` and `init_syscall_percpu(cpu_id)`
+/// have run and before `start_aps()` selects the system-wide identity method.
+pub fn publish_gs_percpu_identity(cpu_id: usize) {
+    assert!(
+        cpu_id < SYSCALL_MAX_CPUS,
+        "publish_gs_percpu_identity: CPU ID {} out of range",
+        cpu_id
+    );
+    let per_cpu_ptr = cpu_local::PER_CPU_DATA
+        .get_cpu(cpu_id)
+        .expect("PER_CPU_DATA must be initialized before publishing GS identity")
+        as *const cpu_local::PerCpuData as u64;
+    // SAFETY: called once per CPU during bring-up before GS identity is selected;
+    // this CPU exclusively owns SYSCALL_PERCPU[cpu_id].
+    unsafe {
+        SYSCALL_PERCPU[cpu_id].encoded_cpu_id = (cpu_id + 1) as u64;
+        SYSCALL_PERCPU[cpu_id].per_cpu_data_ptr = per_cpu_ptr;
+    }
+    assert_kernel_gs_base();
+    cpu_local::publish_gs_identity(cpu_id);
 }
 
 // ============================================================================
