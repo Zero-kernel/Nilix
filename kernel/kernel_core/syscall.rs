@@ -1950,6 +1950,59 @@ fn try_admitted_zeroed_io_buffer(len: usize) -> Result<AdmittedVec<u8>, SyscallE
     try_admitted_zeroed_buffer(mm::HeapClass::BlockingIo, len)
 }
 
+/// Maximum I/O size serviced from a per-call stack scratch buffer instead of
+/// allocating an admitted `BlockingIo` heap vector. Uses zero kernel heap
+/// bytes, so it cannot contribute to heap exhaustion while avoiding allocator
+/// and admission contention on small pipe/console transfers.
+const SMALL_IO_STACK_BUF: usize = 256;
+
+/// Stack-or-heap scratch buffer for `sys_read`/`sys_write`/`sys_writev_console`.
+enum IoScratchBuffer {
+    Stack {
+        buf: [u8; SMALL_IO_STACK_BUF],
+        len: usize,
+    },
+    Heap(AdmittedVec<u8>),
+}
+
+impl IoScratchBuffer {
+    #[inline]
+    fn try_zeroed(len: usize) -> Result<Self, SyscallError> {
+        if len <= SMALL_IO_STACK_BUF {
+            Ok(Self::Stack {
+                buf: [0u8; SMALL_IO_STACK_BUF],
+                len,
+            })
+        } else {
+            Ok(Self::Heap(try_admitted_zeroed_io_buffer(len)?))
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Stack { buf, len } => &buf[..*len],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Stack { buf, len } => &mut buf[..*len],
+            Self::Heap(vec) => vec.as_mut_slice(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Stack { len, .. } => *len,
+            Self::Heap(vec) => vec.len(),
+        }
+    }
+}
+
 /// R180-10 executable regression probe: independently live blocking buffers
 /// accumulate in the authoritative byte ledger and release exactly, including
 /// the deallocation-before-uncharge owner ordering above.
@@ -1993,6 +2046,42 @@ pub fn run_transient_io_admission_self_test() {
     );
     drop(first);
     assert_eq!(mm::heap_class_snapshot(mm::HeapClass::BlockingIo), before);
+}
+
+#[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
+mod io_scratch_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn small_io_scratch_buffer_uses_stack_without_blocking_io_charge() {
+        let before = mm::heap_class_snapshot(mm::HeapClass::BlockingIo);
+
+        let mut small = IoScratchBuffer::try_zeroed(SMALL_IO_STACK_BUF)
+            .expect("256-byte scratch buffer must use stack");
+        assert_eq!(small.len(), SMALL_IO_STACK_BUF);
+        assert!(small.as_slice().iter().all(|&b| b == 0));
+        small.as_mut_slice()[0] = 0x5a;
+        assert_eq!(small.as_slice()[0], 0x5a);
+        assert_eq!(
+            mm::heap_class_snapshot(mm::HeapClass::BlockingIo),
+            before,
+            "stack scratch buffer must consume zero BlockingIo heap admission"
+        );
+        drop(small);
+
+        let large_len = SMALL_IO_STACK_BUF + 1;
+        let large = IoScratchBuffer::try_zeroed(large_len)
+            .expect("buffer above stack threshold must use admitted heap");
+        assert_eq!(large.len(), large_len);
+        assert!(large.as_slice().iter().all(|&b| b == 0));
+        let during_large = mm::heap_class_snapshot(mm::HeapClass::BlockingIo);
+        assert!(
+            during_large.reserved_bytes > before.reserved_bytes,
+            "buffer above stack threshold must reserve BlockingIo heap admission"
+        );
+        drop(large);
+        assert_eq!(mm::heap_class_snapshot(mm::HeapClass::BlockingIo), before);
+    }
 }
 
 /// R130-1 FIX: Maximum number of mmap regions per process.
@@ -5077,50 +5166,28 @@ fn sys_fork() -> SyscallResult {
         coverage::trace_pc(1070); // sys_fork entry
     }
 
-    let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
-
-    // R101-10 FIX: Check if the calling process has active sibling threads.
-    // If so, the forked child will inherit the address space with potentially
-    // locked mutexes that will never be unlocked (the other threads don't exist
-    // in the child). Warn in debug mode; in the future, consider returning ENOSYS.
+    // R101-10 FIX: Warn (debug builds only) when fork is called from a
+    // multi-threaded process. Uses the O(1) thread_group member count instead
+    // of snapshotting PROCESS_TABLE and locking every foreign PCB.
+    #[cfg(debug_assertions)]
     {
-        let parent = parent_arc.lock();
-        let parent_tgid = parent.tgid;
-        let parent_is_thread_leader = parent.pid == parent.tgid;
-        drop(parent);
-
-        // Only check if process is part of a thread group (tgid matches a leader)
-        if parent_is_thread_leader {
-            // R165-15 FIX: process_table_snapshot() is now fallible (returns None
-            // on OOM instead of aborting). This is a best-effort diagnostic, so on
-            // allocation failure we simply skip the warning (sibling_count = 0).
-            let sibling_count = crate::process::process_table_snapshot()
-                .map(|table| {
-                    table
-                        .iter()
-                        .filter(|&&p| p != parent_pid)
-                        .filter(|&&p| {
-                            if let Some(proc_arc) = get_process(p) {
-                                let proc = proc_arc.lock();
-                                proc.tgid == parent_tgid
-                                    && proc.is_thread
-                                    && proc.state != crate::process::ProcessState::Terminated
-                            } else {
-                                false
-                            }
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-
-            if sibling_count > 0 {
-                kprintln!(
-                    "WARNING: fork() called from multi-threaded process (pid={}, {} active threads). \
-                     Child may deadlock on inherited locked mutexes.",
-                    parent_pid, sibling_count
-                );
+        let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+        let sibling_count = {
+            let parent = parent_arc.lock();
+            if parent.pid == parent.tgid {
+                parent.thread_group.members().saturating_sub(1)
+            } else {
+                0
             }
+        };
+        if sibling_count > 0 {
+            kprintln!(
+                "WARNING: fork() called from multi-threaded process (pid={}, {} active threads). \
+                 Child may deadlock on inherited locked mutexes.",
+                parent_pid,
+                sibling_count
+            );
         }
     }
 
@@ -13578,9 +13645,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     };
 
     // R180-10 FIX: ordinary files, pipes, and sockets retain this buffer across
-    // their callback lifetime, which may block.
-    let mut tmp = try_admitted_zeroed_io_buffer(count)?;
-    let bytes_read = read_fn(fd, &mut tmp, buf, copy_to_user)?;
+    // their callback lifetime, which may block. Small transfers (<= 256 B) use
+    // stack storage and consume zero heap bytes.
+    let mut tmp = IoScratchBuffer::try_zeroed(count)?;
+    let bytes_read = read_fn(fd, tmp.as_mut_slice(), buf, copy_to_user)?;
 
     // Z-4 安全修复：将回调返回值 clamp 到请求的大小
     // 防止恶意/错误回调返回超大值导致切片越界 panic
@@ -13620,9 +13688,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     validate_user_ptr(buf, count)?;
 
     // R180-10 FIX: keep aggregate admission through copyin and any blocking
-    // pipe/socket write callback.
-    let mut tmp = try_admitted_zeroed_io_buffer(count)?;
-    copy_from_user(&mut tmp, buf)?;
+    // pipe/socket write callback. Small transfers (<= 256 B) use stack storage
+    // and consume zero heap bytes.
+    let mut tmp = IoScratchBuffer::try_zeroed(count)?;
+    copy_from_user(tmp.as_mut_slice(), buf)?;
 
     // stdout(1)/stderr(2): 直接打印
     // R158-I9 FIX: Accept non-UTF-8 bytes (POSIX write(2) is byte-oriented).
@@ -13637,7 +13706,7 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         }
         // TD-SERIAL-1: one console write session for the whole call.
         let mut session = console_write_session();
-        write_console_lossy(&mut session, &tmp);
+        write_console_lossy(&mut session, tmp.as_slice());
         drop(session);
         // GAP-6 F11 diagnostic: console output is the stress runner's progress.
         #[cfg(feature = "stall_dump")]
@@ -13656,7 +13725,7 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         };
 
         // 在锁外执行写入
-        let bytes_written = write_fn(fd, &tmp)?;
+        let bytes_written = write_fn(fd, tmp.as_slice())?;
 
         // Z-4 安全修复：将回调返回值 clamp 到请求的大小
         Ok(bytes_written.min(count))
@@ -13856,8 +13925,8 @@ fn sys_writev_console(console: crate::process::ConsoleFile, iovs: &[Iovec]) -> S
                 return Err(SyscallError::E2BIG);
             }
             validate_user_ptr(entry.iov_base, entry.iov_len)?;
-            let mut tmp = try_admitted_zeroed_io_buffer(entry.iov_len)?;
-            copy_from_user(&mut tmp, entry.iov_base)?;
+            let mut tmp = IoScratchBuffer::try_zeroed(entry.iov_len)?;
+            copy_from_user(tmp.as_mut_slice(), entry.iov_base)?;
             if console.readable {
                 return Err(SyscallError::EBADF);
             }
@@ -13872,7 +13941,7 @@ fn sys_writev_console(console: crate::process::ConsoleFile, iovs: &[Iovec]) -> S
         {
             coverage::trace_pc(1011); // sys_write stdout/stderr path
         }
-        write_console_lossy(&mut session, &tmp);
+        write_console_lossy(&mut session, tmp.as_slice());
         total_written = total_written
             .checked_add(tmp.len())
             .ok_or(SyscallError::EOVERFLOW)?;
