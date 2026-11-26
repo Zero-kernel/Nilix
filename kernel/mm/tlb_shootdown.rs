@@ -1491,6 +1491,15 @@ pub fn get_stats() -> TlbShootdownStats {
 /// This processes all pending requests, not just the latest, ensuring
 /// no flush is dropped.
 ///
+/// Lock-free check whether this CPU's shootdown mailbox has pending work
+/// (queued entries or a saturated-mailbox fallback generation gap).
+#[inline]
+pub fn has_pending_shootdown() -> bool {
+    let mailbox = current_cpu().tlb_mailbox();
+    mailbox.head.load(Ordering::Acquire) < mailbox.tail.load(Ordering::Acquire)
+        || mailbox.ack_gen.load(Ordering::Acquire) < mailbox.request_gen.load(Ordering::Acquire)
+}
+
 /// # Safety
 ///
 /// Must be called with interrupts disabled (including bounded foreign-root

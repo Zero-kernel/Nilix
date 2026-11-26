@@ -27,8 +27,10 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Most stacks one flush covers: 512 KiB of frames and 16 PIDs held at once.
-pub const KSTACK_FLUSH_BATCH_CAPACITY: usize = 16;
+/// Most stacks one flush covers: 4 MiB of frames (128 × 32 KiB) and 128 PIDs
+/// held at once (0.39% of `PID_MAX`), cutting 16-vCPU broadcast CR3=0 TLB
+/// shootdowns by 8× while keeping bounded memory and OOM-drain recovery.
+pub const KSTACK_FLUSH_BATCH_CAPACITY: usize = 128;
 
 /// A batch completes once its oldest stack has waited this many timer ticks,
 /// about one second at the BSP's nominal 1000 Hz.
@@ -130,14 +132,15 @@ impl<const K: usize> KstackFlushQueue<K> {
     /// completed first, so `stack` itself is never part of that completion:
     /// its callback is still running.
     pub fn defer<B: KstackFlushBackend>(&self, stack: PendingStack, now: u64, backend: &mut B) {
-        let full = {
+        let mut full = TakenBatch::EMPTY;
+        {
             let mut batch = self.batch.lock();
             if batch.len < K {
                 self.push(&mut batch, stack, now);
                 return;
             }
-            self.take(&mut batch)
-        };
+            self.take_into(&mut batch, &mut full);
+        }
         self.complete(&full, Trigger::Count, backend);
         self.push(&mut self.batch.lock(), stack, now);
     }
@@ -148,7 +151,8 @@ impl<const K: usize> KstackFlushQueue<K> {
         if self.pending.load(Ordering::Relaxed) == 0 {
             return;
         }
-        let (due, trigger) = {
+        let mut due = TakenBatch::EMPTY;
+        let trigger = {
             let mut batch = self.batch.lock();
             let trigger = if batch.len == K {
                 Trigger::Count
@@ -158,7 +162,8 @@ impl<const K: usize> KstackFlushQueue<K> {
             } else {
                 return;
             };
-            (self.take(&mut batch), trigger)
+            self.take_into(&mut batch, &mut due);
+            trigger
         };
         self.complete(&due, trigger, backend);
     }
@@ -166,7 +171,8 @@ impl<const K: usize> KstackFlushQueue<K> {
     /// Complete the batch whatever its size and age. An empty batch does not
     /// flush.
     pub fn complete_now<B: KstackFlushBackend>(&self, backend: &mut B) {
-        let waiting = self.take(&mut self.batch.lock());
+        let mut waiting = TakenBatch::EMPTY;
+        self.take_into(&mut self.batch.lock(), &mut waiting);
         if !waiting.is_empty() {
             self.complete(&waiting, Trigger::Explicit, backend);
         }
@@ -196,16 +202,14 @@ impl<const K: usize> KstackFlushQueue<K> {
         self.pending.store(batch.len, Ordering::Relaxed);
     }
 
-    /// Empty the batch into a local copy, so that it completes with the batch
-    /// lock dropped.
-    fn take(&self, batch: &mut Batch<K>) -> TakenBatch<K> {
-        let taken = TakenBatch {
-            stacks: batch.stacks,
-            len: batch.len,
-        };
+    /// Empty the batch into a caller-provided stack buffer, so that it
+    /// completes with the batch lock dropped and avoids an extra by-value copy.
+    fn take_into(&self, batch: &mut Batch<K>, out: &mut TakenBatch<K>) {
+        let len = batch.len;
+        out.stacks[..len].copy_from_slice(&batch.stacks[..len]);
+        out.len = len;
         batch.len = 0;
         self.pending.store(0, Ordering::Relaxed);
-        taken
     }
 
     fn complete<B: KstackFlushBackend>(
@@ -248,6 +252,11 @@ struct TakenBatch<const K: usize> {
 }
 
 impl<const K: usize> TakenBatch<K> {
+    const EMPTY: Self = Self {
+        stacks: [PendingStack::EMPTY; K],
+        len: 0,
+    };
+
     fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -572,5 +581,33 @@ mod tests {
         queue.complete_now(&mut model);
         assert!(model.take().is_empty());
         assert_eq!(queue.stats().batches, 1);
+    }
+
+    #[test]
+    fn c3_batch_capacity_absorbs_multi_wave_16_cpu_reclaims_in_one_flush() {
+        const K: usize = KSTACK_FLUSH_BATCH_CAPACITY;
+        assert!(
+            K >= 128,
+            "expected batch capacity >= 128 for 16c amortization"
+        );
+        let queue = KstackFlushQueue::<K>::new(KSTACK_FLUSH_BATCH_MAX_AGE_TICKS);
+        let mut model = Model::default();
+        // Seven full 16-CPU waves (112 stacks) fit without triggering a flush.
+        for pid in 1..=(16 * 7) {
+            queue.defer(stack(pid), 10, &mut model);
+        }
+        queue.drain_epilogue(10, &mut model);
+        assert!(model.take().is_empty());
+        assert_eq!(queue.stats().pending, 112);
+
+        // Completing the 8th wave fills K=128 and flushes once in drain_epilogue.
+        for pid in (16 * 7 + 1)..=K {
+            queue.defer(stack(pid), 10, &mut model);
+        }
+        queue.drain_epilogue(10, &mut model);
+        assert_eq!(model.take(), completion(1..=K));
+        assert_eq!(queue.stats().batches, 1);
+        assert_eq!(queue.stats().by_count, 1);
+        assert_eq!(queue.stats().pending, 0);
     }
 }
