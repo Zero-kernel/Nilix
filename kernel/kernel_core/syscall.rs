@@ -3050,7 +3050,8 @@ fn validate_user_ptr_mut(ptr: *mut u8, len: usize) -> Result<(), SyscallError> {
     validate_user_ptr(ptr as *const u8, len)
 }
 
-/// ST-K2-P2a: page-table state of one user page for [`verify_user_memory`].
+/// ST-K2-P2a: page-table state of one user page (retained for hosted preflight tests).
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UserPageState {
     /// Present, user-accessible and, for a write, writable or copy-on-write.
@@ -3062,6 +3063,7 @@ enum UserPageState {
 }
 
 /// Classify one page from its leaf translation flags (`None`: not mapped).
+#[cfg(test)]
 fn classify_user_page(flags: Option<PageTableFlags>, require_write: bool) -> UserPageState {
     let Some(flags) = flags else {
         return UserPageState::NotPresent;
@@ -3086,14 +3088,7 @@ fn classify_user_page(flags: Option<PageTableFlags>, require_write: bool) -> Use
 }
 
 /// ST-K2-P2a: the bounded preflight loop over the pages of `[start, end)`.
-///
-/// `first_unready(page, require_write)` walks from `page` and returns the
-/// first page below `end` that is not present, `None` once every remaining
-/// page is ready, or EFAULT for a denied page. Each not-present page is
-/// resolved once through `fault_in(page, require_write)` and then walked
-/// again, so it must end up ready like any other page. A page still absent
-/// after its resolution (a concurrent unmap) fails the call instead of being
-/// retried, which bounds the work by the page count.
+#[cfg(test)]
 fn preflight_user_pages(
     start: usize,
     end: usize,
@@ -3114,62 +3109,49 @@ fn preflight_user_pages(
     Ok(())
 }
 
+/// Issue #90 follow-up (P0): Iterate every 4 KiB page intersecting `[start, start + len)`
+/// and invoke `probe(page_base)` fail-closed.
+fn probe_user_page_span(
+    start: usize,
+    len: usize,
+    mut probe: impl FnMut(usize) -> Result<(), ()>,
+) -> Result<(), SyscallError> {
+    if len == 0 {
+        return Err(SyscallError::EFAULT);
+    }
+    let end = start.checked_add(len).ok_or(SyscallError::EFAULT)?;
+    let mut page = start & !0xfff;
+    while page < end {
+        probe(page).map_err(|()| SyscallError::EFAULT)?;
+        match page.checked_add(0x1000) {
+            Some(next) => page = next,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
 /// 验证用户空间地址是否已映射且具备所需权限
 ///
-/// 通过页表遍历验证地址范围内的每一页都已映射且具有正确的权限标志。
-/// 这比 validate_user_ptr 更严格，可以防止访问未映射内存导致的内核崩溃。
+/// Issue #90 follow-up (P0): Uses hardware SMAP + exception-table guarded probes
+/// ([`crate::usercopy::fault_in_user_page`]) instead of acquiring exclusive
+/// `AS_PT_LOCKS[shard]` (`with_current_manager`) for a software page-table walk.
 ///
-/// ST-K2-P2a: a page that is not present yet (a never-touched shared-anonymous
-/// page) is resolved through the same guarded access path that the syscall's
-/// later usercopy takes, then checked like every other page, so the preflight
-/// accepts exactly the buffers that access would. The result is advisory: the
-/// later access must still be fault tolerant. Callers must hold no lock that
-/// page-fault resolution takes; see [`crate::usercopy::fault_in_user_page`].
-///
-/// # Arguments
-/// * `ptr` - 用户空间缓冲区起始地址
-/// * `len` - 缓冲区长度
-/// * `require_write` - 是否需要写入权限
-///
-/// # Returns
-/// 如果所有页都已正确映射（或按需装入后已正确映射）返回 Ok(()), 否则返回 EFAULT
+/// Security invariants preserved:
+/// - `validate_user_ptr` rejects zero/overflow/kernel-half (`>= USER_HALF_END`) ranges.
+/// - `UserAccessGuard::try_new_for_usercopy()` fails closed on `BOOT_CR3`, and
+///   D0-ISO-1 guarantees user address spaces contain zero supervisor-only lower-half
+///   mappings.
+/// - `CR0.WP = 1` + `lock cmpxchg 0, 0` (when `require_write`) enforces write
+///   permission, breaks CoW, demand-installs shared-anonymous pages, and returns
+///   `EFAULT` on `PROT_READ` / `PROT_NONE` / unmapped pages without modifying data.
+/// - Runs with zero page-table lock acquisitions and interrupts enabled, eliminating
+///   16-vCPU same-AS `AS_PT_LOCKS` contention on `sys_futex` and thread-creation syscalls.
 fn verify_user_memory(ptr: *const u8, len: usize, require_write: bool) -> Result<(), SyscallError> {
-    // 先进行基本的边界检查（拒绝零长度）
     validate_user_ptr(ptr, len)?;
-
-    let start = ptr as usize;
-    let end = start.checked_add(len).ok_or(SyscallError::EFAULT)?;
-
-    preflight_user_pages(
-        start,
-        end,
-        require_write,
-        // 遍历页表验证映射，停在第一个尚未装入的页
-        |from, write| unsafe {
-            mm::page_table::with_current_manager(
-                VirtAddr::new(0),
-                |manager| -> Result<Option<usize>, SyscallError> {
-                    let mut page_addr = from;
-                    while page_addr < end {
-                        let flags = manager
-                            .translate_with_flags(VirtAddr::new(page_addr as u64))
-                            .map(|(_, flags)| flags);
-                        match classify_user_page(flags, write) {
-                            UserPageState::Ready => {}
-                            UserPageState::NotPresent => return Ok(Some(page_addr)),
-                            UserPageState::Denied => return Err(SyscallError::EFAULT),
-                        }
-                        page_addr = page_addr.checked_add(0x1000).ok_or(SyscallError::EFAULT)?;
-                    }
-                    Ok(None)
-                },
-            )
-        },
-        // The walk has released PT_LOCK before the probe faults.
-        |page, write| {
-            crate::usercopy::fault_in_user_page(crate::usercopy::UserAddr::new(page), write)
-        },
-    )
+    probe_user_page_span(ptr as usize, len, |page| {
+        crate::usercopy::fault_in_user_page(crate::usercopy::UserAddr::new(page), require_write)
+    })
 }
 
 /// LEAD-MREMAP-MIGRATE-1: while a growing mremap is in flight, the migration
@@ -3471,6 +3453,67 @@ mod st_k2_p2a_preflight_tests {
             assert_eq!(result, Err(SyscallError::EFAULT));
             assert_eq!(probes, 0);
         }
+    }
+
+    #[test]
+    fn probe_user_page_span_covers_exact_pages_and_fails_closed() {
+        use super::probe_user_page_span;
+        use alloc::vec::Vec;
+
+        // Zero length and arithmetic overflow fail closed without probing.
+        let mut count = 0;
+        assert_eq!(
+            probe_user_page_span(BASE, 0, |_| {
+                count += 1;
+                Ok(())
+            }),
+            Err(SyscallError::EFAULT)
+        );
+        assert_eq!(
+            probe_user_page_span(usize::MAX - 8, 16, |_| {
+                count += 1;
+                Ok(())
+            }),
+            Err(SyscallError::EFAULT)
+        );
+        assert_eq!(count, 0);
+
+        // Single-page aligned and unaligned spans probe exactly one page.
+        let mut visited = Vec::new();
+        assert_eq!(
+            probe_user_page_span(BASE + 64, 4, |p| {
+                visited.push(p);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(visited, alloc::vec![BASE]);
+
+        // Unaligned cross-page span probes every intersecting 4 KiB page.
+        visited.clear();
+        assert_eq!(
+            probe_user_page_span(BASE + PAGE - 8, 16, |p| {
+                visited.push(p);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(visited, alloc::vec![BASE, BASE + PAGE]);
+
+        // Probe error aborts immediately and returns EFAULT.
+        visited.clear();
+        assert_eq!(
+            probe_user_page_span(BASE, 3 * PAGE, |p| {
+                visited.push(p);
+                if p == BASE + PAGE {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(SyscallError::EFAULT)
+        );
+        assert_eq!(visited, alloc::vec![BASE, BASE + PAGE]);
     }
 }
 
@@ -20315,14 +20358,13 @@ fn sys_futex(
     }
 
     // 验证用户内存可访问
-    // E.4 PI: the PI operations read and write the word under the bucket lock.
-    let reads_word = matches!(
+    // E.4 PI: only the PI operations write `uaddr` under the bucket lock;
+    // WAIT/WAKE/REQUEUE/WAIT_REQUEUE_PI only read `uaddr` (or key on it), so
+    // probing them with read intent avoids unnecessary RFO cache-line bouncing
+    // and avoids breaking CoW on read-only futex waits.
+    let writes_word = matches!(
         request,
-        LinuxFutexOp::Wait { .. }
-            | LinuxFutexOp::WaitRequeuePi { .. }
-            | LinuxFutexOp::LockPi { .. }
-            | LinuxFutexOp::TryLockPi
-            | LinuxFutexOp::UnlockPi
+        LinuxFutexOp::LockPi { .. } | LinuxFutexOp::TryLockPi | LinuxFutexOp::UnlockPi
     );
     let compares_word = matches!(
         request,
@@ -20332,7 +20374,7 @@ fn sys_futex(
         request,
         LinuxFutexOp::Wait { .. } | LinuxFutexOp::WaitRequeuePi { .. }
     );
-    verify_user_memory(uaddr as *const u8, core::mem::size_of::<u32>(), reads_word)?;
+    verify_user_memory(uaddr as *const u8, core::mem::size_of::<u32>(), writes_word)?;
 
     // R190-1 FIX: MAC-mediate the futex operation (raw Linux op word) after
     // argument validation and before any word read, wait or wake. Unreadable
