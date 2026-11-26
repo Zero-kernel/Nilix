@@ -2058,6 +2058,82 @@ impl PcpBuddyPool {
             cached_pages,
         }
     }
+
+    /// Issue #109 rollup audit (ASTRA-3): Non-blocking fault-safe borrow of the
+    /// underlying [`BuddyAllocator`] with bounded PCP recovery.
+    ///
+    /// Fault allocators (`handle_shared_anonymous_fault`, `try_grow_user_stack`,
+    /// `map_hold` spare staging) call this directly on `BuddyAllocator`. If the
+    /// buddy is low/empty while order-0 frames are cached in PCP magazines,
+    /// drain any uncontended magazines back into `allocator` using strictly
+    /// non-blocking `try_lock` (preserving deadlock freedom because no path
+    /// holds a PCP magazine lock while acquiring `buddy`). If magazines were
+    /// contended and buddy remains below `PCP_REFILL_BATCH`, fail closed with
+    /// `None` (`Busy`/`EAGAIN`) rather than reporting spurious `ENOMEM`.
+    fn try_with_allocator_with<T, F>(&self, cpu_limit: usize, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut BuddyAllocator) -> T,
+    {
+        let mut guard = self.buddy.try_lock()?;
+        let allocator = guard.as_mut()?;
+        if allocator.free_pages < PCP_HIGH_WATERMARK && self.total_cached_pages() > 0 {
+            let limit = core::cmp::min(cpu_limit, self.pcp.len());
+            let mut buf = [0u64; PCP_HIGH_WATERMARK];
+            let mut total_drained = 0usize;
+            let mut saw_contention = false;
+
+            for cpu in 0..limit {
+                if self.pcp[cpu].cached_count.load(Ordering::Acquire) == 0 {
+                    continue;
+                }
+                let drained = with_irqs_disabled(|| {
+                    let Some(mut mag) = self.pcp[cpu].lock.try_lock() else {
+                        return None;
+                    };
+                    let n = mag.len;
+                    if n > 0 {
+                        buf[..n].copy_from_slice(&mag.frames[..n]);
+                        mag.len = 0;
+                    }
+                    Some(n)
+                });
+                match drained {
+                    None => {
+                        saw_contention = true;
+                    }
+                    Some(0) => {}
+                    Some(n) => {
+                        self.pcp[cpu].cached_count.fetch_sub(n, Ordering::AcqRel);
+                        for &phys in &buf[..n] {
+                            let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+                            if let Err(err) = allocator.try_free_pcp_page(frame) {
+                                if err.is_metadata_corruption() {
+                                    allocator.poisoned = true;
+                                    self.poisoned.store(true, Ordering::Release);
+                                }
+                                kprintln!("[buddy][pcp] fault drain return failed: {:?}", err);
+                            }
+                        }
+                        total_drained += n;
+                    }
+                }
+            }
+
+            if total_drained > 0 {
+                self.stat_cross_cpu_drains.fetch_add(1, Ordering::Relaxed);
+            }
+            // Also treat still-nonzero `total_cached_pages()` (frames in flight
+            // inside another CPU's `drain_all_pcp` or `refill_batch_from_buddy`
+            // awaiting `buddy.lock`) as retryable contention when buddy remains
+            // below `PCP_REFILL_BATCH`, releasing `buddy` so they can land.
+            if (saw_contention || self.total_cached_pages() > 0)
+                && allocator.free_pages < PCP_REFILL_BATCH
+            {
+                return None;
+            }
+        }
+        Some(f(allocator))
+    }
 }
 
 /// 全局 Buddy + PCP 物理页分配器实例
@@ -2072,9 +2148,7 @@ pub fn try_with_allocator<T, F>(f: F) -> Option<T>
 where
     F: FnOnce(&mut BuddyAllocator) -> T,
 {
-    let mut guard = GLOBAL_BUDDY.buddy.try_lock()?;
-    let allocator = guard.as_mut()?;
-    Some(f(allocator))
+    GLOBAL_BUDDY.try_with_allocator_with(cpu_local::max_cpus(), f)
 }
 
 /// 初始化全局Buddy分配器
@@ -2927,6 +3001,69 @@ mod tests {
         assert_eq!(pool.pcp_stats().cached_pages, 0);
         assert_eq!(pool.stats().unwrap().free_pages, initial_free);
         assert!(pool.pcp_stats().hits > 0, "concurrent stress must hit PCP");
+        assert_eq!(
+            pool.buddy.lock().as_ref().unwrap().validate_metadata(),
+            Ok(())
+        );
+    }
+
+    /// Issue #109 rollup audit (ASTRA-3): `try_with_allocator` must recover
+    /// order-0 frames cached in PCP magazines when buddy is empty, and fail
+    /// closed (`None` / Busy) if the magazine holding the only free frames is
+    /// contended instead of returning spurious OOM.
+    #[test]
+    fn try_with_allocator_recovers_pcp_frames_when_buddy_empty() {
+        let pool = make_test_pool(0x4800_0000, 16 * PAGE_SIZE, &[]);
+        let f = pool
+            .try_alloc_order0_with(1, 4, |_| {}, false)
+            .expect("cpu 1 refill");
+        pool.try_free_order0_with(f, 1, |_| 0, |_| {})
+            .expect("cpu 1 free back to PCP");
+        assert_eq!(pool.pcp_stats().cached_pages, 16);
+        assert_eq!(pool.buddy.lock().as_ref().unwrap().free_pages, 0);
+
+        // When CPU 1's PCP magazine is contended and buddy is empty, must fail
+        // closed with `None` (Busy/EAGAIN) rather than spurious `Some(None)` OOM.
+        {
+            let _held = pool.pcp[1].lock.lock();
+            assert!(pool
+                .try_with_allocator_with(4, |buddy| buddy.alloc_pages(0))
+                .is_none());
+        }
+
+        // Once uncontended, `try_with_allocator_with` drains PCP and allocates.
+        let frame = pool
+            .try_with_allocator_with(4, |buddy| buddy.alloc_pages(0))
+            .expect("try_with_allocator must succeed")
+            .expect("fault allocator must recover cached PCP frame");
+        assert_eq!(pool.pcp_stats().cached_pages, 0);
+        assert_eq!(pool.stats().unwrap().free_pages, 15);
+        pool.buddy.lock().as_mut().unwrap().free_pages(frame, 0);
+        assert_eq!(pool.stats().unwrap().free_pages, 16);
+
+        // Simulate in-flight `drain_all_pcp` (magazine already emptied, `cached_count > 0`
+        // awaiting buddy lock) while buddy has 0 free pages: must return retryable `None`.
+        let mut drained_frames = [PhysFrame::containing_address(PhysAddr::new(0)); 16];
+        {
+            let mut b = pool.buddy.lock();
+            for slot in &mut drained_frames {
+                *slot = b.as_mut().unwrap().alloc_pages(0).expect("drain buddy");
+            }
+            assert_eq!(b.as_ref().unwrap().free_pages, 0);
+        }
+        pool.pcp[1].cached_count.store(1, Ordering::Release);
+        assert!(
+            pool.try_with_allocator_with(4, |buddy| buddy.alloc_pages(0))
+                .is_none(),
+            "in-flight PCP frames must fail closed with Busy (None) instead of spurious OOM"
+        );
+        pool.pcp[1].cached_count.store(0, Ordering::Release);
+        {
+            let mut b = pool.buddy.lock();
+            for frame in drained_frames {
+                b.as_mut().unwrap().free_pages(frame, 0);
+            }
+        }
         assert_eq!(
             pool.buddy.lock().as_ref().unwrap().validate_metadata(),
             Ok(())

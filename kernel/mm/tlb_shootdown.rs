@@ -856,6 +856,25 @@ fn collect_target_cpus(target_cr3: u64) -> CpuMask {
 ///
 /// Returns `Some(ticket)` on enqueue, or `None` when the queue is saturated so
 /// the caller falls back to a full-flush `request_gen` epoch.
+/// Issue #109 rollup audit (ASTRA-2): Drain any pending shootdown requests
+/// targeting this CPU while spinning on a remote mailbox or ACK wait.
+///
+/// Under split page-table locks (`AS_PT_LOCKS` + `KERNEL_PT_LOCK`), two CPUs
+/// can concurrently execute `IF=0` page-table transactions and shoot down each
+/// other (e.g., per-AS CoW fault vs shared kernel-stack rollback). Masking
+/// interrupts around [`handle_shootdown_ipi`] preserves its single-consumer
+/// invariant whether the caller entered with `IF=0` or `IF=1`, without ever
+/// enabling interrupts inside a protected page-table critical section.
+#[inline]
+fn drain_local_mailbox_while_waiting() {
+    #[cfg(not(test))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            handle_shootdown_ipi();
+        });
+    }
+}
+
 fn enqueue_mailbox(mailbox: &TlbShootdownMailbox, cr3: u64, start: u64, len: u64) -> Option<u64> {
     const MAILBOX_WAIT_SPINS: usize = 500_000;
     let mut spins = 0usize;
@@ -889,7 +908,9 @@ fn enqueue_mailbox(mailbox: &TlbShootdownMailbox, cr3: u64, start: u64, len: u64
             }
             // CAS failed, retry
         } else {
-            // Queue is full, need to wait
+            // Queue is full, need to wait — service our own mailbox first so a
+            // reciprocal IF=0 shootdown sender waiting on us can make progress.
+            drain_local_mailbox_while_waiting();
             spins += 1;
             if spins.is_multiple_of(100_000) {
                 kprintln!(
@@ -1004,6 +1025,10 @@ fn wait_for_acks(dispatch: &ShootdownDispatch) -> bool {
             core::sync::atomic::fence(Ordering::Release);
             return true;
         }
+        // ASTRA-2 FIX: Service pending shootdowns targeting this CPU so
+        // concurrent IF=0 holders of disjoint PT locks (e.g. AS_PT_LOCKS vs
+        // KERNEL_PT_LOCK) never deadlock waiting on each other's ACKs.
+        drain_local_mailbox_while_waiting();
         spin_loop();
     }
     false
@@ -1756,5 +1781,79 @@ mod tests {
         assert!(!target_mailbox_completed(&mailbox, fallback_ticket, true));
         mailbox.ack_gen.store(12, Ordering::Release);
         assert!(target_mailbox_completed(&mailbox, fallback_ticket, true));
+    }
+
+    /// Issue #109 rollup audit (ASTRA-2): Two concurrent IF=0 shootdown senders
+    /// targeting each other (e.g. `AS_PT_LOCKS` vs `KERNEL_PT_LOCK`) must both
+    /// converge without deadlock when each drains its own mailbox while polling.
+    #[test]
+    fn reciprocal_if0_shootdown_drains_local_mailbox_and_converges() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        fn drain_simulated(mailbox: &TlbShootdownMailbox) {
+            loop {
+                let head = mailbox.head.load(Ordering::Acquire);
+                let tail = mailbox.tail.load(Ordering::Acquire);
+                if head >= tail {
+                    break;
+                }
+                let slot = (head as usize) % TLB_SHOOTDOWN_QUEUE_LEN;
+                let entry = &mailbox.entries[slot];
+                if entry.generation.load(Ordering::Acquire) == 0 {
+                    spin_loop();
+                    continue;
+                }
+                entry.generation.store(0, Ordering::Release);
+                mailbox.head.store(head + 1, Ordering::Release);
+            }
+            let req = mailbox.request_gen.load(Ordering::Acquire);
+            if req > mailbox.ack_gen.load(Ordering::Acquire) {
+                mailbox.ack_gen.store(req, Ordering::Release);
+            }
+        }
+
+        let mb_a = Arc::new(TlbShootdownMailbox::new());
+        let mb_b = Arc::new(TlbShootdownMailbox::new());
+        let start = Arc::new(Barrier::new(2));
+
+        // Both CPUs enqueue shootdowns targeting each other before waiting.
+        let ticket_on_b = enqueue_mailbox(&mb_b, 0x1000, 0x4000, 4096).expect("enqueue B");
+        let ticket_on_a = enqueue_mailbox(&mb_a, 0, 0, 0).expect("enqueue A");
+
+        let mb_a2 = Arc::clone(&mb_a);
+        let mb_b2 = Arc::clone(&mb_b);
+        let start2 = Arc::clone(&start);
+        let t_b = thread::spawn(move || {
+            start2.wait();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                // Drain local mailbox on each poll (and upon exiting IF=0,
+                // mirroring pending 0xFE IPI delivery when interrupts re-enable).
+                drain_simulated(&mb_b2);
+                if target_mailbox_completed(&mb_a2, ticket_on_a, false) {
+                    drain_simulated(&mb_b2);
+                    return true;
+                }
+                thread::yield_now();
+            }
+            false
+        });
+
+        start.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut a_done = false;
+        while Instant::now() < deadline {
+            drain_simulated(&mb_a);
+            if target_mailbox_completed(&mb_b, ticket_on_b, false) {
+                drain_simulated(&mb_a);
+                a_done = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        let b_done = t_b.join().expect("thread B joined");
+        assert!(a_done && b_done, "reciprocal shootdown failed to converge");
     }
 }

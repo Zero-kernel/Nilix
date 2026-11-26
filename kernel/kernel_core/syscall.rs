@@ -26951,28 +26951,46 @@ fn sys_mremap(
                                         // buddy even for the defensive non-present
                                         // case.
                                         let relocated = tx.moved && !prot_none;
-                                        let should_free = !relocated
-                                            && PAGE_REF_COUNT
-                                                .release(frame.start_address().as_u64() as usize)
-                                                .should_free_unmapped();
-                                        if should_free {
+                                        if !relocated {
+                                            // Issue #109 rollup audit (ASTRA-1 / H1):
+                                            // Always complete TLB shootdown BEFORE calling
+                                            // `PAGE_REF_COUNT.release` so a fork peer on
+                                            // another PT lock shard cannot observe refcount
+                                            // 2->1 and perform an in-place writable CoW
+                                            // upgrade (or frame reuse) while a sibling CPU
+                                            // still caches the old translation.
                                             let batch = &mut stage.frames_to_free;
                                             if batch.capacity() == 0 {
-                                                // Its reservation failed: flush and
-                                                // free this frame on its own.
+                                                // Pre-hold reservation failed: flush this
+                                                // page first, then release and free if last.
                                                 mm::flush_current_as_page(page.start_address());
-                                                frame_alloc.deallocate_frame(frame);
+                                                if PAGE_REF_COUNT
+                                                    .release(
+                                                        frame.start_address().as_u64() as usize,
+                                                    )
+                                                    .should_free_unmapped()
+                                                {
+                                                    frame_alloc.deallocate_frame(frame);
+                                                }
                                             } else {
                                                 if batch.len() == batch.capacity() {
-                                                    // R192-RES-2a: full: flush every
-                                                    // page removed so far once, free
-                                                    // the batch and reuse the list.
+                                                    // R192-RES-2a + ASTRA-1: full batch:
+                                                    // flush every page removed so far first,
+                                                    // then release refs & free last-ref frames.
                                                     mm::flush_current_as_range(
                                                         VirtAddr::new(removed_start as u64),
                                                         offset,
                                                     );
-                                                    for freed in batch.drain(..) {
-                                                        frame_alloc.deallocate_frame(freed);
+                                                    for unmapped in batch.drain(..) {
+                                                        if PAGE_REF_COUNT
+                                                            .release(
+                                                                unmapped.start_address().as_u64()
+                                                                    as usize,
+                                                            )
+                                                            .should_free_unmapped()
+                                                        {
+                                                            frame_alloc.deallocate_frame(unmapped);
+                                                        }
                                                     }
                                                 }
                                                 batch.push(frame);
@@ -26984,7 +27002,7 @@ fn sys_mremap(
                                 // A relocated leaf is not freed, but another CPU may
                                 // still cache the source translation of a frame that
                                 // now lives at the destination: flush whenever a leaf
-                                // was removed, as sys_munmap does, before any free.
+                                // was removed, BEFORE releasing any refcount or freeing.
                                 if removed_leaf {
                                     mm::flush_current_as_range(
                                         VirtAddr::new(removed_start as u64),
@@ -26992,7 +27010,12 @@ fn sys_mremap(
                                     );
                                 }
                                 for frame in stage.frames_to_free.drain(..) {
-                                    frame_alloc.deallocate_frame(frame);
+                                    if PAGE_REF_COUNT
+                                        .release(frame.start_address().as_u64() as usize)
+                                        .should_free_unmapped()
+                                    {
+                                        frame_alloc.deallocate_frame(frame);
+                                    }
                                 }
 
                                 manager.prune_empty_tables_in_range(
