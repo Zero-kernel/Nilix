@@ -12445,8 +12445,19 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // to the PCB which is about to be deallocated. Clear ownership now.
         cpu_local::clear_fpu_owner_all_cpus(pid);
 
-        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-        klog_always!("Process {} terminated with exit code {}", pid, exit_code);
+        // R104-2 FIX: Keep PID 1 completion oracles and abnormal exits always
+        // logged; downgrade routine non-init clean exits to Debug to eliminate
+        // IRQ-masked global serial spinlock contention on thread-churn bursts.
+        if should_klog_process_exit_always(pid, exit_code) {
+            klog_always!("Process {} terminated with exit code {}", pid, exit_code);
+        } else {
+            klog!(
+                Debug,
+                "Process {} terminated with exit code {}",
+                pid,
+                exit_code
+            );
+        }
         // TD-SERIAL-1: record the IRQ-masked serial holds for the gates
         // (cycles per ms from the TSC over the BSP's serviced ticks; masked
         // intervals that lose ticks make this an upper bound).
@@ -15334,4 +15345,41 @@ pub fn oom_timestamp() -> u64 {
 pub fn register_oom_callbacks() {
     mm::register_oom_callbacks(oom_snapshot, oom_kill, oom_timestamp);
     klog!(Info, "  OOM killer callbacks registered");
+}
+
+/// Whether a process exit/termination event must be logged unconditionally
+/// via `klog_always!`.
+///
+/// PID 1 exit/termination lines are parsed as completion oracles by boot,
+/// syscall, musl, mitigation, and SMP gates, and non-zero exits carry
+/// fault/signal diagnostics. Routine `pid > 1 && exit_code == 0` thread and
+/// child exits are downgraded to `klog!(Debug, ...)` so concurrent worker
+/// exits do not serialize on the IRQ-masked serial spinlock or leak non-init
+/// PIDs into release serial logs (R104-2).
+#[inline]
+pub const fn should_klog_process_exit_always(pid: ProcessId, exit_code: i32) -> bool {
+    pid == 1 || exit_code != 0
+}
+
+#[cfg(test)]
+mod exit_klog_policy_tests {
+    use super::should_klog_process_exit_always;
+
+    #[test]
+    fn should_klog_process_exit_always_scopes_to_pid1_and_nonzero_exits() {
+        // PID 1 completion oracles must always be logged for both clean and abnormal exits.
+        assert!(should_klog_process_exit_always(1, 0));
+        assert!(should_klog_process_exit_always(1, 1));
+        assert!(should_klog_process_exit_always(1, -9));
+
+        // Routine non-init clean exits (worker threads / children) stay Debug-only.
+        assert!(!should_klog_process_exit_always(2, 0));
+        assert!(!should_klog_process_exit_always(42, 0));
+        assert!(!should_klog_process_exit_always(65535, 0));
+
+        // Abnormal / signal exits of any PID remain unconditionally logged.
+        assert!(should_klog_process_exit_always(2, 1));
+        assert!(should_klog_process_exit_always(42, 139));
+        assert!(should_klog_process_exit_always(42, -11));
+    }
 }
