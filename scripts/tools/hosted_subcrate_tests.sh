@@ -147,7 +147,7 @@ run_suite audit 19 0 \
 # C3 (#90): which display backend console output is mirrored to, and that
 # none is touched when the firmware's framebuffer was rejected, by the
 # memory-map check or by the driver for its geometry.
-run_suite drivers 17 0 \
+run_suite drivers 28 0 \
     --manifest-path kernel/drivers/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features cpu_local/host_harness \
@@ -246,7 +246,7 @@ run_suite cgroup-access 1 0 \
 
 # Includes the C3 aligned TID store and concurrent word tests, the C3
 # work-stealing hint with its model, and P2 wake-affine / placement / voluntary-yield policy tests.
-run_suite kernel-core 206 0 \
+run_suite kernel-core 208 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -286,7 +286,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 206 \
+run_suite mitigation-mappings 5 208 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

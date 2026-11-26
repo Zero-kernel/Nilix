@@ -980,15 +980,14 @@ fn begin_reaping_identity(pid: ProcessId, tgid: ProcessId) {
 
 /// Complete one detached task's cleanup and release recyclable identities only
 /// after the old thread group has no table members and no other Phase-2 reaper.
-fn finish_reaping_identity(pid: ProcessId, tgid: ProcessId) {
+fn finish_reaping_identity(pid: ProcessId, tgid: ProcessId, group: &ThreadGroup) {
     // Lock order matches the allocator and all table scanners:
-    // PROCESS_TABLE -> PCB -> REAPING_PID_STATE.
-    let table = PROCESS_TABLE.lock();
-    let group_has_table_member = table.iter().any(|slot| {
-        slot.as_ref()
-            .map(|process| process.lock().tgid == tgid)
-            .unwrap_or(false)
-    });
+    // PROCESS_TABLE -> REAPING_PID_STATE. Holding PROCESS_TABLE keeps slot
+    // visibility and reaping-bit release atomic with `allocate_global_pid`,
+    // while `group.members()` tracks exact PROCESS_TABLE membership for `tgid`
+    // in O(1) without scanning all PID slots or locking unrelated PCBs.
+    let _table = PROCESS_TABLE.lock();
+    let group_has_table_member = group.members() > 0;
 
     let mut state = REAPING_PID_STATE.lock();
     let remaining = match state.tgid_inflight.get_mut(tgid) {
@@ -6068,6 +6067,7 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
     // even a large teardown wave) never becomes a false global admission failure.
     const MAX_STACK_RETRIES: usize = PID_MAX;
     let mut stack_retries = 0;
+    let mut flushed_pending_stacks = false;
     let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
             let table = PROCESS_TABLE.lock();
@@ -6098,6 +6098,20 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
                 // complete before the allocator wraps back to this PID.
                 let pid_max = PID_MAX.min(MAX_PID);
                 *hint_guard = if pid >= pid_max { 1 } else { pid + 1 };
+                continue;
+            }
+            Err(KernelStackError::AllocationFailed)
+                if !flushed_pending_stacks
+                    && crate::kstack_flush::stats().pending > 0
+                    && x86_64::instructions::interrupts::are_enabled() =>
+            {
+                // Under memory pressure, reclaim frames held in the batched
+                // kernel-stack TLB flush queue before failing process creation.
+                // Drop `NEXT_PID_HINT` before invoking the cross-CPU flush.
+                flushed_pending_stacks = true;
+                drop(hint_guard);
+                crate::kstack_flush::complete_now();
+                hint_guard = NEXT_PID_HINT.lock();
                 continue;
             }
             Err(e) => {
@@ -6314,6 +6328,7 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
 
     const MAX_STACK_RETRIES: usize = PID_MAX;
     let mut stack_retries = 0;
+    let mut flushed_pending_stacks = false;
     let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
             let table = PROCESS_TABLE.lock();
@@ -6338,6 +6353,17 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
                 }
                 let pid_max = PID_MAX.min(MAX_PID);
                 *hint_guard = if pid >= pid_max { 1 } else { pid + 1 };
+                continue;
+            }
+            Err(KernelStackError::AllocationFailed)
+                if !flushed_pending_stacks
+                    && crate::kstack_flush::stats().pending > 0
+                    && x86_64::instructions::interrupts::are_enabled() =>
+            {
+                flushed_pending_stacks = true;
+                drop(hint_guard);
+                crate::kstack_flush::complete_now();
+                hint_guard = NEXT_PID_HINT.lock();
                 continue;
             }
             Err(e) => {
@@ -10730,6 +10756,38 @@ mod thread_group_tests {
     }
 
     #[test]
+    fn single_member_child_exit_bumps_events_before_wake_after_group_shrink() {
+        mm::publish_heap_budgets();
+        let parent = pcb(10, 1);
+        let group = Arc::clone(&parent.lock().thread_group);
+        // Simulate a multi-threaded parent group that entered wait_reap_group
+        // and then shrank back to its sole remaining member before notification.
+        group.join_locked();
+        assert_eq!(group.members(), 2);
+        group.note_child_waiter(true);
+        assert_eq!(group.leave_locked(), 1);
+
+        let before_events = group.child_events();
+        // Production single-member helper must advance `child_events` while
+        // holding `parent.lock()` before `wake_for_child_exit`.
+        {
+            let mut parent_proc = parent.lock();
+            parent_proc.state = ProcessState::Running;
+            let (woke, returned_group, single) =
+                notify_parent_pcb_for_child_exit(&mut parent_proc, 99, 1);
+            assert!(single);
+            assert!(!woke, "running parent was not blocked yet");
+            assert!(Arc::ptr_eq(&returned_group, &group));
+            assert_eq!(
+                group.child_events(),
+                before_events + 1,
+                "child_events must already be visible before parent.lock() releases"
+            );
+        }
+        group.note_child_waiter(false);
+    }
+
+    #[test]
     fn gap5_g8_last_live_member_and_zombie_leader_reaper_redirect() {
         // The live count picks exactly one last member.
         let counted = ThreadGroup::new();
@@ -12637,8 +12695,13 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     // EXT-CI: emit only after synchronous teardown, parent notification and
     // local guard/Arc drops. This is not a scheduler-retirement or global
     // quiescence claim; the host retains a tail window and final diagnostics.
-    if pid == 1 && teardown_completed {
-        klog_always!("CI-EXIT pid=1 code={} stage=teardown-complete", exit_code);
+    if pid == 1 {
+        if teardown_completed {
+            klog_always!("CI-EXIT pid=1 code={} stage=teardown-complete", exit_code);
+        }
+        // Drain any IRQ-buffered serial output synchronously before PID 1
+        // retires so exit markers and TD-SERIAL-1 diagnostics are never lost.
+        drivers::vga_buffer::flush_serial_sync();
     }
 }
 
@@ -12668,6 +12731,25 @@ fn claim_group_exit_report_locked(
 /// runs; that parent's thread group (whose members may wait for it; immutable)
 /// is read after the table is released. `reported_parent` is used only when
 /// the leader is already gone.
+/// Wake `parent_proc` for an exiting child and advance `child_events` while
+/// holding the parent PCB lock whenever this non-terminated parent is the sole
+/// table member of its thread group.
+fn notify_parent_pcb_for_child_exit(
+    parent_proc: &mut Process,
+    leader_pid: ProcessId,
+    now_tick: u64,
+) -> (bool, Arc<ThreadGroup>, bool) {
+    let group = Arc::clone(&parent_proc.thread_group);
+    let single = parent_proc.state != ProcessState::Terminated && group.members() <= 1;
+    if single {
+        // lint-fetch-add: allow (a change counter, compared only for inequality)
+        group.child_events.fetch_add(1, Ordering::SeqCst);
+    }
+    let woke = parent_proc.wake_for_child_exit(leader_pid, now_tick);
+    (woke, group, single)
+}
+
+/// Complete a group exit notification for a single- or multi-threaded parent.
 fn notify_parent_of_group_exit(
     reported_parent: ProcessId,
     leader_pid: ProcessId,
@@ -12689,23 +12771,29 @@ fn notify_parent_of_group_exit(
             .map(Arc::clone);
         (parent_pid, parent_arc)
     };
-    // The leader is a torn-down zombie, but the parent is a live task that may
-    // hold its own PCB while it takes the table (the fork path did): lock it
-    // only after the table is released (GAP-5 stress fix, cpu soak deadlock).
-    let parent_group = parent_arc.map(|parent| Arc::clone(&parent.lock().thread_group));
     if parent_pid == 0 {
         return;
     }
     let _ = crate::signal::send_signal_kernel(parent_pid, crate::signal::Signal::SIGCHLD);
 
-    let mut wake_parent = false;
-    if let Some(parent) = get_process(parent_pid) {
+    // Lock the parent PCB once (reusing `parent_arc` fetched above). If this
+    // non-terminated parent is the sole table member of its thread group,
+    // increment `child_events` BEFORE waking while holding the PCB lock so a
+    // concurrent `wait_reap_group` cannot observe the old counter and sleep
+    // after `wake_for_child_exit` ran; then skip the O(PROCESS_TABLE) scan.
+    let (mut wake_parent, parent_group, single_member) = if let Some(parent) = parent_arc {
         let mut parent_proc = parent.lock();
-        wake_parent = parent_proc.wake_for_child_exit(leader_pid, crate::get_ticks());
-    }
+        let (woke, group, single) =
+            notify_parent_pcb_for_child_exit(&mut parent_proc, leader_pid, crate::get_ticks());
+        (woke, Some(group), single)
+    } else {
+        (false, None, false)
+    };
     // GAP-5 G8 (review D3): any member of the parent's group may wait for it.
     if let Some(group) = parent_group {
-        wake_parent |= wake_group_child_waiters(&group, leader_pid);
+        if !single_member {
+            wake_parent |= wake_group_child_waiters(&group, leader_pid);
+        }
     }
     if wake_parent {
         let _ = crate::signal::kernel_kick_published();
@@ -13538,7 +13626,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
         let mut table = PROCESS_TABLE.lock();
 
         // Phase 1a: Check process state
-        let (memory_space, is_zombie) = {
+        let (memory_space, mm_sole_owner, is_zombie) = {
             if let Some(slot) = table.get(pid) {
                 if let Some(process) = slot {
                     let proc = process.lock();
@@ -13552,15 +13640,19 @@ pub fn cleanup_zombie(pid: ProcessId) {
                         && !proc.switch_reap_pending.load(Ordering::Acquire)
                         && (proc.tgid != pid || proc.thread_group.members() == 1)
                     {
-                        (proc.memory_space, true)
+                        // Every CLONE_VM sharer clones `proc.mm` alongside copying
+                        // `memory_space`. A strong count of 1 while holding the
+                        // zombie's lock proves no other task shares this address
+                        // space, avoiding an O(PROCESS_TABLE) scan + PCB locking.
+                        (proc.memory_space, Arc::strong_count(&proc.mm) == 1, true)
                     } else {
-                        (0, false)
+                        (0, false, false)
                     }
                 } else {
-                    (0, false)
+                    (0, false, false)
                 }
             } else {
-                (0, false)
+                (0, false, false)
             }
         };
 
@@ -13575,7 +13667,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
             // still references it. This is consistent with the updated
             // `address_space_share_count()` which also counts zombies.
             // (Must be done under PROCESS_TABLE lock since we iterate the table.)
-            let keep_address_space = if memory_space == 0 {
+            let keep_address_space = if memory_space == 0 || mm_sole_owner {
                 false
             } else {
                 table.iter().enumerate().any(|(idx, other_slot)| {
@@ -13678,7 +13770,6 @@ pub fn cleanup_zombie(pid: ProcessId) {
     )) = reap_info
     {
         let report_group = group_report.map(|_| Arc::clone(&group));
-        drop(group);
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
         // This is safe because the Arc we hold is the only remaining reference —
         // the table slot was cleared in Phase 1c.
@@ -13709,7 +13800,8 @@ pub fn cleanup_zombie(pid: ProcessId) {
         // Release the PID, and release the TGID only after no old-group table
         // member or concurrent Phase-2 reaper remains. Kernel-stack RCU lag is
         // independently guarded by create_process's AlreadyMapped retry path.
-        finish_reaping_identity(reaped_pid, tgid);
+        finish_reaping_identity(reaped_pid, tgid, &group);
+        drop(group);
         klog!(Info, "Cleaned up zombie process {}", reaped_pid);
 
         // GAP-5 slice 4 G1: report the group only after this thread is fully

@@ -1015,9 +1015,10 @@ unsafe fn serial_init_interrupt() {
 pub fn enable_serial_interrupts() {
     let ier: u16 = SERIAL_PORT + 1;
     unsafe {
-        // 启用接收数据中断 (IER bit 0)
+        // 启用接收数据中断 (IER bit 0)；发送中断 (bit 1) 由 TX 环形缓冲按需置位
         core::arch::asm!("out dx, al", in("dx") ier, in("al") 0x01u8, options(nostack, nomem));
     }
+    drivers::vga_buffer::enable_serial_tx_irq();
 }
 
 /// 获取中断统计信息
@@ -2281,6 +2282,7 @@ extern "C" fn timer_interrupt_body(
     // APs get their own LAPIC timer interrupts but don't maintain wall-clock time
     let timestamp_ms = if is_bsp {
         kernel_core::on_timer_tick();
+        drivers::vga_buffer::serial_tx_kick_if_pending();
 
         // G.1 Observability: Poll watchdogs for hung-task detection.
         // Only BSP polls to avoid duplicate detections. The poll function
@@ -2627,29 +2629,55 @@ extern "C" fn serial_interrupt_handler(_stack_frame: &mut InterruptStackFrameVal
 
     let mut received_any = false;
 
-    // 循环读取所有可用数据（清空 FIFO）
-    loop {
-        // 检查是否有数据可读 (LSR bit 0 = Data Ready)
+    // Drain RX FIFO, then emit one bounded async TX burst, then re-check RX
+    // once so an RX byte arriving during TX drain never leaves edge-triggered
+    // 8259 PIC IRQ4 stuck high.
+    for pass in 0..2 {
+        loop {
+            // 检查是否有数据可读 (LSR bit 0 = Data Ready)
+            let lsr: u8;
+            unsafe {
+                core::arch::asm!("in al, dx", out("al") lsr, in("dx") (SERIAL_PORT + 5), options(nostack, nomem));
+            }
+
+            // 如果没有数据可读，退出循环
+            if lsr & 0x01 == 0 {
+                break;
+            }
+
+            // 读取数据
+            let data: u8;
+            unsafe {
+                core::arch::asm!("in al, dx", out("al") data, in("dx") SERIAL_PORT, options(nostack, nomem));
+            }
+
+            // 将串口数据放入键盘缓冲区（模拟键盘输入）
+            // 串口数据已经是 ASCII，不需要扫描码转换
+            if drivers::keyboard::push_char(data) {
+                received_any = true;
+            }
+        }
+
+        if pass == 0 {
+            // Service any pending TLB shootdown immediately under IF=0 so
+            // back-to-back PIC ExtINT (IRQ4) bursts never delay remote ACKs.
+            if tlb_shootdown::has_pending_shootdown() {
+                tlb_shootdown::handle_shootdown_ipi();
+            }
+            let yield_to_lapic = tlb_shootdown::has_pending_shootdown()
+                || current_cpu().need_resched.load(Ordering::Acquire);
+            drivers::vga_buffer::serial_tx_irq_drain(yield_to_lapic);
+            if tlb_shootdown::has_pending_shootdown() {
+                tlb_shootdown::handle_shootdown_ipi();
+            }
+        }
+
         let lsr: u8;
         unsafe {
             core::arch::asm!("in al, dx", out("al") lsr, in("dx") (SERIAL_PORT + 5), options(nostack, nomem));
         }
-
-        // 如果没有数据可读，退出循环
         if lsr & 0x01 == 0 {
             break;
-        }
-
-        // 读取数据
-        let data: u8;
-        unsafe {
-            core::arch::asm!("in al, dx", out("al") data, in("dx") SERIAL_PORT, options(nostack, nomem));
-        }
-
-        // 将串口数据放入键盘缓冲区（模拟键盘输入）
-        // 串口数据已经是 ASCII，不需要扫描码转换
-        if drivers::keyboard::push_char(data) {
-            received_any = true;
         }
     }
 

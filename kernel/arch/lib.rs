@@ -121,6 +121,7 @@ pub fn serial_write_str(s: &str) {
 
 /// System reboot via keyboard controller
 pub fn reboot() -> ! {
+    drivers::vga_buffer::flush_serial_for_shutdown();
     unsafe {
         // Method 1: Keyboard controller reset
         core::arch::asm!("mov al, 0xFE", "out 0x64, al", options(nostack, nomem));
@@ -150,6 +151,7 @@ pub fn reboot() -> ! {
 
 /// System shutdown via ACPI
 pub fn shutdown() -> ! {
+    drivers::vga_buffer::flush_serial_for_shutdown();
     unsafe {
         // Try QEMU/Bochs magic port shutdown
         core::arch::asm!(
@@ -168,8 +170,10 @@ pub fn shutdown() -> ! {
         );
     }
 
-    // Fallback: halt forever
+    // Fallback: emit final diagnostic and wait for TEMT before permanently
+    // masking interrupts and halting.
     klog_always!("Shutdown failed, halting...");
+    drivers::vga_buffer::flush_serial_for_shutdown();
     loop {
         unsafe { core::arch::asm!("cli; hlt") }
     }
