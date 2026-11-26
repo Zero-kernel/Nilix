@@ -1030,8 +1030,14 @@ pub fn current_epoch() -> u64 {
 /// across an arbitrary callback wave.
 fn try_advance_completed_epoch() {
     let global = GLOBAL_EPOCH.load(Ordering::Acquire);
+    let completed = COMPLETED_EPOCH.load(Ordering::Acquire);
+    if completed >= global {
+        return;
+    }
     let safe = highest_quiescent_epoch(global);
-    COMPLETED_EPOCH.fetch_max(safe, Ordering::AcqRel);
+    if safe > completed {
+        COMPLETED_EPOCH.fetch_max(safe, Ordering::AcqRel);
+    }
 }
 
 /// Return the highest epoch known safe on every CPU in `online_cpu_mask()`.
