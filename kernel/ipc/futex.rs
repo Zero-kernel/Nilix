@@ -1018,43 +1018,86 @@ impl FutexPreparePermit {
         }
     }
 
-    /// GAP-5 slice 4 G4: claim the gate from a syscall entry. Without this,
-    /// two threads of one group entering FUTEX_WAIT or FUTEX_LOCK_PI together
-    /// failed the second with ENOMEM. A busy sibling is waited out by yielding
-    /// (bounded); a full registry is still an immediate resource failure.
+    /// GAP-5 slice 4 G4: claim the gate from a syscall entry, bypassing it
+    /// whenever `existing()` observes an already-live bucket.
+    ///
+    /// While waiting on a same-space sibling that holds the preparation gate,
+    /// each retry re-checks `existing()` before trying to claim the gate again:
+    /// if the sibling just published the target bucket, waiting siblings take
+    /// the fast path in parallel instead of serializing one-by-one through
+    /// `FUTEX_PREPARE_GATES`.
     /// Callers hold no lock and run in process context with IRQs enabled.
-    fn acquire(space: usize) -> Result<Self, FutexError> {
+    fn acquire_unless<T>(
+        space: usize,
+        check_before_first_claim: bool,
+        mut existing: impl FnMut() -> Option<T>,
+    ) -> Result<PermitOrExisting<T>, FutexError> {
+        if check_before_first_claim {
+            if let Some(found) = existing() {
+                return Ok(PermitOrExisting::Existing(found));
+            }
+        }
         let deadline = kernel_core::get_ticks().saturating_add(FUTEX_PREPARE_SIBLING_WAIT_TICKS);
-        for _ in 0..FUTEX_PREPARE_SIBLING_MAX_YIELDS {
+        for attempt in 0..FUTEX_PREPARE_SIBLING_MAX_YIELDS {
+            if attempt != 0 {
+                if let Some(found) = existing() {
+                    return Ok(PermitOrExisting::Existing(found));
+                }
+            }
             match Self::try_claim(space) {
-                FutexGateClaim::Claimed(permit) => return Ok(permit),
+                FutexGateClaim::Claimed(permit) => return Ok(PermitOrExisting::Permit(permit)),
                 FutexGateClaim::RegistryFull => return Err(FutexError::TooManyBuckets),
                 FutexGateClaim::SameTgidBusy if kernel_core::get_ticks() >= deadline => break,
                 FutexGateClaim::SameTgidBusy => kernel_core::force_reschedule(),
             }
         }
-        Err(FutexError::TooManyBuckets)
+        existing()
+            .map(PermitOrExisting::Existing)
+            .ok_or(FutexError::TooManyBuckets)
     }
 
-    /// GAP-5 PI review D2-2: [`Self::acquire`] for FUTEX_LOCK_PI, which must
-    /// not fail with ENOMEM because siblings keep the gate busy. The gate is
-    /// held only across bucket admission, so it is waited for without a
-    /// bound, until a kill (EINTR) or `deadline` (ETIMEDOUT). A full
-    /// registry is still a resource failure.
-    fn acquire_killable(
+    #[cfg(test)]
+    fn acquire(space: usize) -> Result<Self, FutexError> {
+        match Self::acquire_unless(space, false, || None::<()>)? {
+            PermitOrExisting::Permit(permit) => Ok(permit),
+            PermitOrExisting::Existing(()) => unreachable!(),
+        }
+    }
+
+    /// GAP-5 PI review D2-2: killable counterpart of [`Self::acquire_unless`]
+    /// for FUTEX_LOCK_PI, which must not fail with ENOMEM because siblings keep
+    /// the gate busy. The gate is held only across bucket admission, so it is
+    /// waited for without a bound, until a kill (EINTR) or `deadline`
+    /// (ETIMEDOUT), short-circuiting immediately if `existing()` finds a live
+    /// bucket. A full registry is still a resource failure.
+    fn acquire_killable_unless<T>(
         space: usize,
         pid: ProcessId,
         deadline: Option<u64>,
-    ) -> Result<Self, FutexError> {
+        mut existing: impl FnMut() -> Option<T>,
+    ) -> Result<PermitOrExisting<T>, FutexError> {
+        if let Some(found) = existing() {
+            return Ok(PermitOrExisting::Existing(found));
+        }
         let mut round = 0usize;
         loop {
+            if round != 0 {
+                if let Some(found) = existing() {
+                    return Ok(PermitOrExisting::Existing(found));
+                }
+            }
             match Self::try_claim(space) {
-                FutexGateClaim::Claimed(permit) => return Ok(permit),
+                FutexGateClaim::Claimed(permit) => return Ok(PermitOrExisting::Permit(permit)),
                 FutexGateClaim::RegistryFull => return Err(FutexError::TooManyBuckets),
                 FutexGateClaim::SameTgidBusy => pi_pause(pid, deadline, &mut round, false)?,
             }
         }
     }
+}
+
+enum PermitOrExisting<T> {
+    Permit(FutexPreparePermit),
+    Existing(T),
 }
 
 impl Drop for FutexPreparePermit {
@@ -1086,12 +1129,68 @@ fn get_live_bucket_with(
     Err(FutexError::TooManyBuckets)
 }
 
+/// Fast path: return an already-resident, non-tombstoned bucket from
+/// `FUTEX_TABLE` without touching `FUTEX_PREPARE_GATES`.
+///
+/// Checking `!unlinked` under the bucket lock avoids handing out an obviously
+/// tombstoned `Arc`; callers must still re-verify `!unlinked` under the bucket
+/// lock when publishing a waiter or owner (R172-07/08).
+fn lookup_live_bucket(key: FutexKey) -> Option<FutexBucketRef> {
+    let bucket = lookup_bucket(key)?;
+    if !bucket.lock().unlinked {
+        Some(bucket)
+    } else {
+        None
+    }
+}
+
 fn get_or_create_live_bucket(
     key: FutexKey,
     permit: &FutexPreparePermit,
     space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
 ) -> Result<FutexBucketRef, FutexError> {
     get_live_bucket_with(|| get_or_create_bucket_with_permit(key, permit, space_pin))
+}
+
+/// Obtain a live bucket for `key`, taking a per-space [`FutexPreparePermit`]
+/// only when `key` is not already resident in `FUTEX_TABLE`.
+fn get_or_create_live_bucket_fast(
+    key: FutexKey,
+    space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
+) -> Result<FutexBucketRef, FutexError> {
+    match FutexPreparePermit::acquire_unless(key.0, true, || lookup_live_bucket(key))? {
+        PermitOrExisting::Existing(bucket) => Ok(bucket),
+        PermitOrExisting::Permit(permit) => get_or_create_live_bucket(key, &permit, space_pin),
+    }
+}
+
+/// Slow-path continuation after the caller already observed `lookup_bucket(key)`
+/// miss: attempts to claim the preparation gate immediately on the first round,
+/// then re-checks [`lookup_live_bucket`] after any sibling-busy yield so a
+/// racing creator unblocks all waiting siblings in parallel.
+fn get_or_create_live_bucket_after_miss(
+    key: FutexKey,
+    space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
+) -> Result<FutexBucketRef, FutexError> {
+    match FutexPreparePermit::acquire_unless(key.0, false, || lookup_live_bucket(key))? {
+        PermitOrExisting::Existing(bucket) => Ok(bucket),
+        PermitOrExisting::Permit(permit) => get_or_create_live_bucket(key, &permit, space_pin),
+    }
+}
+
+/// Killable counterpart of [`get_or_create_live_bucket_fast`] for PI locks.
+fn get_or_create_live_bucket_fast_killable(
+    key: FutexKey,
+    space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
+    pid: ProcessId,
+    deadline: Option<u64>,
+) -> Result<FutexBucketRef, FutexError> {
+    match FutexPreparePermit::acquire_killable_unless(key.0, pid, deadline, || {
+        lookup_live_bucket(key)
+    })? {
+        PermitOrExisting::Existing(bucket) => Ok(bucket),
+        PermitOrExisting::Permit(permit) => get_or_create_live_bucket(key, &permit, space_pin),
+    }
 }
 
 lazy_static::lazy_static! {
@@ -1755,25 +1854,56 @@ pub fn futex_wait(
     // every task sharing it (CLONE_THREAD siblings and CLONE_VM children)
     // can wake each other.
     let key = (space.id, uaddr);
-    let prepare_permit = FutexPreparePermit::acquire(space.id)?;
 
     // A mark left by an earlier wait of this task must not end this one. It
     // is cleared before any waker can see the record published below.
     clear_wake_mark(pid);
-    let (bucket, queue) = publish_plain_waiter(key, space, record, expected, &prepare_permit)?;
+    let (bucket, queue) = publish_plain_waiter(key, space, record, expected)?;
 
     // Sleep on the origin queue unless a waker has already taken the record.
     // The mark is read under the queue's `waiters` lock, which a waker's
     // `wake_specific` takes after setting it: either this check sees the
     // mark, or the waker finds the task queued.
-    let prepared = queue.try_prepare_with_timeout_after(timeout_ns, || {
+    //
+    // Zero-allocation fast path: arm without claiming `FutexPreparePermit`
+    // whenever the queue (and global `TIMED_WAITERS`, if timed) already has
+    // spare capacity. Only if backing growth is needed do we serialize
+    // detached allocation per space via `FutexPreparePermit` (RF180-47),
+    // short-circuiting if a sibling finishes growing it first.
+    let prepared = match queue.try_prepare_noalloc_with_timeout_after(timeout_ns, || {
         if wake_mark_is_set(pid) {
             Err(())
         } else {
             Ok(())
         }
-    });
-    drop(prepare_permit);
+    }) {
+        Some(done) => Ok(done),
+        None => match FutexPreparePermit::acquire_unless(space.id, false, || {
+            if wake_mark_is_set(pid) {
+                Some(Err(()))
+            } else {
+                queue.try_prepare_noalloc_with_timeout_after(timeout_ns, || {
+                    if wake_mark_is_set(pid) {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }) {
+            Ok(PermitOrExisting::Existing(done)) => Ok(done),
+            Ok(PermitOrExisting::Permit(_permit)) => {
+                queue.try_prepare_with_timeout_after(timeout_ns, || {
+                    if wake_mark_is_set(pid) {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+            Err(_) => Ok(Ok(PrepareWait::Immediate(WaitOutcome::ResourceExhausted))),
+        },
+    };
     let outcome = match prepared {
         Ok(Ok(PrepareWait::Armed(ticket))) => queue.finish_prepared(ticket),
         Ok(Ok(PrepareWait::Immediate(outcome))) => outcome,
@@ -1799,6 +1929,9 @@ pub fn futex_wait(
 
 enum PlainPublish {
     Published(FutexQueueRef),
+    /// The waiter list needs larger backing; prepare it outside the bucket lock
+    /// and retry on the same bucket.
+    NeedGrowth(usize, usize),
     Retry,
     /// GAP-5 PI review D2-1: the word faulted under the bucket lock.
     FaultIn,
@@ -1811,28 +1944,57 @@ enum PlainPublish {
 /// or stored its new value before this read (P2-B / RF178-8 lost-wake rule,
 /// the Linux hash-bucket rule). That read does not resolve a fault (review
 /// D2-1): the word is faulted in with the lock dropped and the step retried.
+///
+/// Fast path: when `key` already has a live bucket with spare waiter-list
+/// capacity, this publishes in a single `bucket.lock()` acquisition without
+/// acquiring a per-space [`FutexPreparePermit`]. Bucket creation on miss (or
+/// after an unlinked tombstone) still takes [`FutexPreparePermit`] so
+/// RF180-47 bucket-cap serialization is preserved.
 fn publish_plain_waiter(
     key: FutexKey,
     space: &FutexSpace,
     record: FutexWaiterRecord,
     expected: u32,
-    permit: &FutexPreparePermit,
 ) -> Result<(FutexBucketRef, FutexQueueRef), FutexError> {
+    publish_plain_waiter_with(
+        key,
+        space.pin.as_ref(),
+        record,
+        expected,
+        &LockedUserWord(key.1),
+        || fault_in_word(key.1, false),
+    )
+}
+
+fn publish_plain_waiter_with(
+    key: FutexKey,
+    space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
+    record: FutexWaiterRecord,
+    expected: u32,
+    word: &dyn LockedWord,
+    mut fault_in: impl FnMut() -> Result<(), FutexError>,
+) -> Result<(FutexBucketRef, FutexQueueRef), FutexError> {
+    let mut current_bucket: Option<FutexBucketRef> = None;
+    let mut prepared: Option<PreparedWaiterList> = None;
+    // RF180-47: detached waiter-list growth is serialized per space by holding
+    // `FutexPreparePermit` from `prepare_waiter_list_growth` until the prepared
+    // backing is either installed or dropped outside `bucket.lock()`.
+    let mut growth_permit: Option<FutexPreparePermit> = None;
     let mut last = None;
     let mut faults = 0usize;
     let mut retries = 0usize;
+    // Track whether the current lookup/fault-in attempt already grew the waiter
+    // list once without a race. Initial cold-bucket growth (`capacity == 0`) or
+    // first growth after a `FaultIn` recreates the bucket does not consume the
+    // race-retry budget, matching the pre-lock prepare model on `main`.
+    let mut grew_this_attempt = false;
     while retries < FUTEX_REVALIDATE_RETRIES {
-        let bucket = get_or_create_live_bucket(key, permit, space.pin.as_ref())?;
-        let (len, capacity) = {
-            let b = bucket.lock();
-            (b.waiters.len(), b.waiters.capacity())
-        };
-        let mut prepared = match prepare_waiter_list_growth(len, capacity, 1) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                cleanup_empty_bucket(key, &bucket);
-                return Err(error);
-            }
+        let bucket = match current_bucket.take() {
+            Some(bucket) => bucket,
+            None => match lookup_bucket(key) {
+                Some(bucket) => bucket,
+                None => get_or_create_live_bucket_after_miss(key, space_pin)?,
+            },
         };
         let mut retired = None;
         let outcome = {
@@ -1843,9 +2005,9 @@ fn publish_plain_waiter(
             } else if !direct_waiter_fits(&b) {
                 PlainPublish::Failed(FutexError::TooManyBuckets)
             } else if !ensure_waiter_list_capacity(&mut b.waiters, 1, &mut prepared, &mut retired) {
-                PlainPublish::Retry
+                PlainPublish::NeedGrowth(b.waiters.len(), b.waiters.capacity())
             } else {
-                match LockedUserWord(key.1).read() {
+                match word.read() {
                     Ok(value) if value == expected => match reserve_bucket_waiter(&mut b) {
                         // R172-07/08: waiter_count >= 1 now pins the bucket
                         // table-resident until this task's epilogue.
@@ -1863,12 +2025,77 @@ fn publish_plain_waiter(
                 }
             }
         };
-        // Neither unused nor replaced backing is freed under the bucket lock.
+        // Never free replaced backing under the bucket lock, and always drop
+        // any detached `prepared` backing before releasing `growth_permit`.
         drop(retired);
-        drop(prepared);
+        drop(prepared.take());
+        drop(growth_permit.take());
         match outcome {
             PlainPublish::Published(queue) => return Ok((bucket, queue)),
+            PlainPublish::NeedGrowth(_, _) => {
+                if grew_this_attempt {
+                    retries += 1;
+                    if retries >= FUTEX_REVALIDATE_RETRIES {
+                        last = Some(bucket);
+                        break;
+                    }
+                } else {
+                    grew_this_attempt = true;
+                }
+                match FutexPreparePermit::acquire_unless(key.0, false, || {
+                    let b = bucket.lock();
+                    (b.unlinked || b.waiters.len().saturating_add(1) <= b.waiters.capacity())
+                        .then_some(())
+                }) {
+                    Ok(PermitOrExisting::Existing(())) => {
+                        // A sibling already grew the waiter list or tombstoned
+                        // the bucket; retry without allocating.
+                        current_bucket = Some(bucket);
+                    }
+                    Ok(PermitOrExisting::Permit(permit)) => {
+                        let snapshot = {
+                            let b = bucket.lock();
+                            if b.unlinked {
+                                None
+                            } else {
+                                Some((b.waiters.len(), b.waiters.capacity()))
+                            }
+                        };
+                        match snapshot {
+                            None => {
+                                drop(permit);
+                                grew_this_attempt = false;
+                                retries += 1;
+                                last = Some(bucket);
+                            }
+                            Some((len, capacity)) => {
+                                match prepare_waiter_list_growth(len, capacity, 1) {
+                                    Ok(Some(next)) => {
+                                        prepared = Some(next);
+                                        growth_permit = Some(permit);
+                                        current_bucket = Some(bucket);
+                                    }
+                                    Ok(None) => {
+                                        drop(permit);
+                                        current_bucket = Some(bucket);
+                                    }
+                                    Err(error) => {
+                                        drop(permit);
+                                        cleanup_empty_bucket(key, &bucket);
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        cleanup_empty_bucket(key, &bucket);
+                        return Err(error);
+                    }
+                }
+            }
             PlainPublish::Retry => {
+                grew_this_attempt = false;
                 retries += 1;
                 last = Some(bucket);
             }
@@ -1876,8 +2103,9 @@ fn publish_plain_waiter(
             // and remapped under the caller: give up with EFAULT eventually.
             PlainPublish::FaultIn if faults < FUTEX_REVALIDATE_RETRIES => {
                 faults += 1;
+                grew_this_attempt = false;
                 cleanup_empty_bucket(key, &bucket);
-                fault_in_word(key.1, false)?;
+                fault_in()?;
             }
             PlainPublish::FaultIn => {
                 cleanup_empty_bucket(key, &bucket);
@@ -1889,7 +2117,9 @@ fn publish_plain_waiter(
             }
         }
     }
-    if let Some(bucket) = last {
+    drop(prepared);
+    drop(growth_permit);
+    if let Some(bucket) = current_bucket.or(last) {
         cleanup_empty_bucket(key, &bucket);
     }
     // R181-1: retry exhaustion is a resource failure (ENOMEM), not EAGAIN.
@@ -2157,13 +2387,9 @@ fn prepare_requeue_target(
     key: FutexKey,
     wanted: usize,
 ) -> (Option<FutexBucketRef>, Option<PreparedWaiterList>) {
-    let Ok(permit) = FutexPreparePermit::acquire(space.id) else {
+    let Ok(target) = get_or_create_live_bucket_fast(key, space.pin.as_ref()) else {
         return (None, None);
     };
-    let Ok(target) = get_or_create_live_bucket(key, &permit, space.pin.as_ref()) else {
-        return (None, None);
-    };
-    drop(permit);
     let (len, capacity) = {
         let b = target.lock();
         (b.waiters.len(), b.waiters.capacity())
@@ -2965,22 +3191,68 @@ fn pi_lock_attempt(
         None
     };
 
-    let permit = FutexPreparePermit::acquire_killable(space.id, caller.pid, deadline)?;
-    let bucket = get_or_create_live_bucket(key, &permit, space.pin.as_ref())?;
-    let prepared = if trylock {
-        Ok(None)
+    let bucket =
+        get_or_create_live_bucket_fast_killable(key, space.pin.as_ref(), caller.pid, deadline)?;
+    let (mut prepared, growth_permit) = if trylock {
+        (None, None)
     } else {
-        let (len, capacity) = {
+        let needs_growth = {
             let b = bucket.lock();
-            (b.pi_waiters.len(), b.pi_waiters.capacity())
+            !b.unlinked && b.pi_waiters.len().saturating_add(1) > b.pi_waiters.capacity()
         };
-        prepare_pi_waiter_growth(len, capacity, 1)
-    };
-    let mut prepared = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            cleanup_empty_bucket(key, &bucket);
-            return Err(error);
+        if !needs_growth {
+            (None, None)
+        } else {
+            // RF180-47: serialize detached PI waiter-map growth per space via
+            // `FutexPreparePermit` so concurrent siblings cannot amplify
+            // transient `HeapClass::Futex` allocations from the same snapshot.
+            let claimed = match FutexPreparePermit::acquire_killable_unless(
+                space.id,
+                caller.pid,
+                deadline,
+                || {
+                    let b = bucket.lock();
+                    (b.unlinked || b.pi_waiters.len().saturating_add(1) <= b.pi_waiters.capacity())
+                        .then_some(())
+                },
+            ) {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    cleanup_empty_bucket(key, &bucket);
+                    return Err(error);
+                }
+            };
+            match claimed {
+                PermitOrExisting::Existing(()) => (None, None),
+                PermitOrExisting::Permit(permit) => {
+                    let snapshot = {
+                        let b = bucket.lock();
+                        if b.unlinked {
+                            None
+                        } else {
+                            Some((b.pi_waiters.len(), b.pi_waiters.capacity()))
+                        }
+                    };
+                    match snapshot {
+                        None => {
+                            drop(permit);
+                            (None, None)
+                        }
+                        Some((len, capacity)) => match prepare_pi_waiter_growth(len, capacity, 1) {
+                            Ok(Some(next)) => (Some(next), Some(permit)),
+                            Ok(None) => {
+                                drop(permit);
+                                (None, None)
+                            }
+                            Err(error) => {
+                                drop(permit);
+                                cleanup_empty_bucket(key, &bucket);
+                                return Err(error);
+                            }
+                        },
+                    }
+                }
+            }
         }
     };
     // A mark left by an earlier wait must not end this one; cleared before
@@ -3002,12 +3274,12 @@ fn pi_lock_attempt(
         );
         (outcome, b.pi_waiters.take_empty_capacity())
     };
-    // No backing is freed under the bucket lock.
+    // No backing is freed under the bucket lock, and detached backing is
+    // released before dropping `growth_permit`.
     drop(retired_empty);
     drop(retired);
     drop(prepared);
-    // Published (or not): the bucket is pinned by waiter_count if needed.
-    drop(permit);
+    drop(growth_permit);
     let attempt = match outcome {
         Ok(PiLocked::Queued) => {
             let queue = bucket.lock().queue.clone();
@@ -3464,10 +3736,8 @@ fn wait_requeue_pi_published(
 ) -> Result<usize, FutexError> {
     let pid = caller.pid;
     let record = FutexWaiterRecord::requeue_pi(key2.1, pid as u32);
-    let permit = FutexPreparePermit::acquire(space.id)?;
     clear_wait_marks(pid);
-    let (bucket, queue) = publish_plain_waiter(key, space, record, expected, &permit)?;
-    drop(permit);
+    let (bucket, queue) = publish_plain_waiter(key, space, record, expected)?;
 
     let mut result = Err(FutexError::WouldBlock);
     for attempt in 0..FUTEX_PI_ATTEMPTS {
@@ -3739,9 +4009,7 @@ fn prepare_requeue_pi_target(
     key: FutexKey,
     wanted: usize,
 ) -> Result<(Option<FutexBucketRef>, Option<PreparedPiWaiterCapacity>), FutexError> {
-    let permit = FutexPreparePermit::acquire(space.id)?;
-    let target = get_or_create_live_bucket(key, &permit, space.pin.as_ref())?;
-    drop(permit);
+    let target = get_or_create_live_bucket_fast(key, space.pin.as_ref())?;
     let (len, capacity) = {
         let b = target.lock();
         (b.pi_waiters.len(), b.pi_waiters.capacity())
@@ -4241,9 +4509,10 @@ fn publish_futex_bucket_candidate(
 
 fn get_or_create_bucket_with_permit(
     key: FutexKey,
-    _permit: &FutexPreparePermit,
+    permit: &FutexPreparePermit,
     space_pin: Option<&Weak<OwnerCpuMutex<MmState>>>,
 ) -> Result<FutexBucketRef, FutexError> {
+    debug_assert_eq!(permit.space, key.0);
     {
         let table = FUTEX_TABLE.lock();
         if let Some(bucket) = table.get(&key) {
@@ -6717,5 +6986,289 @@ mod tests {
             size_of::<usize>(),
             align_of::<usize>()
         ));
+    }
+
+    #[test]
+    fn futex_parity_existing_bucket_fast_path_bypasses_busy_sibling_permit() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::Futex);
+        let space = 0x1900_1000;
+        let existing_key = (space, 0x1000);
+        let missing_key = (space, 0x2000);
+
+        let live = get_or_create_bucket(existing_key).expect("seed live bucket");
+        let sibling = FutexPreparePermit::try_acquire(space).expect("sibling holds gate");
+
+        let fast = get_or_create_live_bucket_fast(existing_key, None)
+            .expect("existing live bucket must bypass busy sibling permit");
+        assert!(Arc::ptr_eq(&live, &fast));
+
+        let fast_pi = get_or_create_live_bucket_fast_killable(existing_key, None, 42, None)
+            .expect("killable fast path must bypass busy sibling permit");
+        assert!(Arc::ptr_eq(&live, &fast_pi));
+
+        // Creating a brand-new bucket in the same space still serializes on the
+        // per-space preparation gate.
+        assert!(matches!(
+            get_or_create_live_bucket_fast(missing_key, None),
+            Err(FutexError::TooManyBuckets)
+        ));
+
+        drop(sibling);
+        let created = get_or_create_live_bucket_fast(missing_key, None)
+            .expect("missing bucket creates once sibling releases gate");
+        assert!(!Arc::ptr_eq(&live, &created));
+
+        drop(fast_pi);
+        drop(fast);
+        drop(live);
+        drop(created);
+        cleanup_global_test_bucket(existing_key);
+        cleanup_global_test_bucket(missing_key);
+        assert_eq!(active_futex_count(), 0);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Futex), before);
+    }
+
+    #[test]
+    fn futex_parity_existing_bucket_fast_path_succeeds_when_prepare_gate_registry_full() {
+        use alloc::vec::Vec;
+
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::Futex);
+        let space = 0x1900_2000;
+        let existing_key = (space, 0x1000);
+        let missing_key = (space, 0x2000);
+
+        let live = get_or_create_bucket(existing_key).expect("seed live bucket");
+
+        let mut held = Vec::new();
+        held.try_reserve_exact(FUTEX_PREPARE_GATE_COUNT)
+            .expect("gate ledger");
+        for index in 0..FUTEX_PREPARE_GATE_COUNT {
+            held.push(
+                FutexPreparePermit::try_acquire(0x1910_0000 + index as ProcessId)
+                    .expect("fill gate registry"),
+            );
+        }
+
+        let fast = get_or_create_live_bucket_fast(existing_key, None)
+            .expect("existing live bucket must succeed even when gate registry is full");
+        assert!(Arc::ptr_eq(&live, &fast));
+
+        assert!(matches!(
+            get_or_create_live_bucket_fast(missing_key, None),
+            Err(FutexError::TooManyBuckets)
+        ));
+
+        drop(held);
+        drop(fast);
+        drop(live);
+        cleanup_global_test_bucket(existing_key);
+        assert_eq!(active_futex_count(), 0);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Futex), before);
+    }
+
+    #[test]
+    fn futex_parity_fast_path_recreates_after_tombstone_and_enforces_per_space_cap() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::Futex);
+        let space = 0x1900_3000;
+        let key0 = (space, 0x1000);
+
+        let first = get_or_create_live_bucket_fast(key0, None).expect("initial bucket");
+        cleanup_empty_bucket(key0, &first);
+        assert!(first.lock().unlinked);
+        assert!(lookup_live_bucket(key0).is_none());
+
+        let recreated = get_or_create_live_bucket_fast(key0, None)
+            .expect("tombstoned key must recreate via slow path");
+        assert!(!Arc::ptr_eq(&first, &recreated));
+        assert!(!recreated.lock().unlinked);
+        drop(first);
+
+        for index in 1..MAX_FUTEX_BUCKETS_PER_SPACE {
+            let key = (space, 0x1000 + index);
+            drop(get_or_create_live_bucket_fast(key, None).expect("fill per-space cap"));
+        }
+
+        // Joining an already-resident key at the per-space cap succeeds without
+        // consuming a slot, while a new key beyond the cap is still rejected.
+        let at_cap = get_or_create_live_bucket_fast(key0, None)
+            .expect("existing bucket at per-space cap must still succeed");
+        assert!(Arc::ptr_eq(&recreated, &at_cap));
+        assert!(matches!(
+            get_or_create_live_bucket_fast((space, 0x2000 + MAX_FUTEX_BUCKETS_PER_SPACE), None),
+            Err(FutexError::TooManyBuckets)
+        ));
+
+        drop(at_cap);
+        drop(recreated);
+        for index in 0..MAX_FUTEX_BUCKETS_PER_SPACE {
+            cleanup_global_test_bucket((space, 0x1000 + index));
+        }
+        assert_eq!(active_futex_count(), 0);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Futex), before);
+    }
+
+    #[test]
+    fn futex_parity_publish_plain_waiter_fast_path_growth_mismatch_and_fault_in() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::Futex);
+        let space = 0x1900_4000;
+        let uaddr = 0x4000;
+        let key = (space, uaddr);
+        let word = TestWord::new(7);
+
+        let record = |pid: u32| FutexWaiterRecord {
+            origin: uaddr,
+            pid,
+            bitset: FUTEX_BITSET_MATCH_ANY,
+        };
+
+        // Waiter 1 creates the bucket via the slow path and grows waiter list 0 -> 4.
+        let (bucket, queue) = publish_plain_waiter_with(key, None, record(1), 7, &word, || Ok(()))
+            .expect("cold waiter publish");
+        assert_eq!(bucket.lock().waiters.capacity(), 4);
+
+        // Hold the space's preparation gate: waiters that fit in existing
+        // capacity (2..=4) publish via the zero-alloc single-lock fast path
+        // without touching FUTEX_PREPARE_GATES.
+        let sibling = FutexPreparePermit::try_acquire(space).expect("sibling holds gate");
+        for pid in 2..=4u32 {
+            let (b, _) = publish_plain_waiter_with(key, None, record(pid), 7, &word, || Ok(()))
+                .expect("spare-capacity fast-path publish without permit");
+            assert!(Arc::ptr_eq(&bucket, &b));
+        }
+        assert_eq!(bucket.lock().waiter_count, 4);
+        assert_eq!(bucket.lock().waiters.len(), 4);
+
+        // Waiter 5 needs waiter-list growth (4 -> 8): RF180-47 serializes
+        // detached backing allocation on FutexPreparePermit, so while `sibling`
+        // holds the gate this must fail bounded without amplifying heap use.
+        let before_growth_reject = mm::heap_class_snapshot(HeapClass::Futex);
+        assert!(matches!(
+            publish_plain_waiter_with(key, None, record(5), 7, &word, || Ok(())),
+            Err(FutexError::TooManyBuckets)
+        ));
+        assert_eq!(
+            mm::heap_class_snapshot(HeapClass::Futex),
+            before_growth_reject
+        );
+        assert_eq!(bucket.lock().waiter_count, 4);
+
+        // Release the sibling gate: waiter 5 grows 4 -> 8 under the permit and
+        // releases the permit before returning.
+        drop(sibling);
+        let (b5, _) = publish_plain_waiter_with(key, None, record(5), 7, &word, || Ok(()))
+            .expect("growth publish succeeds once permit is free");
+        assert!(Arc::ptr_eq(&bucket, &b5));
+        assert_eq!(bucket.lock().waiters.capacity(), 8);
+
+        // Re-hold the sibling gate: waiters 6 (spare capacity), mismatch, and
+        // fault-in retry on the still-live bucket with spare capacity all
+        // bypass FUTEX_PREPARE_GATES cleanly.
+        let sibling = FutexPreparePermit::try_acquire(space).expect("sibling re-holds gate");
+        let (b6, _) = publish_plain_waiter_with(key, None, record(6), 7, &word, || Ok(()))
+            .expect("post-growth fast-path publish without permit");
+        assert!(Arc::ptr_eq(&bucket, &b6));
+        assert_eq!(bucket.lock().waiter_count, 6);
+
+        assert!(matches!(
+            publish_plain_waiter_with(key, None, record(7), 99, &word, || Ok(())),
+            Err(FutexError::WouldBlock)
+        ));
+        assert_eq!(bucket.lock().waiter_count, 6);
+        assert_eq!(bucket.lock().waiters.len(), 6);
+
+        word.fault.set(true);
+        let mut fault_ins = 0usize;
+        let (b_fault, _) = publish_plain_waiter_with(key, None, record(8), 7, &word, || {
+            fault_ins += 1;
+            word.fault.set(false);
+            Ok(())
+        })
+        .expect("fault-in retry on live bucket with spare capacity without permit");
+        assert_eq!(fault_ins, 1);
+        assert!(Arc::ptr_eq(&bucket, &b_fault));
+        assert_eq!(bucket.lock().waiter_count, 7);
+        assert_eq!(bucket.lock().waiters.len(), 7);
+
+        drop(sibling);
+        drop(b5);
+        drop(b6);
+        drop(b_fault);
+        {
+            let mut b = bucket.lock();
+            b.waiter_count = 0;
+            b.waiters.clear_retaining_capacity();
+            drop(b.waiters.take_empty_capacity());
+        }
+        cleanup_empty_bucket(key, &bucket);
+        drop(queue);
+        drop(bucket);
+        assert_eq!(active_futex_count(), 0);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Futex), before);
+    }
+
+    #[test]
+    fn futex_parity_cold_bucket_fault_recovery_does_not_exhaust_revalidate_budget() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let before = mm::heap_class_snapshot(HeapClass::Futex);
+        let space = 0x1900_5000;
+        let uaddr = 0x5000;
+        let key = (space, uaddr);
+        let record = FutexWaiterRecord {
+            origin: uaddr,
+            pid: 11,
+            bitset: FUTEX_BITSET_MATCH_ANY,
+        };
+
+        // Case A: mapping stabilizes on the 16th (final) fault-in callback.
+        // Each fault cleans up the cold bucket and forces a fresh 0 -> 4 growth,
+        // which must not consume the race-retry budget and falsely yield ENOMEM.
+        let word = TestWord::new(42);
+        word.fault.set(true);
+        let mut fault_ins = 0usize;
+        let (bucket, queue) = publish_plain_waiter_with(key, None, record, 42, &word, || {
+            fault_ins += 1;
+            if fault_ins == FUTEX_REVALIDATE_RETRIES {
+                word.fault.set(false);
+            }
+            Ok(())
+        })
+        .expect("16th cold-bucket fault-in stabilization must succeed");
+        assert_eq!(fault_ins, FUTEX_REVALIDATE_RETRIES);
+        assert_eq!(bucket.lock().waiter_count, 1);
+        {
+            let mut b = bucket.lock();
+            b.waiter_count = 0;
+            b.waiters.clear_retaining_capacity();
+            drop(b.waiters.take_empty_capacity());
+        }
+        cleanup_empty_bucket(key, &bucket);
+        drop(queue);
+        drop(bucket);
+        assert_eq!(active_futex_count(), 0);
+
+        // Case B: persistent word fault must report EFAULT after
+        // FUTEX_REVALIDATE_RETRIES fault-ins, never false ENOMEM.
+        let persistent = TestWord::new(42);
+        persistent.fault.set(true);
+        let mut persistent_fault_ins = 0usize;
+        assert!(matches!(
+            publish_plain_waiter_with(key, None, record, 42, &persistent, || {
+                persistent_fault_ins += 1;
+                Ok(())
+            }),
+            Err(FutexError::Fault)
+        ));
+        assert_eq!(persistent_fault_ins, FUTEX_REVALIDATE_RETRIES);
+        assert_eq!(active_futex_count(), 0);
+        assert_eq!(mm::heap_class_snapshot(HeapClass::Futex), before);
     }
 }
