@@ -252,6 +252,13 @@ run_suite kernel-core 198 0 \
     --features host_harness \
     --lib --locked
 
+# Includes SMP AP trampoline GDT/CR4/CR3 sanitizer invariants and syscall frame layout tests.
+run_suite arch 6 0 \
+    --manifest-path kernel/arch/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features mm/host_harness \
+    --lib --locked
+
 # Source-discovery/placeholder polarity oracle.  This is intentionally a
 # separate integration target: it validates the same 78 RuntimeTest
 # implementations reported by kernel/build.rs and fails closed on stale P0/P1
