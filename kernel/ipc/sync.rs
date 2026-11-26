@@ -679,6 +679,12 @@ impl WaitQueue {
             kernel_core::force_reschedule();
             return;
         }
+        // Lazy-TLB: keep this CPU parked on `BOOT_CR3` across repeated halts
+        // in this wait loop so sibling `munmap`/`mprotect`/CoW TLB shootdowns
+        // skip this CPU and do not wake it out of HLT. `Drop` restores the
+        // task's user CR3 before returning to any caller that accesses user
+        // memory or returns to Ring 3.
+        let mut lazy_tlb = kernel_core::wait_kick::BlockedWaitLazyTlb::new(pid);
         loop {
             let snapshot = kernel_core::wait_kick::snapshot();
             kernel_core::force_reschedule();
@@ -693,6 +699,7 @@ impl WaitQueue {
             {
                 return;
             }
+            lazy_tlb.enter_before_halt(snapshot);
             kernel_core::wait_kick::halt_blocked_wait(snapshot);
         }
     }
