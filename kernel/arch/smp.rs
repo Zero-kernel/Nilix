@@ -84,6 +84,31 @@ const RSDP_SEARCH_END: u64 = 0x100000;
 /// Maximum CPUs we support
 const MAX_CPUS: usize = cpu_local::MAX_CPUS;
 
+/// CR4 bit 17 (PCIDE). Per Intel SDM Vol. 3A §4.10.1, setting CR4.PCIDE=1
+/// outside IA-32e mode (`EFER.LMA == 0`) or while `CR3[11:0] != 0` raises
+/// `#GP(0)`. The 32-bit protected-mode AP trampoline must clear this bit and
+/// let `ap_rust_entry` re-enable it once in 64-bit long mode.
+const CR4_PCIDE_BIT: u64 = 1 << 17;
+
+/// Mask IA-32e-only CR4 bits that must not be written by the 32-bit
+/// protected-mode AP trampoline before `EFER.LMA == 1`.
+#[inline]
+const fn trampoline_safe_cr4(bsp_cr4: u64) -> u64 {
+    bsp_cr4 & !CR4_PCIDE_BIT
+}
+
+/// Strip any active PCID bits (`CR3[11:0]`) from the PML4 physical address
+/// passed to the AP trampoline so the AP enters long mode with `CR3[11:0] == 0`
+/// (an Intel SDM prerequisite before enabling `CR4.PCIDE` in `ap_rust_entry`).
+#[inline]
+const fn trampoline_safe_cr3(bsp_cr3: u64) -> u64 {
+    bsp_cr3 & !0xFFF
+}
+
+/// Whether BSP had `CR4.PCIDE` enabled at SMP bring-up time; APs mirror this
+/// in `ap_rust_entry` after entering 64-bit long mode.
+static BSP_CR4_PCIDE: AtomicBool = AtomicBool::new(false);
+
 /// Timeout for AP to signal ready (in spin iterations)
 const AP_READY_TIMEOUT: usize = 1_000_000;
 
@@ -392,37 +417,43 @@ fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     }
 
     // Entry 1 (selector 0x08): 32-bit code descriptor
-    // 0x00CF9A000000FFFF: Base=0, Limit=0xFFFFF, G=1, D/B=1, L=0, P=1, DPL=0, S=1, Type=0xA
+    // 0x00CF9B000000FFFF: Base=0, Limit=0xFFFFF, G=1, D/B=1, L=0, P=1, DPL=0, S=1, Type=0xB (Accessed=1)
+    // Pre-setting the Accessed bit (bit 0 of the access byte) ensures segment
+    // loads never trigger a hardware descriptor write cycle on a read-only
+    // W^X trampoline page (Intel SDM Vol. 3A §3.4.5.1).
     code[i] = 0xFF;
     code[i + 1] = 0xFF;
     code[i + 2] = 0x00;
     code[i + 3] = 0x00;
     code[i + 4] = 0x00;
-    code[i + 5] = 0x9A;
+    code[i + 5] = 0x9B;
     code[i + 6] = 0xCF;
     code[i + 7] = 0x00;
     i += 8;
 
     // Entry 2 (selector 0x10): 32-bit data descriptor
-    // 0x00CF92000000FFFF: Base=0, Limit=0xFFFFF, G=1, D/B=1, L=0, P=1, DPL=0, S=1, Type=0x2
+    // 0x00CF93000000FFFF: Base=0, Limit=0xFFFFF, G=1, D/B=1, L=0, P=1, DPL=0, S=1, Type=0x3 (Accessed=1)
     code[i] = 0xFF;
     code[i + 1] = 0xFF;
     code[i + 2] = 0x00;
     code[i + 3] = 0x00;
     code[i + 4] = 0x00;
-    code[i + 5] = 0x92;
+    code[i + 5] = 0x93;
     code[i + 6] = 0xCF;
     code[i + 7] = 0x00;
     i += 8;
 
     // Entry 3 (selector 0x18): 64-bit code descriptor
-    // 0x00AF9A000000FFFF: Base=0, Limit=0xFFFFF, G=1, D/B=0, L=1, P=1, DPL=0, S=1, Type=0xA
+    // 0x00AF9B000000FFFF: Base=0, Limit=0xFFFFF, G=1, D/B=0, L=1, P=1, DPL=0, S=1, Type=0xB (Accessed=1)
+    // Real Intel hardware / KVM enforces CR0.WP=1 on GDT Accessed-bit updates
+    // during `jmp far 0x18:0x80c0`; with `0x9A` on the read-only trampoline
+    // page (memory_hardening.rs), loading CS=0x18 raised `#PF(CR2=0x8088)`.
     code[i] = 0xFF;
     code[i + 1] = 0xFF;
     code[i + 2] = 0x00;
     code[i + 3] = 0x00;
     code[i + 4] = 0x00;
-    code[i + 5] = 0x9A;
+    code[i + 5] = 0x9B;
     code[i + 6] = 0xAF;
     code[i + 7] = 0x00;
     i += 8;
@@ -927,6 +958,10 @@ pub fn start_aps() -> usize {
     let cr3_phys = read_cr3();
     let cr4 = read_cr4();
     let efer = read_efer();
+    let bsp_pcide = (cr4 & CR4_PCIDE_BIT) != 0;
+    BSP_CR4_PCIDE.store(bsp_pcide, Ordering::Release);
+    let trampoline_cr3 = trampoline_safe_cr3(cr3_phys);
+    let trampoline_cr4 = trampoline_safe_cr4(cr4);
 
     // R131-8 FIX: Use kprintln! (debug-only) instead of klog! (release-active)
     // to prevent leaking BSP CR3 physical address in release builds.
@@ -954,13 +989,13 @@ pub fn start_aps() -> usize {
         let data_ptr = (PHYSICAL_MEMORY_OFFSET + TRAMPOLINE_PHYS + TRAMPOLINE_DATA_OFFSET as u64)
             as *mut ApTrampolineData;
         unsafe {
-            (*data_ptr).pml4_phys = cr3_phys;
+            (*data_ptr).pml4_phys = trampoline_cr3;
             (*data_ptr).stack_top = stack_top;
             (*data_ptr).entry_point = ap_rust_entry as *const () as u64;
             (*data_ptr).cpu_index = cpu_index as u32;
             (*data_ptr).lapic_id = *lapic_id;
             (*data_ptr).efer = efer;
-            (*data_ptr).cr4 = cr4;
+            (*data_ptr).cr4 = trampoline_cr4;
             // R67-2 FIX: Provide address where AP signals it has read all data.
             // We use the virtual address since the AP runs with paging enabled.
             (*data_ptr).claim_flag_addr = &AP_DATA_CLAIMED as *const AtomicU64 as u64;
@@ -1302,20 +1337,58 @@ pub extern "C" fn ap_rust_entry(
     // deadlock hazard as the IRQ/resched locals (R163-6 was never wired in).
     kernel_core::force_init_usercopy_locals();
 
+    // Real-hardware / KVM parity: the 32-bit protected-mode trampoline masks
+    // CR4.PCIDE because Intel SDM Vol. 3A §4.10.1 forbids setting PCIDE while
+    // EFER.LMA == 0. Now that this AP is in 64-bit IA-32e mode with CR3[11:0]
+    // == 0 (ensured by `trampoline_safe_cr3`), mirror BSP's CR4.PCIDE before
+    // enabling interrupts or joining TLB shootdowns.
+    if BSP_CR4_PCIDE.load(Ordering::Acquire) {
+        use x86_64::registers::control::{Cr3, Cr4, Cr4Flags};
+        let (_, raw_cr3_low) = Cr3::read_raw();
+        let cr3_pcid = raw_cr3_low & 0x0FFF;
+        let pcid_supported = (unsafe { core::arch::x86_64::__cpuid(1) }.ecx & (1 << 17)) != 0;
+        if cr3_pcid != 0 || !pcid_supported {
+            klog!(
+                Error,
+                "[SMP] SECURITY: CPU {} cannot enable CR4.PCIDE (cr3_pcid=0x{:x}, supported={}) - halting AP",
+                cpu_idx,
+                cr3_pcid,
+                pcid_supported
+            );
+            let _ = AP_BOOT_STATE.compare_exchange(
+                AP_BOOT_STARTING,
+                AP_BOOT_REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            halt_rejected_ap();
+        }
+        let mut ap_cr4 = Cr4::read();
+        if !ap_cr4.contains(Cr4Flags::PCID) {
+            ap_cr4.insert(Cr4Flags::PCID);
+            unsafe { Cr4::write(ap_cr4) };
+        }
+    }
+
     // Issue #109 §4.2: fail-closed verify this AP matches BSP's latched SMAP
     // state and enforces CR0.WP=1 before enabling interrupts or accepting user
     // tasks (hardware usercopy relies on both CR0.WP and CR4.SMAP).
     {
         use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
-        let smap_hw = Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
+        let cr4_hw = Cr4::read();
+        let smap_hw = cr4_hw.contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
+        let pcide_hw = cr4_hw.contains(Cr4Flags::PCID);
         let wp_hw = Cr0::read().contains(Cr0Flags::WRITE_PROTECT);
-        if smap_hw != kernel_core::smap_enabled_cached() || !wp_hw {
+        let pcide_expected = BSP_CR4_PCIDE.load(Ordering::Acquire);
+        if smap_hw != kernel_core::smap_enabled_cached() || pcide_hw != pcide_expected || !wp_hw {
             klog!(
                 Error,
-                "[SMP] SECURITY: CPU {} CR4.SMAP/CR0.WP mismatch (smap={} expected={}, wp={}) - halting AP",
+                "[SMP] SECURITY: CPU {} CR4/CR0 mismatch (smap={} expected={}, pcide={} expected={}, wp={}) - halting AP",
                 cpu_idx,
                 smap_hw,
                 kernel_core::smap_enabled_cached(),
+                pcide_hw,
+                pcide_expected,
                 wp_hw
             );
             let _ = AP_BOOT_STATE.compare_exchange(
@@ -2140,5 +2213,42 @@ mod topology_tests {
         assert!(super::lapic_ids_are_unique(&[0, 1, 2, 3]));
         assert!(!super::lapic_ids_are_unique(&[0, 1, 1, 2]));
         assert!(!super::lapic_ids_are_unique(&[7, 7]));
+    }
+
+    #[test]
+    fn trampoline_gdt_descriptors_preset_accessed_bit() {
+        let code = super::generate_trampoline();
+        // GDT lives at offset 0x70: 4 entries x 8 bytes.
+        // Entry 0 (0x70..0x78): null descriptor.
+        assert_eq!(&code[0x70..0x78], &[0u8; 8]);
+        // Entry 1 (0x78..0x80): 32-bit code, access byte 0x9B (Accessed=1), flags 0xCF.
+        assert_eq!(code[0x78 + 5], 0x9B);
+        assert_eq!(code[0x78 + 6], 0xCF);
+        // Entry 2 (0x80..0x88): 32-bit data, access byte 0x93 (Accessed=1), flags 0xCF.
+        assert_eq!(code[0x80 + 5], 0x93);
+        assert_eq!(code[0x80 + 6], 0xCF);
+        // Entry 3 (0x88..0x90): 64-bit code, access byte 0x9B (Accessed=1), flags 0xAF.
+        assert_eq!(code[0x88 + 5], 0x9B);
+        assert_eq!(code[0x88 + 6], 0xAF);
+    }
+
+    #[test]
+    fn trampoline_cr4_and_cr3_sanitizers_strip_pcid_only() {
+        // PAE | PGE | OSFXSR | OSXMMEXCPT | UMIP | SMEP | SMAP (without PCIDE)
+        let bsp_cr4_no_pcid: u64 =
+            (1 << 5) | (1 << 7) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 20) | (1 << 21);
+        assert_eq!(super::trampoline_safe_cr4(bsp_cr4_no_pcid), bsp_cr4_no_pcid);
+
+        let bsp_cr4_with_pcid = bsp_cr4_no_pcid | super::CR4_PCIDE_BIT;
+        let safe_cr4 = super::trampoline_safe_cr4(bsp_cr4_with_pcid);
+        assert_eq!(safe_cr4 & super::CR4_PCIDE_BIT, 0);
+        assert_eq!(safe_cr4, bsp_cr4_no_pcid);
+
+        let bsp_cr3: u64 = 0x0000_0000_0e03_5abc;
+        assert_eq!(super::trampoline_safe_cr3(bsp_cr3), 0x0000_0000_0e03_5000);
+        assert_eq!(
+            super::trampoline_safe_cr3(0x0000_0000_0e03_5000),
+            0x0000_0000_0e03_5000
+        );
     }
 }
