@@ -279,10 +279,13 @@ impl RuntimeTest for StackGuardPageTest {
     }
 
     // STRICT-Q S3 (D5): Ring-3 guard-page SIGSEGV and lazy stack growth verified in ring3-mm.
+    // Keep the marker free of the bare substring "page fault" so
+    // nilix-syz-fuzzer's boot serial fatal classifier does not trip on it;
+    // "user stack guard page" uniquely pins the ring3-mm stack-guard leg.
     fn scope(&self) -> TestScope {
         TestScope::CoveredBy {
             gate: "ring3-mm",
-            marker: "user stack guard page faults while the lazy region above it grows",
+            marker: "user stack guard page",
         }
     }
 
