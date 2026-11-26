@@ -244,9 +244,9 @@ run_suite cgroup-access 1 0 \
     --features host_harness \
     --test cgroup_access --locked
 
-# Includes the C3 aligned TID store and concurrent word tests, and the C3
-# work-stealing hint with its model.
-run_suite kernel-core 186 0 \
+# Includes the C3 aligned TID store and concurrent word tests, the C3
+# work-stealing hint with its model, and P2 wake-affine / placement policy tests.
+run_suite kernel-core 194 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -279,7 +279,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 186 \
+run_suite mitigation-mappings 5 194 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \
