@@ -8431,7 +8431,13 @@ pub(crate) fn wait_for_job_control_resume(pid: ProcessId, generation: u64) {
             attempted_schedule = false;
         } else {
             interrupts::enable();
-            crate::scheduler_hook::force_reschedule();
+            if crate::scheduler_hook::process_deferred_work_ready()
+                && !cpu_local::current_cpu().in_irq()
+            {
+                crate::scheduler_hook::drain_and_force_reschedule();
+            } else {
+                crate::scheduler_hook::force_reschedule();
+            }
             attempted_schedule = true;
         }
     }

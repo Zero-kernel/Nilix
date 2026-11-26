@@ -55,11 +55,14 @@ impl<const N: usize> CallbackSlots<N> {
 }
 
 /// RF178-33: Distinguish a normal process-context scheduling point from the
-/// timer IRQ-return fast path. The latter must remain strictly bounded.
+/// timer IRQ-return fast path and voluntary `sched_yield()`. The IRQ-return
+/// path remains strictly bounded, while voluntary yields rotate only among
+/// locally queued runnable tasks without scanning remote CPUs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReschedOrigin {
     Process,
     IrqReturn,
+    VoluntaryYield,
 }
 
 /// 重调度回调类型：force=true 强制调度，false 仅在需要时调度
@@ -125,7 +128,7 @@ static PROCESS_DEFERRED_WORK_READY: AtomicBool = AtomicBool::new(false);
 /// `Weak` port-charge reclamation, so the interval only affects RECLAIM LATENCY,
 /// never correctness (`delete_cgroup` sweeps synchronously before its gate).
 const PORT_CHARGE_SWEEP_INTERVAL: u32 = 256;
-static PORT_CHARGE_SWEEP_TICK: AtomicU32 = AtomicU32::new(0);
+static PORT_CHARGE_SWEEP_TICK: CpuLocal<AtomicU32> = CpuLocal::new(|| AtomicU32::new(0));
 
 /// R151-5 FIX: Force-initialize the per-CPU resched flag before IRQs are enabled.
 ///
@@ -134,6 +137,7 @@ static PORT_CHARGE_SWEEP_TICK: AtomicU32 = AtomicU32::new(0);
 /// a CPU can deadlock inside `Once::call_once()` heap allocation.
 pub fn force_init_resched_locals() {
     IRQ_RESCHED_PENDING.force_init();
+    PORT_CHARGE_SWEEP_TICK.force_init();
 }
 
 /// 注册定时器回调
@@ -177,7 +181,7 @@ pub fn process_deferred_work_ready() -> bool {
 }
 
 fn drain_level_triggered_deferred(pending: &AtomicBool, mut invoke_snapshot: impl FnMut()) -> bool {
-    if !pending.swap(false, Ordering::AcqRel) {
+    if !pending.load(Ordering::Acquire) || !pending.swap(false, Ordering::AcqRel) {
         return false;
     }
     invoke_snapshot();
@@ -282,7 +286,7 @@ pub fn on_scheduler_tick() {
 /// process-context path where deferred destruction work gets done.
 #[inline]
 pub fn reschedule_if_needed() {
-    reschedule_if_needed_inner(None);
+    reschedule_if_needed_inner(None, None);
 }
 
 /// Run the full process-context deferred drain, invoke `post_drain`, and only
@@ -295,10 +299,53 @@ pub fn reschedule_if_needed() {
 /// enabled.
 #[inline]
 pub fn reschedule_if_needed_with_post_drain(post_drain: fn()) {
-    reschedule_if_needed_inner(Some(post_drain));
+    reschedule_if_needed_inner(Some(post_drain), None);
 }
 
-fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
+/// Run the full process-context deferred drain and then force a reschedule
+/// even when `NEED_RESCHED` and `IRQ_RESCHED_PENDING` are clear.
+///
+/// Used by kernel-internal yield/retry loops that do not pass through the
+/// syscall-return safe point on each iteration (`yield_and_halt`, stdin/accept
+/// retry loops) so they both make deferred-work progress (U10-3) and actually
+/// yield the CPU instead of spinning until quantum expiry.
+#[inline]
+pub fn drain_and_force_reschedule() {
+    reschedule_if_needed_inner(None, Some(ReschedOrigin::Process));
+}
+
+/// Run the full process-context deferred drain once and then execute a
+/// voluntary local yield (`sched_yield()`).
+///
+/// Combining the U10-3 deferred-work drain with `ReschedOrigin::VoluntaryYield`
+/// guarantees pending deferred work (e.g. IRQ stdin wakes, autoreap, RCU) is
+/// drained BEFORE switching away (even if the yielding task is stopped before
+/// returning), while eliminating the duplicate drain and reschedule previously
+/// performed across `sys_yield()` and `finish_syscall_tail()`.
+#[inline]
+pub fn drain_and_yield_reschedule() {
+    if process_deferred_work_ready() {
+        reschedule_if_needed_inner(None, Some(ReschedOrigin::VoluntaryYield));
+    } else {
+        yield_reschedule();
+    }
+}
+
+#[inline]
+fn resolve_resched_dispatch(
+    irq_pending: bool,
+    forced_origin: Option<ReschedOrigin>,
+) -> (bool, ReschedOrigin) {
+    if irq_pending {
+        (true, ReschedOrigin::Process)
+    } else if let Some(origin) = forced_origin {
+        (true, origin)
+    } else {
+        (false, ReschedOrigin::Process)
+    }
+}
+
+fn reschedule_if_needed_inner(post_drain: Option<fn()>, forced_origin: Option<ReschedOrigin>) {
     // R169-5 FIX (D1-CGROUP-IRQ-L5): This is the full process-context
     // deferred-work drain — it performs BLOCKING Level-8 (sockets/tcp_conns
     // teardown) and non-IRQ-safe Level-5 (CGROUP_REGISTRY port-uncharge,
@@ -355,8 +402,13 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
     // never crosses L8 -> L5 under a lock. Rate-gated (1 pass per
     // PORT_CHARGE_SWEEP_INTERVAL drains) to amortize the full-map scan.
     {
-        // Coarse wrapping rate-gate tick, not an ID/refcount — wraparound is benign.
-        let prev = PORT_CHARGE_SWEEP_TICK.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow
+        // Per-CPU wrapping rate-gate tick avoids cross-CPU cache-line bouncing
+        // on every syscall return while preserving the amortized sweep cadence.
+        let prev = PORT_CHARGE_SWEEP_TICK.with(|tick| {
+            let prev = tick.load(Ordering::Relaxed);
+            tick.store(prev.wrapping_add(1), Ordering::Relaxed);
+            prev
+        });
         if prev % PORT_CHARGE_SWEEP_INTERVAL == 0 {
             net::socket_table().sweep_stranded_port_charges();
         }
@@ -415,7 +467,21 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>) {
     // across switch_context corrupts the lock when the resumed task drops
     // its own stale MutexGuard. Same copy-then-call pattern as on_scheduler_tick().
     if let Some(cb) = RESCHED_CB.get().copied() {
-        cb(irq_pending, ReschedOrigin::Process);
+        let (force, origin) = resolve_resched_dispatch(irq_pending, forced_origin);
+        cb(force, origin);
+    }
+}
+
+/// Voluntary local yield (`sched_yield()`).
+///
+/// Switches to another runnable task already queued on the current CPU without
+/// triggering cross-CPU work-stealing or duplicating the syscall-return
+/// deferred-work drain (which runs immediately in `finish_syscall_tail()`).
+#[inline]
+pub fn yield_reschedule() {
+    assert_kernel_entry_state();
+    if let Some(cb) = RESCHED_CB.get().copied() {
+        cb(true, ReschedOrigin::VoluntaryYield);
     }
 }
 
@@ -532,5 +598,30 @@ mod tests {
         assert!(!IRQ_SOFT_PROGRESS_PENDING.load(Ordering::Acquire));
         assert!(!cpu_local::current_cpu().in_soft_progress());
         PROCESS_DEFERRED_WORK_READY.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn resolve_resched_dispatch_preserves_forced_yield_and_irq_precedence() {
+        assert_eq!(
+            resolve_resched_dispatch(false, None),
+            (false, ReschedOrigin::Process)
+        );
+        assert_eq!(
+            resolve_resched_dispatch(true, None),
+            (true, ReschedOrigin::Process)
+        );
+        assert_eq!(
+            resolve_resched_dispatch(false, Some(ReschedOrigin::Process)),
+            (true, ReschedOrigin::Process)
+        );
+        assert_eq!(
+            resolve_resched_dispatch(false, Some(ReschedOrigin::VoluntaryYield)),
+            (true, ReschedOrigin::VoluntaryYield)
+        );
+        // Pending IRQ reschedule upgrades voluntary yield to full Process origin.
+        assert_eq!(
+            resolve_resched_dispatch(true, Some(ReschedOrigin::VoluntaryYield)),
+            (true, ReschedOrigin::Process)
+        );
     }
 }

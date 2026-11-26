@@ -712,8 +712,10 @@ pub fn wake_stdin_waiters() {
 /// fires and reaches this drain via reschedule_if_needed(). Matches the proven
 /// SOCKET_WAITERS pattern (lines 724-843).
 pub fn drain_deferred_stdin_wakes() {
-    // Fast path: no wake pending
-    if !STDIN_WAKE_PENDING.swap(false, AtomicOrdering::Acquire) {
+    // Fast path: no wake pending (read-before-swap avoids cross-CPU RMW traffic)
+    if !STDIN_WAKE_PENDING.load(AtomicOrdering::Acquire)
+        || !STDIN_WAKE_PENDING.swap(false, AtomicOrdering::AcqRel)
+    {
         return;
     }
 
@@ -4841,7 +4843,8 @@ fn finish_syscall(
     if dispatched {
         audit_syscall_exit(syscall_num, args, timestamp, lsm_ctx, &result);
     }
-    finish_syscall_tail(result)
+    let voluntary_yield = dispatched && syscall_num == 24 && result.is_ok();
+    finish_syscall_tail(result, voluntary_yield)
 }
 
 /// Audit record and LSM exit hook for a dispatched call.
@@ -4894,7 +4897,7 @@ fn audit_syscall_exit(
 }
 
 /// Return safe point, signal delivery and rescheduling for every syscall.
-fn finish_syscall_tail(mut result: SyscallResult) -> i64 {
+fn finish_syscall_tail(mut result: SyscallResult, mut voluntary_yield: bool) -> i64 {
     // Compute the syscall's return value (→ RAX). Captured here because signal
     // delivery saves it into the sigframe (so `rt_sigreturn` restores the
     // interrupted context's RAX — the EINTR / partial-op short-count contract: the
@@ -4941,6 +4944,7 @@ fn finish_syscall_tail(mut result: SyscallResult) -> i64 {
                 }
                 SignalTailStep::ExecHandoff => {
                     drop(proc_arc);
+                    voluntary_yield = false;
                     result = run_exec_handoff();
                     ret_val = match &result {
                         Ok(val) => *val as i64,
@@ -4960,8 +4964,16 @@ fn finish_syscall_tail(mut result: SyscallResult) -> i64 {
     }
 
     // 在返回用户态前检查是否需要调度
-    // 这是定时器中断设置的 NEED_RESCHED 标志的主要消费点
-    crate::reschedule_if_needed();
+    // 这是定时器中断设置的 NEED_RESCHED 标志的主要消费点。
+    // For `sched_yield()` (syscall 24), perform ONE combined deferred-work drain
+    // + voluntary local yield here so U10-3 deferred work always runs BEFORE
+    // switching away (even if the task is stopped before returning) without
+    // duplicating the drain or reschedule across `sys_yield()` and this tail.
+    if voluntary_yield {
+        crate::scheduler_hook::drain_and_yield_reschedule();
+    } else {
+        crate::reschedule_if_needed();
+    }
 
     // G.1: Count successful syscall exit (after all processing complete)
     increment_counter(TraceCounter::SyscallExit, 1);
@@ -20773,12 +20785,14 @@ mod gap5_futex_abi_tests {
 // 其他系统调用
 // ============================================================================
 
-/// U10-3: a voluntary process-context yield is also a safe deferred-work
-/// progress point. IRQ-return scheduling remains deliberately nonblocking.
+/// U10-3: a voluntary process-context yield in a kernel retry/wait loop is
+/// also a safe deferred-work progress point, and MUST force a reschedule even
+/// when `need_resched` is clear. IRQ-return scheduling remains deliberately
+/// nonblocking.
 #[inline]
 fn yield_with_deferred_work() {
     if crate::scheduler_hook::process_deferred_work_ready() {
-        crate::scheduler_hook::reschedule_if_needed();
+        crate::scheduler_hook::drain_and_force_reschedule();
     } else {
         crate::force_reschedule();
     }
@@ -20786,19 +20800,12 @@ fn yield_with_deferred_work() {
 
 /// sys_yield - 主动让出CPU
 fn sys_yield() -> SyscallResult {
-    // 将当前进程状态设置为Ready
-    if let Some(pid) = current_pid() {
-        if let Some(process) = get_process(pid) {
-            let mut proc = process.lock();
-            proc.enter_ready_at(crate::get_ticks());
-        }
-    }
-
-    // 强制触发重调度，立即执行上下文切换
-    // 注意：force_reschedule() 可能不会返回（如果切换到其他进程）
-    // 当本进程再次被调度时，会从这里继续执行
-    yield_with_deferred_work();
-
+    // The combined U10-3 deferred-work drain and `ReschedOrigin::VoluntaryYield`
+    // dispatch run once in `finish_syscall_tail()` right before returning to
+    // user mode. This avoids pre-locking `PROCESS_TABLE` + PCB to flip
+    // `Running -> Ready` (`prepare_switch()` already marks `old` Ready on an
+    // actual switch) and eliminates the duplicate drain/reschedule while still
+    // guaranteeing deferred work drains before any context switch away.
     Ok(0)
 }
 
@@ -20978,15 +20985,13 @@ fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Syscal
         // the mask is written.
         crate::process::note_publication(target_pid);
     }
-    let is_running = proc.state == ProcessState::Running;
-    // Note: We don't track which CPU a process is running on in the PCB currently,
-    // so for cross-CPU migration we rely on the scheduler's periodic load balancing.
-    // For self-migration, we can check current_cpu_id().
+    let is_on_cpu = proc.on_cpu.load(core::sync::atomic::Ordering::Acquire);
     drop(proc);
 
     // If the caller changed its own affinity and current CPU is now disallowed,
-    // trigger immediate reschedule
-    if target_pid == caller_pid && is_running {
+    // trigger immediate reschedule so this CPU switches off (handing off to
+    // idle if no local peer exists) and pushes the task to an allowed CPU.
+    if target_pid == caller_pid && is_on_cpu {
         let cpu_id = current_cpu_id();
         // new_mask is never 0 here (normalize_affinity_mask rejects it)
         let cpu_still_allowed = cpu_id < 64 && (new_mask & (1u64 << cpu_id)) != 0;

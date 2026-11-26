@@ -506,6 +506,61 @@ static PENDING_PREV_ON_CPU: CpuLocal<PrevOnCpu> = CpuLocal::new(|| PrevOnCpu {
     generation: AtomicU64::new(0),
 });
 
+/// Outcome of a nonblocking effective-affinity lookup (`cpuset ∩ task affinity`).
+/// Distinguishes transient lock contention (must retry) from a genuinely empty
+/// effective cpuset (no online target exists; never spin or force idle handoffs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectiveMaskLookup {
+    Allowed(u64),
+    Empty,
+    Contended,
+}
+
+/// RF178-33: fail-closed, nonblocking affinity lookup for IRQ return.
+#[inline]
+fn try_effective_allowed_cpus_state_inner(proc: &process::Process) -> EffectiveMaskLookup {
+    let cpuset_id = CpusetId(proc.cpuset_id);
+    let Some(effective) = cpuset::try_effective_cpus(cpuset_id, proc.allowed_cpus) else {
+        return EffectiveMaskLookup::Contended;
+    };
+    if effective != 0 {
+        return EffectiveMaskLookup::Allowed(effective);
+    }
+
+    let Some(cpuset_only) = cpuset::try_effective_cpus(cpuset_id, 0) else {
+        return EffectiveMaskLookup::Contended;
+    };
+    if cpuset_only != 0 {
+        EffectiveMaskLookup::Allowed(cpuset_only)
+    } else {
+        EffectiveMaskLookup::Empty
+    }
+}
+
+/// Per-CPU pending state for outgoing Ready tasks whose effective CPU affinity
+/// excludes this CPU.
+///
+/// `pending` is the authoritative level-triggered obligation (never lost on
+/// consecutive switches or transient lock contention). `hint_pid`/`hint_gen`
+/// provide an O(1) fast-path when a single disallowed task switched out; a
+/// second switch before drain sets `overflow` so the drain scans the local
+/// queue for every stranded disallowed resident and re-arms `pending` if any
+/// contention or incomplete batch remains.
+struct PendingAffinityPush {
+    pending: AtomicBool,
+    overflow: AtomicBool,
+    hint_pid: AtomicU64,
+    hint_gen: AtomicU64,
+}
+
+static PENDING_AFFINITY_MIGRATE: CpuLocal<PendingAffinityPush> =
+    CpuLocal::new(|| PendingAffinityPush {
+        pending: AtomicBool::new(false),
+        overflow: AtomicBool::new(false),
+        hint_pid: AtomicU64::new(0),
+        hint_gen: AtomicU64::new(0),
+    });
+
 /// GAP-6 F11 diagnostic (stress builds only): once the guest console has been
 /// silent for `STALL_TICKS`, print every online CPU's current task, published
 /// generation and pending-previous slot, then the task table. Process context
@@ -769,6 +824,39 @@ fn finish_pending_prev() -> bool {
             // Now another CPU can.
             if proc.state == ProcessState::Ready {
                 process::note_publication(pid as Pid);
+                // If this outgoing Ready task is disallowed on the local CPU
+                // (e.g. after `sched_setaffinity`) and has an online allowed
+                // target, record a level-triggered push obligation so process
+                // context (or an IRQ-return idle handoff if the replacement
+                // loops without syscalls) migrates it promptly without loss.
+                if !proc.stopped {
+                    let local_cpu = current_cpu_id();
+                    let need_push = match try_effective_allowed_cpus_state_inner(&proc) {
+                        EffectiveMaskLookup::Allowed(mask) => {
+                            !Scheduler::cpu_allowed(local_cpu, mask)
+                                && (mask & Scheduler::ready_online_cpu_mask()) != 0
+                        }
+                        // Contended cpuset lookup: conservatively request a
+                        // process-context check so a disallowed task cannot strand.
+                        EffectiveMaskLookup::Contended => true,
+                        // Empty effective cpuset: no eligible target exists.
+                        EffectiveMaskLookup::Empty => false,
+                    };
+                    if need_push {
+                        PENDING_AFFINITY_MIGRATE.with(|slot| {
+                            if slot.pending.load(Ordering::Acquire) {
+                                slot.overflow.store(true, Ordering::SeqCst);
+                            } else {
+                                slot.hint_gen.store(generation, Ordering::Release);
+                                slot.hint_pid.store(pid, Ordering::Release);
+                                if slot.pending.swap(true, Ordering::SeqCst) {
+                                    // Remote restore_to_source armed pending concurrently.
+                                    slot.overflow.store(true, Ordering::SeqCst);
+                                }
+                            }
+                        });
+                    }
+                }
             }
         }
     }
@@ -1486,14 +1574,10 @@ impl Scheduler {
     /// RF178-33: fail-closed, nonblocking affinity lookup for IRQ return.
     #[inline]
     fn try_effective_allowed_cpus(proc: &process::Process) -> Option<u64> {
-        let cpuset_id = CpusetId(proc.cpuset_id);
-        let effective = cpuset::try_effective_cpus(cpuset_id, proc.allowed_cpus)?;
-        if effective != 0 {
-            return Some(effective);
+        match try_effective_allowed_cpus_state_inner(proc) {
+            EffectiveMaskLookup::Allowed(mask) => Some(mask),
+            EffectiveMaskLookup::Empty | EffectiveMaskLookup::Contended => None,
         }
-
-        let cpuset_only = cpuset::try_effective_cpus(cpuset_id, 0)?;
-        (cpuset_only != 0).then_some(cpuset_only)
     }
 
     /// Check whether a CPU is permitted by the affinity mask (bit N = CPU N).
@@ -1690,7 +1774,18 @@ impl Scheduler {
     /// canonical `READY_QUEUE -> PCB` lock order, uses non-blocking `try_lock`
     /// on the source queue and PCB, and retains a source rollback slot until
     /// destination publication commits (RF180-46).
-    fn migrate_specific_ready(pid: Pid, generation: u64, src_cpu: usize, dst_cpu: usize) -> bool {
+    ///
+    /// `allow_throttled` permits moving a disallowed task onto an allowed CPU's
+    /// queue even while its cgroup quota is throttled (execution still enforces
+    /// quota throttling in `select_next_with_cursor` and `prepare_switch`),
+    /// preventing post-replenishment stranding on the disallowed queue.
+    fn migrate_specific_ready(
+        pid: Pid,
+        generation: u64,
+        src_cpu: usize,
+        dst_cpu: usize,
+        allow_throttled: bool,
+    ) -> bool {
         if src_cpu == dst_cpu || !interrupts::are_enabled() {
             return false;
         }
@@ -1723,9 +1818,11 @@ impl Scheduler {
                 if !Self::cpu_allowed(dst_cpu, effective_mask) {
                     return None;
                 }
-                let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
-                if cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some() {
-                    return None;
+                if !allow_throttled {
+                    let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
+                    if cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some() {
+                        return None;
+                    }
                 }
                 Some((bucket_prio, proc.dynamic_priority))
             });
@@ -1829,7 +1926,180 @@ impl Scheduler {
         if target_cpu == home_cpu {
             return;
         }
-        let _ = Self::migrate_specific_ready(pid, expected_generation, home_cpu, target_cpu);
+        let _ = Self::migrate_specific_ready(pid, expected_generation, home_cpu, target_cpu, false);
+    }
+
+    /// Push one specific disallowed off-CPU Ready task from `local_cpu` to an
+    /// allowed online CPU. Returns `true` if the task is no longer stranded on
+    /// `local_cpu` (migrated, already moved/reaped, or now allowed/unrunnable),
+    /// or `false` if transient lock contention requires a retry.
+    fn try_push_one_disallowed(local_cpu: usize, pid: Pid, expected_generation: u64) -> bool {
+        if steal_hint::hint().queue_cpu(pid) != Some(local_cpu) {
+            return true;
+        }
+        let pcb = match process::try_get_process(pid) {
+            None => return false,
+            Some(None) => return true,
+            Some(Some(pcb)) => pcb,
+        };
+        let allowed_cpus = {
+            let Some(proc) = pcb.try_lock() else {
+                return false;
+            };
+            if proc.pid != pid
+                || proc.generation != expected_generation
+                || proc.state != ProcessState::Ready
+                || proc.stopped
+                || proc.on_cpu.load(Ordering::Acquire)
+                || process::is_pending_irq_kill(pid)
+            {
+                return true;
+            }
+            let allowed_cpus = match try_effective_allowed_cpus_state_inner(&proc) {
+                EffectiveMaskLookup::Allowed(mask) => mask,
+                EffectiveMaskLookup::Empty => return true,
+                EffectiveMaskLookup::Contended => return false,
+            };
+            if Self::cpu_allowed(local_cpu, allowed_cpus) {
+                return true;
+            }
+            allowed_cpus
+        };
+        drop(pcb);
+
+        let online_mask = Self::ready_online_cpu_mask();
+        if (allowed_cpus & online_mask) == 0 {
+            return true;
+        }
+        let Some(target_cpu) = kernel_core::wait_kick::select_wake_affine_cpu(
+            online_mask,
+            local_cpu,
+            allowed_cpus,
+            Self::cpu_is_idle,
+            Self::cpu_is_halted_hint,
+            Self::published_queue_len,
+        ) else {
+            return true;
+        };
+        if target_cpu == local_cpu {
+            return true;
+        }
+        // Migrate disallowed residents onto an allowed CPU even if currently
+        // quota-throttled (execution still enforces quota throttling), so quota
+        // replenishment never leaves the task stranded on the disallowed queue.
+        if Self::migrate_specific_ready(pid, expected_generation, local_cpu, target_cpu, true) {
+            return true;
+        }
+        // If another CPU already stole or removed `pid` in the meantime, no
+        // retry is needed (a concurrent rollback re-arms `source_cpu` in
+        // `restore_to_source`); otherwise keep the obligation armed.
+        steal_hint::hint().queue_cpu(pid) != Some(local_cpu)
+    }
+
+    /// Push all off-CPU Ready residents of `local_cpu` whose effective affinity
+    /// excludes `local_cpu` onto allowed online CPUs (IF-on, no locks held).
+    ///
+    /// Re-arms `PENDING_AFFINITY_MIGRATE` whenever any lock contention or batch
+    /// overflow leaves work unverified, so no disallowed task can ever strand.
+    fn drain_pending_affinity_migrate() {
+        if !interrupts::are_enabled() {
+            return;
+        }
+        let has_pending =
+            PENDING_AFFINITY_MIGRATE.with(|slot| slot.pending.load(Ordering::Acquire));
+        if !has_pending {
+            return;
+        }
+        let local_cpu = current_cpu_id();
+        // Clear `pending` before `overflow` (reverse of remote `restore_to_source`'s
+        // `overflow = true; pending = true` SeqCst pair) so no concurrent rollback
+        // can have its `overflow` cleared without leaving `pending == true` with
+        // `hint_pid == 0` (which forces a full scan on the next pass).
+        let (overflow, hint_pid, hint_gen) = interrupts::without_interrupts(|| {
+            PENDING_AFFINITY_MIGRATE.with(|slot| {
+                let pid = slot.hint_pid.swap(0, Ordering::AcqRel);
+                let gen = if pid != 0 {
+                    slot.hint_gen.load(Ordering::Acquire)
+                } else {
+                    0
+                };
+                slot.pending.store(false, Ordering::SeqCst);
+                let overflow = slot.overflow.swap(false, Ordering::SeqCst);
+                (overflow, pid, gen)
+            })
+        });
+
+        // O(1) fast path: single disallowed task switched out with no overflow.
+        if !overflow && hint_pid != 0 {
+            if Self::try_push_one_disallowed(local_cpu, hint_pid as Pid, hint_gen) {
+                return;
+            }
+        }
+
+        // Full scan / retry path: inspect this CPU's ready queue for every
+        // off-CPU Ready disallowed task (handles consecutive IRQ-return
+        // handoffs, rollbacks, and transient lock contention without losing any task).
+        const BATCH_CAP: usize = 8;
+        let mut batch = [(0usize, 0u64); BATCH_CAP];
+        let mut count = 0usize;
+        let mut retry_needed = false;
+
+        if let Some(queue_ref) = Self::ready_queue_for_cpu(local_cpu) {
+            if let Some(guard) = queue_ref.try_lock() {
+                let online_mask = Self::ready_online_cpu_mask();
+                'scan: for (_prio, bucket) in guard.iter() {
+                    for (&pid, pcb) in bucket.iter() {
+                        if process::is_pending_irq_kill(pid) {
+                            continue;
+                        }
+                        let Some(proc) = pcb.try_lock() else {
+                            retry_needed = true;
+                            continue;
+                        };
+                        if proc.state != ProcessState::Ready
+                            || proc.stopped
+                            || proc.on_cpu.load(Ordering::Acquire)
+                        {
+                            continue;
+                        }
+                        let mask = match try_effective_allowed_cpus_state_inner(&proc) {
+                            EffectiveMaskLookup::Allowed(mask) => mask,
+                            EffectiveMaskLookup::Empty => continue,
+                            EffectiveMaskLookup::Contended => {
+                                retry_needed = true;
+                                continue;
+                            }
+                        };
+                        if Self::cpu_allowed(local_cpu, mask) || (mask & online_mask) == 0 {
+                            continue;
+                        }
+                        if count == BATCH_CAP {
+                            retry_needed = true;
+                            break 'scan;
+                        }
+                        batch[count] = (pid, proc.generation);
+                        count += 1;
+                    }
+                }
+            } else {
+                retry_needed = true;
+            }
+        }
+
+        for &(pid, gen) in &batch[..count] {
+            if !Self::try_push_one_disallowed(local_cpu, pid, gen) {
+                retry_needed = true;
+            }
+        }
+
+        if retry_needed {
+            interrupts::without_interrupts(|| {
+                PENDING_AFFINITY_MIGRATE.with(|slot| {
+                    slot.overflow.store(true, Ordering::SeqCst);
+                    slot.pending.store(true, Ordering::SeqCst);
+                });
+            });
+        }
     }
 
     #[inline]
@@ -2367,6 +2637,26 @@ impl Scheduler {
         pid: Pid,
         pcb: ProcessControlBlock,
     ) {
+        // Check before locking `source` whether the rolled-back task is
+        // disallowed on `source_cpu`. A concurrent affinity drain on
+        // `source_cpu` may have observed `queue_cpu(pid) == None` while the
+        // aborted migration was in flight and cleared its pending bit.
+        let needs_affinity_rearm = match pcb.try_lock() {
+            Some(proc) => {
+                proc.state == ProcessState::Ready
+                    && !proc.stopped
+                    && !proc.on_cpu.load(Ordering::Acquire)
+                    && match try_effective_allowed_cpus_state_inner(&proc) {
+                        EffectiveMaskLookup::Allowed(mask) => {
+                            !Self::cpu_allowed(source_cpu, mask)
+                                && (mask & Self::ready_online_cpu_mask()) != 0
+                        }
+                        EffectiveMaskLookup::Contended => true,
+                        EffectiveMaskLookup::Empty => false,
+                    }
+            }
+            None => true,
+        };
         {
             let source = Self::ready_queue_for_cpu(source_cpu)
                 .expect("migration source queue disappeared before rollback");
@@ -2378,6 +2668,14 @@ impl Scheduler {
             );
             Self::mark_queue_mutated(source_cpu);
             Self::note_enqueued(&source, source_cpu, pid);
+        }
+        if needs_affinity_rearm {
+            if let Some(slot) = PENDING_AFFINITY_MIGRATE.get_cpu(source_cpu) {
+                // Store `overflow` before `pending` (reverse of drain's clear
+                // order) so `source_cpu` performs a full scan after rollback.
+                slot.overflow.store(true, Ordering::SeqCst);
+                slot.pending.store(true, Ordering::SeqCst);
+            }
         }
         Self::arm_ready_cpu(source_cpu);
     }
@@ -2797,6 +3095,17 @@ impl Scheduler {
             let cpu_id = current_cpu_id();
             steal_hint::hint().tick(cpu_id, LOAD_BALANCE_INTERVAL_TICKS);
 
+            // If this CPU still owes a process-context push migration for an
+            // off-CPU disallowed resident (e.g. a syscall-free task resumed an
+            // IrqReturn continuation, or an earlier push hit transient lock
+            // contention), request a reschedule so IRQ-return hands off to
+            // idle (or the idle loop wakes) and completes the migration.
+            if PENDING_AFFINITY_MIGRATE.with(|slot| slot.pending.load(Ordering::Acquire))
+                || PENDING_PREV_ON_CPU.with(|slot| slot.pid.load(Ordering::Acquire) != 0)
+            {
+                current_cpu().set_need_resched();
+            }
+
             // R67-4 FIX: Use per-CPU current process
             let current_pid = process::current_pid();
             if current_pid
@@ -2962,13 +3271,50 @@ impl Scheduler {
         current_cpu().need_resched.store(false, Ordering::SeqCst);
     }
 
+    /// Capture outgoing user TLS bases and FPU state before switching a live
+    /// task off this CPU (either to another task or to the idle bootstrap
+    /// context when migrating off a disallowed CPU).
+    #[inline]
+    fn save_outgoing_tls_and_fpu(old_pid: Pid, old: &mut process::Process) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use x86_64::registers::model_specific::Msr;
+            const MSR_FS_BASE: u32 = 0xC000_0100;
+            const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+            unsafe {
+                old.fs_base = Msr::new(MSR_FS_BASE).read();
+                old.gs_base = Msr::new(MSR_KERNEL_GS_BASE).read();
+            }
+        }
+
+        let per_cpu = current_cpu();
+        if per_cpu.get_fpu_owner() == old_pid {
+            unsafe {
+                use x86_64::registers::control::{Cr0, Cr0Flags};
+                let cr0 = Cr0::read();
+                if cr0.contains(Cr0Flags::TASK_SWITCHED) {
+                    let mut new_cr0 = cr0;
+                    new_cr0.remove(Cr0Flags::TASK_SWITCHED);
+                    Cr0::write(new_cr0);
+                }
+                core::arch::asm!(
+                    "fxsave64 [{}]",
+                    in(reg) old.context.fx.data.as_mut_ptr(),
+                    options(nostack)
+                );
+            }
+            old.fpu_used = true;
+            per_cpu.set_fpu_owner(NO_FPU_OWNER);
+        }
+    }
+
     /// RF178-33 / RF180-46: prepare one switch without a blocking lock.
     ///
     /// Both process-origin and IRQ-return scheduling enter here with IF clear.
     /// Every potentially contended lock is therefore try-only. A failed
     /// acquisition leaves all task/current publications unchanged and rearms
     /// the level-triggered reschedule request.
-    fn prepare_switch() -> Option<PreparedSwitch> {
+    fn prepare_switch(origin: kernel_core::ReschedOrigin) -> Option<PreparedSwitch> {
         let current_slot = Self::current_process_slot();
         let Some(mut current_guard) = current_slot.try_lock() else {
             current_cpu().set_need_resched();
@@ -3006,8 +3352,14 @@ impl Scheduler {
         let old_needs_drain = old_pid
             .map(|pid| process::is_pending_irq_kill(pid) || process::is_thread_autoreap_marked(pid))
             .unwrap_or(false);
-        let candidate_deferred = old_needs_drain && selection.candidate.is_some();
-        let candidate = if old_needs_drain {
+        let disallowed_drain_handoff = kernel_core::wait_kick::should_handoff_for_disallowed_drain(
+            origin == kernel_core::ReschedOrigin::IrqReturn,
+            PENDING_AFFINITY_MIGRATE.with(|slot| slot.pending.load(Ordering::Acquire)),
+            old_pid.is_some(),
+        );
+        let force_idle_for_drain = old_needs_drain || disallowed_drain_handoff;
+        let candidate_deferred = force_idle_for_drain && selection.candidate.is_some();
+        let candidate = if force_idle_for_drain {
             None
         } else {
             selection.candidate
@@ -3062,7 +3414,74 @@ impl Scheduler {
                             next_kcov_token: 0,
                         });
                     }
-                    if old.state == ProcessState::Ready && old.on_cpu.load(Ordering::Acquire) {
+                    let old_runnable =
+                        matches!(old.state, ProcessState::Running | ProcessState::Ready);
+                    let old_on_cpu = old.on_cpu.load(Ordering::Acquire);
+                    if old_runnable && !old.stopped && old_on_cpu {
+                        let need_affinity_idle = match try_effective_allowed_cpus_state_inner(&old)
+                        {
+                            EffectiveMaskLookup::Contended => {
+                                current_cpu().set_need_resched();
+                                false
+                            }
+                            EffectiveMaskLookup::Empty => false,
+                            EffectiveMaskLookup::Allowed(effective_mask) => {
+                                kernel_core::wait_kick::should_handoff_disallowed_task_to_idle(
+                                    true,
+                                    false,
+                                    true,
+                                    local_cpu,
+                                    effective_mask,
+                                    Self::ready_online_cpu_mask(),
+                                )
+                            }
+                        };
+                        if need_affinity_idle || disallowed_drain_handoff {
+                            if let Some(bootstrap) =
+                                BOOTSTRAP_CONTEXT.with(BootstrapContext::target)
+                            {
+                                let old_pid = old.pid;
+                                let old_generation = old.generation;
+                                let old_space = old.memory_space;
+                                Self::save_outgoing_tls_and_fpu(old_pid, &mut old);
+                                old.enter_ready_at(kernel_core::get_ticks());
+                                let old_ctx_ptr = &mut old.context as *mut _ as *mut ArchContext;
+                                drop(old);
+                                drop(queue);
+                                *current_guard = None;
+                                CURRENT_GENERATION[local_cpu].store(0, Ordering::Release);
+                                drop(current_guard);
+                                mm::heap_admission::set_current_owner(None);
+                                process::set_current_pid(None);
+                                process::note_context_switch(local_cpu);
+                                if !selection.complete_cycle
+                                    || candidate_deferred
+                                    || disallowed_drain_handoff
+                                {
+                                    current_cpu().set_need_resched();
+                                }
+                                if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
+                                    stats.total_switches = stats.total_switches.saturating_add(1);
+                                }
+                                return Some(PreparedSwitch {
+                                    old_pid,
+                                    old_generation,
+                                    old_space,
+                                    old_ctx_ptr,
+                                    next_space: 0,
+                                    next_user_space: 0,
+                                    next_ctx_ptr: bootstrap.context,
+                                    next_kstack_top: bootstrap.kernel_stack_top,
+                                    next_cs: bootstrap.cs,
+                                    next_fs_base: bootstrap.fs_base,
+                                    next_gs_base: bootstrap.gs_base,
+                                    next_wd_handle: None,
+                                    next_kcov_token: 0,
+                                });
+                            }
+                        }
+                    }
+                    if old.state == ProcessState::Ready && old_on_cpu {
                         old.enter_running_at(kernel_core::get_ticks());
                     }
                 } else {
@@ -3108,41 +3527,8 @@ impl Scheduler {
             return None;
         }
 
-        #[cfg(target_arch = "x86_64")]
-        if let Some(old) = old.as_mut() {
-            use x86_64::registers::model_specific::Msr;
-            const MSR_FS_BASE: u32 = 0xC000_0100;
-            const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-            unsafe {
-                old.fs_base = Msr::new(MSR_FS_BASE).read();
-                old.gs_base = Msr::new(MSR_KERNEL_GS_BASE).read();
-            }
-        }
-
-        let per_cpu = current_cpu();
-        if old_pid
-            .map(|pid| per_cpu.get_fpu_owner() == pid)
-            .unwrap_or(false)
-        {
-            let old = old
-                .as_mut()
-                .expect("current PID with FPU ownership must retain its PCB");
-            unsafe {
-                use x86_64::registers::control::{Cr0, Cr0Flags};
-                let cr0 = Cr0::read();
-                if cr0.contains(Cr0Flags::TASK_SWITCHED) {
-                    let mut new_cr0 = cr0;
-                    new_cr0.remove(Cr0Flags::TASK_SWITCHED);
-                    Cr0::write(new_cr0);
-                }
-                core::arch::asm!(
-                    "fxsave64 [{}]",
-                    in(reg) old.context.fx.data.as_mut_ptr(),
-                    options(nostack)
-                );
-            }
-            old.fpu_used = true;
-            per_cpu.set_fpu_owner(NO_FPU_OWNER);
+        if let (Some(old_pid), Some(old)) = (old_pid, old.as_mut()) {
+            Self::save_outgoing_tls_and_fpu(old_pid, old);
         }
 
         let (old_ctx_ptr, old_generation, old_space) = if let Some(old) = old.as_mut() {
@@ -3363,25 +3749,53 @@ impl Scheduler {
     ///
     /// **警告**: 此函数可能不会返回（如果发生上下文切换）
     pub fn reschedule_now(force: bool, origin: kernel_core::ReschedOrigin) {
+        let is_voluntary_yield = origin == kernel_core::ReschedOrigin::VoluntaryYield;
         // RF180-46: allocating load distribution stays in IF-on process
         // context. The actual claim/save transaction below is shared with IRQ
         // return and is entirely try-only once IF is cleared.
-        if origin == kernel_core::ReschedOrigin::Process && interrupts::are_enabled() {
+        if matches!(
+            origin,
+            kernel_core::ReschedOrigin::Process | kernel_core::ReschedOrigin::VoluntaryYield
+        ) && interrupts::are_enabled()
+        {
+            // Push any outgoing disallowed task whose on_cpu gate cleared on an
+            // earlier IRQ-return or switch_to_user boundary before checking local
+            // queues or stealing.
+            Self::drain_pending_affinity_migrate();
             // C3 repair 3 (#90): send the kicks this CPU recorded, before a
             // blocking wait or an exit switches away. Process context, no
             // lock held (RF178-35).
             kernel_core::wait_kick::flush_wake_kicks();
             #[cfg(feature = "stall_dump")]
             stall_dump_if_silent();
-            if BALANCE_DUE.swap(false, Ordering::Relaxed) {
+            if BALANCE_DUE.load(Ordering::Relaxed) && BALANCE_DUE.swap(false, Ordering::Relaxed) {
                 Self::balance_queues();
             }
+            let local_cpu = current_cpu_id();
             let need_resched = current_cpu().need_resched.load(Ordering::Acquire);
-            let cpu_is_idle = Self::cpu_is_idle(current_cpu_id());
-            if kernel_core::wait_kick::should_try_steal_on_process_resched(
+            let cpu_is_idle = Self::cpu_is_idle(local_cpu);
+            if is_voluntary_yield {
+                let old_needs_drain = process::current_pid()
+                    .map(|pid| {
+                        process::is_pending_irq_kill(pid) || process::is_thread_autoreap_marked(pid)
+                    })
+                    .unwrap_or(false);
+                let has_pending_prev =
+                    PENDING_PREV_ON_CPU.with(|s| s.pid.load(Ordering::Acquire) != 0);
+                if kernel_core::wait_kick::can_short_circuit_voluntary_yield(
+                    cpu_is_idle,
+                    need_resched,
+                    Self::published_queue_len(local_cpu),
+                    old_needs_drain || has_pending_prev,
+                ) {
+                    return;
+                }
+            }
+            if kernel_core::wait_kick::should_try_steal_on_process_resched_with_yield(
                 cpu_is_idle,
                 force,
                 need_resched,
+                is_voluntary_yield,
             ) {
                 let current_pid = Self::get_current();
                 let _ = Self::try_steal_to_local_queue(current_pid);
@@ -3401,7 +3815,7 @@ impl Scheduler {
                 return;
             }
             current_cpu().need_resched.store(false, Ordering::SeqCst);
-            if let Some(prepared) = Self::prepare_switch() {
+            if let Some(prepared) = Self::prepare_switch(origin) {
                 // GAP-6 F6: these locals live on the outgoing task's own stack,
                 // so after execute_switch returns they name the task that was
                 // just resumed here, whichever CPU resumed it.
@@ -3416,6 +3830,14 @@ impl Scheduler {
                 }
             }
         });
+
+        if matches!(
+            origin,
+            kernel_core::ReschedOrigin::Process | kernel_core::ReschedOrigin::VoluntaryYield
+        ) && interrupts::are_enabled()
+        {
+            Self::drain_pending_affinity_migrate();
+        }
     }
 }
 
@@ -4628,6 +5050,7 @@ fn force_init_sched_locals() {
     NEXT_CONTEXT_SHADOW.force_init();
     BOOTSTRAP_CONTEXT.force_init(); // KSA-011: idle save/restore never lazily allocates with IF=0.
     PENDING_PREV_ON_CPU.force_init(); // R172-03: per-CPU finish_task_switch slot
+    PENDING_AFFINITY_MIGRATE.force_init(); // Immediate affinity push slot (IF-off writer)
 }
 
 /// 初始化调度器

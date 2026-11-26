@@ -216,7 +216,12 @@ impl<const CPUS: usize> WaitKicks<CPUS> {
         if this >= CPUS {
             return 0;
         }
-        self.published[this].0.swap(0, Ordering::AcqRel);
+        if self.published[this].0.load(Ordering::Relaxed) != 0 {
+            self.published[this].0.swap(0, Ordering::AcqRel);
+        }
+        if self.pending[this].0.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
         self.pending[this].0.swap(0, Ordering::AcqRel)
     }
 
@@ -399,7 +404,73 @@ pub fn should_try_steal_on_process_resched(
     force: bool,
     need_resched: bool,
 ) -> bool {
-    cpu_is_idle || force || need_resched
+    should_try_steal_on_process_resched_with_yield(cpu_is_idle, force, need_resched, false)
+}
+
+/// Gate process-context work-stealing in `reschedule_now`, distinguishing
+/// voluntary `sched_yield()` from blocking/exit/preemption reschedules.
+///
+/// A voluntary yield only rotates among runnable tasks already queued on the
+/// local CPU (matching Linux `do_sched_yield()`) and must not trigger remote
+/// queue scans unless the CPU is idle or already armed with `need_resched`.
+#[inline]
+pub fn should_try_steal_on_process_resched_with_yield(
+    cpu_is_idle: bool,
+    force: bool,
+    need_resched: bool,
+    is_voluntary_yield: bool,
+) -> bool {
+    cpu_is_idle || need_resched || (force && !is_voluntary_yield)
+}
+
+/// Fast-path gate for voluntary `sched_yield()` when the running task is the
+/// sole resident of its local ready queue and no reschedule or pending drain
+/// requires entering `prepare_switch()`.
+#[inline]
+pub fn can_short_circuit_voluntary_yield(
+    cpu_is_idle: bool,
+    need_resched: bool,
+    published_local_len: usize,
+    pending_drain_or_prev: bool,
+) -> bool {
+    !cpu_is_idle && !need_resched && published_local_len <= 1 && !pending_drain_or_prev
+}
+
+/// Decide whether a live running task whose effective CPU affinity excludes
+/// `local_cpu` should hand off to the bootstrap/idle context when no local
+/// replacement task is runnable, so its `on_cpu` gate clears and it can be
+/// pushed immediately to an allowed online CPU.
+#[inline]
+pub fn should_handoff_disallowed_task_to_idle(
+    is_runnable: bool,
+    stopped: bool,
+    on_cpu: bool,
+    local_cpu: usize,
+    effective_mask: u64,
+    online_mask: u64,
+) -> bool {
+    if !is_runnable || stopped || !on_cpu {
+        return false;
+    }
+    let local_allowed =
+        effective_mask == 0 || (local_cpu < 64 && (effective_mask & bit(local_cpu)) != 0);
+    if local_allowed {
+        return false;
+    }
+    (effective_mask & online_mask) != 0
+}
+
+/// Decide whether an IRQ-return reschedule must temporarily hand off the
+/// current live task to the bootstrap/idle context so process context can
+/// drain pending disallowed-task push migrations (preventing starvation when
+/// the local CPU runs a syscall-free user loop).
+#[inline]
+pub fn should_handoff_for_disallowed_drain(
+    is_irq_return: bool,
+    disallowed_push_pending: bool,
+    has_current_task: bool,
+) -> bool {
+    is_irq_return && disallowed_push_pending && has_current_task
 }
 
 /// Idle-aware, staggered CPU selection for newly spawned work (`fork`/`clone`).
@@ -1495,6 +1566,126 @@ mod tests {
         assert!(should_try_steal_on_process_resched(true, false, false));
         assert!(should_try_steal_on_process_resched(false, true, false));
         assert!(should_try_steal_on_process_resched(false, false, true));
+    }
+
+    #[test]
+    fn voluntary_yield_steal_gate_skips_remote_scans_unless_idle_or_resched_armed() {
+        // Voluntary yield on a running CPU with need_resched clear must NOT steal.
+        assert!(!should_try_steal_on_process_resched_with_yield(
+            false, true, false, true
+        ));
+        assert!(!should_try_steal_on_process_resched_with_yield(
+            false, false, false, true
+        ));
+        // Idle CPU or armed need_resched still permits stealing.
+        assert!(should_try_steal_on_process_resched_with_yield(
+            true, true, false, true
+        ));
+        assert!(should_try_steal_on_process_resched_with_yield(
+            false, true, true, true
+        ));
+        // Non-yield forced reschedules (blocking wait, exit, halt loop) still steal.
+        assert!(should_try_steal_on_process_resched_with_yield(
+            false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn voluntary_yield_short_circuit_only_when_sole_resident_and_clean() {
+        // Sole running task with no reschedule or pending drain/prev: fast return.
+        assert!(can_short_circuit_voluntary_yield(false, false, 0, false));
+        assert!(can_short_circuit_voluntary_yield(false, false, 1, false));
+        // Another resident in the local queue must enter prepare_switch() immediately.
+        assert!(!can_short_circuit_voluntary_yield(false, false, 2, false));
+        // Idle CPU, armed need_resched, or pending drain/prev must not short-circuit.
+        assert!(!can_short_circuit_voluntary_yield(true, false, 1, false));
+        assert!(!can_short_circuit_voluntary_yield(false, true, 1, false));
+        assert!(!can_short_circuit_voluntary_yield(false, false, 1, true));
+    }
+
+    #[test]
+    fn take_pending_fast_path_preserves_publish_and_clears_masks() {
+        let kicks: WaitKicks<4> = WaitKicks::new();
+        assert_eq!(kicks.take_pending(0), 0);
+
+        // Publish to a non-halted CPU populates `published` only; take_pending clears it.
+        kicks.publish(0, 2);
+        assert_eq!(kicks.take_pending(0), 0);
+        assert_eq!(kicks.take_published(0), 0);
+
+        // Publish to a halted CPU populates both `published` and `pending`.
+        kicks.mark_halted(3);
+        kicks.publish(0, 3);
+        assert_eq!(kicks.take_pending(0), bit(3));
+        assert_eq!(kicks.take_pending(0), 0);
+        assert_eq!(kicks.take_published(0), 0);
+    }
+
+    #[test]
+    fn disallowed_task_idle_handoff_requires_runnable_unpinned_and_online_target() {
+        let online = bit(0) | bit(1) | bit(2) | bit(3);
+        // Running task on CPU 1 pinned to CPU 0 (which is online): must hand off.
+        assert!(should_handoff_disallowed_task_to_idle(
+            true,
+            false,
+            true,
+            1,
+            bit(0),
+            online
+        ));
+        // Unrestricted (mask 0) or already on an allowed CPU: stay running.
+        assert!(!should_handoff_disallowed_task_to_idle(
+            true, false, true, 1, 0, online
+        ));
+        assert!(!should_handoff_disallowed_task_to_idle(
+            true,
+            false,
+            true,
+            1,
+            bit(1) | bit(2),
+            online
+        ));
+        // Non-runnable, stopped, off-CPU, or no online target CPU: never hand off.
+        assert!(!should_handoff_disallowed_task_to_idle(
+            false,
+            false,
+            true,
+            1,
+            bit(0),
+            online
+        ));
+        assert!(!should_handoff_disallowed_task_to_idle(
+            true,
+            true,
+            true,
+            1,
+            bit(0),
+            online
+        ));
+        assert!(!should_handoff_disallowed_task_to_idle(
+            true,
+            false,
+            false,
+            1,
+            bit(0),
+            online
+        ));
+        assert!(!should_handoff_disallowed_task_to_idle(
+            true,
+            false,
+            true,
+            1,
+            bit(7),
+            online
+        ));
+    }
+
+    #[test]
+    fn irq_return_disallowed_drain_handoff_only_triggers_when_pending_with_task() {
+        assert!(should_handoff_for_disallowed_drain(true, true, true));
+        assert!(!should_handoff_for_disallowed_drain(false, true, true));
+        assert!(!should_handoff_for_disallowed_drain(true, false, true));
+        assert!(!should_handoff_for_disallowed_drain(true, true, false));
     }
 
     #[test]

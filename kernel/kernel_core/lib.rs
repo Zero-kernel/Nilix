@@ -189,11 +189,12 @@ pub use cap::{
     Shm, Socket, Timer, DEFAULT_CAP_SLOTS,
 };
 pub use scheduler_hook::{
-    drain_requested_soft_progress, force_init_resched_locals, force_reschedule,
-    force_reschedule_from_irq, mark_process_deferred_work_ready, on_scheduler_tick,
-    process_deferred_work_ready, register_kernel_gs_assert, register_resched_callback,
-    register_soft_progress_callback, register_timer_callback, request_resched_from_irq,
-    request_soft_progress_from_irq, reschedule_if_needed, reschedule_if_needed_with_post_drain,
+    drain_and_force_reschedule, drain_and_yield_reschedule, drain_requested_soft_progress,
+    force_init_resched_locals, force_reschedule, force_reschedule_from_irq,
+    mark_process_deferred_work_ready, on_scheduler_tick, process_deferred_work_ready,
+    register_kernel_gs_assert, register_resched_callback, register_soft_progress_callback,
+    register_timer_callback, request_resched_from_irq, request_soft_progress_from_irq,
+    reschedule_if_needed, reschedule_if_needed_with_post_drain, yield_reschedule,
     CallbackRegistrationError, ReschedOrigin,
 };
 pub use signal::{
