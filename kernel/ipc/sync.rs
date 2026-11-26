@@ -908,6 +908,12 @@ impl WaitQueue {
         self.wake_specific_if(pid, || true)
     }
 
+    /// Wake `pid` if present and return the exact generation of the readied
+    /// PCB (if a live PCB transitioned `Blocked -> Ready`).
+    pub(crate) fn wake_specific_with_generation(&self, pid: ProcessId) -> Option<u64> {
+        self.wake_specific_if_with_generation(pid, || true)
+    }
+
     /// GAP-5 futex parity: [`Self::wake_specific`], but only if `still_wanted`,
     /// evaluated under this queue's waiters lock, returns true. A futex waker
     /// that readies a task after dropping the bucket lock passes a check of
@@ -941,6 +947,40 @@ impl WaitQueue {
             } else {
                 false
             }
+        })
+    }
+
+    /// Identity-preserving variant of [`Self::wake_specific_if`] that returns
+    /// `Some(proc.generation)` when a live Blocked PCB was readied, allowing
+    /// deferred wake-affine placement outside the wait-queue lock to reject a
+    /// recycled PID (generation ABA).
+    pub(crate) fn wake_specific_if_with_generation(
+        &self,
+        pid: ProcessId,
+        still_wanted: impl FnOnce() -> bool,
+    ) -> Option<u64> {
+        interrupts::without_interrupts(|| {
+            let mut waiters = self.waiters.lock();
+            if !still_wanted() {
+                return None;
+            }
+            let pos = waiters.iter().position(|&(p, _)| p == pid)?;
+            let entry_gen = waiters[pos].1;
+            waiters.remove_retaining_capacity(pos);
+            let proc_arc = process::get_process(pid)?;
+            let mut proc = proc_arc.lock();
+            if proc.state != ProcessState::Blocked {
+                return None;
+            }
+            if is_process_generation_stamp(entry_gen) {
+                let stamped = unstamp_process_generation(entry_gen);
+                if stamped != proc.generation {
+                    return None;
+                }
+            }
+            let generation = proc.generation;
+            proc.enter_ready_at(kernel_core::get_ticks());
+            Some(generation)
         })
     }
 

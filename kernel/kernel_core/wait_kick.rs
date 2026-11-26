@@ -201,6 +201,16 @@ impl<const CPUS: usize> WaitKicks<CPUS> {
             .is_some_and(|halted| halted.0.load(Ordering::SeqCst))
     }
 
+    /// Advisory halt-state read for wake-affine / new-work CPU placement.
+    /// Uses `Acquire` rather than `SeqCst`; correctness never depends on it
+    /// (the Dekker handshake in `publish` / `halt_sequence` stays `SeqCst`).
+    #[inline]
+    pub fn is_halted_hint(&self, cpu: usize) -> bool {
+        self.halted
+            .get(cpu)
+            .is_some_and(|halted| halted.0.load(Ordering::Acquire))
+    }
+
     /// The kicks CPU `this` recorded; its published mask is cleared too.
     pub fn take_pending(&self, this: usize) -> u64 {
         if this >= CPUS {
@@ -312,6 +322,14 @@ static KICKS: KernelWaitKicks = WaitKicks::new();
 /// Sends one reschedule IPI to a CPU; registered by the scheduler.
 static KICK_CPU: spin::Once<fn(usize)> = spin::Once::new();
 
+/// Optional wake-affine placement hook registered by the scheduler.
+/// Runs in IF-on process context with no futex/waitqueue/PCB lock held after
+/// a task becomes Ready, placing it on an allowed idle CPU when its home CPU
+/// is busy or disallowed while preserving cache locality when its home CPU is
+/// free and permitted (or the system is saturated). Carries `(pid, generation)`
+/// captured at wake time so a recycled PID is rejected.
+static WAKE_AFFINE_HOOK: spin::Once<fn(usize, u64)> = spin::Once::new();
+
 /// The kernel's wait-and-kick state.
 #[inline]
 pub fn kicks() -> &'static KernelWaitKicks {
@@ -322,6 +340,217 @@ pub fn kicks() -> &'static KernelWaitKicks {
 /// registered and sent only after.
 pub fn register_cpu_kick(kick: fn(usize)) {
     KICK_CPU.call_once(|| kick);
+}
+
+/// Register the scheduler's wake-affine placement hook.
+pub fn register_wake_affine_hook(hook: fn(usize, u64)) {
+    WAKE_AFFINE_HOOK.call_once(|| hook);
+}
+
+/// Ask the scheduler to apply wake-affine placement for a freshly readied task
+/// identified by `(pid, generation)`. Callers must hold no lock and run in
+/// process context with interrupts enabled.
+#[inline]
+pub fn note_wake_affine(pid: usize, generation: u64) {
+    if let Some(hook) = WAKE_AFFINE_HOOK.get() {
+        hook(pid, generation);
+    }
+}
+
+/// Compute the intersection of online CPUs with `allowed_cpus` (where `0` means
+/// unrestricted, matching `Scheduler::cpu_allowed`).
+#[inline]
+fn eligible_cpu_mask(online_mask: u64, allowed_cpus: u64) -> u64 {
+    if allowed_cpus == 0 {
+        online_mask
+    } else {
+        online_mask & allowed_cpus
+    }
+}
+
+/// Visit every set bit in `mask` in staggered ring order starting immediately
+/// after `start_after` (wrapping around modulo 64). Staggering prevents
+/// concurrent spawns or wakes from colliding on the lowest-numbered idle CPU.
+#[inline]
+fn for_each_staggered_cpu(mask: u64, start_after: usize, mut visit: impl FnMut(usize)) {
+    if mask == 0 {
+        return;
+    }
+    let shift = ((start_after.wrapping_add(1)) & 63) as u32;
+    let mut rotated = mask.rotate_right(shift);
+    while rotated != 0 {
+        let tz = rotated.trailing_zeros();
+        let cpu = ((tz + shift) & 63) as usize;
+        visit(cpu);
+        rotated &= rotated - 1;
+    }
+}
+
+/// Gate process-context work-stealing in `reschedule_now`.
+///
+/// Only CPUs that are idle, explicitly rescheduling (`force`: blocking wait,
+/// task exit, `sched_yield`, pending IRQ resched), or already flagged with
+/// `need_resched` should scan and steal from remote queues. A running task
+/// returning from an ordinary syscall (`futex_wake`, `clone`, `write`, etc.)
+/// must not steal remote work and preempt itself.
+#[inline]
+pub fn should_try_steal_on_process_resched(
+    cpu_is_idle: bool,
+    force: bool,
+    need_resched: bool,
+) -> bool {
+    cpu_is_idle || force || need_resched
+}
+
+/// Idle-aware, staggered CPU selection for newly spawned work (`fork`/`clone`).
+///
+/// Priority:
+/// 1. `preferred_cpu` if allowed and currently idle (e.g. BSP boot).
+/// 2. An allowed idle CPU with an empty queue (`is_idle && queue_len == 0`),
+///    scanned in staggered ring order after `preferred_cpu`.
+/// 3. An allowed idle or halted CPU with minimum `queue_len` (breaking ties
+///    in favor of truly idle CPUs over halted-waiter CPUs, then staggered).
+/// 4. Saturated fallback: least-loaded allowed CPU when `least_len + threshold
+///    < preferred_len` (or when `preferred_cpu` is disallowed), otherwise
+///    `preferred_cpu`.
+pub fn select_target_cpu_for_new_work(
+    online_mask: u64,
+    preferred_cpu: usize,
+    allowed_cpus: u64,
+    load_imbalance_threshold: usize,
+    is_idle: impl Fn(usize) -> bool,
+    is_halted: impl Fn(usize) -> bool,
+    queue_len: impl Fn(usize) -> usize,
+) -> Option<usize> {
+    let eligible = eligible_cpu_mask(online_mask, allowed_cpus);
+    if eligible == 0 {
+        return None;
+    }
+
+    let preferred_allowed = preferred_cpu < 64 && (eligible & bit(preferred_cpu)) != 0;
+    if preferred_allowed && is_idle(preferred_cpu) {
+        return Some(preferred_cpu);
+    }
+
+    let mut first_empty_idle: Option<usize> = None;
+    let mut best_idle_or_halted: Option<(usize, usize, bool)> = None;
+    let mut least: Option<(usize, usize)> = None;
+
+    for_each_staggered_cpu(eligible, preferred_cpu, |cpu| {
+        let len = queue_len(cpu);
+        if least.is_none_or(|(_, best_len)| len < best_len) {
+            least = Some((cpu, len));
+        }
+        if cpu == preferred_cpu {
+            return;
+        }
+        let idle = is_idle(cpu);
+        let halted = !idle && is_halted(cpu);
+        if idle && len == 0 && first_empty_idle.is_none() {
+            first_empty_idle = Some(cpu);
+        }
+        if idle || halted {
+            let better = match best_idle_or_halted {
+                None => true,
+                Some((_, best_len, best_idle)) => {
+                    len < best_len || (len == best_len && idle && !best_idle)
+                }
+            };
+            if better {
+                best_idle_or_halted = Some((cpu, len, idle));
+            }
+        }
+    });
+
+    if let Some(cpu) = first_empty_idle {
+        return Some(cpu);
+    }
+    if let Some((cpu, _, _)) = best_idle_or_halted {
+        return Some(cpu);
+    }
+
+    let (least_cpu, least_len) = least?;
+    if !preferred_allowed {
+        return Some(least_cpu);
+    }
+    let preferred_len = queue_len(preferred_cpu);
+    if least_cpu != preferred_cpu
+        && least_len.saturating_add(load_imbalance_threshold) < preferred_len
+    {
+        Some(least_cpu)
+    } else {
+        Some(preferred_cpu)
+    }
+}
+
+/// Wake-affine CPU selection for a freshly readied task (e.g. `futex_wake`).
+///
+/// Priority:
+/// 1. Keep `home_cpu` (zero migration, warm cache/TLB) if allowed and free
+///    (`is_idle(home_cpu) || is_halted(home_cpu)`).
+/// 2. When `home_cpu` is busy running another task (or disallowed), pick an
+///    allowed free CPU in staggered ring order after `home_cpu`: empty idle
+///    -> non-empty idle (min queue_len) -> halted CPU (min queue_len).
+/// 3. Under saturation (no allowed CPU is idle or halted), keep `home_cpu` if
+///    allowed to avoid pointless migration churn.
+/// 4. If `home_cpu` is disallowed (affinity/cpuset changed while blocked),
+///    fall back to the least-loaded allowed CPU.
+pub fn select_wake_affine_cpu(
+    online_mask: u64,
+    home_cpu: usize,
+    allowed_cpus: u64,
+    is_idle: impl Fn(usize) -> bool,
+    is_halted: impl Fn(usize) -> bool,
+    queue_len: impl Fn(usize) -> usize,
+) -> Option<usize> {
+    let eligible = eligible_cpu_mask(online_mask, allowed_cpus);
+    if eligible == 0 {
+        return None;
+    }
+
+    let home_allowed = home_cpu < 64 && (eligible & bit(home_cpu)) != 0;
+    if home_allowed && (is_idle(home_cpu) || is_halted(home_cpu)) {
+        return Some(home_cpu);
+    }
+
+    let mut first_empty_idle: Option<usize> = None;
+    let mut best_idle: Option<(usize, usize)> = None;
+    let mut best_halted: Option<(usize, usize)> = None;
+    let mut least: Option<(usize, usize)> = None;
+
+    for_each_staggered_cpu(eligible, home_cpu, |cpu| {
+        let len = queue_len(cpu);
+        if least.is_none_or(|(_, best_len)| len < best_len) {
+            least = Some((cpu, len));
+        }
+        if cpu == home_cpu {
+            return;
+        }
+        if is_idle(cpu) {
+            if len == 0 && first_empty_idle.is_none() {
+                first_empty_idle = Some(cpu);
+            }
+            if best_idle.is_none_or(|(_, best_len)| len < best_len) {
+                best_idle = Some((cpu, len));
+            }
+        } else if is_halted(cpu) && best_halted.is_none_or(|(_, best_len)| len < best_len) {
+            best_halted = Some((cpu, len));
+        }
+    });
+
+    if let Some(cpu) = first_empty_idle {
+        return Some(cpu);
+    }
+    if let Some((cpu, _)) = best_idle {
+        return Some(cpu);
+    }
+    if let Some((cpu, _)) = best_halted {
+        return Some(cpu);
+    }
+    if home_allowed {
+        return Some(home_cpu);
+    }
+    least.map(|(cpu, _)| cpu)
 }
 
 /// The publication hook: the task `pid` became Ready (`Process::enter_ready_at`
@@ -962,5 +1191,196 @@ mod tests {
             post_unq.merge(FatalExitPost::Kick),
             FatalExitPost::Broadcast
         );
+    }
+
+    #[test]
+    fn wake_affine_keeps_home_cpu_when_idle_or_halted() {
+        let online = 0b1111u64;
+        // Home CPU 2 is halted (e.g. parked on the blocked waiter) while CPU 3 is empty idle.
+        // Wake-affine must keep CPU 2 for warm cache/TLB and zero migration.
+        let picked = select_wake_affine_cpu(
+            online,
+            2,
+            0,
+            |cpu| cpu == 3,
+            |cpu| cpu == 2,
+            |cpu| usize::from(cpu != 3),
+        );
+        assert_eq!(picked, Some(2));
+
+        // Home CPU 1 is truly idle: must stay on CPU 1.
+        let picked_idle =
+            select_wake_affine_cpu(online, 1, 0, |cpu| cpu == 1 || cpu == 3, |_| false, |_| 0);
+        assert_eq!(picked_idle, Some(1));
+    }
+
+    #[test]
+    fn wake_affine_migrates_to_idle_cpu_when_home_cpu_busy() {
+        let online = 0b1111_1111u64;
+        // Home CPU 2 is busy. CPUs 0 and 5 are empty idle; staggered scan after 2
+        // must pick CPU 5 first instead of colliding on CPU 0.
+        let picked = select_wake_affine_cpu(
+            online,
+            2,
+            0,
+            |cpu| cpu == 0 || cpu == 5,
+            |cpu| cpu == 3,
+            |cpu| if cpu == 0 || cpu == 5 { 0 } else { 1 },
+        );
+        assert_eq!(picked, Some(5));
+
+        // No empty idle CPU: prefer non-empty idle (CPU 4) over halted CPU (CPU 3).
+        let picked_idle = select_wake_affine_cpu(
+            online,
+            2,
+            0,
+            |cpu| cpu == 4,
+            |cpu| cpu == 3,
+            |cpu| if cpu == 4 { 2 } else { 1 },
+        );
+        assert_eq!(picked_idle, Some(4));
+
+        // No truly idle CPU: fall back to halted CPU with shortest queue (CPU 6).
+        let picked_halted = select_wake_affine_cpu(
+            online,
+            2,
+            0,
+            |_| false,
+            |cpu| cpu == 3 || cpu == 6,
+            |cpu| if cpu == 6 { 1 } else { 3 },
+        );
+        assert_eq!(picked_halted, Some(6));
+    }
+
+    #[test]
+    fn wake_affine_stays_on_home_cpu_when_all_cpus_busy() {
+        let online = 0b1111u64;
+        // Every CPU is busy running tasks; home CPU 1 has queue_len 3 while CPU 0 has 1.
+        // Saturated wake-affine must keep home CPU 1 to prevent migration churn.
+        let picked = select_wake_affine_cpu(
+            online,
+            1,
+            0,
+            |_| false,
+            |_| false,
+            |cpu| if cpu == 1 { 3 } else { 1 },
+        );
+        assert_eq!(picked, Some(1));
+    }
+
+    #[test]
+    fn wake_affine_respects_allowed_cpus_and_cpuset_isolation() {
+        let online = 0b1111_1111u64;
+        // Only CPUs 4 and 6 are allowed. Even though CPU 3 is empty idle and CPU 2
+        // is halted, selection must never escape {4, 6}; halted CPU 6 wins.
+        let allowed = bit(4) | bit(6);
+        let picked = select_wake_affine_cpu(
+            online,
+            2,
+            allowed,
+            |cpu| cpu == 3,
+            |cpu| cpu == 2 || cpu == 6,
+            |cpu| if cpu == 4 { 1 } else { 2 },
+        );
+        assert_eq!(picked, Some(6));
+
+        // Saturated and home CPU 2 disallowed: must pick least-loaded allowed CPU (4).
+        let picked_sat = select_wake_affine_cpu(
+            online,
+            2,
+            allowed,
+            |_| false,
+            |_| false,
+            |cpu| if cpu == 4 { 1 } else { 3 },
+        );
+        assert_eq!(picked_sat, Some(4));
+
+        // Disjoint affinity mask: returns None (fail closed).
+        assert_eq!(
+            select_wake_affine_cpu(online, 2, bit(10), |_| true, |_| false, |_| 0),
+            None
+        );
+    }
+
+    #[test]
+    fn new_work_spreads_across_idle_cpus_before_packing_preferred() {
+        let online = 0b1111u64;
+        // Parent running on busy CPU 0 (queue_len=1); CPUs 1..3 are idle with len=0.
+        // Successive spawns must land on CPUs 1, 2, 3 instead of stacking on CPU 0.
+        let mut lens = [1usize, 0, 0, 0];
+        let mut picked = [0usize; 3];
+        for slot in &mut picked {
+            let cpu =
+                select_target_cpu_for_new_work(online, 0, 0, 1, |c| c != 0, |_| false, |c| lens[c])
+                    .expect("eligible idle CPU");
+            lens[cpu] += 1;
+            *slot = cpu;
+        }
+        assert_eq!(picked, [1, 2, 3]);
+
+        // When preferred CPU itself is idle (e.g. boot), stay on preferred CPU.
+        let boot_pick = select_target_cpu_for_new_work(online, 0, 0, 1, |_| true, |_| false, |_| 0);
+        assert_eq!(boot_pick, Some(0));
+
+        // When all CPUs are busy within LOAD_IMBALANCE_THRESHOLD (1), preserve preferred CPU.
+        let sat_keep = select_target_cpu_for_new_work(
+            online,
+            2,
+            0,
+            1,
+            |_| false,
+            |_| false,
+            |c| if c == 2 { 2 } else { 1 },
+        );
+        assert_eq!(sat_keep, Some(2));
+
+        // When imbalance exceeds threshold, move to least-loaded allowed CPU (staggered after 2 -> 3).
+        let sat_spread = select_target_cpu_for_new_work(
+            online,
+            2,
+            0,
+            1,
+            |_| false,
+            |_| false,
+            |c| if c == 2 { 3 } else { 1 },
+        );
+        assert_eq!(sat_spread, Some(3));
+    }
+
+    #[test]
+    fn process_resched_steal_gate_skips_running_syscall_returns() {
+        assert!(!should_try_steal_on_process_resched(false, false, false));
+        assert!(should_try_steal_on_process_resched(true, false, false));
+        assert!(should_try_steal_on_process_resched(false, true, false));
+        assert!(should_try_steal_on_process_resched(false, false, true));
+    }
+
+    #[test]
+    fn wake_affine_relocates_disallowed_idle_home_cpu() {
+        // Regression test (Codex audit Finding 1): waiter sits on idle CPU 0
+        // after its affinity narrowed to busy CPU 1 only. Placement must NOT
+        // keep idle CPU 0; it must select allowed CPU 1 so the waiter is
+        // migrated and armed there instead of stranding on CPU 0.
+        let online = bit(0) | bit(1);
+        let picked = select_wake_affine_cpu(online, 0, bit(1), |cpu| cpu == 0, |_| false, |_| 1);
+        assert_eq!(picked, Some(1));
+    }
+
+    #[test]
+    fn wake_affine_hook_dispatches_registered_pid() {
+        static SEEN_PID: AtomicU64 = AtomicU64::new(0);
+        static SEEN_GEN: AtomicU64 = AtomicU64::new(0);
+        fn record_wake(pid: usize, generation: u64) {
+            SEEN_PID.store(pid as u64, Ordering::SeqCst);
+            SEEN_GEN.store(generation, Ordering::SeqCst);
+        }
+
+        let _serial = KERNEL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        SEEN_PID.store(0, Ordering::SeqCst);
+        SEEN_GEN.store(0, Ordering::SeqCst);
+        register_wake_affine_hook(record_wake);
+        note_wake_affine(4242, 99);
+        assert_eq!(SEEN_PID.load(Ordering::SeqCst), 4242);
+        assert_eq!(SEEN_GEN.load(Ordering::SeqCst), 99);
     }
 }

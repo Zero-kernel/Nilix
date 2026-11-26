@@ -703,6 +703,11 @@ const FUTEX_DEFERRED_WAKES: usize = MAX_FUTEX_RECORDS_PER_BUCKET;
 struct FutexDeferredWakes {
     entries: [(usize, u32); FUTEX_DEFERRED_WAKES],
     len: usize,
+    /// `(pid, generation)` pairs readied directly under the home bucket lock,
+    /// carrying the exact identity captured at wake time so deferred placement
+    /// rejects any recycled PID.
+    woken: [(u32, u64); FUTEX_DEFERRED_WAKES],
+    woken_len: usize,
 }
 
 impl FutexDeferredWakes {
@@ -710,6 +715,8 @@ impl FutexDeferredWakes {
         Self {
             entries: [(0, 0); FUTEX_DEFERRED_WAKES],
             len: 0,
+            woken: [(0, 0); FUTEX_DEFERRED_WAKES],
+            woken_len: 0,
         }
     }
 
@@ -724,7 +731,16 @@ impl FutexDeferredWakes {
         self.len += 1;
     }
 
-    /// Ready each task on its origin bucket's queue. Call with no lock held.
+    fn push_woken(&mut self, pid: u32, generation: u64) {
+        if self.woken_len < self.woken.len() {
+            self.woken[self.woken_len] = (pid, generation);
+            self.woken_len += 1;
+        }
+    }
+
+    /// Ready each deferred task on its origin bucket's queue, apply wake-affine
+    /// placement for all woken tasks, and flush targeted wake kicks right away.
+    /// Call with no lock held.
     ///
     /// The origin bucket is table-resident while the task is still asleep
     /// there (its `waiter_count` attachment lasts until the task's own
@@ -735,13 +751,26 @@ impl FutexDeferredWakes {
     /// task left this wait and started another (on the same word or a newer
     /// bucket for it) does not end the new one.
     fn run(&self, space: usize) {
+        let mut any_woken = false;
+        for &(pid, generation) in &self.woken[..self.woken_len] {
+            kernel_core::wait_kick::note_wake_affine(pid as ProcessId, generation);
+            any_woken = true;
+        }
         for &(origin, pid) in &self.entries[..self.len] {
             let bucket = lookup_bucket((space, origin));
             if let Some(bucket) = bucket {
                 let queue = bucket.lock().queue.clone();
                 let pid = pid as ProcessId;
-                let _ = queue.wake_specific_if(pid, || wake_mark_is_set(pid));
+                if let Some(generation) =
+                    queue.wake_specific_if_with_generation(pid, || wake_mark_is_set(pid))
+                {
+                    kernel_core::wait_kick::note_wake_affine(pid, generation);
+                    any_woken = true;
+                }
             }
+        }
+        if any_woken {
+            kernel_core::wait_kick::flush_wake_kicks();
         }
     }
 }
@@ -763,7 +792,12 @@ fn dequeue_record_locked(
     set_wake_mark(record.pid as ProcessId);
     let origin = record.sleep_origin(home);
     if origin == home {
-        let _ = bucket.queue.wake_specific(record.pid as ProcessId);
+        if let Some(generation) = bucket
+            .queue
+            .wake_specific_with_generation(record.pid as ProcessId)
+        {
+            deferred.push_woken(record.pid, generation);
+        }
     } else {
         deferred.push(origin, record.pid);
     }

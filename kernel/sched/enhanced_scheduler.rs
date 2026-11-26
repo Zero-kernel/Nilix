@@ -1632,56 +1632,204 @@ impl Scheduler {
         (0..max_cpus().min(64)).filter(move |&cpu_id| (mask & (1u64 << cpu_id)) != 0)
     }
 
-    /// Find the least loaded CPU and its queue length
-    ///
-    /// # Arguments
-    /// * `exclude` - Optional CPU to exclude from search
-    /// * `allowed_cpus` - Affinity mask (bit N = CPU N allowed). If 0, all CPUs are considered.
-    fn least_loaded_cpu(exclude: Option<usize>, allowed_cpus: u64) -> Option<(usize, usize)> {
-        let mut best_cpu = None;
-        let mut best_len = usize::MAX;
+    /// Bitmap of online CPUs that have an initialized ready queue.
+    #[inline]
+    fn ready_online_cpu_mask() -> u64 {
+        let mut mask = 0u64;
         for cpu_id in Self::online_cpu_ids() {
-            if Some(cpu_id) == exclude {
-                continue;
-            }
-            // R70-2 FIX: Filter by affinity mask (0 means no restriction)
-            if allowed_cpus != 0 && !Self::cpu_allowed(cpu_id, allowed_cpus) {
-                continue;
-            }
             if Self::ready_queue_for_cpu(cpu_id).is_some() {
-                let len = Self::published_queue_len(cpu_id);
-                if len < best_len {
-                    best_len = len;
-                    best_cpu = Some(cpu_id);
-                }
+                mask |= 1u64 << cpu_id;
             }
         }
-        best_cpu.map(|cpu_id| (cpu_id, best_len))
+        mask
     }
 
-    /// Select target CPU for new/resumed work (load-aware placement)
+    /// Lock-free check for whether `cpu_id` currently has no task running on it.
+    /// `CURRENT_GENERATION` is `0` when parked in idle/bootstrap and non-zero
+    /// (`NEXT_GENERATION` starts at 1) while running any task.
+    #[inline]
+    fn cpu_is_idle(cpu_id: usize) -> bool {
+        CURRENT_GENERATION
+            .get(cpu_id)
+            .is_some_and(|gen| gen.load(Ordering::Acquire) == 0)
+    }
+
+    /// Advisory halt-state check for wake-affine / new-work placement.
+    #[inline]
+    fn cpu_is_halted_hint(cpu_id: usize) -> bool {
+        kernel_core::wait_kick::kicks().is_halted_hint(cpu_id)
+    }
+
+    /// Select target CPU for new work (idle-aware, staggered placement).
+    ///
+    /// Prefers idle/halted allowed CPUs in staggered ring order after
+    /// `preferred_cpu` when `preferred_cpu` is busy running the spawning task,
+    /// avoiding packing newly spawned threads onto the parent's core where
+    /// remote idle CPUs would otherwise have to steal them.
     ///
     /// # Arguments
     /// * `preferred_cpu` - Default CPU (usually current CPU)
     /// * `allowed_cpus` - Affinity mask (bit N = CPU N allowed). If 0, all CPUs are considered.
     fn target_cpu_for_new_work(preferred_cpu: usize, allowed_cpus: u64) -> Option<usize> {
-        // R70-2 FIX: Pass affinity mask to least_loaded_cpu
-        let (least_cpu, least_len) = Self::least_loaded_cpu(None, allowed_cpus)?;
-        let preferred_len = Self::published_queue_len(preferred_cpu);
+        let online_mask = Self::ready_online_cpu_mask();
+        kernel_core::wait_kick::select_target_cpu_for_new_work(
+            online_mask,
+            preferred_cpu,
+            allowed_cpus,
+            LOAD_IMBALANCE_THRESHOLD,
+            Self::cpu_is_idle,
+            Self::cpu_is_halted_hint,
+            Self::published_queue_len,
+        )
+    }
 
-        // If preferred CPU is not allowed, always use least_cpu
-        if allowed_cpus != 0 && !Self::cpu_allowed(preferred_cpu, allowed_cpus) {
-            return Some(least_cpu);
+    /// Migrate one specific identity-verified Ready task from `src_cpu` to
+    /// `dst_cpu`.
+    ///
+    /// Process context with interrupts enabled and no lock held. Maintains the
+    /// canonical `READY_QUEUE -> PCB` lock order, uses non-blocking `try_lock`
+    /// on the source queue and PCB, and retains a source rollback slot until
+    /// destination publication commits (RF180-46).
+    fn migrate_specific_ready(pid: Pid, generation: u64, src_cpu: usize, dst_cpu: usize) -> bool {
+        if src_cpu == dst_cpu || !interrupts::are_enabled() {
+            return false;
         }
+        let Some(src_queue) = Self::ready_queue_for_cpu(src_cpu) else {
+            return false;
+        };
+        let Some(dst_queue) = Self::ready_queue_for_cpu(dst_cpu) else {
+            return false;
+        };
 
-        if least_len != usize::MAX
-            && least_cpu != preferred_cpu
-            && least_len + LOAD_IMBALANCE_THRESHOLD < preferred_len
+        let removed = {
+            let Some(mut guard) = src_queue.try_lock() else {
+                return false;
+            };
+            // Membership-based lookup (R171-M4-1: never key by dynamic_priority
+            // because PI boosts can drift it from the bucket key).
+            let found = guard.iter().find_map(|(bucket_prio, bucket)| {
+                let pcb = bucket.get(&pid)?;
+                let proc = pcb.try_lock()?;
+                if proc.pid != pid
+                    || proc.generation != generation
+                    || proc.state != ProcessState::Ready
+                    || proc.stopped
+                    || proc.on_cpu.load(Ordering::Acquire)
+                    || process::is_pending_irq_kill(pid)
+                {
+                    return None;
+                }
+                let effective_mask = Self::try_effective_allowed_cpus(&proc)?;
+                if !Self::cpu_allowed(dst_cpu, effective_mask) {
+                    return None;
+                }
+                let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
+                if cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some() {
+                    return None;
+                }
+                Some((bucket_prio, proc.dynamic_priority))
+            });
+            let Some((membership_priority, eff_prio)) = found else {
+                return false;
+            };
+            let pcb = guard.remove_for_migration(membership_priority, &pid);
+            if let Some(pcb) = pcb {
+                Self::mark_queue_mutated(src_cpu);
+                Self::note_removed(&guard, src_cpu, pid);
+                Some((pcb, membership_priority, eff_prio))
+            } else {
+                None
+            }
+        };
+
+        let Some((pcb, membership_priority, eff_prio)) = removed else {
+            return false;
+        };
+
+        match Self::try_insert_ready(dst_queue, dst_cpu, eff_prio, pid, Arc::clone(&pcb)) {
+            Ok(()) => {
+                let retired = {
+                    src_queue
+                        .lock()
+                        .commit_migration_removal(membership_priority)
+                };
+                drop(retired);
+                drop(pcb);
+                process::note_task_migration(dst_cpu);
+                Self::arm_ready_cpu(dst_cpu);
+                true
+            }
+            Err(_) => {
+                Self::restore_to_source(src_cpu, membership_priority, pid, pcb);
+                false
+            }
+        }
+    }
+
+    /// Wake-affine placement for a freshly readied task (e.g. `futex_wake`).
+    ///
+    /// Called with interrupts enabled and no lock held. Validates the exact
+    /// `(pid, expected_generation)` captured at wake time (rejecting recycled
+    /// PIDs) and effective affinity BEFORE keeping an idle/halted `home_cpu`,
+    /// so a waiter whose affinity moved off `home_cpu` while blocked is
+    /// relocated to an allowed CPU rather than stranded. When `home_cpu` is
+    /// permitted and free (or all CPUs are busy), keeps the task on `home_cpu`
+    /// for cache/TLB warmth and zero migration.
+    pub fn wake_affine_place_pid(pid: Pid, expected_generation: u64) {
+        if !interrupts::are_enabled() || cpu_local::online_cpu_mask().count_ones() < 2 {
+            return;
+        }
+        let Some(home_cpu) = steal_hint::hint().queue_cpu(pid) else {
+            return;
+        };
+
+        let pcb = match process::try_get_process(pid) {
+            Some(Some(pcb)) => pcb,
+            _ => return,
+        };
+        let allowed_cpus = {
+            let Some(proc) = pcb.try_lock() else {
+                return;
+            };
+            if proc.pid != pid
+                || proc.generation != expected_generation
+                || proc.state != ProcessState::Ready
+                || proc.stopped
+                || proc.on_cpu.load(Ordering::Acquire)
+                || process::is_pending_irq_kill(pid)
+            {
+                return;
+            }
+            let Some(allowed_cpus) = Self::try_effective_allowed_cpus(&proc) else {
+                return;
+            };
+            allowed_cpus
+        };
+        drop(pcb);
+
+        // Zero-migration fast path only AFTER confirming `home_cpu` is still
+        // allowed by effective affinity (cpuset ∩ task affinity).
+        if Self::cpu_allowed(home_cpu, allowed_cpus)
+            && (Self::cpu_is_idle(home_cpu) || Self::cpu_is_halted_hint(home_cpu))
         {
-            Some(least_cpu)
-        } else {
-            Some(preferred_cpu)
+            return;
         }
+
+        let online_mask = Self::ready_online_cpu_mask();
+        let Some(target_cpu) = kernel_core::wait_kick::select_wake_affine_cpu(
+            online_mask,
+            home_cpu,
+            allowed_cpus,
+            Self::cpu_is_idle,
+            Self::cpu_is_halted_hint,
+            Self::published_queue_len,
+        ) else {
+            return;
+        };
+        if target_cpu == home_cpu {
+            return;
+        }
+        let _ = Self::migrate_specific_ready(pid, expected_generation, home_cpu, target_cpu);
     }
 
     #[inline]
@@ -3228,8 +3376,16 @@ impl Scheduler {
             if BALANCE_DUE.swap(false, Ordering::Relaxed) {
                 Self::balance_queues();
             }
-            let current_pid = Self::get_current();
-            let _ = Self::try_steal_to_local_queue(current_pid);
+            let need_resched = current_cpu().need_resched.load(Ordering::Acquire);
+            let cpu_is_idle = Self::cpu_is_idle(current_cpu_id());
+            if kernel_core::wait_kick::should_try_steal_on_process_resched(
+                cpu_is_idle,
+                force,
+                need_resched,
+            ) {
+                let current_pid = Self::get_current();
+                let _ = Self::try_steal_to_local_queue(current_pid);
+            }
         }
 
         interrupts::without_interrupts(|| {
@@ -4506,6 +4662,8 @@ pub fn init() {
     kernel_core::register_kick_callback(Scheduler::kick_all_for_reschedule);
     // C3 repair 3 (#90): one reschedule IPI to one CPU, for wake kicks.
     kernel_core::wait_kick::register_cpu_kick(Scheduler::kick_cpu);
+    // Wake-affine placement for freshly readied tasks (e.g. futex wakeups).
+    kernel_core::wait_kick::register_wake_affine_hook(Scheduler::wake_affine_place_pid);
 
     klog_always!("Enhanced scheduler initialized");
     klog_always!("  Ready queue: per-CPU with work stealing (R69-1)");
