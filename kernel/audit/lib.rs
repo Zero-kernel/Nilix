@@ -495,31 +495,6 @@ impl Sha256Writer {
     }
 
     #[inline]
-    fn write_u8(&mut self, v: u8) {
-        self.hasher.update(&[v]);
-    }
-
-    #[inline]
-    fn write_u16(&mut self, v: u16) {
-        self.hasher.update(&v.to_le_bytes());
-    }
-
-    #[inline]
-    fn write_u32(&mut self, v: u32) {
-        self.hasher.update(&v.to_le_bytes());
-    }
-
-    #[inline]
-    fn write_u64(&mut self, v: u64) {
-        self.hasher.update(&v.to_le_bytes());
-    }
-
-    #[inline]
-    fn write_i32(&mut self, v: i32) {
-        self.write_u32(v as u32);
-    }
-
-    #[inline]
     fn write_bytes(&mut self, data: &[u8]) {
         self.hasher.update(data);
     }
@@ -606,34 +581,98 @@ pub mod crypto {
     }
 }
 
-/// Compute SHA-256 hash of an AuditObject
-fn hash_object(hasher: &mut Sha256Writer, obj: &AuditObject) {
+/// Maximum serialized size of domain separator + prev_hash + AuditEvent:
+/// 20 ("AUDIT-HMAC-SHA256-V1") + 32 (prev_hash) + 8 (id) + 8 (ts) + 1 (kind)
+/// + 1 (outcome) + 4 (pid) + 4 (uid) + 4 (gid) + 8 (cap_id) + 1 (arg_count)
+/// + 56 (7 * u64 args) + 4 (errno) + 8 (dropped) + 26 (largest AuditObject)
+/// = 185 bytes.
+const MAX_SERIALIZED_EVENT_BYTES: usize = 256;
+
+/// Stack-backed contiguous serializer for audit hash payloads.
+///
+/// Packing the fixed-size event once avoids ~20 streaming `Sha256::update`
+/// calls per event while preserving byte-for-byte identical encoding.
+struct PayloadBuf {
+    buf: [u8; MAX_SERIALIZED_EVENT_BYTES],
+    len: usize,
+}
+
+impl PayloadBuf {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; MAX_SERIALIZED_EVENT_BYTES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, data: &[u8]) {
+        let end = self.len + data.len();
+        self.buf[self.len..end].copy_from_slice(data);
+        self.len = end;
+    }
+
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.buf[self.len] = v;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn write_u16(&mut self, v: u16) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.write_bytes(&v.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_i32(&mut self, v: i32) {
+        self.write_u32(v as u32);
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// Serialize an AuditObject into `out` using canonical little-endian framing.
+fn write_object_payload(out: &mut PayloadBuf, obj: &AuditObject) {
     match obj {
         AuditObject::None => {
-            hasher.write_u8(0);
+            out.write_u8(0);
         }
         AuditObject::Path {
             inode,
             mode,
             path_hash,
         } => {
-            hasher.write_u8(1);
-            hasher.write_u64(*inode);
-            hasher.write_u32(*mode);
-            hasher.write_u64(*path_hash);
+            out.write_u8(1);
+            out.write_u64(*inode);
+            out.write_u32(*mode);
+            out.write_u64(*path_hash);
         }
         AuditObject::Endpoint { id } => {
-            hasher.write_u8(2);
-            hasher.write_u64(*id);
+            out.write_u8(2);
+            out.write_u64(*id);
         }
         AuditObject::Process { pid, signal } => {
-            hasher.write_u8(3);
-            hasher.write_u32(*pid);
-            hasher.write_u32(signal.unwrap_or(0));
+            out.write_u8(3);
+            out.write_u32(*pid);
+            out.write_u32(signal.unwrap_or(0));
         }
         AuditObject::Capability { cap_id } => {
-            hasher.write_u8(4);
-            hasher.write_u64(*cap_id);
+            out.write_u8(4);
+            out.write_u64(*cap_id);
         }
         AuditObject::Socket {
             proto,
@@ -642,65 +681,70 @@ fn hash_object(hasher: &mut Sha256Writer, obj: &AuditObject) {
             remote_addr,
             remote_port,
         } => {
-            hasher.write_u8(5);
-            hasher.write_u8(*proto);
-            hasher.write_u64(*local_addr);
-            hasher.write_u16(*local_port);
-            hasher.write_u64(*remote_addr);
-            hasher.write_u16(*remote_port);
+            out.write_u8(5);
+            out.write_u8(*proto);
+            out.write_u64(*local_addr);
+            out.write_u16(*local_port);
+            out.write_u64(*remote_addr);
+            out.write_u16(*remote_port);
         }
         AuditObject::Memory { vaddr, size, prot } => {
-            hasher.write_u8(6);
-            hasher.write_u64(*vaddr);
-            hasher.write_u64(*size);
-            hasher.write_u32(*prot);
+            out.write_u8(6);
+            out.write_u64(*vaddr);
+            out.write_u64(*size);
+            out.write_u32(*prot);
         }
         AuditObject::Namespace {
             ns_id,
             ns_type,
             parent_id,
         } => {
-            hasher.write_u8(7);
-            hasher.write_u64(*ns_id);
-            hasher.write_u32(*ns_type);
-            hasher.write_u64(*parent_id);
+            out.write_u8(7);
+            out.write_u64(*ns_id);
+            out.write_u32(*ns_type);
+            out.write_u64(*parent_id);
         }
     }
 }
 
-/// Serialize the event payload (excluding key handling) into the hasher.
+/// Serialize domain separator + `prev_hash` + `event` into a contiguous buffer.
 ///
-/// This is a shared helper used by both plain SHA-256 and HMAC-SHA256 modes
-/// to ensure consistent event encoding.
-fn write_event_payload(hasher: &mut Sha256Writer, prev_hash: [u8; 32], event: &AuditEvent) {
+/// Shared by plain SHA-256, keyed HMAC-SHA256 verification, and the hot
+/// precomputed-midstate HMAC ring path so all three hash the exact same bytes.
+#[inline]
+fn serialize_event_payload(prefix: &[u8], prev_hash: [u8; 32], event: &AuditEvent) -> PayloadBuf {
+    let mut out = PayloadBuf::new();
+    out.write_bytes(prefix);
+
     // Chain to previous event
-    hasher.write_bytes(&prev_hash);
+    out.write_bytes(&prev_hash);
 
     // Event metadata
-    hasher.write_u64(event.id);
-    hasher.write_u64(event.timestamp);
-    hasher.write_u8(event.kind as u8);
-    hasher.write_u8(event.outcome as u8);
+    out.write_u64(event.id);
+    out.write_u64(event.timestamp);
+    out.write_u8(event.kind as u8);
+    out.write_u8(event.outcome as u8);
 
     // Subject
-    hasher.write_u32(event.subject.pid);
-    hasher.write_u32(event.subject.uid);
-    hasher.write_u32(event.subject.gid);
-    hasher.write_u64(event.subject.cap_id.unwrap_or(0));
+    out.write_u32(event.subject.pid);
+    out.write_u32(event.subject.uid);
+    out.write_u32(event.subject.gid);
+    out.write_u64(event.subject.cap_id.unwrap_or(0));
 
     // Arguments
-    hasher.write_u8(event.arg_count);
+    out.write_u8(event.arg_count);
     let arg_count = core::cmp::min(event.arg_count as usize, MAX_ARGS);
     for i in 0..arg_count {
-        hasher.write_u64(event.args[i]);
+        out.write_u64(event.args[i]);
     }
 
     // Error and dropped count
-    hasher.write_i32(event.errno);
-    hasher.write_u64(event.dropped);
+    out.write_i32(event.errno);
+    out.write_u64(event.dropped);
 
     // Object
-    hash_object(hasher, &event.object);
+    write_object_payload(&mut out, &event.object);
+    out
 }
 
 /// Securely zero a buffer to scrub sensitive key material.
@@ -824,18 +868,15 @@ fn hash_event_prefixed(prev_hash: [u8; 32], event: &AuditEvent, key: Option<&[u8
     match key {
         Some(k) => {
             // HMAC-SHA256 mode: proper keyed authentication
+            let payload = serialize_event_payload(b"AUDIT-HMAC-SHA256-V1", prev_hash, event);
             hmac_sha256(k, |hasher| {
-                // Domain separator for keyed mode
-                hasher.write_bytes(b"AUDIT-HMAC-SHA256-V1");
-                write_event_payload(hasher, prev_hash, event);
+                hasher.write_bytes(payload.as_bytes());
             })
         }
         None => {
             // Plain SHA-256 mode: domain-separated hash chain
-            let mut hasher = Sha256Writer::new();
-            hasher.write_bytes(b"AUDIT-SHA256-V1");
-            write_event_payload(&mut hasher, prev_hash, event);
-            hasher.finish()
+            let payload = serialize_event_payload(b"AUDIT-SHA256-V1", prev_hash, event);
+            Sha256::digest(payload.as_bytes())
         }
     }
 }
@@ -844,15 +885,21 @@ fn hash_event_prefixed(prev_hash: [u8; 32], event: &AuditEvent, key: Option<&[u8
 // Ring Buffer
 // ============================================================================
 
-/// R65-15 FIX: HMAC key storage
+/// R65-15 FIX: HMAC key storage with precomputed RFC 2104 SHA-256 midstates.
 ///
-/// The key is stored inline to avoid allocation in the hot path.
-/// We use Option to track whether a key has been set.
+/// The key and its `ipad`/`opad` SHA-256 chaining midstates are stored inline
+/// to avoid allocation and repeated key-block hashing in the syscall hot path.
+/// `ipad_state` is the SHA-256 state after compressing `(K' ^ 0x36)` (64 bytes);
+/// `opad_state` is the SHA-256 state after compressing `(K' ^ 0x5c)` (64 bytes).
 struct HmacKey {
     /// Key data (padded with zeros if shorter than MAX_HMAC_KEY_SIZE)
     data: [u8; MAX_HMAC_KEY_SIZE],
     /// Actual key length (0 means no key set)
     len: usize,
+    /// Precomputed SHA-256 midstate after the 64-byte HMAC inner pad block.
+    ipad_state: [u32; 8],
+    /// Precomputed SHA-256 midstate after the 64-byte HMAC outer pad block.
+    opad_state: [u32; 8],
 }
 
 impl HmacKey {
@@ -860,6 +907,8 @@ impl HmacKey {
         Self {
             data: [0u8; MAX_HMAC_KEY_SIZE],
             len: 0,
+            ipad_state: [0u32; 8],
+            opad_state: [0u32; 8],
         }
     }
 
@@ -867,18 +916,75 @@ impl HmacKey {
         self.len > 0
     }
 
-    fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
+    /// Install a validated key (`<= MAX_HMAC_KEY_SIZE` bytes) and precompute
+    /// its RFC 2104 `ipad`/`opad` SHA-256 midstates once.
+    fn set(&mut self, key: &[u8]) {
+        debug_assert!(key.len() <= MAX_HMAC_KEY_SIZE);
+        self.data[..key.len()].copy_from_slice(key);
+        self.len = key.len();
+
+        let mut key_block = [0u8; SHA256_BLOCK_SIZE];
+        if key.len() > SHA256_BLOCK_SIZE {
+            let mut hashed_key = Sha256::digest(key);
+            key_block[..hashed_key.len()].copy_from_slice(&hashed_key);
+            secure_zeroize(&mut hashed_key);
+        } else {
+            key_block[..key.len()].copy_from_slice(key);
+        }
+
+        let mut inner_pad = [0u8; SHA256_BLOCK_SIZE];
+        let mut outer_pad = [0u8; SHA256_BLOCK_SIZE];
+        for i in 0..SHA256_BLOCK_SIZE {
+            inner_pad[i] = key_block[i] ^ HMAC_IPAD;
+            outer_pad[i] = key_block[i] ^ HMAC_OPAD;
+        }
+
+        // Write precomputed RFC 2104 midstates directly into `self` so no
+        // temporary key-derived chaining state lives on the stack.
+        Sha256::compute_block_midstate(&inner_pad, &mut self.ipad_state);
+        Sha256::compute_block_midstate(&outer_pad, &mut self.opad_state);
+
+        // R94-10: scrub transient pad buffers immediately after precomputation.
+        secure_zeroize(&mut key_block);
+        secure_zeroize(&mut inner_pad);
+        secure_zeroize(&mut outer_pad);
+    }
+
+    /// Compute the RFC 2104 / FIPS 198-1 HMAC-SHA256 digest of an audit event
+    /// using the precomputed `ipad`/`opad` SHA-256 midstates.
+    #[inline]
+    fn hash_event(&self, prev_hash: [u8; 32], event: &AuditEvent) -> [u8; 32] {
+        debug_assert!(self.is_set());
+        let payload = serialize_event_payload(b"AUDIT-HMAC-SHA256-V1", prev_hash, event);
+        let mut inner_digest = Sha256::digest_from_midstate(
+            &self.ipad_state,
+            SHA256_BLOCK_SIZE as u64,
+            payload.as_bytes(),
+        );
+        let digest = Sha256::digest_single_block_from_midstate(
+            &self.opad_state,
+            SHA256_BLOCK_SIZE as u64,
+            &inner_digest,
+        );
+        // R94-10: scrub intermediate HMAC inner digest before returning.
+        secure_zeroize(&mut inner_digest);
+        digest
     }
 }
 
 /// R66-10 FIX: Zeroize key material on drop to prevent memory disclosure.
 impl Drop for HmacKey {
     fn drop(&mut self) {
-        // Zeroize key material to avoid lingering secrets in memory
-        // Use volatile writes to prevent optimization away
+        // Zeroize key material and precomputed key-derived midstates to avoid
+        // lingering secrets in memory. Volatile writes prevent elision.
         for byte in self.data.iter_mut() {
             unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        for word in self.ipad_state.iter_mut() {
+            unsafe { core::ptr::write_volatile(word, 0) };
+        }
+        for word in self.opad_state.iter_mut() {
+            unsafe { core::ptr::write_volatile(word, 0) };
         }
         self.len = 0;
         // Memory barrier to ensure zeroization is not reordered
@@ -1031,8 +1137,7 @@ impl AuditRing {
         {
             return Err(AuditError::KeyAlreadySet);
         }
-        self.hmac_key.data[..key.len()].copy_from_slice(key);
-        self.hmac_key.len = key.len();
+        self.hmac_key.set(key);
         self.content_version = self.content_version.wrapping_add(1);
         Ok(())
     }
@@ -1083,7 +1188,7 @@ impl AuditRing {
 
         // R65-15 FIX: Use HMAC-SHA256 when key is set, otherwise plain SHA-256
         event.hash = if self.hmac_key.is_set() {
-            hash_event_prefixed(event.prev_hash, &event, Some(self.hmac_key.as_slice()))
+            self.hmac_key.hash_event(event.prev_hash, &event)
         } else {
             hash_event(event.prev_hash, &event)
         };
@@ -3417,5 +3522,110 @@ mod tests {
             1,
         );
         assert_eq!(res, Err(AuditError::Uninitialized));
+    }
+
+    #[test]
+    fn test_hmac_precomputed_midstate_matches_reference_for_all_objects() {
+        let objects = [
+            AuditObject::None,
+            AuditObject::Path {
+                inode: 0x1122_3344_5566_7788,
+                mode: 0o100644,
+                path_hash: 0xfeed_face_cafe_beef,
+            },
+            AuditObject::Endpoint { id: 42 },
+            AuditObject::Process {
+                pid: 123,
+                signal: Some(9),
+            },
+            AuditObject::Capability {
+                cap_id: 0xabcd_0001,
+            },
+            AuditObject::Socket {
+                proto: 6,
+                local_addr: 0x7f00_0001,
+                local_port: 8080,
+                remote_addr: 0x0a00_0002,
+                remote_port: 443,
+            },
+            AuditObject::Memory {
+                vaddr: 0x0000_7fff_0000_1000,
+                size: 0x2000,
+                prot: 3,
+            },
+            AuditObject::Namespace {
+                ns_id: 7,
+                ns_type: 2,
+                parent_id: 1,
+            },
+        ];
+        let keys: [&[u8]; 3] = [
+            &[0x11u8; MIN_HMAC_KEY_SIZE],
+            &[0x5au8; 32],
+            &[0xa5u8; MAX_HMAC_KEY_SIZE],
+        ];
+        let prev = [0x3cu8; 32];
+
+        for key in keys {
+            let mut hmac_key = HmacKey::empty();
+            hmac_key.set(key);
+            assert!(hmac_key.is_set());
+
+            for (idx, obj) in objects.iter().copied().enumerate() {
+                let args: [u64; MAX_ARGS] = [1, 2, 3, 4, 5, 6, 7];
+                let arg_slice = &args[..(idx % (MAX_ARGS + 1))];
+                let mut event = AuditEvent::new(
+                    1000 + idx as u64,
+                    AuditKind::Syscall,
+                    AuditOutcome::Success,
+                    AuditSubject::new(10 + idx as u32, 1000, 1000, Some(idx as u64)),
+                    obj,
+                    arg_slice,
+                    -(idx as i32),
+                );
+                event.id = idx as u64;
+                event.dropped = idx as u64 * 3;
+
+                let fast = hmac_key.hash_event(prev, &event);
+                let reference = hash_event_prefixed(prev, &event, Some(key));
+                assert_eq!(
+                    fast,
+                    reference,
+                    "precomputed HMAC midstate diverged for key len={} object idx={}",
+                    key.len(),
+                    idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_audit_ring_keyed_chain_verifies_with_precomputed_midstate() {
+        let key = [0x7bu8; 32];
+        let mut ring = AuditRing::with_capacity(8).expect("ring allocation");
+        ring.set_key(&key)
+            .expect("set_key succeeds before first event");
+
+        for i in 0..5u64 {
+            let event = AuditEvent::new(
+                100 + i,
+                AuditKind::Syscall,
+                AuditOutcome::Success,
+                AuditSubject::new(1, 0, 0, None),
+                AuditObject::None,
+                &[i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6],
+                0,
+            );
+            ring.push(event);
+        }
+
+        let mut drained = alloc::vec::Vec::with_capacity(8);
+        let meta = ring.drain_into(&mut drained).expect("drain succeeds");
+        assert_eq!(drained.len(), 5);
+        assert_eq!(meta.tail_hash, drained[4].hash);
+        assert!(
+            verify_chain_hmac(&drained, &key),
+            "ring chain hashed via precomputed HMAC midstates must pass verify_chain_hmac"
+        );
     }
 }
