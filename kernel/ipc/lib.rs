@@ -719,44 +719,27 @@ fn futex_callback(
     request: kernel_core::syscall::FutexRequest,
 ) -> Result<usize, SyscallError> {
     use kernel_core::syscall::FutexRequest;
-    use mm::page_table::{with_current_manager, PHYSICAL_MEMORY_OFFSET};
+    use kernel_core::usercopy::{fault_in_user_page, UserAddr, MMAP_MIN_ADDR, USER_SPACE_TOP};
     use process::current_pid;
-    use x86_64::structures::paging::PageTableFlags;
-    use x86_64::VirtAddr;
 
     // R32-IPC-2 FIX: Validate alignment (u32 must be 4-byte aligned)
     if uaddr & 0x3 != 0 {
         return Err(SyscallError::EINVAL);
     }
 
-    // R32-IPC-2 FIX: Validate user-space address range
-    // Reject kernel addresses (addresses >= PHYSICAL_MEMORY_OFFSET are kernel space)
-    if uaddr as u64 >= PHYSICAL_MEMORY_OFFSET {
+    // R32-IPC-2 + Issue #90 follow-up (P0): Validate user-space address range
+    // [MMAP_MIN_ADDR, USER_SPACE_TOP] (inclusive of the final 4-byte word at
+    // USER_SPACE_TOP - 4), non-boot CR3, and PRESENT | USER_ACCESSIBLE mapping
+    // via hardware SMAP + exception-table probe instead of acquiring exclusive
+    // `AS_PT_LOCKS[shard]` (`with_current_manager`) on every futex call.
+    if uaddr < MMAP_MIN_ADDR
+        || uaddr
+            .checked_add(core::mem::size_of::<u32>())
+            .is_none_or(|end| end > USER_SPACE_TOP)
+    {
         return Err(SyscallError::EFAULT);
     }
-
-    // R32-IPC-2 FIX: Verify page is mapped with USER_ACCESSIBLE flag
-    unsafe {
-        with_current_manager(VirtAddr::new(0), |mgr| {
-            // Check start and end of u32 value
-            let end_addr = uaddr
-                .checked_add(core::mem::size_of::<u32>() - 1)
-                .ok_or(SyscallError::EFAULT)?;
-
-            for addr in [uaddr, end_addr] {
-                if let Some((_, flags)) = mgr.translate_with_flags(VirtAddr::new(addr as u64)) {
-                    if !flags.contains(PageTableFlags::PRESENT)
-                        || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
-                    {
-                        return Err(SyscallError::EFAULT);
-                    }
-                } else {
-                    return Err(SyscallError::EFAULT);
-                }
-            }
-            Ok(())
-        })?;
-    }
+    fault_in_user_page(UserAddr::new(uaddr), false).map_err(|()| SyscallError::EFAULT)?;
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
 
