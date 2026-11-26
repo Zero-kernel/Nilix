@@ -10281,6 +10281,88 @@ pub fn activate_memory_space(memory_space: usize, user_memory_space: Option<usiz
     }
 }
 
+/// Park this CPU on `BOOT_CR3` during a blocked wait (lazy-TLB), removing it
+/// from targeted TLB shootdowns while the current task is halted in Ring 0.
+///
+/// Memory ordering when **leaving** a user address space (`IF=0`):
+/// 1. Check `Cr3::read().0 != boot_frame` (returns `false` if already on
+///    `BOOT_CR3`, e.g. kernel thread or outer lazy-TLB guard).
+/// 2. Write `Cr3::write(boot_frame, boot_flags)` FIRST so hardware leaves the
+///    user root and flushes all non-global user TLB entries before unpublishing
+///    the user CR3 from `CPU_ACTIVE_CR3`.
+/// 3. Publish `BOOT_CR3` via `track_cr3_switch` (`SeqCst`) so subsequent remote
+///    shootdowns on the user address space skip this CPU.
+/// 4. Synchronize both `PER_CPU_DATA` and GS-relative `SyscallPerCpu` KPTI
+///    metadata to `single(BOOT_CR3)` so paranoid IDT stubs (`#NMI`/`#DF`) match
+///    hardware CR3.
+/// 5. Drain any shootdown already queued before step 3 (`handle_shootdown_ipi`)
+///    so waiting senders observe their ACK immediately.
+#[cfg(target_os = "none")]
+pub fn enter_lazy_kernel_cr3() -> bool {
+    let (boot_frame, boot_flags) = *BOOT_CR3;
+    let boot_cr3_phys = boot_frame.start_address().as_u64();
+    if boot_cr3_phys == 0 {
+        return false;
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let (current_frame, _) = Cr3::read();
+        if current_frame == boot_frame {
+            return false;
+        }
+        unsafe { Cr3::write(boot_frame, boot_flags) };
+        mm::tlb_shootdown::track_cr3_switch(boot_cr3_phys);
+
+        let kpti_ctx = security::KptiContext::single(boot_cr3_phys);
+        security::install_kpti_context(kpti_ctx);
+        notify_kpti_cr3_update(boot_cr3_phys, boot_cr3_phys);
+
+        mm::tlb_shootdown::handle_shootdown_ipi();
+        true
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn enter_lazy_kernel_cr3() -> bool {
+    false
+}
+
+/// Restore `pid`'s user address space `(memory_space, user_memory_space)` after
+/// leaving a blocked wait, if this CPU is still parked on `BOOT_CR3`.
+///
+/// If a context switch already switched away and later resumed `pid` via
+/// `execute_switch`, hardware CR3 is no longer `BOOT_CR3` and this returns
+/// immediately without locking the PCB or rewriting CR3.
+#[cfg(target_os = "none")]
+pub fn leave_lazy_kernel_cr3(pid: ProcessId) {
+    let (boot_frame, _) = *BOOT_CR3;
+    if Cr3::read().0 != boot_frame {
+        return;
+    }
+    if current_pid() != Some(pid) {
+        return;
+    }
+    let Some(proc_arc) = get_process(pid) else {
+        return;
+    };
+    let (memory_space, user_memory_space) = {
+        let proc = proc_arc.lock();
+        if proc.state == ProcessState::Zombie || proc.memory_space == 0 {
+            return;
+        }
+        (proc.memory_space, proc.user_memory_space)
+    };
+    // Re-entering a user address space publishes `memory_space` to
+    // `CPU_ACTIVE_CR3` (`SeqCst`) BEFORE writing CR3, serializing against any
+    // concurrent remote shootdown and restoring dual KPTI metadata under IF=0.
+    activate_memory_space(memory_space, Some(user_memory_space));
+}
+
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn leave_lazy_kernel_cr3(_pid: ProcessId) {}
+
 /// H.3 KPTI: Re-synchronize per-CPU KPTI CR3 pair for the currently loaded address space.
 ///
 /// This must be called after `user_memory_space` is updated in the PCB but CR3 has

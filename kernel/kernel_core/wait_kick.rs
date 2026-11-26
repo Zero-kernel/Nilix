@@ -656,10 +656,152 @@ pub fn halt_until_event(
     outcome
 }
 
+/// Operations backing [`BlockedWaitLazyTlbState`]; mocked in hosted tests.
+pub trait LazyTlbOps {
+    /// Whether this wait is ready to halt (same CPU, `ready_seq` unchanged,
+    /// no reschedule or blocked-wait drain pending).
+    fn ready_to_halt(&self) -> bool;
+    /// Switch this CPU onto `BOOT_CR3` if currently on a user root.
+    /// Returns `true` iff this call performed the switch.
+    fn enter_boot_cr3(&mut self) -> bool;
+    /// Restore the blocked task's user CR3 if still parked on `BOOT_CR3`.
+    fn leave_boot_cr3(&mut self);
+}
+
+/// Pure, hosted-testable state machine for blocked-wait lazy-TLB parking.
+///
+/// Tracks whether this guard instance owns a restore obligation (`entered`).
+/// Nested guards compose cleanly: an inner guard's `enter_boot_cr3()` sees the
+/// CPU already on `BOOT_CR3`, returns `false`, and leaves the outer guard to
+/// stay parked across repeated timer-tick halts and restore once on exit.
+pub struct BlockedWaitLazyTlbState<O: LazyTlbOps> {
+    ops: O,
+    entered: bool,
+}
+
+impl<O: LazyTlbOps> BlockedWaitLazyTlbState<O> {
+    #[inline]
+    pub fn new(ops: O) -> Self {
+        Self {
+            ops,
+            entered: false,
+        }
+    }
+
+    /// Park on `BOOT_CR3` right before halting if no wake or work is already
+    /// pending. Safe to call on every loop iteration: if a context switch
+    /// swapped this task out and back in (reloading its user CR3) while it
+    /// stayed blocked, the next iteration re-enters `BOOT_CR3`.
+    #[inline]
+    pub fn enter_before_halt(&mut self) {
+        if !self.ops.ready_to_halt() {
+            return;
+        }
+        if self.ops.enter_boot_cr3() {
+            self.entered = true;
+        }
+    }
+
+    /// Restore the user address space if this guard switched to `BOOT_CR3`.
+    /// Idempotent with [`Drop`].
+    #[inline]
+    pub fn restore(&mut self) {
+        if self.entered {
+            self.entered = false;
+            self.ops.leave_boot_cr3();
+        }
+    }
+
+    #[cfg(test)]
+    fn is_entered(&self) -> bool {
+        self.entered
+    }
+}
+
+impl<O: LazyTlbOps> Drop for BlockedWaitLazyTlbState<O> {
+    #[inline]
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+struct KernelLazyTlbOps {
+    pid: usize,
+    snap: Option<WaitSnapshot>,
+}
+
+impl LazyTlbOps for KernelLazyTlbOps {
+    #[inline]
+    fn ready_to_halt(&self) -> bool {
+        if cfg!(not(target_os = "none")) || !x86_64::instructions::interrupts::are_enabled() {
+            return false;
+        }
+        let Some(snap) = self.snap else {
+            return false;
+        };
+        if cpu_local::current_cpu_id() != snap.cpu {
+            return false;
+        }
+        KICKS.seq_unchanged(snap.cpu, snap.seq)
+            && !cpu_local::current_cpu()
+                .need_resched
+                .load(Ordering::Acquire)
+            && !crate::process::blocked_wait_work_pending()
+    }
+
+    #[inline]
+    fn enter_boot_cr3(&mut self) -> bool {
+        crate::process::enter_lazy_kernel_cr3()
+    }
+
+    #[inline]
+    fn leave_boot_cr3(&mut self) {
+        crate::process::leave_lazy_kernel_cr3(self.pid);
+    }
+}
+
+/// RAII guard that parks a blocked waiter's CPU on `BOOT_CR3` across halts
+/// (lazy-TLB) and restores the task's user address space before returning.
+pub struct BlockedWaitLazyTlb {
+    inner: BlockedWaitLazyTlbState<KernelLazyTlbOps>,
+}
+
+impl BlockedWaitLazyTlb {
+    #[inline]
+    pub fn new(pid: usize) -> Self {
+        Self {
+            inner: BlockedWaitLazyTlbState::new(KernelLazyTlbOps { pid, snap: None }),
+        }
+    }
+
+    /// Enter `BOOT_CR3` before `halt_blocked_wait(snap)` when no wake or
+    /// reschedule is already pending.
+    #[inline]
+    pub fn enter_before_halt(&mut self, snap: WaitSnapshot) {
+        self.inner.ops.snap = Some(snap);
+        self.inner.enter_before_halt();
+    }
+
+    /// Restore the task's user address space early (idempotent with `Drop`).
+    #[inline]
+    pub fn restore(&mut self) {
+        self.inner.restore();
+    }
+}
+
 /// The halt of a blocked wait (`block_until_resolved`, the waitpid loops):
 /// not while a reschedule is requested or a drain the waiter may depend on is
 /// flagged (`run_blocked_wait_drains`).
+///
+/// Parks this CPU on `BOOT_CR3` while halted if no outer [`BlockedWaitLazyTlb`]
+/// guard has already done so, removing the halted waiter from targeted TLB
+/// shootdowns and restoring its user CR3 before returning to callers that may
+/// copy out to user memory (such as `waitpid`).
 pub fn halt_blocked_wait(snap: WaitSnapshot) -> HaltOutcome {
+    let mut lazy_tlb = crate::process::current_pid().map(BlockedWaitLazyTlb::new);
+    if let Some(guard) = lazy_tlb.as_mut() {
+        guard.enter_before_halt(snap);
+    }
     halt_until_event(snap, HaltSite::Wait, || {
         cpu_local::current_cpu().need_resched.load(Ordering::SeqCst)
             || crate::process::blocked_wait_work_pending()
@@ -1382,5 +1524,188 @@ mod tests {
         note_wake_affine(4242, 99);
         assert_eq!(SEEN_PID.load(Ordering::SeqCst), 4242);
         assert_eq!(SEEN_GEN.load(Ordering::SeqCst), 99);
+    }
+
+    #[test]
+    fn lazy_tlb_enters_once_and_composes_with_inner_guard_until_drop() {
+        use core::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct SharedCpu {
+            on_boot_cr3: bool,
+            ready: bool,
+            enters: usize,
+            restores: usize,
+        }
+
+        struct MockOps(Rc<RefCell<SharedCpu>>);
+        impl LazyTlbOps for MockOps {
+            fn ready_to_halt(&self) -> bool {
+                self.0.borrow().ready
+            }
+            fn enter_boot_cr3(&mut self) -> bool {
+                let mut cpu = self.0.borrow_mut();
+                if cpu.on_boot_cr3 {
+                    return false;
+                }
+                cpu.on_boot_cr3 = true;
+                cpu.enters += 1;
+                true
+            }
+            fn leave_boot_cr3(&mut self) {
+                let mut cpu = self.0.borrow_mut();
+                if cpu.on_boot_cr3 {
+                    cpu.on_boot_cr3 = false;
+                    cpu.restores += 1;
+                }
+            }
+        }
+
+        let cpu = Rc::new(RefCell::new(SharedCpu {
+            on_boot_cr3: false,
+            ready: true,
+            enters: 0,
+            restores: 0,
+        }));
+
+        {
+            let mut outer = BlockedWaitLazyTlbState::new(MockOps(Rc::clone(&cpu)));
+            outer.enter_before_halt();
+            assert!(outer.is_entered());
+            assert!(cpu.borrow().on_boot_cr3);
+            assert_eq!(cpu.borrow().enters, 1);
+
+            // Inner guard (like `halt_blocked_wait` inside `block_until_resolved`)
+            // sees CPU already on BOOT_CR3, must not re-enter or restore on drop.
+            for _ in 0..3 {
+                let mut inner = BlockedWaitLazyTlbState::new(MockOps(Rc::clone(&cpu)));
+                inner.enter_before_halt();
+                assert!(!inner.is_entered());
+            }
+            assert!(cpu.borrow().on_boot_cr3);
+            assert_eq!(cpu.borrow().enters, 1);
+            assert_eq!(cpu.borrow().restores, 0);
+        }
+
+        // Dropping the outer guard restores user CR3 exactly once.
+        assert!(!cpu.borrow().on_boot_cr3);
+        assert_eq!(cpu.borrow().enters, 1);
+        assert_eq!(cpu.borrow().restores, 1);
+    }
+
+    #[test]
+    fn lazy_tlb_skips_entry_when_wake_or_work_already_pending() {
+        struct PendingOps {
+            enters: usize,
+            restores: usize,
+        }
+        impl LazyTlbOps for PendingOps {
+            fn ready_to_halt(&self) -> bool {
+                false
+            }
+            fn enter_boot_cr3(&mut self) -> bool {
+                self.enters += 1;
+                true
+            }
+            fn leave_boot_cr3(&mut self) {
+                self.restores += 1;
+            }
+        }
+
+        let mut guard = BlockedWaitLazyTlbState::new(PendingOps {
+            enters: 0,
+            restores: 0,
+        });
+        guard.enter_before_halt();
+        assert!(!guard.is_entered());
+        assert_eq!(guard.ops.enters, 0);
+        guard.restore();
+        assert_eq!(guard.ops.restores, 0);
+    }
+
+    #[test]
+    fn lazy_tlb_reenters_after_context_switch_and_skips_redundant_restore() {
+        use core::cell::RefCell;
+        use std::rc::Rc;
+
+        struct SharedCpu {
+            on_boot_cr3: bool,
+            enters: usize,
+            restores: usize,
+        }
+        struct MockOps(Rc<RefCell<SharedCpu>>);
+        impl LazyTlbOps for MockOps {
+            fn ready_to_halt(&self) -> bool {
+                true
+            }
+            fn enter_boot_cr3(&mut self) -> bool {
+                let mut cpu = self.0.borrow_mut();
+                if cpu.on_boot_cr3 {
+                    return false;
+                }
+                cpu.on_boot_cr3 = true;
+                cpu.enters += 1;
+                true
+            }
+            fn leave_boot_cr3(&mut self) {
+                let mut cpu = self.0.borrow_mut();
+                if cpu.on_boot_cr3 {
+                    cpu.on_boot_cr3 = false;
+                    cpu.restores += 1;
+                }
+            }
+        }
+
+        let cpu = Rc::new(RefCell::new(SharedCpu {
+            on_boot_cr3: false,
+            enters: 0,
+            restores: 0,
+        }));
+
+        {
+            let mut guard = BlockedWaitLazyTlbState::new(MockOps(Rc::clone(&cpu)));
+            guard.enter_before_halt();
+            assert_eq!(cpu.borrow().enters, 1);
+
+            // Simulate scheduler switching to another task and later resuming
+            // this task with its user CR3 restored by `execute_switch`.
+            cpu.borrow_mut().on_boot_cr3 = false;
+
+            // Still blocked on next pass -> must re-enter BOOT_CR3.
+            guard.enter_before_halt();
+            assert!(cpu.borrow().on_boot_cr3);
+            assert_eq!(cpu.borrow().enters, 2);
+
+            // Simulate another switch-away and wake-resume restoring user CR3
+            // before the guard drops -> drop must skip redundant restore.
+            cpu.borrow_mut().on_boot_cr3 = false;
+        }
+        assert_eq!(cpu.borrow().restores, 0);
+    }
+
+    #[test]
+    fn lazy_tlb_noop_when_already_on_boot_cr3() {
+        struct KernelThreadOps {
+            restores: usize,
+        }
+        impl LazyTlbOps for KernelThreadOps {
+            fn ready_to_halt(&self) -> bool {
+                true
+            }
+            fn enter_boot_cr3(&mut self) -> bool {
+                // Already on BOOT_CR3 (kernel thread).
+                false
+            }
+            fn leave_boot_cr3(&mut self) {
+                self.restores += 1;
+            }
+        }
+
+        let mut guard = BlockedWaitLazyTlbState::new(KernelThreadOps { restores: 0 });
+        guard.enter_before_halt();
+        assert!(!guard.is_entered());
+        guard.restore();
+        assert_eq!(guard.ops.restores, 0);
     }
 }
