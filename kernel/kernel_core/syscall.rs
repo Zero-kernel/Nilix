@@ -4984,8 +4984,14 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
         // R115-1 FIX: Removed duplicate hook_task_exit() call.
         // terminate_process() is the sole call site for the LSM exit hook,
         // preventing double-fire in audit logs.
-        // R104-2 FIX: Gate to prevent leaking PID in release builds.
-        klog_always!("Process {} exited with code {}", pid, exit_code);
+        // R104-2 FIX: Keep PID 1 completion oracles and abnormal exits always
+        // logged; downgrade routine non-init clean exits to Debug to eliminate
+        // IRQ-masked global serial spinlock contention on thread-churn bursts.
+        if crate::process::should_klog_process_exit_always(pid, exit_code) {
+            klog_always!("Process {} exited with code {}", pid, exit_code);
+        } else {
+            klog!(Debug, "Process {} exited with code {}", pid, exit_code);
+        }
 
         // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
         // interrupts and switches to boot CR3 before halting.
