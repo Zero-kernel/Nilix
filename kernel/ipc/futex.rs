@@ -4970,6 +4970,366 @@ fn drop_pi_boost(pid: ProcessId, key: FutexKey) {
     }
 }
 
+/// E.4 / STRICT-Q: executable priority-inheritance verification probe.
+///
+/// Exercises the live futex PI priority-inheritance engine (`select_top_pi_waiter`,
+/// `refresh_pi_boosts`, `walk_pi_chain`, `pi_boost_step`, and `drop_pi_boost`)
+/// against real `ProcessArc` PCBs registered in `PROCESS_TABLE` and real
+/// `FutexBucketRef` buckets in `FUTEX_TABLE`, then tears down all test state
+/// cleanly with zero residual buckets or process-table entries.
+pub fn run_pi_priority_inheritance_self_test() -> Result<(), &'static str> {
+    const TEST_SPACE: usize = 0x1900_9900;
+    let key_a: FutexKey = (TEST_SPACE, 0x2000);
+    let key_b: FutexKey = (TEST_SPACE, 0x2004);
+    let buckets_before = active_futex_count();
+
+    // 1. Verify PI waiter ordering picks lowest numeric priority, then oldest seq.
+    let mut waiters: AdmittedMap<ProcessId, PiWaiter> = AdmittedMap::new(HeapClass::Futex);
+    waiters
+        .try_insert(
+            101,
+            PiWaiter {
+                origin: 0x2000,
+                seq: 1,
+                tid: 101,
+                priority: 60,
+            },
+        )
+        .map_err(|_| "pi_waiters insert 101 failed")?;
+    waiters
+        .try_insert(
+            102,
+            PiWaiter {
+                origin: 0x2000,
+                seq: 3,
+                tid: 102,
+                priority: 20,
+            },
+        )
+        .map_err(|_| "pi_waiters insert 102 failed")?;
+    waiters
+        .try_insert(
+            103,
+            PiWaiter {
+                origin: 0x2000,
+                seq: 2,
+                tid: 103,
+                priority: 20,
+            },
+        )
+        .map_err(|_| "pi_waiters insert 103 failed")?;
+    let best = select_top_pi_waiter(&waiters).ok_or("select_top_pi_waiter returned None")?;
+    if best.0 != 103 || best.1.priority != 20 {
+        return Err("select_top_pi_waiter did not pick highest priority with oldest seq");
+    }
+    waiters.remove(&103);
+    let next = select_top_pi_waiter(&waiters).ok_or("select_top_pi_waiter returned None")?;
+    if next.0 != 102 || next.1.priority != 20 {
+        return Err("select_top_pi_waiter did not advance to next waiter of priority 20");
+    }
+    waiters.remove(&102);
+    let last = select_top_pi_waiter(&waiters).ok_or("select_top_pi_waiter returned None")?;
+    if last.0 != 101 || last.1.priority != 60 {
+        return Err("select_top_pi_waiter did not fall back to priority 60");
+    }
+    drop(waiters);
+
+    // 2. Register two real PCBs in PROCESS_TABLE (`owner` at base prio 80 and
+    //    `mid` at base prio 70) and two live buckets in FUTEX_TABLE to drive
+    //    `refresh_pi_boosts`, transitive `walk_pi_chain`, waiter relaxation,
+    //    `previous` owner handoff, and `drop_pi_boost` end-to-end.
+    struct PiSelfTestGuard {
+        pids: [Option<ProcessId>; 2],
+        buckets: [Option<(FutexKey, FutexBucketRef)>; 2],
+    }
+
+    impl Drop for PiSelfTestGuard {
+        fn drop(&mut self) {
+            for slot in &mut self.buckets {
+                if let Some((key, bucket)) = slot.take() {
+                    let retired = {
+                        let mut b = bucket.lock();
+                        b.pi_owner = None;
+                        while let Some((pid, _)) = select_top_pi_waiter(&b.pi_waiters) {
+                            b.pi_waiters.remove_retaining_capacity(&pid);
+                        }
+                        b.pi_waiters.take_empty_capacity()
+                    };
+                    drop(retired);
+                    cleanup_empty_bucket(key, &bucket);
+                    drop(bucket);
+                }
+            }
+            let mut removed: [Option<process::ProcessArc>; 2] = [None, None];
+            let retired_table = {
+                let mut table = process::PROCESS_TABLE.lock();
+                for (i, pid_slot) in self.pids.iter_mut().enumerate() {
+                    if let Some(pid) = pid_slot.take() {
+                        if let Some(entry) = table.get_mut(pid) {
+                            removed[i] = entry.take();
+                        }
+                    }
+                }
+                if table.iter().all(Option::is_none) {
+                    table.clear_retaining_capacity();
+                    table.take_empty_capacity()
+                } else {
+                    None
+                }
+            };
+            drop(retired_table);
+            drop(removed);
+        }
+    }
+
+    let mut guard = PiSelfTestGuard {
+        pids: [None, None],
+        buckets: [None, None],
+    };
+
+    // Pick two free slots in PROCESS_TABLE (>= 1) without touching NEXT_PID_HINT
+    // or allocating kernel stacks.
+    let (pid_owner, pid_mid) = {
+        let table = process::PROCESS_TABLE.lock();
+        let mut found = [0usize; 2];
+        let mut count = 0usize;
+        for idx in 1..table.len() {
+            if table[idx].is_none() {
+                found[count] = idx;
+                count += 1;
+                if count == 2 {
+                    break;
+                }
+            }
+        }
+        let mut next_idx = table.len().max(1);
+        while count < 2 {
+            found[count] = next_idx;
+            next_idx += 1;
+            count += 1;
+        }
+        (found[0], found[1])
+    };
+    let owner_arc = process::Process::try_new_pcb(
+        pid_owner,
+        0,
+        process::ProcessNameSnapshot::from_parts("pi_owner", ""),
+        80,
+    )
+    .map_err(|_| "try_new_pcb(owner) failed")?;
+    let mid_arc = process::Process::try_new_pcb(
+        pid_mid,
+        0,
+        process::ProcessNameSnapshot::from_parts("pi_mid", ""),
+        70,
+    )
+    .map_err(|_| "try_new_pcb(mid) failed")?;
+
+    let target_len = pid_owner.max(pid_mid) + 1;
+    let prepared = mm::PreparedAdmittedVecCapacity::<Option<process::ProcessArc>>::try_new(
+        HeapClass::CoreProcess,
+        target_len,
+    )
+    .map_err(|_| "prepare PROCESS_TABLE capacity failed")?;
+    let retired_grow = {
+        let mut table = process::PROCESS_TABLE.lock();
+        let retired = if table.capacity() < target_len {
+            Some(
+                table
+                    .install_prepared_deferred(prepared)
+                    .map_err(|_| "install_prepared_deferred(PROCESS_TABLE) failed")?,
+            )
+        } else {
+            drop(prepared);
+            None
+        };
+        while table.len() < target_len {
+            table
+                .push_reserved(None)
+                .map_err(|_| "PROCESS_TABLE push_reserved failed")?;
+        }
+        if table[pid_owner].is_some() || table[pid_mid].is_some() {
+            return Err("PROCESS_TABLE test slots unexpectedly occupied");
+        }
+        table[pid_owner] = Some(owner_arc.clone());
+        table[pid_mid] = Some(mid_arc.clone());
+        guard.pids = [Some(pid_owner), Some(pid_mid)];
+        retired
+    };
+    drop(retired_grow);
+
+    let permit =
+        FutexPreparePermit::try_acquire(TEST_SPACE).map_err(|_| "FutexPreparePermit failed")?;
+    let bucket_a = get_or_create_live_bucket(key_a, &permit, None)
+        .map_err(|_| "get_or_create_live_bucket(key_a) failed")?;
+    guard.buckets[0] = Some((key_a, bucket_a.clone()));
+    let bucket_b = get_or_create_live_bucket(key_b, &permit, None)
+        .map_err(|_| "get_or_create_live_bucket(key_b) failed")?;
+    guard.buckets[1] = Some((key_b, bucket_b.clone()));
+    drop(permit);
+
+    // Verify initial base priorities.
+    if owner_arc.lock().effective_priority() != 80 || mid_arc.lock().effective_priority() != 70 {
+        return Err("initial PCB base priorities mismatch");
+    }
+
+    // 2a. Single-hop PI donation: mid (70) waits on bucket_a owned by owner (80).
+    {
+        let mut b = bucket_a.lock();
+        b.pi_owner = Some(PiOwner {
+            pid: pid_owner,
+            tid: pid_owner as u32,
+            fixup: false,
+        });
+        let seq = b.next_pi_seq();
+        b.pi_waiters
+            .try_insert(
+                pid_mid,
+                PiWaiter {
+                    origin: key_a.1,
+                    seq,
+                    tid: pid_mid as u32,
+                    priority: 70,
+                },
+            )
+            .map_err(|_| "insert mid into bucket_a failed")?;
+    }
+    mid_arc.lock().set_waiting_on_futex(Some(key_a));
+    refresh_pi_boosts(key_a, &bucket_a, None);
+    {
+        let o = owner_arc.lock();
+        if o.effective_priority() != 70 || o.dynamic_priority != 70 {
+            return Err("refresh_pi_boosts did not boost owner to mid priority 70");
+        }
+    }
+
+    // 2b. Transitive 2-hop PI chain: high-priority waiter (15) waits on bucket_b
+    //     owned by mid -> walk_pi_chain must propagate 15 through bucket_a to owner.
+    const HIGH_WAITER: ProcessId = 999;
+    {
+        let mut b = bucket_b.lock();
+        b.pi_owner = Some(PiOwner {
+            pid: pid_mid,
+            tid: pid_mid as u32,
+            fixup: false,
+        });
+        let seq = b.next_pi_seq();
+        b.pi_waiters
+            .try_insert(
+                HIGH_WAITER,
+                PiWaiter {
+                    origin: key_b.1,
+                    seq,
+                    tid: HIGH_WAITER as u32,
+                    priority: 15,
+                },
+            )
+            .map_err(|_| "insert HIGH_WAITER into bucket_b failed")?;
+    }
+    refresh_pi_boosts(key_b, &bucket_b, None);
+    {
+        let m = mid_arc.lock();
+        let o = owner_arc.lock();
+        if m.effective_priority() != 15 || m.dynamic_priority != 15 {
+            return Err("refresh_pi_boosts did not boost mid to high waiter priority 15");
+        }
+        if o.effective_priority() != 15 || o.dynamic_priority != 15 {
+            return Err("walk_pi_chain did not transitively boost owner to priority 15");
+        }
+    }
+
+    // 2c. Partial relaxation: add direct waiter (prio 30) on bucket_a, remove
+    //     HIGH_WAITER from bucket_b, refresh bucket_b -> mid relaxes to 70,
+    //     owner relaxes to 30 (retaining bucket_a's remaining waiter donation).
+    const MED_WAITER: ProcessId = 998;
+    {
+        let mut ba = bucket_a.lock();
+        let seq = ba.next_pi_seq();
+        ba.pi_waiters
+            .try_insert(
+                MED_WAITER,
+                PiWaiter {
+                    origin: key_a.1,
+                    seq,
+                    tid: MED_WAITER as u32,
+                    priority: 30,
+                },
+            )
+            .map_err(|_| "insert MED_WAITER into bucket_a failed")?;
+    }
+    {
+        let mut bb = bucket_b.lock();
+        bb.pi_waiters.remove_retaining_capacity(&HIGH_WAITER);
+    }
+    refresh_pi_boosts(key_b, &bucket_b, None);
+    {
+        let m = mid_arc.lock();
+        let o = owner_arc.lock();
+        if m.effective_priority() != 70 || m.dynamic_priority != 70 {
+            return Err("refresh_pi_boosts did not relax mid to base priority 70");
+        }
+        if o.effective_priority() != 30 || o.dynamic_priority != 30 {
+            return Err("walk_pi_chain did not relax owner to remaining waiter priority 30");
+        }
+    }
+
+    // 2d. Ownership handoff (`previous = Some(pid_owner)`): mid takes bucket_a
+    //     while MED_WAITER (30) still waits -> owner returns to base 80, mid
+    //     inherits 30 from MED_WAITER.
+    mid_arc.lock().set_waiting_on_futex(None);
+    {
+        let mut ba = bucket_a.lock();
+        ba.pi_waiters.remove_retaining_capacity(&pid_mid);
+        ba.pi_owner = Some(PiOwner {
+            pid: pid_mid,
+            tid: pid_mid as u32,
+            fixup: false,
+        });
+    }
+    refresh_pi_boosts(key_a, &bucket_a, Some(pid_owner));
+    {
+        let o = owner_arc.lock();
+        let m = mid_arc.lock();
+        if o.effective_priority() != 80 || o.dynamic_priority != 80 {
+            return Err("previous-owner handoff did not restore owner base priority 80");
+        }
+        if m.effective_priority() != 30 || m.dynamic_priority != 30 {
+            return Err("new owner mid did not inherit MED_WAITER priority 30 on handoff");
+        }
+        if !o.pi_boosts.is_empty() {
+            return Err("previous owner still holds stale PI boost entry after handoff");
+        }
+    }
+
+    // 2e. Final unlock via `drop_pi_boost`: mid restores cleanly to base 70.
+    {
+        let mut ba = bucket_a.lock();
+        ba.pi_waiters.remove_retaining_capacity(&MED_WAITER);
+        ba.pi_owner = None;
+    }
+    drop_pi_boost(pid_mid, key_a);
+    {
+        let m = mid_arc.lock();
+        if m.effective_priority() != 70 || m.dynamic_priority != 70 {
+            return Err("drop_pi_boost did not restore mid base priority 70");
+        }
+        if !m.pi_boosts.is_empty() || m.pi_boost_reservation.is_some() {
+            return Err("mid PI boost table or reservation not empty after drop_pi_boost");
+        }
+    }
+
+    drop(owner_arc);
+    drop(mid_arc);
+    drop(bucket_a);
+    drop(bucket_b);
+    drop(guard);
+
+    if active_futex_count() != buckets_before {
+        return Err("PI self-test leaked an entry in FUTEX_TABLE");
+    }
+    Ok(())
+}
+
 /// R188-U34 executable probe for the robust-futex exit contract.  The probe is
 /// deliberately pure and allocation-free so it can run during the hosted and
 /// boot integration suites without manufacturing a live user address space.

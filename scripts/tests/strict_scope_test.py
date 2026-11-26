@@ -18,7 +18,10 @@ SOURCES = {
 }
 SUITES = {"RuntimeTest": ("RUNTIME",), "SecurityTest": ("SECURITY", "SECURITY-BOOT")}
 # A CoveredBy gate names the oracle whose output must contain its marker.
-COVERING_ORACLES = {"ring3-mm": ROOT / "scripts/gates/boot/ring3_mm_oracle.sh"}
+COVERING_ORACLES = {
+    "ring3-mm": ROOT / "scripts/gates/boot/ring3_mm_oracle.sh",
+    "stress": ROOT / "scripts/gates/stress/stress_test.sh",
+}
 
 RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
 IMPL = re.compile(r"^impl (RuntimeTest|SecurityTest) for (\w+) \{$", re.MULTILINE)
@@ -26,8 +29,8 @@ TRAIT = re.compile(r"^pub trait (RuntimeTest|SecurityTest) \{$", re.MULTILINE)
 NAME = re.compile(r"fn name\(&self\) -> &'static str \{\s*\"([^\"]+)\"\s*\}")
 SCOPE = re.compile(r"fn scope\(&self\) -> TestScope \{(.*?)\n    \}", re.DOTALL)
 NEEDS_CPUS = re.compile(r"\s*TestScope::NeedsCpus\(([1-9][0-9]*)\)\s*")
-OUT_OF_SCOPE = re.compile(r'\s*TestScope::OutOfScope \{\s*milestone: "(\S+)",\s*reason: "[^"]+",?\s*\}\s*')
-COVERED_BY = re.compile(r'\s*TestScope::CoveredBy \{\s*gate: "(\S+)",\s*marker: "([^"]+)",?\s*\}\s*')
+OUT_OF_SCOPE = re.compile(r'\s*TestScope::OutOfScope \{\s*milestone:\s+"(\S+)",\s*reason:\s+"[^"]+",?\s*\}\s*')
+COVERED_BY = re.compile(r'\s*TestScope::CoveredBy \{\s*gate:\s+"(\S+)",\s*marker:\s+"([^"]+)",?\s*\}\s*')
 
 
 def rust_tokens(text):
