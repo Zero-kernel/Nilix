@@ -431,7 +431,29 @@ impl WaitQueue {
     where
         F: FnMut() -> Result<(), E>,
     {
-        self.try_prepare_inner(timeout_ns, check, false)
+        self.try_prepare_inner(timeout_ns, check, false, true)
+            .map(|res| res.expect("allow_grow=true always resolves"))
+    }
+
+    /// Zero-allocation fast path of [`Self::try_prepare_with_timeout_after`].
+    ///
+    /// Attempts to arm the wait using only already-resident queue and
+    /// `TIMED_WAITERS` capacity, without allocating any detached backing.
+    /// Returns `None` if either deque needs capacity growth so callers can
+    /// serialize detached preparation (for example under `FutexPreparePermit`)
+    /// before falling back to [`Self::try_prepare_with_timeout_after`].
+    pub(crate) fn try_prepare_noalloc_with_timeout_after<F, E>(
+        &self,
+        timeout_ns: Option<u64>,
+        check: F,
+    ) -> Option<Result<PrepareWait, E>>
+    where
+        F: FnMut() -> Result<(), E>,
+    {
+        match self.try_prepare_inner(timeout_ns, check, false, false) {
+            Ok(done) => done,
+            Err(_) => unreachable!("allow_grow=false never allocates"),
+        }
     }
 
     /// GAP-5 PI parity (review D2-2): [`Self::try_prepare_with_timeout_after`]
@@ -450,7 +472,8 @@ impl WaitQueue {
     where
         F: FnMut() -> Result<(), E>,
     {
-        self.try_prepare_inner(timeout_ns, check, true)
+        self.try_prepare_inner(timeout_ns, check, true, true)
+            .map(|res| res.expect("allow_grow=true always resolves"))
     }
 
     /// Whether an arm must give up instead of publishing `Blocked`. Called
@@ -471,7 +494,8 @@ impl WaitQueue {
         timeout_ns: Option<u64>,
         mut check: F,
         killable: bool,
-    ) -> Result<Result<PrepareWait, E>, AdmittedAllocError>
+        allow_grow: bool,
+    ) -> Result<Option<Result<PrepareWait, E>>, AdmittedAllocError>
     where
         F: FnMut() -> Result<(), E>,
     {
@@ -482,13 +506,13 @@ impl WaitQueue {
 
         let pid = match process::current_pid() {
             Some(pid) => pid,
-            None => return Ok(Ok(PrepareWait::Immediate(WaitOutcome::NoProcess))),
+            None => return Ok(Some(Ok(PrepareWait::Immediate(WaitOutcome::NoProcess)))),
         };
         if self.closed.load(Ordering::Acquire) {
-            return Ok(Ok(PrepareWait::Immediate(WaitOutcome::Closed)));
+            return Ok(Some(Ok(PrepareWait::Immediate(WaitOutcome::Closed))));
         }
         if matches!(timeout_ns, Some(0)) {
-            return Ok(Ok(PrepareWait::Immediate(WaitOutcome::TimedOut)));
+            return Ok(Some(Ok(PrepareWait::Immediate(WaitOutcome::TimedOut))));
         }
 
         let deadline_tick = timeout_ns.map(|ns| {
@@ -497,11 +521,13 @@ impl WaitQueue {
         });
         let wait_seq = deadline_tick.map(|_| process::alloc_wait_seq());
         if wait_seq.is_some() && !WAITQUEUE_TIMER_INIT.load(Ordering::Acquire) {
-            return Ok(Ok(PrepareWait::Immediate(WaitOutcome::ResourceExhausted)));
+            return Ok(Some(Ok(PrepareWait::Immediate(
+                WaitOutcome::ResourceExhausted,
+            ))));
         }
         let process = match process::get_process(pid) {
             Some(process) => process,
-            None => return Ok(Ok(PrepareWait::Immediate(WaitOutcome::NoProcess))),
+            None => return Ok(Some(Ok(PrepareWait::Immediate(WaitOutcome::NoProcess)))),
         };
         let generation = self.wait_generation.fetch_add(1, Ordering::Relaxed);
 
@@ -510,7 +536,23 @@ impl WaitQueue {
             // backings before taking WaitQueue/TIMED_WAITERS/PCB locks. A race
             // can consume the snapshot capacity; that case publishes nothing,
             // drops the detached owners after IRQs are restored, and retries.
-            let mut capacity = self.prepare_transaction_capacity(pid, deadline_tick.is_some())?;
+            // When `allow_grow == false`, skip pre-allocation and return `None`
+            // if resident capacity does not fit.
+            let mut capacity = if allow_grow {
+                self.prepare_transaction_capacity(pid, deadline_tick.is_some())?
+            } else {
+                PreparedWaitTransactionCapacity {
+                    queue: PreparedWaitQueueCapacity {
+                        pid: Some(pid),
+                        prepared: None,
+                        retired_replaced: None,
+                        retired_empty: None,
+                    },
+                    timer_prepared: None,
+                    timer_retired_replaced: None,
+                    timer_retired_empty: None,
+                }
+            };
             debug_assert_eq!(capacity.queue.pid, Some(pid));
 
             let attempt = interrupts::without_interrupts(|| {
@@ -620,8 +662,9 @@ impl WaitQueue {
             // IRQs and every live queue/timer/PCB lock have been released.
             drop(capacity);
             match attempt {
+                ArmAttempt::RetryCapacity if !allow_grow => return Ok(None),
                 ArmAttempt::RetryCapacity => continue,
-                ArmAttempt::Complete(result) => return Ok(result),
+                ArmAttempt::Complete(result) => return Ok(Some(result)),
             }
         }
     }
