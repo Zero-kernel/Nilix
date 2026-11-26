@@ -123,6 +123,9 @@ pub(crate) unsafe fn inspect(kernel: u64, user: u64) {
     // a user page a task mapped at 1 MiB is not.
     let low_alias = low_mapping.is_some_and(|(_, accessible)| !accessible);
     klog::klog_always!("MITIGATION-MAP PASS kernel={:x} user={:x} shared_user=true recursive_absent=true private_island=true lower_island_absent=true text_retained=true data_retained=true heap_retained=true stack_retained=true low_alias={} full_isolation=false", kernel, user, low_alias);
+    // Flush synchronously so a subsequent GDB breakpoint in mitigation_check.py
+    // cannot freeze QEMU while the tail of this 245-byte marker is still queued.
+    drivers::vga_buffer::flush_serial_sync();
     if !RENDEZVOUS_STARTED.swap(true, Ordering::AcqRel) {
         zero_mitigation_probe_anchor();
         klog::klog_always!(
@@ -130,6 +133,7 @@ pub(crate) unsafe fn inspect(kernel: u64, user: u64) {
             zero_mitigation_probe_anchor as *const () as usize,
             &ZERO_MITIGATION_PROBE_RELEASE as *const AtomicU8 as usize,
         );
+        drivers::vga_buffer::flush_serial_sync();
         while ZERO_MITIGATION_PROBE_RELEASE.load(Ordering::Acquire) == 0 {
             core::hint::spin_loop();
         }
