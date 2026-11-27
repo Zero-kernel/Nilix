@@ -878,54 +878,60 @@ impl CgroupCtrlInode {
                     return Err(FsError::Busy);
                 }
 
-                // R171 M2-1 SLICE-1 FIX + migrate_task lock-discipline
-                // (cgroup.rs:1909 "hold the target Process lock across migrate_task"):
-                // hold the Process lock across the ENTIRE migration window
-                // (re-verify + exec gate + migrate_task + charge transfer + cgroup_id
-                // update), mirroring sys_cgroup_attach (R155-5). The prior code called
-                // migrate_task BEFORE taking proc_guard, which (a) violated
-                // migrate_task's documented contract and (b) let a cgroup re-home
-                // interleave an exec's lock-dropped load_elf charge window (the SLICE-1
-                // bug). Hold the snapshot+update under one lock as before; just acquire
-                // it one step earlier so the membership move is covered too.
-                let mut proc_guard = proc.lock();
-                // RF180-2 FIX: the Arc captured above can outlive table removal.
-                // Reject a reaped identity before calling raw-PID migrate_task;
-                // while this live PCB lock remains held, the reaper cannot take
-                // the slot and publish a successor until the migration finishes.
-                if proc_guard.generation != target_generation {
-                    return Err(FsError::NotFound);
-                }
-                // RF180-45 REVIEW FIX: repeat the state gate under the guard
-                // held across the complete membership/accounting transaction.
-                if proc_guard.state == ProcessState::Provisioning {
-                    return Err(FsError::Busy);
-                }
-                if matches!(
-                    proc_guard.state,
-                    ProcessState::Zombie | ProcessState::Terminated
-                ) {
-                    return Err(FsError::NotFound);
-                }
-                // Re-verify memory_space under the held lock — exec/clone could have
-                // changed it between the share-count check (lock-free) and here.
-                if proc_guard.memory_space != memory_space {
-                    return Err(FsError::Busy);
-                }
-                // R181-3 FIX: identity re-verify alone does NOT close the
-                // CLONE_VM race — a clone in the check->lock gap adds a sibling
-                // WITHOUT changing this task's memory_space value. Re-count
-                // under the held lock via the fail-closed try_lock variant
-                // (the blocking counter would ABBA-invert the Level-5 order
-                // PROCESS_TABLE -> Process::inner). Any contention aborts to
-                // EBUSY: a skipped sibling could BE the CLONE_VM partner, so
-                // an incomplete observation must never admit the migration.
-                if memory_space != 0 {
-                    match process::try_address_space_share_count_holding(memory_space, pid) {
-                        Some(count) if count <= 1 => {}
-                        _ => return Err(FsError::Busy),
+                // R171 M2-1 SLICE-1 + R181-3 FIX: hold the Process lock across
+                // the ENTIRE migration window, retrying bounded transient
+                // `try_address_space_share_count_holding` contention with
+                // `proc_guard` dropped between attempts while re-verifying
+                // `generation`, `state`, and `memory_space` on every iteration.
+                let mut proc_guard = {
+                    let mut attempt = 0usize;
+                    loop {
+                        let guard = proc.lock();
+                        // RF180-2 FIX: the Arc captured above can outlive table removal.
+                        // Reject a reaped identity before calling raw-PID migrate_task;
+                        // while this live PCB lock remains held, the reaper cannot take
+                        // the slot and publish a successor until the migration finishes.
+                        if guard.generation != target_generation {
+                            return Err(FsError::NotFound);
+                        }
+                        // RF180-45 REVIEW FIX: repeat the state gate under the guard
+                        // held across the complete membership/accounting transaction.
+                        if guard.state == ProcessState::Provisioning {
+                            return Err(FsError::Busy);
+                        }
+                        if matches!(guard.state, ProcessState::Zombie | ProcessState::Terminated) {
+                            return Err(FsError::NotFound);
+                        }
+                        // Re-verify memory_space under the held lock — exec/clone could have
+                        // changed it between the share-count check (lock-free) and here.
+                        if guard.memory_space != memory_space {
+                            return Err(FsError::Busy);
+                        }
+                        // R181-3 FIX: authoritative recount under the held lock via the
+                        // fail-closed try_lock variant (never ABBA-inverting Level-5
+                        // PROCESS_TABLE -> Process::inner). Genuine sharing (count > 1)
+                        // rejects immediately; transient lock contention drops `guard`
+                        // and performs bounded spin-only backoff (never yielding, since
+                        // `FileHandle::write` holds `offset.lock()` across `write_at`).
+                        if memory_space != 0 {
+                            match process::try_address_space_share_count_holding(memory_space, pid)
+                            {
+                                Some(count) if count <= 1 => break guard,
+                                Some(_) => return Err(FsError::Busy),
+                                None => {
+                                    drop(guard);
+                                    if attempt + 1 >= process::CGROUP_MIGRATE_SPIN_RETRIES {
+                                        return Err(FsError::Busy);
+                                    }
+                                    process::cgroup_migrate_spin_backoff(attempt);
+                                    attempt += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        break guard;
                     }
-                }
+                };
                 // SLICE-1: refuse to re-home a task mid-`sys_exec`. Its load_elf
                 // charge (to the exec-time snapshot cgroup, Process lock dropped) must
                 // not race this membership move. Bounded exec window → retry.

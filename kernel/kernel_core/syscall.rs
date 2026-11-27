@@ -24730,30 +24730,20 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         return Err(SyscallError::EBUSY);
     }
 
-    // R155-5 FIX: Hold Process lock across the ENTIRE migration window
-    // (migrate_task + charge transfer + cgroup_id update).
-    let mut proc = process.lock();
-
-    // R156-1 FIX: Re-verify memory_space after re-acquiring lock.
-    // Between the share_count check and here, exec/clone could have
-    // changed memory_space. Return EAGAIN so caller can retry.
-    if proc.memory_space != memory_space {
-        return Err(SyscallError::EAGAIN);
-    }
-
-    // R181-3 FIX: identity re-verify alone does not close the CLONE_VM race —
-    // a clone in the check->lock gap adds a sibling WITHOUT changing this
-    // task's memory_space value. Authoritative re-count under the held lock
-    // via the fail-closed try_lock variant (the blocking counter would
-    // ABBA-invert the Level-5 PROCESS_TABLE -> Process::inner order). Any
-    // contention aborts to EAGAIN — an incomplete observation must never
-    // admit the migration (a skipped sibling could BE the CLONE_VM partner).
-    if memory_space != 0 {
-        match crate::process::try_address_space_share_count_holding(memory_space, pid) {
-            Some(count) if count <= 1 => {}
-            _ => return Err(SyscallError::EAGAIN),
-        }
-    }
+    // R155-5 + R156-1 + R181-3 FIX: Hold Process lock across the ENTIRE
+    // migration window (recount + exec/fork/grow gates + migrate_task + charge
+    // transfer + cgroup_id update). Authoritative share recount uses the
+    // non-blocking `try_address_space_share_count_holding` (never ABBA-inverting
+    // Level-5 `PROCESS_TABLE -> Process::inner`), dropping `proc` and backing
+    // off over a bounded retry budget on transient sibling/table `try_lock`
+    // contention so concurrent parent `waitpid()`/`write()` calls do not cause
+    // spurious `EAGAIN` failures.
+    let mut proc = crate::process::lock_for_exclusive_address_space(&process, pid, memory_space)
+        .map_err(|err| match err {
+            crate::process::ExclusiveAddressSpaceError::Shared(_) => SyscallError::EBUSY,
+            crate::process::ExclusiveAddressSpaceError::MemorySpaceChanged
+            | crate::process::ExclusiveAddressSpaceError::Contended => SyscallError::EAGAIN,
+        })?;
 
     // R171 M2-1 SLICE-1 FIX: refuse to re-home a task that is mid-`sys_exec`.
     // exec HARD-charges the new image to its snapshot cgroup inside load_elf with

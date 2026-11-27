@@ -7452,6 +7452,118 @@ pub fn try_address_space_share_count_holding(
     .ok()
 }
 
+/// Bounded retry budget for `try_address_space_share_count_holding` transient
+/// `PROCESS_TABLE` / sibling-PCB `try_lock` contention during cgroup migration.
+pub const CGROUP_MIGRATE_SHARE_RETRIES: usize = 64;
+
+/// Number of initial short exponential spin-pause retries before yielding the
+/// CPU (with all locks dropped) so a preempted lock holder can make progress.
+pub const CGROUP_MIGRATE_SPIN_RETRIES: usize = 16;
+
+/// Failure reasons for [`lock_for_exclusive_address_space`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusiveAddressSpaceError {
+    /// `proc.memory_space` changed between preflight and lock acquisition.
+    MemorySpaceChanged,
+    /// Authoritative under-lock recount observed a shared `CLONE_VM` space.
+    Shared(usize),
+    /// Transient `PROCESS_TABLE` / sibling lock contention exhausted retries.
+    Contended,
+}
+
+/// Pure spin-pause backoff between bounded cgroup-migration share-count retries.
+///
+/// Safe to invoke when an outer caller may still hold a non-process lock (for
+/// example, VFS `FileHandle::offset` across `cgroupfs` `inode.write_at()`),
+/// because this helper never yields or enters the scheduler.
+#[inline]
+pub fn cgroup_migrate_spin_backoff(attempt: usize) {
+    for _ in 0..(1usize << attempt.min(6)) {
+        core::hint::spin_loop();
+    }
+}
+
+/// Lock-free backoff between cgroup-migration share-count retries.
+///
+/// # Safety / Lock Discipline
+/// Caller MUST hold zero spinlocks (`Process::inner`, `PROCESS_TABLE`, VFS
+/// file-offset locks, etc.) before invoking this helper because attempts
+/// `>= CGROUP_MIGRATE_SPIN_RETRIES` may voluntarily yield the CPU when
+/// interrupts are enabled.
+#[inline]
+pub fn cgroup_migrate_contention_backoff(attempt: usize) {
+    if attempt < CGROUP_MIGRATE_SPIN_RETRIES {
+        cgroup_migrate_spin_backoff(attempt);
+    } else {
+        #[cfg(test)]
+        {
+            core::hint::spin_loop();
+        }
+        #[cfg(not(test))]
+        {
+            if x86_64::instructions::interrupts::are_enabled() {
+                crate::scheduler_hook::yield_reschedule();
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Acquire `process.lock()` and authoritatively verify that `expected_memory_space`
+/// is unchanged and unshared (`count <= 1`), retrying bounded transient
+/// `try_lock` contention from `recount` with `process.lock()` dropped between
+/// attempts so Level-5 lock ordering (`PROCESS_TABLE -> Process::inner`) is
+/// strictly preserved and unrelated sibling lock holders (e.g., parent in
+/// `waitpid`) do not cause spurious `EAGAIN` failures.
+pub fn lock_for_exclusive_address_space_with<'a, F, B>(
+    process: &'a OwnerCpuMutex<Process>,
+    expected_memory_space: usize,
+    mut recount: F,
+    mut backoff: B,
+) -> Result<crate::owner_lock::OwnerCpuMutexGuard<'a, Process>, ExclusiveAddressSpaceError>
+where
+    F: FnMut(usize) -> Option<usize>,
+    B: FnMut(usize),
+{
+    for attempt in 0..CGROUP_MIGRATE_SHARE_RETRIES {
+        let proc = process.lock();
+        if proc.memory_space != expected_memory_space {
+            return Err(ExclusiveAddressSpaceError::MemorySpaceChanged);
+        }
+        if expected_memory_space == 0 {
+            return Ok(proc);
+        }
+        match recount(expected_memory_space) {
+            Some(count) if count <= 1 => return Ok(proc),
+            Some(count) => return Err(ExclusiveAddressSpaceError::Shared(count)),
+            None => {
+                drop(proc);
+                if attempt + 1 >= CGROUP_MIGRATE_SHARE_RETRIES {
+                    return Err(ExclusiveAddressSpaceError::Contended);
+                }
+                backoff(attempt);
+            }
+        }
+    }
+    Err(ExclusiveAddressSpaceError::Contended)
+}
+
+/// Production entry point for [`lock_for_exclusive_address_space_with`] using
+/// [`try_address_space_share_count_holding`] and [`cgroup_migrate_contention_backoff`].
+pub fn lock_for_exclusive_address_space<'a>(
+    process: &'a ProcessArc,
+    pid: ProcessId,
+    expected_memory_space: usize,
+) -> Result<crate::owner_lock::OwnerCpuMutexGuard<'a, Process>, ExclusiveAddressSpaceError> {
+    lock_for_exclusive_address_space_with(
+        process,
+        expected_memory_space,
+        |ms| try_address_space_share_count_holding(ms, pid),
+        cgroup_migrate_contention_backoff,
+    )
+}
+
 /// D2-ARC second consumer: fail-closed under-held-`Process::inner` recount of the
 /// seccomp isolation predicates. Returns `Some((thread_group_count,
 /// pure_vm_sibling_count))` on a complete observation, `None` on any contention.
@@ -15647,5 +15759,129 @@ mod exit_klog_policy_tests {
         assert!(should_klog_process_exit_always(2, 1));
         assert!(should_klog_process_exit_always(42, 139));
         assert!(should_klog_process_exit_always(42, -11));
+    }
+}
+
+#[cfg(test)]
+mod exclusive_address_space_retry_tests {
+    use super::{
+        lock_for_exclusive_address_space_with, ExclusiveAddressSpaceError, Process,
+        CGROUP_MIGRATE_SHARE_RETRIES,
+    };
+    use crate::owner_lock::OwnerCpuMutex;
+    use alloc::string::String;
+
+    fn test_process(memory_space: usize) -> OwnerCpuMutex<Process> {
+        let mut p = Process::new(10, 1, String::from("cg-test"), 10);
+        p.memory_space = memory_space;
+        OwnerCpuMutex::new(p)
+    }
+
+    #[test]
+    fn retries_transient_contention_with_lock_dropped_and_succeeds() {
+        let proc_lock = test_process(0x2000_0000);
+        let mut recount_calls = 0usize;
+        let mut backoff_calls = 0usize;
+
+        let guard = lock_for_exclusive_address_space_with(
+            &proc_lock,
+            0x2000_0000,
+            |ms| {
+                assert_eq!(ms, 0x2000_0000);
+                // Process lock must be held during the recount call.
+                assert!(proc_lock.try_lock().is_none());
+                recount_calls += 1;
+                if recount_calls < 4 {
+                    None
+                } else {
+                    Some(1)
+                }
+            },
+            |attempt| {
+                // Process lock must be DROPPED before backoff/yield.
+                assert!(
+                    proc_lock.try_lock().is_some(),
+                    "process lock leaked into backoff on attempt {}",
+                    attempt
+                );
+                assert_eq!(attempt, backoff_calls);
+                backoff_calls += 1;
+            },
+        )
+        .expect("transient contention must succeed once cleared");
+
+        assert_eq!(guard.memory_space, 0x2000_0000);
+        assert_eq!(recount_calls, 4);
+        assert_eq!(backoff_calls, 3);
+    }
+
+    #[test]
+    fn rejects_shared_and_changed_memory_space_immediately() {
+        let proc_lock = test_process(0x3000_0000);
+        let mut backoff_calls = 0usize;
+
+        let shared = lock_for_exclusive_address_space_with(
+            &proc_lock,
+            0x3000_0000,
+            |_| Some(2),
+            |_| backoff_calls += 1,
+        );
+        assert_eq!(shared.err(), Some(ExclusiveAddressSpaceError::Shared(2)));
+        assert_eq!(backoff_calls, 0);
+
+        let changed = lock_for_exclusive_address_space_with(
+            &proc_lock,
+            0x4000_0000,
+            |_| panic!("recount must not run when memory_space changed"),
+            |_| backoff_calls += 1,
+        );
+        assert_eq!(
+            changed.err(),
+            Some(ExclusiveAddressSpaceError::MemorySpaceChanged)
+        );
+        assert_eq!(backoff_calls, 0);
+
+        // Invariant revalidation across retry: if memory_space changes while
+        // the lock is dropped for backoff, the next iteration rejects cleanly.
+        let mut mid_recounts = 0usize;
+        let mut mid_backoffs = 0usize;
+        let mid_changed = lock_for_exclusive_address_space_with(
+            &proc_lock,
+            0x3000_0000,
+            |_| {
+                mid_recounts += 1;
+                None
+            },
+            |_| {
+                mid_backoffs += 1;
+                proc_lock.lock().memory_space = 0x9999_0000;
+            },
+        );
+        assert_eq!(
+            mid_changed.err(),
+            Some(ExclusiveAddressSpaceError::MemorySpaceChanged)
+        );
+        assert_eq!(mid_recounts, 1);
+        assert_eq!(mid_backoffs, 1);
+    }
+
+    #[test]
+    fn fails_closed_after_retry_budget_on_persistent_contention() {
+        let proc_lock = test_process(0x5000_0000);
+        let mut recount_calls = 0usize;
+        let mut backoff_calls = 0usize;
+
+        let res = lock_for_exclusive_address_space_with(
+            &proc_lock,
+            0x5000_0000,
+            |_| {
+                recount_calls += 1;
+                None
+            },
+            |_| backoff_calls += 1,
+        );
+        assert_eq!(res.err(), Some(ExclusiveAddressSpaceError::Contended));
+        assert_eq!(recount_calls, CGROUP_MIGRATE_SHARE_RETRIES);
+        assert_eq!(backoff_calls, CGROUP_MIGRATE_SHARE_RETRIES - 1);
     }
 }
