@@ -628,16 +628,23 @@ impl RuntimeTest for CpuAffinityEnforcementTest {
 mod vfs_smp_race_state {
     use core::sync::atomic::AtomicU64;
 
+    pub static RENAME_ACTIVE_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static RENAME_EXITED_RUN_ID: AtomicU64 = AtomicU64::new(0);
     pub static RENAME_ROUND: AtomicU64 = AtomicU64::new(0);
     pub static RENAME_AP_DONE: AtomicU64 = AtomicU64::new(0);
     pub static RENAME_AP_RESULT: AtomicU64 = AtomicU64::new(0); // 1 = Ok, 2 = expected Err, 3 = unexpected
-    pub static RENAME_AP_EXITED: AtomicU64 = AtomicU64::new(0);
 
-    pub static DIR_RACE_GO: AtomicU64 = AtomicU64::new(0);
-    pub static DIR_RACE_AP_STARTED: AtomicU64 = AtomicU64::new(0);
-    pub static DIR_RACE_AP_OPS: AtomicU64 = AtomicU64::new(0);
-    pub static DIR_RACE_EXITED: AtomicU64 = AtomicU64::new(0);
-    pub static DIR_RACE_ERR: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_ACTIVE_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_EXITED_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_AP_STARTED: AtomicU64 = AtomicU64::new(0);
+    // Synchronized two-phase competing create / unlink protocol per round.
+    // u64::MAX in either round atomic signals immediate abort/exit.
+    pub static DIR_CREATE_ROUND: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_AP_CREATE_RES: AtomicU64 = AtomicU64::new(0); // 1 = Ok, 2 = Exists, 3 = unexpected
+    pub static DIR_AP_CREATE_DONE: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_UNLINK_ROUND: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_AP_UNLINK_RES: AtomicU64 = AtomicU64::new(0); // 1 = Ok, 2 = NotFound, 3 = unexpected
+    pub static DIR_AP_UNLINK_DONE: AtomicU64 = AtomicU64::new(0);
 }
 
 fn vfs_rename_race_ap_worker() {
@@ -646,6 +653,7 @@ fn vfs_rename_race_ap_worker() {
     use vfs::{FsError, VFS};
     use vfs_smp_race_state::*;
 
+    let my_run_id = RENAME_ACTIVE_RUN_ID.load(Ordering::Acquire);
     let mut seen = 0u64;
     loop {
         let round = RENAME_ROUND.load(Ordering::Acquire);
@@ -667,7 +675,7 @@ fn vfs_rename_race_ap_worker() {
         RENAME_AP_RESULT.store(code, Ordering::Release);
         RENAME_AP_DONE.store(round, Ordering::Release);
     }
-    RENAME_AP_EXITED.store(1, Ordering::Release);
+    RENAME_EXITED_RUN_ID.store(my_run_id, Ordering::Release);
 }
 
 fn vfs_dir_atomicity_ap_worker() {
@@ -676,29 +684,52 @@ fn vfs_dir_atomicity_ap_worker() {
     use vfs::{FileMode, FsError, VFS};
     use vfs_smp_race_state::*;
 
-    DIR_RACE_AP_STARTED.store(1, Ordering::Release);
-    while DIR_RACE_GO.load(Ordering::Acquire) == 0 {
-        spin_loop();
-    }
-    for i in 0..32usize {
-        let name = alloc::format!("/__sq_dir_atom/race_{}", i % 4);
-        match VFS.create_trusted(&name, FileMode::regular(0o644)) {
-            Ok(_) | Err(FsError::Exists | FsError::Again) => {}
-            Err(_) => {
-                DIR_RACE_ERR.fetch_add(1, Ordering::SeqCst);
+    let my_run_id = DIR_ACTIVE_RUN_ID.load(Ordering::Acquire);
+    DIR_AP_STARTED.store(my_run_id, Ordering::Release);
+
+    let mut last_round = 0u64;
+    loop {
+        let round = DIR_CREATE_ROUND.load(Ordering::Acquire);
+        if round == u64::MAX {
+            break;
+        }
+        if round == last_round {
+            spin_loop();
+            continue;
+        }
+        last_round = round;
+
+        let name = alloc::format!("/__sq_dir_atom/race_{}", round % 4);
+        let create_code = match VFS.create_trusted(&name, FileMode::regular(0o644)) {
+            Ok(_) => 1,
+            Err(FsError::Exists) => 2,
+            Err(_) => 3,
+        };
+        DIR_AP_CREATE_RES.store(create_code, Ordering::Release);
+        DIR_AP_CREATE_DONE.store(round, Ordering::Release);
+
+        // Wait for BSP to verify Phase A create exclusivity and arm Phase B unlink.
+        loop {
+            let uround = DIR_UNLINK_ROUND.load(Ordering::Acquire);
+            if uround == u64::MAX {
+                DIR_EXITED_RUN_ID.store(my_run_id, Ordering::Release);
+                return;
+            }
+            if uround >= round {
                 break;
             }
+            spin_loop();
         }
-        match VFS.unlink_trusted(&name, Some(false)) {
-            Ok(()) | Err(FsError::NotFound | FsError::Again) => {}
-            Err(_) => {
-                DIR_RACE_ERR.fetch_add(1, Ordering::SeqCst);
-                break;
-            }
-        }
-        DIR_RACE_AP_OPS.fetch_add(1, Ordering::Release);
+
+        let unlink_code = match VFS.unlink_trusted(&name, Some(false)) {
+            Ok(()) => 1,
+            Err(FsError::NotFound) => 2,
+            Err(_) => 3,
+        };
+        DIR_AP_UNLINK_RES.store(unlink_code, Ordering::Release);
+        DIR_AP_UNLINK_DONE.store(round, Ordering::Release);
     }
-    DIR_RACE_EXITED.store(1, Ordering::Release);
+    DIR_EXITED_RUN_ID.store(my_run_id, Ordering::Release);
 }
 
 /// VFS Data Plane: Verifies basic RAMFS create/write/read/truncate/unlink operations.
@@ -1007,6 +1038,7 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
 
         let mut created_a = false;
         let mut created_b = false;
+        let mut ap_still_active = false;
         let outcome: Result<(), String> = (|| {
             VFS.create_trusted(A, FileMode::directory(0o755))
                 .map_err(|e| alloc::format!("mkdir {} failed: {:?}", A, e))?;
@@ -1039,11 +1071,19 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
                 if let Some(target) =
                     (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id))
                 {
+                    if RENAME_ACTIVE_RUN_ID.load(Ordering::Acquire)
+                        != RENAME_EXITED_RUN_ID.load(Ordering::Acquire)
+                    {
+                        return Err(String::from(
+                            "previous rename race AP worker has not exited yet",
+                        ));
+                    }
                     RENAME_ROUND.store(0, Ordering::Release);
                     RENAME_AP_DONE.store(0, Ordering::Release);
                     RENAME_AP_RESULT.store(0, Ordering::Release);
-                    RENAME_AP_EXITED.store(0, Ordering::Release);
+                    let run_id = RENAME_ACTIVE_RUN_ID.fetch_add(1, Ordering::AcqRel) + 1;
 
+                    ap_still_active = true;
                     let _ = set_ap_test_probe(target, Some(vfs_rename_race_ap_worker));
                     send_ipi(target, IpiType::Reschedule);
 
@@ -1137,11 +1177,13 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
 
                     RENAME_ROUND.store(u64::MAX, Ordering::Release);
                     let cancelled = set_ap_test_probe(target, None);
-                    let mut ap_exited = cancelled;
-                    if !cancelled {
+                    if cancelled {
+                        RENAME_EXITED_RUN_ID.store(run_id, Ordering::Release);
+                        ap_still_active = false;
+                    } else {
                         for _ in 0..50_000_000usize {
-                            if RENAME_AP_EXITED.load(Ordering::Acquire) != 0 {
-                                ap_exited = true;
+                            if RENAME_EXITED_RUN_ID.load(Ordering::Acquire) == run_id {
+                                ap_still_active = false;
                                 break;
                             }
                             spin_loop();
@@ -1150,7 +1192,7 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
                     if let Some(msg) = race_err {
                         return Err(msg);
                     }
-                    if !ap_exited {
+                    if ap_still_active {
                         return Err(alloc::format!(
                             "AP {} timed out exiting rename race worker",
                             target
@@ -1160,6 +1202,17 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
             }
             Ok(())
         })();
+
+        // Never unlink the fixture directory while a timed-out AP worker may
+        // still be executing rename operations inside it.
+        if ap_still_active {
+            return match outcome {
+                Err(msg) => TestResult::Fail(msg),
+                Ok(()) => TestResult::Fail(String::from(
+                    "rename race AP worker still active; fixture retained",
+                )),
+            };
+        }
 
         if created_a && created_b {
             let _ = VFS.unlink_trusted(A_IN_B, Some(true));
@@ -1375,6 +1428,7 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
         let mut created_file_a = false;
         let mut created_file_b = false;
         let mut ran_smp_race = false;
+        let mut ap_still_active = false;
 
         let outcome: Result<(), String> = (|| {
             VFS.create_trusted(SUB, FileMode::directory(0o755))
@@ -1448,91 +1502,210 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
                 ));
             }
 
-            // 4. On SMP (2+ CPUs), race concurrent BSP + AP create/unlink in ROOT.
+            // 4. On SMP (2+ CPUs), run 32 synchronized two-phase competing
+            //    BSP + AP create/unlink rounds on the same absent name:
+            //    - Phase A: both compete on create; exactly one succeeds, the
+            //      other gets Exists, and stat confirms the entry is present.
+            //    - Phase B: both compete on unlink; exactly one succeeds, the
+            //      other gets NotFound, and stat confirms the entry is absent.
             if num_online_cpus() >= 2 {
                 let self_cpu = current_cpu_id();
                 if let Some(target) =
                     (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id))
                 {
-                    DIR_RACE_GO.store(0, Ordering::Release);
-                    DIR_RACE_AP_STARTED.store(0, Ordering::Release);
-                    DIR_RACE_AP_OPS.store(0, Ordering::Release);
-                    DIR_RACE_EXITED.store(0, Ordering::Release);
-                    DIR_RACE_ERR.store(0, Ordering::Release);
+                    if DIR_ACTIVE_RUN_ID.load(Ordering::Acquire)
+                        != DIR_EXITED_RUN_ID.load(Ordering::Acquire)
+                    {
+                        return Err(String::from(
+                            "previous directory atomicity AP worker has not exited yet",
+                        ));
+                    }
+
+                    DIR_AP_STARTED.store(0, Ordering::Release);
+                    DIR_CREATE_ROUND.store(0, Ordering::Release);
+                    DIR_AP_CREATE_RES.store(0, Ordering::Release);
+                    DIR_AP_CREATE_DONE.store(0, Ordering::Release);
+                    DIR_UNLINK_ROUND.store(0, Ordering::Release);
+                    DIR_AP_UNLINK_RES.store(0, Ordering::Release);
+                    DIR_AP_UNLINK_DONE.store(0, Ordering::Release);
+                    let run_id = DIR_ACTIVE_RUN_ID.fetch_add(1, Ordering::AcqRel) + 1;
 
                     ran_smp_race = true;
+                    ap_still_active = true;
                     let _ = set_ap_test_probe(target, Some(vfs_dir_atomicity_ap_worker));
                     send_ipi(target, IpiType::Reschedule);
 
                     let mut ap_started = false;
                     for _ in 0..50_000_000usize {
-                        if DIR_RACE_AP_STARTED.load(Ordering::Acquire) != 0 {
+                        if DIR_AP_STARTED.load(Ordering::Acquire) == run_id {
                             ap_started = true;
                             break;
                         }
                         spin_loop();
                     }
+
+                    let mut race_err: Option<String> = None;
                     if !ap_started {
-                        let _ = set_ap_test_probe(target, None);
-                        DIR_RACE_GO.store(1, Ordering::Release);
-                        return Err(alloc::format!(
+                        race_err = Some(alloc::format!(
                             "AP {} failed to start directory atomicity worker",
                             target
                         ));
-                    }
+                    } else {
+                        for round in 1..=32u64 {
+                            let name = alloc::format!("/__sq_dir_atom/race_{}", round % 4);
 
-                    DIR_RACE_GO.store(1, Ordering::Release);
+                            // Phase A: competing create of the same absent entry.
+                            DIR_AP_CREATE_RES.store(0, Ordering::Release);
+                            DIR_CREATE_ROUND.store(round, Ordering::Release);
+                            let bsp_create = VFS.create_trusted(&name, FileMode::regular(0o644));
 
-                    let mut bsp_err: Option<String> = None;
-                    for i in 0..32usize {
-                        let name = alloc::format!("/__sq_dir_atom/race_{}", i % 4);
-                        match VFS.create_trusted(&name, FileMode::regular(0o644)) {
-                            Ok(_) | Err(FsError::Exists | FsError::Again) => {}
-                            Err(e) => {
-                                bsp_err =
-                                    Some(alloc::format!("BSP concurrent create failed: {:?}", e));
+                            let mut ap_create_done = false;
+                            for _ in 0..50_000_000usize {
+                                if DIR_AP_CREATE_DONE.load(Ordering::Acquire) == round {
+                                    ap_create_done = true;
+                                    break;
+                                }
+                                spin_loop();
+                            }
+                            if !ap_create_done {
+                                race_err = Some(alloc::format!(
+                                    "AP {} timed out on competing create round {}",
+                                    target,
+                                    round
+                                ));
+                                break;
+                            }
+                            let ap_create = DIR_AP_CREATE_RES.load(Ordering::Acquire);
+                            let bsp_created = match bsp_create {
+                                Ok(_) => true,
+                                Err(FsError::Exists) => false,
+                                Err(e) => {
+                                    race_err = Some(alloc::format!(
+                                        "BSP unexpected create error on round {}: {:?}",
+                                        round,
+                                        e
+                                    ));
+                                    break;
+                                }
+                            };
+                            let ap_created = match ap_create {
+                                1 => true,
+                                2 => false,
+                                _ => {
+                                    race_err = Some(alloc::format!(
+                                        "AP unexpected create error on round {}",
+                                        round
+                                    ));
+                                    break;
+                                }
+                            };
+                            if bsp_created == ap_created {
+                                race_err = Some(alloc::format!(
+                                    "directory create atomicity violation on round {}: bsp={} ap={}",
+                                    round,
+                                    bsp_created,
+                                    ap_created
+                                ));
+                                break;
+                            }
+                            if VFS.stat_trusted(&name).is_err() {
+                                race_err = Some(alloc::format!(
+                                    "created entry {} missing at Phase A boundary (round {})",
+                                    name,
+                                    round
+                                ));
+                                break;
+                            }
+
+                            // Phase B: competing unlink of the created entry.
+                            DIR_AP_UNLINK_RES.store(0, Ordering::Release);
+                            DIR_UNLINK_ROUND.store(round, Ordering::Release);
+                            let bsp_unlink = VFS.unlink_trusted(&name, Some(false));
+
+                            let mut ap_unlink_done = false;
+                            for _ in 0..50_000_000usize {
+                                if DIR_AP_UNLINK_DONE.load(Ordering::Acquire) == round {
+                                    ap_unlink_done = true;
+                                    break;
+                                }
+                                spin_loop();
+                            }
+                            if !ap_unlink_done {
+                                race_err = Some(alloc::format!(
+                                    "AP {} timed out on competing unlink round {}",
+                                    target,
+                                    round
+                                ));
+                                break;
+                            }
+                            let ap_unlink = DIR_AP_UNLINK_RES.load(Ordering::Acquire);
+                            let bsp_unlinked = match bsp_unlink {
+                                Ok(()) => true,
+                                Err(FsError::NotFound) => false,
+                                Err(e) => {
+                                    race_err = Some(alloc::format!(
+                                        "BSP unexpected unlink error on round {}: {:?}",
+                                        round,
+                                        e
+                                    ));
+                                    break;
+                                }
+                            };
+                            let ap_unlinked = match ap_unlink {
+                                1 => true,
+                                2 => false,
+                                _ => {
+                                    race_err = Some(alloc::format!(
+                                        "AP unexpected unlink error on round {}",
+                                        round
+                                    ));
+                                    break;
+                                }
+                            };
+                            if bsp_unlinked == ap_unlinked {
+                                race_err = Some(alloc::format!(
+                                    "directory unlink atomicity violation on round {}: bsp={} ap={}",
+                                    round,
+                                    bsp_unlinked,
+                                    ap_unlinked
+                                ));
+                                break;
+                            }
+                            if !matches!(VFS.stat_trusted(&name), Err(FsError::NotFound)) {
+                                race_err = Some(alloc::format!(
+                                    "unlinked entry {} still present at Phase B boundary (round {})",
+                                    name,
+                                    round
+                                ));
                                 break;
                             }
                         }
-                        match VFS.unlink_trusted(&name, Some(false)) {
-                            Ok(()) | Err(FsError::NotFound | FsError::Again) => {}
-                            Err(e) => {
-                                bsp_err =
-                                    Some(alloc::format!("BSP concurrent unlink failed: {:?}", e));
-                                break;
-                            }
-                        }
                     }
 
-                    let mut ap_done = false;
-                    for _ in 0..50_000_000usize {
-                        if DIR_RACE_EXITED.load(Ordering::Acquire) != 0 {
-                            ap_done = true;
-                            break;
+                    // Signal abort/exit to AP and require either probe cancellation
+                    // or a matching run-ID exit ack before releasing the fixture.
+                    DIR_CREATE_ROUND.store(u64::MAX, Ordering::Release);
+                    DIR_UNLINK_ROUND.store(u64::MAX, Ordering::Release);
+                    let cancelled = set_ap_test_probe(target, None);
+                    if cancelled {
+                        DIR_EXITED_RUN_ID.store(run_id, Ordering::Release);
+                        ap_still_active = false;
+                    } else {
+                        for _ in 0..50_000_000usize {
+                            if DIR_EXITED_RUN_ID.load(Ordering::Acquire) == run_id {
+                                ap_still_active = false;
+                                break;
+                            }
+                            spin_loop();
                         }
-                        spin_loop();
                     }
-                    let _ = set_ap_test_probe(target, None);
-                    if !ap_done {
-                        return Err(alloc::format!(
-                            "AP {} timed out during directory atomicity race",
-                            target
-                        ));
-                    }
-                    if let Some(msg) = bsp_err {
+                    if let Some(msg) = race_err {
                         return Err(msg);
                     }
-                    if DIR_RACE_ERR.load(Ordering::Acquire) != 0 {
-                        return Err(String::from(
-                            "AP observed unexpected error during concurrent directory race",
-                        ));
-                    }
-                    let ap_ops = DIR_RACE_AP_OPS.load(Ordering::Acquire);
-                    if ap_ops != 32 {
+                    if ap_still_active {
                         return Err(alloc::format!(
-                            "AP {} completed only {}/32 directory race iterations",
-                            target,
-                            ap_ops
+                            "AP {} timed out exiting directory atomicity worker",
+                            target
                         ));
                     }
                 }
@@ -1540,6 +1713,17 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
 
             Ok(())
         })();
+
+        // Never remove the fixture directory while a timed-out AP worker may
+        // still be operating on entries inside it.
+        if ap_still_active {
+            return match outcome {
+                Err(msg) => TestResult::Fail(msg),
+                Ok(()) => TestResult::Fail(String::from(
+                    "directory atomicity AP worker still active; fixture retained",
+                )),
+            };
+        }
 
         if ran_smp_race {
             for i in 0..4usize {

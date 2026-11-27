@@ -41,7 +41,10 @@ mod heavy_tlb_state {
     pub static CONC_AP_DONE: AtomicU64 = AtomicU64::new(0);
     pub static CONC_AP_SAW_BSP: AtomicU64 = AtomicU64::new(0);
     pub static CONC_AP_SAW_OWN: AtomicU64 = AtomicU64::new(0);
-    pub static AP_EXITED: AtomicU64 = AtomicU64::new(0);
+    // Monotonic per-invocation run IDs (never reset to 0) so a late exit from a
+    // timed-out AP callback can never satisfy a subsequent rerun's exit check.
+    pub static ACTIVE_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static EXITED_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub const fn ap_sentinel(cround: u64) -> u64 {
@@ -57,12 +60,13 @@ fn heavy_tlb_ap_worker() {
     use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
     use x86_64::{PhysAddr, VirtAddr};
 
+    let my_run_id = ACTIVE_RUN_ID.load(Ordering::Acquire);
     let scratch_phys = SCRATCH_CR3_PHYS.load(Ordering::Acquire);
     let pt_phys = PT_FRAME_PHYS.load(Ordering::Acquire);
     let ap_f0 = AP_FRAME_0_PHYS.load(Ordering::Acquire);
     let ap_f1 = AP_FRAME_1_PHYS.load(Ordering::Acquire);
     if scratch_phys == 0 || pt_phys == 0 || ap_f0 == 0 || ap_f1 == 0 {
-        AP_EXITED.store(1, Ordering::Release);
+        EXITED_RUN_ID.store(my_run_id, Ordering::Release);
         return;
     }
 
@@ -156,7 +160,7 @@ fn heavy_tlb_ap_worker() {
             Cr3::write_raw(saved_frame, saved_raw & 0x0FFF);
         }
     });
-    AP_EXITED.store(1, Ordering::Release);
+    EXITED_RUN_ID.store(my_run_id, Ordering::Release);
 }
 
 /// Heavy TLB Shootdown Contention Test (R175 D0-CROSS-2, bounded SMP probe).
@@ -206,6 +210,14 @@ impl RuntimeTest for HeavyTlbShootdownContentionTest {
         let Some(target) = (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) else {
             return TestResult::Fail(String::from("No online AP found for heavy TLB contention"));
         };
+
+        // Never reuse shared TLB probe state while an earlier timed-out AP
+        // callback has not yet acknowledged exit.
+        if ACTIVE_RUN_ID.load(Ordering::Acquire) != EXITED_RUN_ID.load(Ordering::Acquire) {
+            return TestResult::Fail(String::from(
+                "previous heavy TLB shootdown AP callback has not exited yet",
+            ));
+        }
 
         let mut allocator = FrameAllocator::new();
         let alloc_zeroed = |alloc: &mut FrameAllocator| -> Option<PhysFrame<Size4KiB>> {
@@ -323,12 +335,12 @@ impl RuntimeTest for HeavyTlbShootdownContentionTest {
         CONC_AP_DONE.store(0, Ordering::Release);
         CONC_AP_SAW_BSP.store(0, Ordering::Release);
         CONC_AP_SAW_OWN.store(0, Ordering::Release);
-        AP_EXITED.store(0, Ordering::Release);
         ROUND.store(0, Ordering::Release);
         PT_FRAME_PHYS.store(pt_frame.start_address().as_u64(), Ordering::Release);
         AP_FRAME_0_PHYS.store(ap_f0.start_address().as_u64(), Ordering::Release);
         AP_FRAME_1_PHYS.store(ap_f1.start_address().as_u64(), Ordering::Release);
         SCRATCH_CR3_PHYS.store(scratch_phys, Ordering::Release);
+        let run_id = ACTIVE_RUN_ID.fetch_add(1, Ordering::AcqRel) + 1;
 
         let mut ap_may_hold_scratch = true;
         let _ = set_ap_test_probe(target, Some(heavy_tlb_ap_worker));
@@ -524,10 +536,15 @@ impl RuntimeTest for HeavyTlbShootdownContentionTest {
         CONC_ROUND.store(u64::MAX, Ordering::Release);
         let cancelled = set_ap_test_probe(target, None);
         if cancelled {
+            EXITED_RUN_ID.store(run_id, Ordering::Release);
             ap_may_hold_scratch = false;
         } else {
             for _ in 0..100_000_000usize {
-                if AP_EXITED.load(Ordering::Acquire) != 0 {
+                // Keep servicing BSP's shootdown mailbox during exit wait: if
+                // Phase 2 timed out right as AP dispatched its flush, BSP (IF=0
+                // at boot) must ACK it so AP does not panic in wait_for_acks.
+                x86_64::instructions::interrupts::without_interrupts(handle_shootdown_ipi);
+                if EXITED_RUN_ID.load(Ordering::Acquire) == run_id {
                     ap_may_hold_scratch = false;
                     break;
                 }

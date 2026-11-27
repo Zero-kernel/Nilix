@@ -9486,6 +9486,8 @@ static S8_MIG_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 static S8_MIG_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static S8_MIG_CANARY_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static S8_MIG_SYSCALL_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S8_MIG_FRAME_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S8_MIG_FRAME_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static S8_MIG_TID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 static S8_MIG_SEED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static S8_MIG_CPUS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -9501,7 +9503,20 @@ static S8_MIG_BLOCK_CPU: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 static S8_MIG_POST_CPU: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
+static S8_MIG_EXP_RIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static S8_MIG_EXP_R12: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static S8_MIG_EXP_R13: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static S8_MIG_EXP_R14: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static S8_MIG_EXP_R15: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static S8_RDTSCP_CAP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+const S8_SA_SIGINFO_FLAG: u64 = 0x0000_0004;
+// Offsets within x86_64 ucontext_t (uc_mcontext starts at +40; see kernel/kernel_core/signal_frame.rs).
+const S8_UC_R12_OFF: usize = 40 + 32;
+const S8_UC_R13_OFF: usize = 40 + 40;
+const S8_UC_R14_OFF: usize = 40 + 48;
+const S8_UC_R15_OFF: usize = 40 + 56;
+const S8_UC_RAX_OFF: usize = 40 + 104;
+const S8_UC_RIP_OFF: usize = 40 + 128;
 
 fn s8_has_rdtscp() -> bool {
     use core::sync::atomic::Ordering;
@@ -9565,12 +9580,43 @@ fn s8_current_cpu_id() -> u32 {
     }
 }
 
-extern "C" fn s8_migration_signal_handler(signo: i32) {
+extern "C" fn s8_migration_signal_handler(signo: i32, _info: *const u8, ucontext: *const u8) {
+    use core::sync::atomic::Ordering;
     let cpu = s8_current_cpu_id();
-    S8_SIG_LAST_CPU.store(cpu, core::sync::atomic::Ordering::Release);
-    S8_SIG_CPUS_SEEN.fetch_or(1u64 << cpu, core::sync::atomic::Ordering::SeqCst);
-    S4_SIG_LAST.store(signo, core::sync::atomic::Ordering::SeqCst);
-    S4_SIG_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    S8_SIG_LAST_CPU.store(cpu, Ordering::Release);
+    S8_SIG_CPUS_SEEN.fetch_or(1u64 << cpu, Ordering::SeqCst);
+
+    // Inspect the saved ucontext_t to prove this handler genuinely interrupted
+    // the migrated inline SYS_FUTEX syscall frame (matching its exact post-syscall
+    // RIP, -EINTR return in RAX, and all four runtime-seeded callee-saved canaries
+    // r12-r15) rather than a later diagnostic syscall.
+    let frame_ok = if ucontext.is_null() {
+        false
+    } else {
+        let rd = |off: usize| unsafe { core::ptr::read_unaligned(ucontext.add(off) as *const u64) };
+        let saved_rip = rd(S8_UC_RIP_OFF);
+        let saved_rax = rd(S8_UC_RAX_OFF);
+        let saved_r12 = rd(S8_UC_R12_OFF);
+        let saved_r13 = rd(S8_UC_R13_OFF);
+        let saved_r14 = rd(S8_UC_R14_OFF);
+        let saved_r15 = rd(S8_UC_R15_OFF);
+        let exp_rip = S8_MIG_EXP_RIP.load(Ordering::Acquire);
+        exp_rip != 0
+            && saved_rip == exp_rip
+            && errno(saved_rax) == S4_EINTR
+            && saved_r12 == S8_MIG_EXP_R12.load(Ordering::Acquire)
+            && saved_r13 == S8_MIG_EXP_R13.load(Ordering::Acquire)
+            && saved_r14 == S8_MIG_EXP_R14.load(Ordering::Acquire)
+            && saved_r15 == S8_MIG_EXP_R15.load(Ordering::Acquire)
+    };
+    if frame_ok {
+        S8_MIG_FRAME_OK.fetch_add(1, Ordering::SeqCst);
+    } else {
+        S8_MIG_FRAME_ERR.fetch_add(1, Ordering::SeqCst);
+    }
+
+    S4_SIG_LAST.store(signo, Ordering::SeqCst);
+    S4_SIG_COUNT.fetch_add(1, Ordering::SeqCst);
 }
 
 extern "C" fn s8_signal_migration_worker() -> ! {
@@ -9607,6 +9653,10 @@ extern "C" fn s8_signal_migration_worker() -> ! {
         let e13 = seed.rotate_left(13) ^ 0x8877_6655_4433_2211u64;
         let e14 = seed.rotate_left(29) ^ 0xA5A5_5A5A_F0F0_0F0Fu64;
         let e15 = seed.rotate_left(47) ^ 0x55AA_55AA_33CC_33CCu64;
+        S8_MIG_EXP_R12.store(e12, Ordering::Release);
+        S8_MIG_EXP_R13.store(e13, Ordering::Release);
+        S8_MIG_EXP_R14.store(e14, Ordering::Release);
+        S8_MIG_EXP_R15.store(e15, Ordering::Release);
         let mut r12 = e12;
         let mut r13 = e13;
         let mut r14 = e14;
@@ -9614,7 +9664,10 @@ extern "C" fn s8_signal_migration_worker() -> ! {
         let mut ret: u64 = 202; // SYS_FUTEX
         unsafe {
             core::arch::asm!(
+                "lea rcx, [rip + 2f]",
+                "mov [r11], rcx",
                 "syscall",
+                "2:",
                 inout("rax") ret,
                 in("rdi") S8_MIG_FUTEX.0.as_ptr() as u64,
                 in("rsi") (FUTEX_WAIT_OP | FUTEX_PRIVATE),
@@ -9622,12 +9675,12 @@ extern "C" fn s8_signal_migration_worker() -> ! {
                 in("r10") 0u64,
                 in("r8") 0u64,
                 in("r9") 0u64,
+                inout("r11") S8_MIG_EXP_RIP.as_ptr() => _,
                 inout("r12") r12,
                 inout("r13") r13,
                 inout("r14") r14,
                 inout("r15") r15,
                 out("rcx") _,
-                out("r11") _,
                 options(nostack),
             );
         }
@@ -9655,6 +9708,8 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     S8_MIG_READY.store(0, Ordering::SeqCst);
     S8_MIG_CANARY_ERR.store(0, Ordering::SeqCst);
     S8_MIG_SYSCALL_ERR.store(0, Ordering::SeqCst);
+    S8_MIG_FRAME_OK.store(0, Ordering::SeqCst);
+    S8_MIG_FRAME_ERR.store(0, Ordering::SeqCst);
     S8_MIG_TID.store(-1, Ordering::SeqCst);
     S8_MIG_CPUS_SEEN.store(0, Ordering::SeqCst);
     S8_SIG_CPUS_SEEN.store(0, Ordering::SeqCst);
@@ -9665,6 +9720,11 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     S8_MIG_DONE.store(0, Ordering::SeqCst);
     S8_MIG_BLOCK_CPU.store(u32::MAX, Ordering::SeqCst);
     S8_MIG_POST_CPU.store(u32::MAX, Ordering::SeqCst);
+    S8_MIG_EXP_RIP.store(0, Ordering::SeqCst);
+    S8_MIG_EXP_R12.store(0, Ordering::SeqCst);
+    S8_MIG_EXP_R13.store(0, Ordering::SeqCst);
+    S8_MIG_EXP_R14.store(0, Ordering::SeqCst);
+    S8_MIG_EXP_R15.store(0, Ordering::SeqCst);
     // Probe CPUID once on the parent thread before spawning the worker/handler.
     let _ = s8_has_rdtscp();
     let seed = monotonic_ns()
@@ -9675,8 +9735,8 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     S8_MIG_SEED.store(seed, Ordering::Release);
 
     let act: [u64; 4] = [
-        s8_migration_signal_handler as extern "C" fn(i32) as usize as u64,
-        SA_RESTORER_FLAG,
+        s8_migration_signal_handler as extern "C" fn(i32, *const u8, *const u8) as usize as u64,
+        SA_RESTORER_FLAG | S8_SA_SIGINFO_FLAG,
         pi_sigreturn_trampoline as unsafe extern "C" fn() as usize as u64,
         0,
     ];
@@ -9846,6 +9906,10 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     }
     if S8_MIG_SYSCALL_ERR.load(Ordering::SeqCst) != 0 {
         return 0x4a;
+    }
+    if S8_MIG_FRAME_ERR.load(Ordering::SeqCst) != 0 || S8_MIG_FRAME_OK.load(Ordering::SeqCst) != 24
+    {
+        return 0x4b;
     }
     if signals_observed < 24 || S4_SIG_LAST.load(Ordering::SeqCst) != SIGUSR1_NR as i32 {
         return 0x46;
