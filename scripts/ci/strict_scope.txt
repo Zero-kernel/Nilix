@@ -36,16 +36,31 @@ RUNTIME tlb_shootdown_targeted_negative_control not_applicable needs_cpus:2
 # STRICT-Q S8 (D1 + D4): bounded heavy SMP runtime tests require 2+ CPUs.
 RUNTIME r175_heavy_tlb_contention not_applicable needs_cpus:2
 
+# STRICT-Q S5 (D1): cross-CPU COW TLB shootdown requires 2+ CPUs.
+RUNTIME r23_1_cow_tlb_shootdown not_applicable needs_cpus:2
+
+# STRICT-Q S6 (D1): cross-CPU work-stealing on_cpu gate probe requires 2+ CPUs.
+RUNTIME r172_03_work_stealing_on_cpu_gate not_applicable needs_cpus:2
+
 # STRICT-Q S3 (D4 + D5): verified COVERED-BY entries backed by ring3-mm and stress oracles.
 RUNTIME r174_b3_pt_charge_tracking covered covered_by:ring3-mm
 RUNTIME m0_7_stack_guard_page covered covered_by:ring3-mm
 RUNTIME futex_wait_wake_correctness covered covered_by:ring3-mm
 RUNTIME r175_extended_runtime_1hour covered covered_by:stress
 
-# STRICT-Q S4 & S8 (D5): Ring-3 IPC, signal-migration, and namespace-teardown legs verified by ring3-mm.
+# STRICT-Q S4, S5, S6, S8 & S9 (D5): Ring-3 MM, IPC, arch, scheduler, signal-migration, and namespace-teardown legs verified by ring3-mm.
+RUNTIME r172_01_context_switch_rip_rflags covered covered_by:ring3-mm
+RUNTIME r172_04_tls_isolation covered covered_by:ring3-mm
+RUNTIME r172_05_syscall_active_leak covered covered_by:ring3-mm
+RUNTIME r174_a1_fpu_state_irq_isolation covered covered_by:ring3-mm
+RUNTIME r174_b4_brk_va_reservation_toctou covered covered_by:ring3-mm
 RUNTIME r172_08_futex_bucket_toctou covered covered_by:ring3-mm
 RUNTIME r41_3_pipe_eintr_wake covered covered_by:ring3-mm
 RUNTIME m0_5_signal_delivery_blocked_syscall covered covered_by:ring3-mm
+RUNTIME r172_03_smp_work_stealing_safety covered covered_by:ring3-mm
+RUNTIME process_migration_safety covered covered_by:ring3-mm
+RUNTIME scheduler_load_balancing covered covered_by:ring3-mm
+RUNTIME cpu_affinity_enforcement covered covered_by:ring3-mm
 RUNTIME r175_rapid_signal_migration covered covered_by:ring3-mm
 RUNTIME r175_namespace_teardown_storm covered covered_by:ring3-mm
 

@@ -143,6 +143,11 @@ futex bucket TOCTOU: concurrent wait/wake/requeue across rotating words loses no
 pipe read wakes with EINTR on SIGUSR1 delivery and remains usable afterward
 signal delivery interrupts blocked nanosleep and futex_wait with EINTR and runs handler
 namespace teardown storm: unshare CLONE_NEWPID init SIGKILL cascades to stopped and running members across waves
+brk VA reservation TOCTOU: concurrent CLONE_VM brk and MAP_FIXED_NOREPLACE never overlap
+context switch RIP/RFLAGS: concurrent threads preserve Ring-3 CS/SS, callee registers and flags across yields and preemptions
+TLS isolation: concurrent threads preserve distinct FS_BASE and GS_BASE across context switches
+syscall_active isolation: interleaved blocking syscalls on one CPU never leak EBUSY
+FPU IRQ isolation: concurrent SSE XMM0-XMM7 state stays bit-exact across timer preemptions
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.
@@ -161,6 +166,18 @@ if [ "${KERNEL_TEST_CPUS:-1}" -gt 1 ]; then
     fi
     if grep -Fq '[SKIP] rapid signal migration:' "$serial"; then
         report_fail "cross-CPU rapid signal migration oracle skipped on SMP"
+    fi
+    if ! grep -Fq "[PASS] CPU affinity enforcement: sched_setaffinity pins execution strictly to each online CPU and rejects invalid masks" "$serial"; then
+        report_fail "missing SMP CPU affinity enforcement oracle"
+    fi
+    if ! grep -Fq "[PASS] process migration safety: forced cross-CPU hops preserve per-CPU state, FS/GS TLS and PID identity" "$serial"; then
+        report_fail "missing SMP process migration safety oracle"
+    fi
+    if ! grep -Fq "[PASS] scheduler load balancing: unpinned runnable workers distribute across multiple online CPUs" "$serial"; then
+        report_fail "missing SMP scheduler load balancing oracle"
+    fi
+    if ! grep -Fq "[PASS] SMP work stealing safety: concurrent unpinned task waves preserve per-task TLS and identity across CPUs" "$serial"; then
+        report_fail "missing SMP work stealing safety oracle"
     fi
     # ST-K2-P2(b): a page-table holder paused before its munmap shootdown got
     # its acknowledgement from a sibling's IF=0 Busy shared fault, in every one
@@ -184,6 +201,18 @@ if [ "${KERNEL_TEST_CPUS:-1}" -gt 1 ]; then
 else
     if ! grep -Fq "[PASS] rapid signal delivery on single CPU preserves registers and handler state" "$serial"; then
         report_fail "missing single-CPU rapid signal canary oracle"
+    fi
+    if ! grep -Fq "[PASS] CPU affinity enforcement on single CPU: pins to CPU 0 and rejects invalid masks" "$serial"; then
+        report_fail "missing single-CPU affinity enforcement canary oracle"
+    fi
+    if ! grep -Fq "[PASS] process migration safety on single CPU: state and TLS stay intact across affinity refreshes" "$serial"; then
+        report_fail "missing single-CPU process migration canary oracle"
+    fi
+    if ! grep -Fq "[PASS] scheduler load balancing on single CPU: runnable workers complete fairly on CPU 0" "$serial"; then
+        report_fail "missing single-CPU scheduler load balancing canary oracle"
+    fi
+    if ! grep -Fq "[PASS] SMP work stealing safety on single CPU: concurrent task waves preserve per-task TLS and identity" "$serial"; then
+        report_fail "missing single-CPU work stealing canary oracle"
     fi
 fi
 # PR86-1: SMP must witness actual final release, not exit-before-waitid.

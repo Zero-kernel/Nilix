@@ -440,14 +440,58 @@ exit 0
         self.assertIn("-device\nintel-iommu,intremap=on\n", arguments)
 
     def test_runtime_harnesses_attach_the_restricted_user_network(self):
-        # STRICT-Q D2(a): kernel_test.sh and the three SMP harnesses give the guest a
-        # virtio-net eth0; extending boot_check.sh is a separate, undecided proposal.
+        # STRICT-Q D2(a) + #103 Option 1: all runtime harnesses (including
+        # boot_check.sh) attach the restricted user-mode virtio-net eth0.
         netdev = "-netdev\nuser,id=net0,restrict=on,ipv6=off\n-device\nvirtio-net-pci,netdev=net0,romfile=\n"
-        for name, attached in (("kernel_test.sh", True), ("smp_test.sh", True), ("smp_test_4core.sh", True),
-                               ("extended_smp_test.sh", True), ("boot_check.sh", False)):
+        for name in ("kernel_test.sh", "smp_test.sh", "smp_test_4core.sh",
+                     "extended_smp_test.sh", "boot_check.sh"):
             with self.subTest(script=name):
                 self.assert_gate(self.run_gate(name), 0)
-                self.assertEqual(netdev in (self.work / "qemu.arguments").read_text(), attached)
+                self.assertIn(netdev, (self.work / "qemu.arguments").read_text())
+
+    def test_strict_d3_retpoline_boot_warning_exemption_is_scoped_and_exact(self):
+        d3_scope = frozenset([
+            gate_log.D3_RETPOLINE_SCOPE,
+            ("SECURITY", "spectre_v2_retpoline", "out_of_scope", "out_of_scope:N6"),
+        ])
+        base_serial = (
+            "      WARNING: Spectre mitigations failed: RetpolineRequired\n"
+            'SECURITY-BOOT-CASE name=spectre_v2_retpoline status=out_of_scope scope=out_of_scope:N6 owner=security::tests reason="N6"\n'
+            "SECURITY-BOOT-COUNTS passed=0 warning=0 deferred=0 skipped=0 failed=0 not_applicable=0 out_of_scope=1 covered=0\n"
+            'SECURITY-CASE name=spectre_v2_retpoline status=out_of_scope scope=out_of_scope:N6 owner=security::tests reason="N6"\n'
+            "SECURITY-COUNTS passed=0 warning=0 deferred=0 skipped=0 failed=0 not_applicable=0 out_of_scope=1 covered=0\n"
+            'RUNTIME-CASE name=heap_allocation status=pass owner=kernel::runtime_tests::HeapAllocationTest reason=""\n'
+            "=== Test Summary: 1 passed, 0 deferred, 0 failed ===\n"
+            "RUNTIME-COUNTS passed=1 warning=0 deferred=0 skipped=0 failed=0 not_applicable=0 out_of_scope=0 covered=0\n"
+            "Process 1 exited with code 0\n"
+        )
+        # Non-strict mode still counts the boot warning and stays QUALIFIED.
+        non_strict = gate_log.evaluate(base_serial, "", "", TERM, 124, strict=False, strict_scope=d3_scope)
+        self.assertEqual(non_strict.status, 3)
+        self.assertEqual(non_strict.warning_markers, 1)
+        self.assertEqual(non_strict.details["declared_strict_warnings"], 0)
+
+        # Strict mode with D3 retpoline scope accepts exactly one RetpolineRequired line.
+        strict_ok = gate_log.evaluate(base_serial, "", "", TERM, 124, strict=True, strict_scope=d3_scope)
+        self.assertEqual(strict_ok.status, 0)
+        self.assertEqual(strict_ok.warning_markers, 0)
+        self.assertEqual(strict_ok.details["declared_strict_warnings"], 1)
+
+        # Strict mode without D3 retpoline scope rejects the warning.
+        strict_no_scope = gate_log.evaluate(base_serial, "", "", TERM, 124, strict=True, strict_scope=frozenset())
+        self.assertEqual(strict_no_scope.status, 1)
+        self.assertEqual(strict_no_scope.warning_markers, 1)
+
+        # Strict mode still rejects a different SpectreError warning or duplicate line.
+        other_warn = base_serial.replace("RetpolineRequired", "IbrsUnsupported")
+        strict_other = gate_log.evaluate(other_warn, "", "", TERM, 124, strict=True, strict_scope=d3_scope)
+        self.assertEqual(strict_other.status, 1)
+        self.assertEqual(strict_other.warning_markers, 1)
+
+        dup_warn = "      WARNING: Spectre mitigations failed: RetpolineRequired\n" + base_serial
+        strict_dup = gate_log.evaluate(dup_warn, "", "", TERM, 124, strict=True, strict_scope=d3_scope)
+        self.assertEqual(strict_dup.status, 1)
+        self.assertEqual(strict_dup.warning_markers, 1)
 
     def test_extended_aggregate_does_not_turn_qualified_into_pass(self):
         self.assert_gate(self.run_gate("extended_smp_test.sh", second_serial=QUALIFIED), 3)

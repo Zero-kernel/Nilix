@@ -365,6 +365,18 @@ pub extern "C" fn _start() -> ! {
     test_signal_delivery_blocked_syscall(&mut results);
     test_rapid_signal_migration(&mut results);
     test_namespace_teardown_storm(&mut results);
+    // STRICT-Q S5: Ring-3 concurrent CLONE_VM brk + MAP_FIXED_NOREPLACE leg.
+    test_brk_va_reservation_toctou(&mut results);
+    // STRICT-Q S9: Ring-3 context-switch RIP/RFLAGS, TLS, syscall_active, and FPU IRQ isolation legs.
+    test_context_switch_rip_rflags(&mut results);
+    test_tls_isolation(&mut results);
+    test_syscall_active_leak(&mut results);
+    test_fpu_state_irq_isolation(&mut results);
+    // STRICT-Q S6: Ring-3 CPU affinity, forced migration, load balancing, and SMP work-stealing legs.
+    test_cpu_affinity_enforcement(&mut results);
+    test_process_migration_safety(&mut results);
+    test_scheduler_load_balancing(&mut results);
+    test_smp_work_stealing_safety(&mut results);
 
     // Print summary
     println("");
@@ -10332,4 +10344,1502 @@ fn test_namespace_teardown_storm(results: &mut TestResult) {
     results.pass(
         "namespace teardown storm: unshare CLONE_NEWPID init SIGKILL cascades to stopped and running members across waves",
     );
+}
+
+// ---------------------------------------------------------------------------
+// STRICT-Q S5 (R174-B4): Concurrent CLONE_VM brk() VA reservation TOCTOU test.
+// ---------------------------------------------------------------------------
+
+static S5_BRK_TARGET: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static S5_BRK_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_MMAP_WINS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_MMAP_EEXIST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_SMP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn s5_brk_mmap_racer() -> ! {
+    use core::sync::atomic::Ordering;
+    if S5_BRK_SMP.load(Ordering::Acquire) != 0 {
+        let _ = cow_test_pin(2);
+    }
+    let target = S5_BRK_TARGET.load(Ordering::Acquire);
+    S5_BRK_READY.store(1, Ordering::Release);
+
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
+    let mut seq = 0u64;
+    while S5_BRK_STOP.load(Ordering::Acquire) == 0 {
+        seq = seq.wrapping_add(1);
+        let got = unsafe { mmap_raw(target, PAGE, flags) };
+        if got == target as i64 {
+            // While this mapping is live at `target`, sys_brk MUST NOT have
+            // grown past `target` (neither previously nor concurrently).
+            let cur_brk = unsafe { syscall1(SYS_BRK, 0) as usize };
+            if cur_brk > target {
+                let _ = unsafe { munmap(target, PAGE) };
+                S5_BRK_ERR.store(1, Ordering::Release);
+                break;
+            }
+            let sentinel = 0x5B40_0000_0000_0000u64 | (seq & 0xFFFF_FFFF);
+            unsafe {
+                core::ptr::write_volatile(target as *mut u64, sentinel);
+                userspace::syscall::sys_yield();
+            }
+            let after_val = unsafe { core::ptr::read_volatile(target as *const u64) };
+            let after_brk = unsafe { syscall1(SYS_BRK, 0) as usize };
+            let unmap_rc = unsafe { munmap(target, PAGE) };
+            if after_val != sentinel || after_brk > target || unmap_rc != 0 {
+                S5_BRK_ERR.store(2, Ordering::Release);
+                break;
+            }
+            S5_BRK_MMAP_WINS.fetch_add(1, Ordering::Relaxed);
+        } else if got == -(EEXIST as i64) {
+            S5_BRK_MMAP_EEXIST.fetch_add(1, Ordering::Relaxed);
+        } else {
+            S5_BRK_ERR.store(3, Ordering::Release);
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn s5_brk_va_reservation_toctou_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    const SPAN_PAGES: usize = 16;
+    const TARGET_PAGE_OFF: usize = 8;
+    const ROUNDS: u64 = 64;
+
+    let old = unsafe { syscall1(SYS_BRK, 0) as usize };
+    if old == 0 {
+        return 0x70;
+    }
+    let base = (old + PAGE - 1) & !(PAGE - 1);
+    let top = base + SPAN_PAGES * PAGE;
+    let target = base + TARGET_PAGE_OFF * PAGE;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
+
+    // 1. Deterministic boundary contract before spawning the sibling thread:
+    //    - mmap at `target` succeeds while heap is at `old`;
+    //    - brk(top) crossing `target` MUST refuse (return unchanged <= target);
+    //    - after munmap, brk(top) succeeds and MAP_FIXED_NOREPLACE at `target`
+    //      returns -EEXIST.
+    if unsafe { mmap_raw(target, PAGE, flags) } != target as i64 {
+        return 0x71;
+    }
+    unsafe { core::ptr::write_volatile(target as *mut u64, 0xB411_0001) };
+    let blocked_brk = unsafe { syscall1(SYS_BRK, top as u64) as usize };
+    let intact = unsafe { core::ptr::read_volatile(target as *const u64) } == 0xB411_0001;
+    let unmap_ok = unsafe { munmap(target, PAGE) } == 0;
+    if blocked_brk > target || !intact || !unmap_ok {
+        return 0x72;
+    }
+
+    if unsafe { syscall1(SYS_BRK, top as u64) as usize } != top {
+        return 0x73;
+    }
+    unsafe { core::ptr::write_volatile(target as *mut u64, 0xB422_0002) };
+    let eexist_rc = unsafe { mmap_raw(target, PAGE, flags) };
+    let heap_intact = unsafe { core::ptr::read_volatile(target as *const u64) } == 0xB422_0002;
+    let shrunk = unsafe { syscall1(SYS_BRK, base as u64) as usize } == base;
+    if eexist_rc != -(EEXIST as i64) || !heap_intact || !shrunk {
+        let _ = unsafe { syscall1(SYS_BRK, old as u64) };
+        return 0x74;
+    }
+
+    // 2. Concurrent CLONE_VM race: main thread repeatedly grows/verifies/shrinks
+    //    brk across [base, top) while sibling thread hammers MAP_FIXED_NOREPLACE
+    //    at `target` inside that exact grow window.
+    let cpus = unsafe { cow_test_command(0, 0) };
+    let smp = !is_error(cpus) && (cpus & 3) == 3;
+    if smp {
+        let _ = cow_test_pin(1);
+    }
+
+    S5_BRK_TARGET.store(target, Ordering::Release);
+    S5_BRK_STOP.store(0, Ordering::Release);
+    S5_BRK_READY.store(0, Ordering::Release);
+    S5_BRK_MMAP_WINS.store(0, Ordering::Release);
+    S5_BRK_MMAP_EEXIST.store(0, Ordering::Release);
+    S5_BRK_ERR.store(0, Ordering::Release);
+    S5_BRK_SMP.store(if smp { 1 } else { 0 }, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            s5_brk_mmap_racer,
+        )
+    };
+    if is_error(tid) || tid == 0 {
+        let _ = unsafe { syscall1(SYS_BRK, old as u64) };
+        return 0x75;
+    }
+
+    for _ in 0..THREAD_POLL_YIELDS {
+        if S5_BRK_READY.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if S5_BRK_READY.load(Ordering::Acquire) == 0 {
+        S5_BRK_STOP.store(1, Ordering::Release);
+        let _ = g8_join_thread();
+        let _ = unsafe { syscall1(SYS_BRK, old as u64) };
+        return 0x76;
+    }
+
+    let mut brk_grows = 0u64;
+    let mut main_err = 0u64;
+    for round in 1..=ROUNDS {
+        if S5_BRK_ERR.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        let got = unsafe { syscall1(SYS_BRK, top as u64) as usize };
+        if got == top {
+            brk_grows += 1;
+            let p0 = base as *mut u64;
+            let pm = target as *mut u64;
+            let pe = (top - PAGE) as *mut u64;
+            let pat = 0xB400_0000_0000_0000u64 | round;
+            unsafe {
+                core::ptr::write_volatile(p0, pat);
+                core::ptr::write_volatile(pm, pat ^ 1);
+                core::ptr::write_volatile(pe, pat ^ 2);
+                userspace::syscall::sys_yield();
+            }
+            let v0 = unsafe { core::ptr::read_volatile(p0) };
+            let vm = unsafe { core::ptr::read_volatile(pm) };
+            let ve = unsafe { core::ptr::read_volatile(pe) };
+            if v0 != pat || vm != (pat ^ 1) || ve != (pat ^ 2) {
+                main_err = 0x77;
+                break;
+            }
+            let back = unsafe { syscall1(SYS_BRK, base as u64) as usize };
+            if back != base {
+                main_err = 0x78;
+                break;
+            }
+        } else if got != base {
+            main_err = 0x79;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+
+    S5_BRK_STOP.store(1, Ordering::Release);
+    let joined = g8_join_thread();
+    let restored = unsafe { syscall1(SYS_BRK, old as u64) as usize } == old;
+
+    if !joined {
+        return 0x7a;
+    }
+    if main_err != 0 {
+        return main_err;
+    }
+    let racer_err = S5_BRK_ERR.load(Ordering::Acquire);
+    if racer_err != 0 {
+        return 0x7b + racer_err as u64;
+    }
+    let racer_total =
+        S5_BRK_MMAP_WINS.load(Ordering::Relaxed) + S5_BRK_MMAP_EEXIST.load(Ordering::Relaxed);
+    if !restored || brk_grows == 0 || racer_total == 0 {
+        return 0x7f;
+    }
+    S4_LEG_OK
+}
+
+/// R174-B4: Verify concurrent CLONE_VM brk() and MAP_FIXED_NOREPLACE never overlap.
+fn test_brk_va_reservation_toctou(results: &mut TestResult) {
+    print("Testing R174-B4 concurrent CLONE_VM brk VA reservation TOCTOU... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("brk VA reservation TOCTOU: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s5_brk_va_reservation_toctou_leg()) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => {
+            results.pass(
+                "brk VA reservation TOCTOU: concurrent CLONE_VM brk and MAP_FIXED_NOREPLACE never overlap",
+            );
+        }
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("brk VA reservation TOCTOU: concurrent overlap or corruption detected");
+        }
+        None => results.fail("brk VA reservation TOCTOU: could not reap host"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// STRICT-Q S9: Ring-3 context switch RIP/RFLAGS, TLS, syscall_active, FPU IRQ.
+// ---------------------------------------------------------------------------
+
+const S9_SYS_ARCH_PRCTL: u64 = 158;
+const S9_ARCH_SET_GS: u64 = 0x1001;
+const S9_ARCH_SET_FS: u64 = 0x1002;
+const S9_ARCH_GET_FS: u64 = 0x1003;
+const S9_ARCH_GET_GS: u64 = 0x1004;
+const S9_SYS_SCHED_SETAFFINITY: u64 = 203;
+const S9_SYS_SCHED_GETAFFINITY: u64 = 204;
+const S9_FUTEX_WAIT: u64 = 0;
+const S9_FUTEX_WAKE: u64 = 1;
+const S9_EBUSY: i32 = 16;
+const S9_EINVAL: i32 = 22;
+
+#[repr(C, align(64))]
+struct S9TlsBlock {
+    magic0: u64,
+    magic1: u64,
+    pad: [u64; 6],
+}
+
+static S9_CTX_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_CTX_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_CTX_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_CTX_ITERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline(never)]
+unsafe fn s9_verify_ctx_round(tag: u64, round: u64) -> bool {
+    let mut r12 = 0x1200_0000_0000_0000u64 | (tag << 40) | round;
+    let mut r13 = 0x1300_0000_0000_0000u64 | (tag << 40) | (round ^ 0x55AA);
+    let mut r14 = 0x1400_0000_0000_0000u64 | (tag << 40) | (round.wrapping_mul(3));
+    let mut r15 = 0x1500_0000_0000_0000u64 | (tag << 40) | (round.wrapping_mul(7));
+    let exp12 = r12;
+    let exp13 = r13;
+    let exp14 = r14;
+    let exp15 = r15;
+    let cs_before: u64;
+    let ss_before: u64;
+    let cs_after: u64;
+    let ss_after: u64;
+    let rflags_after: u64;
+
+    // Preserve callee-saved r12-r15 and verify Ring-3 CS/SS + DF==0 across both
+    // an inline SYS_SCHED_YIELD (24) and a pure user-space preemption spin.
+    core::arch::asm!(
+        "xor {cs_b:e}, {cs_b:e}",
+        "mov {cs_b:x}, cs",
+        "xor {ss_b:e}, {ss_b:e}",
+        "mov {ss_b:x}, ss",
+        "mov eax, 24",
+        "syscall",
+        "mov eax, 4096",
+        "2:",
+        "pause",
+        "dec eax",
+        "jnz 2b",
+        "xor {cs_a:e}, {cs_a:e}",
+        "mov {cs_a:x}, cs",
+        "xor {ss_a:e}, {ss_a:e}",
+        "mov {ss_a:x}, ss",
+        "pushfq",
+        "pop {rfl}",
+        inout("r12") r12,
+        inout("r13") r13,
+        inout("r14") r14,
+        inout("r15") r15,
+        cs_b = out(reg) cs_before,
+        ss_b = out(reg) ss_before,
+        cs_a = out(reg) cs_after,
+        ss_a = out(reg) ss_after,
+        rfl = out(reg) rflags_after,
+        out("rax") _,
+        out("rcx") _,
+        out("r11") _,
+        options(preserves_flags),
+    );
+
+    r12 == exp12
+        && r13 == exp13
+        && r14 == exp14
+        && r15 == exp15
+        && (cs_before & 3) == 3
+        && (ss_before & 3) == 3
+        && (cs_after & 3) == 3
+        && (ss_after & 3) == 3
+        && (rflags_after & (1 << 10)) == 0 // DF must remain clear
+        && (rflags_after & (1 << 9)) != 0 // IF must remain enabled in Ring 3
+}
+
+extern "C" fn s9_ctx_sibling() -> ! {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    S9_CTX_READY.store(1, Ordering::Release);
+    let mut round = 0u64;
+    while S9_CTX_STOP.load(Ordering::Acquire) == 0 {
+        round = round.wrapping_add(1);
+        if !unsafe { s9_verify_ctx_round(2, round) } {
+            S9_CTX_ERR.store(1, Ordering::Release);
+            break;
+        }
+        S9_CTX_ITERS.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn s9_context_switch_rip_rflags_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    S9_CTX_READY.store(0, Ordering::Release);
+    S9_CTX_STOP.store(0, Ordering::Release);
+    S9_CTX_ERR.store(0, Ordering::Release);
+    S9_CTX_ITERS.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            s9_ctx_sibling,
+        )
+    };
+    if is_error(tid) || tid == 0 {
+        return 0x80;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if S9_CTX_READY.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if S9_CTX_READY.load(Ordering::Acquire) == 0 {
+        S9_CTX_STOP.store(1, Ordering::Release);
+        let _ = g8_join_thread();
+        return 0x81;
+    }
+
+    let mut main_ok = true;
+    let sleep_1ms = [0i64, 1_000_000i64];
+    for round in 1..=64u64 {
+        if S9_CTX_ERR.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        if !unsafe { s9_verify_ctx_round(1, round) } {
+            main_ok = false;
+            break;
+        }
+        if round & 15 == 0 {
+            let _ = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+        }
+    }
+    S9_CTX_STOP.store(1, Ordering::Release);
+    let joined = g8_join_thread();
+    if !joined
+        || !main_ok
+        || S9_CTX_ERR.load(Ordering::Acquire) != 0
+        || S9_CTX_ITERS.load(Ordering::Relaxed) == 0
+    {
+        return 0x82;
+    }
+    S4_LEG_OK
+}
+
+/// R172-01: Verify RIP/RFLAGS/CS/SS and callee registers survive concurrent clone+yield/preemption.
+fn test_context_switch_rip_rflags(results: &mut TestResult) {
+    print("Testing R172-01 context switch RIP/RFLAGS/CS/SS preservation... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("context switch RIP/RFLAGS: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s9_context_switch_rip_rflags_leg()) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => results.pass(
+            "context switch RIP/RFLAGS: concurrent threads preserve Ring-3 CS/SS, callee registers and flags across yields and preemptions",
+        ),
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("context switch RIP/RFLAGS: register, flag, or ring check failed");
+        }
+        None => results.fail("context switch RIP/RFLAGS: could not reap host"),
+    }
+}
+
+static S9_TLS_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_TLS_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_TLS_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_TLS_ITERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline(never)]
+unsafe fn s9_check_fs_gs(
+    exp_fs_base: u64,
+    exp_fs0: u64,
+    exp_fs1: u64,
+    exp_gs_base: u64,
+    exp_gs0: u64,
+    exp_gs1: u64,
+) -> bool {
+    let mut got_fs = 0u64;
+    let mut got_gs = 0u64;
+    if is_error(syscall2(
+        S9_SYS_ARCH_PRCTL,
+        S9_ARCH_GET_FS,
+        &mut got_fs as *mut u64 as u64,
+    )) || is_error(syscall2(
+        S9_SYS_ARCH_PRCTL,
+        S9_ARCH_GET_GS,
+        &mut got_gs as *mut u64 as u64,
+    )) {
+        return false;
+    }
+    if got_fs != exp_fs_base || got_gs != exp_gs_base {
+        return false;
+    }
+    let fs0: u64;
+    let fs1: u64;
+    let gs0: u64;
+    let gs1: u64;
+    core::arch::asm!(
+        "mov {fs0}, qword ptr fs:[0]",
+        "mov {fs1}, qword ptr fs:[8]",
+        "mov {gs0}, qword ptr gs:[0]",
+        "mov {gs1}, qword ptr gs:[8]",
+        fs0 = out(reg) fs0,
+        fs1 = out(reg) fs1,
+        gs0 = out(reg) gs0,
+        gs1 = out(reg) gs1,
+        options(nostack, preserves_flags),
+    );
+    fs0 == exp_fs0 && fs1 == exp_fs1 && gs0 == exp_gs0 && gs1 == exp_gs1
+}
+
+extern "C" fn s9_tls_sibling() -> ! {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    let fs_blk = S9TlsBlock {
+        magic0: 0xF5B0_1111_2222_3333,
+        magic1: 0xF5B1_4444_5555_6666,
+        pad: [0; 6],
+    };
+    let gs_blk = S9TlsBlock {
+        magic0: 0x65B0_7777_8888_9999,
+        magic1: 0x65B1_AAAA_BBBB_CCCC,
+        pad: [0; 6],
+    };
+    let fs_base = &fs_blk as *const S9TlsBlock as u64;
+    let gs_base = &gs_blk as *const S9TlsBlock as u64;
+    if is_error(unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, fs_base) })
+        || is_error(unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_GS, gs_base) })
+    {
+        S9_TLS_ERR.store(1, Ordering::Release);
+        S9_TLS_READY.store(1, Ordering::Release);
+        unsafe { raw_exit(SYS_EXIT, 1) };
+    }
+    S9_TLS_READY.store(1, Ordering::Release);
+    while S9_TLS_STOP.load(Ordering::Acquire) == 0 {
+        if !unsafe {
+            s9_check_fs_gs(
+                fs_base,
+                fs_blk.magic0,
+                fs_blk.magic1,
+                gs_base,
+                gs_blk.magic0,
+                gs_blk.magic1,
+            )
+        } {
+            S9_TLS_ERR.store(2, Ordering::Release);
+            break;
+        }
+        S9_TLS_ITERS.fetch_add(1, Ordering::Relaxed);
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, 0) };
+    let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_GS, 0) };
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn s9_tls_isolation_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    let fs_blk = S9TlsBlock {
+        magic0: 0xF5A0_1234_5678_9ABC,
+        magic1: 0xF5A1_DEF0_1357_2468,
+        pad: [0; 6],
+    };
+    let gs_blk = S9TlsBlock {
+        magic0: 0x65A0_CAFE_BABE_0001,
+        magic1: 0x65A1_DEAD_BEEF_0002,
+        pad: [0; 6],
+    };
+    let fs_base = &fs_blk as *const S9TlsBlock as u64;
+    let gs_base = &gs_blk as *const S9TlsBlock as u64;
+    if is_error(unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, fs_base) })
+        || is_error(unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_GS, gs_base) })
+    {
+        return 0x84;
+    }
+
+    S9_TLS_READY.store(0, Ordering::Release);
+    S9_TLS_STOP.store(0, Ordering::Release);
+    S9_TLS_ERR.store(0, Ordering::Release);
+    S9_TLS_ITERS.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            s9_tls_sibling,
+        )
+    };
+    if is_error(tid) || tid == 0 {
+        let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, 0) };
+        let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_GS, 0) };
+        return 0x85;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if S9_TLS_READY.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if S9_TLS_READY.load(Ordering::Acquire) == 0 {
+        S9_TLS_STOP.store(1, Ordering::Release);
+        let _ = g8_join_thread();
+        return 0x86;
+    }
+
+    let mut main_ok = true;
+    let sleep_1ms = [0i64, 1_000_000i64];
+    for round in 1..=96u64 {
+        if S9_TLS_ERR.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        if !unsafe {
+            s9_check_fs_gs(
+                fs_base,
+                fs_blk.magic0,
+                fs_blk.magic1,
+                gs_base,
+                gs_blk.magic0,
+                gs_blk.magic1,
+            )
+        } {
+            main_ok = false;
+            break;
+        }
+        if round & 31 == 0 {
+            let _ = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+        } else {
+            unsafe { userspace::syscall::sys_yield() };
+        }
+    }
+
+    S9_TLS_STOP.store(1, Ordering::Release);
+    let joined = g8_join_thread();
+    let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, 0) };
+    let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_GS, 0) };
+    if !joined
+        || !main_ok
+        || S9_TLS_ERR.load(Ordering::Acquire) != 0
+        || S9_TLS_ITERS.load(Ordering::Relaxed) == 0
+    {
+        return 0x87;
+    }
+    S4_LEG_OK
+}
+
+/// R172-04: Verify FS_BASE and GS_BASE TLS isolation across context switches.
+fn test_tls_isolation(results: &mut TestResult) {
+    print("Testing R172-04 FS_BASE/GS_BASE TLS isolation... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("TLS isolation: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s9_tls_isolation_leg()) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => results.pass(
+            "TLS isolation: concurrent threads preserve distinct FS_BASE and GS_BASE across context switches",
+        ),
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("TLS isolation: FS_BASE or GS_BASE leaked across context switch");
+        }
+        None => results.fail("TLS isolation: could not reap host"),
+    }
+}
+
+static S9_SYSCALL_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_SYSCALL_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_SYSCALL_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_SYSCALL_TGID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static S9_SYSCALL_FUTEX: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+
+extern "C" fn s9_syscall_active_sibling() -> ! {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    let exp_pid = S9_SYSCALL_TGID.load(Ordering::Acquire);
+    let sleep_1ms = [0i64, 1_000_000i64];
+    S9_SYSCALL_READY.store(1, Ordering::Release);
+    while S9_SYSCALL_STOP.load(Ordering::Acquire) == 0 {
+        let got_pid = unsafe { sys_getpid() };
+        if is_error(got_pid) || got_pid != exp_pid {
+            S9_SYSCALL_ERR.store(1, Ordering::Release);
+            break;
+        }
+        let r = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+        if is_error(r) && errno(r) == S9_EBUSY {
+            S9_SYSCALL_ERR.store(2, Ordering::Release);
+            break;
+        }
+        let w = unsafe {
+            syscall4(
+                SYS_FUTEX,
+                S9_SYSCALL_FUTEX.0.as_ptr() as u64,
+                S9_FUTEX_WAKE,
+                1,
+                0,
+            )
+        };
+        if is_error(w) && errno(w) == S9_EBUSY {
+            S9_SYSCALL_ERR.store(3, Ordering::Release);
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn s9_syscall_active_leak_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    let my_pid = unsafe { sys_getpid() };
+    if is_error(my_pid) {
+        return 0x88;
+    }
+
+    // Also fork an independent process pinned to CPU 0 hammering blocking syscalls.
+    let peer = unsafe { sys_fork() };
+    if is_error(peer) {
+        return 0x89;
+    }
+    if peer == 0 {
+        let _ = cow_test_pin(1);
+        let child_pid = unsafe { sys_getpid() };
+        let sleep_1ms = [0i64, 1_000_000i64];
+        for _ in 0..16u32 {
+            let p = unsafe { sys_getpid() };
+            if is_error(p) || p != child_pid {
+                unsafe { raw_exit(SYS_EXIT_GROUP, 1) };
+            }
+            let r = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+            if is_error(r) && errno(r) == S9_EBUSY {
+                unsafe { raw_exit(SYS_EXIT_GROUP, 2) };
+            }
+            unsafe { userspace::syscall::sys_yield() };
+        }
+        unsafe { raw_exit(SYS_EXIT_GROUP, S4_LEG_OK) };
+    }
+
+    S9_SYSCALL_TGID.store(my_pid, Ordering::Release);
+    S9_SYSCALL_READY.store(0, Ordering::Release);
+    S9_SYSCALL_STOP.store(0, Ordering::Release);
+    S9_SYSCALL_ERR.store(0, Ordering::Release);
+    S9_SYSCALL_FUTEX.0.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            s9_syscall_active_sibling,
+        )
+    };
+    if is_error(tid) || tid == 0 {
+        let _ = reap_pid(peer);
+        return 0x8a;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if S9_SYSCALL_READY.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+
+    let sleep_1ms = [0i64, 1_000_000i64];
+    let mut main_ok = true;
+    for _ in 0..24u32 {
+        if S9_SYSCALL_ERR.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        let p = unsafe { sys_getpid() };
+        if is_error(p) || p != my_pid {
+            main_ok = false;
+            break;
+        }
+        let f = unsafe {
+            syscall4(
+                SYS_FUTEX,
+                S9_SYSCALL_FUTEX.0.as_ptr() as u64,
+                S9_FUTEX_WAIT,
+                0,
+                sleep_1ms.as_ptr() as u64,
+            )
+        };
+        if is_error(f) && errno(f) == S9_EBUSY {
+            main_ok = false;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+
+    S9_SYSCALL_STOP.store(1, Ordering::Release);
+    let _ = unsafe {
+        syscall4(
+            SYS_FUTEX,
+            S9_SYSCALL_FUTEX.0.as_ptr() as u64,
+            S9_FUTEX_WAKE,
+            1,
+            0,
+        )
+    };
+    let joined = g8_join_thread();
+    let peer_ok = reap_pid(peer) == Some(S4_LEG_OK);
+    if !joined || !peer_ok || !main_ok || S9_SYSCALL_ERR.load(Ordering::Acquire) != 0 {
+        return 0x8b;
+    }
+    S4_LEG_OK
+}
+
+/// R172-05: Verify per-CPU syscall_active flag is cleared on switch_out (never leaks EBUSY).
+fn test_syscall_active_leak(results: &mut TestResult) {
+    print("Testing R172-05 per-CPU syscall_active isolation... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("syscall_active isolation: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s9_syscall_active_leak_leg()) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => results.pass(
+            "syscall_active isolation: interleaved blocking syscalls on one CPU never leak EBUSY",
+        ),
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("syscall_active isolation: leaked EBUSY or mismatched PID");
+        }
+        None => results.fail("syscall_active isolation: could not reap host"),
+    }
+}
+
+static S9_FPU_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_FPU_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_FPU_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S9_FPU_ITERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline(never)]
+unsafe fn s9_sse_spin_and_verify(input: &[u64; 16], spin_iters: u32) -> bool {
+    let mut output = [0u64; 16];
+    core::arch::asm!(
+        "movdqu xmm0, [{in_ptr} + 0]",
+        "movdqu xmm1, [{in_ptr} + 16]",
+        "movdqu xmm2, [{in_ptr} + 32]",
+        "movdqu xmm3, [{in_ptr} + 48]",
+        "movdqu xmm4, [{in_ptr} + 64]",
+        "movdqu xmm5, [{in_ptr} + 80]",
+        "movdqu xmm6, [{in_ptr} + 96]",
+        "movdqu xmm7, [{in_ptr} + 112]",
+        "2:",
+        "pause",
+        "dec {cnt:e}",
+        "jnz 2b",
+        "movdqu [{out_ptr} + 0], xmm0",
+        "movdqu [{out_ptr} + 16], xmm1",
+        "movdqu [{out_ptr} + 32], xmm2",
+        "movdqu [{out_ptr} + 48], xmm3",
+        "movdqu [{out_ptr} + 64], xmm4",
+        "movdqu [{out_ptr} + 80], xmm5",
+        "movdqu [{out_ptr} + 96], xmm6",
+        "movdqu [{out_ptr} + 112], xmm7",
+        in_ptr = in(reg) input.as_ptr(),
+        out_ptr = in(reg) output.as_mut_ptr(),
+        cnt = inout(reg) spin_iters => _,
+        out("xmm0") _,
+        out("xmm1") _,
+        out("xmm2") _,
+        out("xmm3") _,
+        out("xmm4") _,
+        out("xmm5") _,
+        out("xmm6") _,
+        out("xmm7") _,
+        options(nostack),
+    );
+    output == *input
+}
+
+fn s9_make_sse_pattern(tag: u64, round: u64) -> [u64; 16] {
+    let mut buf = [0u64; 16];
+    for (i, slot) in buf.iter_mut().enumerate() {
+        *slot = (tag << 56)
+            ^ ((i as u64) << 48)
+            ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ 0x0000_5A5A_A5A5_1357;
+    }
+    buf
+}
+
+extern "C" fn s9_fpu_sibling() -> ! {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    S9_FPU_READY.store(1, Ordering::Release);
+    let mut round = 0u64;
+    while S9_FPU_STOP.load(Ordering::Acquire) == 0 {
+        round = round.wrapping_add(1);
+        let pat = s9_make_sse_pattern(0xB2, round);
+        if !unsafe { s9_sse_spin_and_verify(&pat, 25_000) } {
+            S9_FPU_ERR.store(1, Ordering::Release);
+            break;
+        }
+        S9_FPU_ITERS.fetch_add(1, Ordering::Relaxed);
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn s9_fpu_state_irq_isolation_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    let _ = cow_test_pin(1);
+    S9_FPU_READY.store(0, Ordering::Release);
+    S9_FPU_STOP.store(0, Ordering::Release);
+    S9_FPU_ERR.store(0, Ordering::Release);
+    S9_FPU_ITERS.store(0, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            s9_fpu_sibling,
+        )
+    };
+    if is_error(tid) || tid == 0 {
+        return 0x8c;
+    }
+    for _ in 0..THREAD_POLL_YIELDS {
+        if S9_FPU_READY.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if S9_FPU_READY.load(Ordering::Acquire) == 0 {
+        S9_FPU_STOP.store(1, Ordering::Release);
+        let _ = g8_join_thread();
+        return 0x8d;
+    }
+
+    let sleep_1ms = [0i64, 1_000_000i64];
+    let mut main_ok = true;
+    for round in 1..=20u64 {
+        if S9_FPU_ERR.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        let pat = s9_make_sse_pattern(0xA1, round);
+        if !unsafe { s9_sse_spin_and_verify(&pat, 25_000) } {
+            main_ok = false;
+            break;
+        }
+        if round & 3 == 0 {
+            let _ = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+        } else {
+            unsafe { userspace::syscall::sys_yield() };
+        }
+    }
+
+    S9_FPU_STOP.store(1, Ordering::Release);
+    let joined = g8_join_thread();
+    if !joined
+        || !main_ok
+        || S9_FPU_ERR.load(Ordering::Acquire) != 0
+        || S9_FPU_ITERS.load(Ordering::Relaxed) == 0
+    {
+        return 0x8e;
+    }
+    S4_LEG_OK
+}
+
+/// R174-A1: Verify SSE XMM0-XMM7 state stays bit-exact across timer IRQ preemptions.
+fn test_fpu_state_irq_isolation(results: &mut TestResult) {
+    print("Testing R174-A1 FPU/SSE state IRQ isolation... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("FPU IRQ isolation: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s9_fpu_state_irq_isolation_leg()) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => results.pass(
+            "FPU IRQ isolation: concurrent SSE XMM0-XMM7 state stays bit-exact across timer preemptions",
+        ),
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("FPU IRQ isolation: XMM state corrupted across preemption");
+        }
+        None => results.fail("FPU IRQ isolation: could not reap host"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// STRICT-Q S6: Ring-3 CPU affinity, migration, load balancing & work stealing.
+// ---------------------------------------------------------------------------
+
+fn s6_online_cpu_mask() -> u64 {
+    let raw = unsafe { cow_test_command(0, 0) };
+    if is_error(raw) || raw == 0 {
+        1
+    } else {
+        raw
+    }
+}
+
+fn s6_set_affinity(mask: u64) -> u64 {
+    unsafe { syscall3(S9_SYS_SCHED_SETAFFINITY, 0, 8, &mask as *const u64 as u64) }
+}
+
+fn s6_get_affinity() -> Result<u64, i32> {
+    let mut got = 0u64;
+    let r = unsafe { syscall3(S9_SYS_SCHED_GETAFFINITY, 0, 8, &mut got as *mut u64 as u64) };
+    if is_error(r) {
+        Err(errno(r))
+    } else {
+        Ok(got)
+    }
+}
+
+fn s6_cpu_affinity_leg(online_mask: u64) -> u64 {
+    // Negative controls: empty mask and offline CPU bit must fail with EINVAL.
+    let r_empty = s6_set_affinity(0);
+    if !is_error(r_empty) || errno(r_empty) != S9_EINVAL {
+        return 0x90;
+    }
+    let r_offline = s6_set_affinity(1u64 << 63);
+    if !is_error(r_offline) || errno(r_offline) != S9_EINVAL {
+        return 0x91;
+    }
+
+    let sleep_1ms = [0i64, 1_000_000i64];
+    let mut checked = 0u32;
+    for cpu in 0..8usize {
+        if (online_mask & (1u64 << cpu)) == 0 {
+            continue;
+        }
+        let target_mask = 1u64 << cpu;
+        if s6_set_affinity(target_mask) != 0 {
+            return 0x92;
+        }
+        match s6_get_affinity() {
+            Ok(m) if m == target_mask => {}
+            _ => return 0x93,
+        }
+        // Allow reschedule onto target_cpu, then assert every subsequent sample
+        // stays strictly pinned to `cpu`.
+        let mut landed = false;
+        for attempt in 0..64u32 {
+            if attempt < 32 {
+                unsafe { userspace::syscall::sys_yield() };
+            } else {
+                let _ = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+            }
+            if s8_current_cpu_id() == cpu as u32 {
+                landed = true;
+                break;
+            }
+        }
+        if !landed {
+            return 0x94;
+        }
+        for sample in 0..16u32 {
+            if sample == 8 {
+                let _ = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+            } else {
+                unsafe { userspace::syscall::sys_yield() };
+            }
+            if s8_current_cpu_id() != cpu as u32 {
+                return 0x95;
+            }
+        }
+        checked += 1;
+    }
+
+    if s6_set_affinity(online_mask) != 0 {
+        return 0x96;
+    }
+    if checked == 0 {
+        return 0x97;
+    }
+    S4_LEG_OK
+}
+
+/// CPU Affinity Enforcement: verify sched_setaffinity pins to every online CPU and rejects invalid masks.
+fn test_cpu_affinity_enforcement(results: &mut TestResult) {
+    print("Testing CPU affinity enforcement... ");
+    let online_mask = s6_online_cpu_mask();
+    let smp = online_mask.count_ones() >= 2;
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("CPU affinity enforcement: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s6_cpu_affinity_leg(online_mask)) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => {
+            if smp {
+                results.pass(
+                    "CPU affinity enforcement: sched_setaffinity pins execution strictly to each online CPU and rejects invalid masks",
+                );
+            } else {
+                results.pass(
+                    "CPU affinity enforcement on single CPU: pins to CPU 0 and rejects invalid masks",
+                );
+            }
+        }
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("CPU affinity enforcement: pinning or invalid-mask check failed");
+        }
+        None => results.fail("CPU affinity enforcement: could not reap host"),
+    }
+}
+
+fn s6_process_migration_leg(online_mask: u64) -> u64 {
+    let my_pid = unsafe { sys_getpid() };
+    if is_error(my_pid) {
+        return 0x98;
+    }
+    let fs_blk = S9TlsBlock {
+        magic0: 0x116A_0001_2222_3333,
+        magic1: 0x116A_0002_4444_5555,
+        pad: [0; 6],
+    };
+    let gs_blk = S9TlsBlock {
+        magic0: 0x116A_0003_6666_7777,
+        magic1: 0x116A_0004_8888_9999,
+        pad: [0; 6],
+    };
+    let fs_base = &fs_blk as *const S9TlsBlock as u64;
+    let gs_base = &gs_blk as *const S9TlsBlock as u64;
+    if is_error(unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, fs_base) })
+        || is_error(unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_GS, gs_base) })
+    {
+        return 0x99;
+    }
+
+    let mut cpus = [0usize; 8];
+    let mut ncpus = 0usize;
+    for c in 0..8usize {
+        if (online_mask & (1u64 << c)) != 0 {
+            cpus[ncpus] = c;
+            ncpus += 1;
+        }
+    }
+    if ncpus == 0 {
+        return 0x9a;
+    }
+
+    let sleep_1ms = [0i64, 1_000_000i64];
+    let hops = if ncpus >= 2 { 24 } else { 8 };
+    let mut visited_mask = 0u64;
+    for hop in 0..hops {
+        let target = cpus[hop % ncpus];
+        if s6_set_affinity(1u64 << target) != 0 {
+            return 0x9b;
+        }
+        let mut landed = false;
+        for attempt in 0..64u32 {
+            if attempt < 32 {
+                unsafe { userspace::syscall::sys_yield() };
+            } else {
+                let _ = unsafe { syscall2(SYS_NANOSLEEP, sleep_1ms.as_ptr() as u64, 0) };
+            }
+            if s8_current_cpu_id() == target as u32 {
+                landed = true;
+                break;
+            }
+        }
+        if !landed {
+            return 0x9c;
+        }
+        visited_mask |= 1u64 << target;
+        if unsafe { sys_getpid() } != my_pid {
+            return 0x9d;
+        }
+        if !unsafe {
+            s9_check_fs_gs(
+                fs_base,
+                fs_blk.magic0,
+                fs_blk.magic1,
+                gs_base,
+                gs_blk.magic0,
+                gs_blk.magic1,
+            )
+        } {
+            return 0x9e;
+        }
+    }
+
+    let _ = s6_set_affinity(online_mask);
+    let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, 0) };
+    let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_GS, 0) };
+    if ncpus >= 2 && visited_mask.count_ones() < 2 {
+        return 0x9f;
+    }
+    S4_LEG_OK
+}
+
+/// Process Migration Safety: verify forced cross-CPU hops preserve per-CPU state, TLS, and PID.
+fn test_process_migration_safety(results: &mut TestResult) {
+    print("Testing forced cross-CPU process migration safety... ");
+    let online_mask = s6_online_cpu_mask();
+    let smp = online_mask.count_ones() >= 2;
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("process migration safety: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s6_process_migration_leg(online_mask)) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => {
+            if smp {
+                results.pass(
+                    "process migration safety: forced cross-CPU hops preserve per-CPU state, FS/GS TLS and PID identity",
+                );
+            } else {
+                results.pass(
+                    "process migration safety on single CPU: state and TLS stay intact across affinity refreshes",
+                );
+            }
+        }
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("process migration safety: cross-CPU hop corrupted TLS or state");
+        }
+        None => results.fail("process migration safety: could not reap host"),
+    }
+}
+
+#[repr(C)]
+struct S6SharedStats {
+    go: core::sync::atomic::AtomicU32,
+    ready: core::sync::atomic::AtomicU32,
+    cpu_mask: core::sync::atomic::AtomicU64,
+    completed: core::sync::atomic::AtomicU32,
+}
+
+fn s6_load_balancing_leg(online_mask: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    const WORKERS: usize = 4;
+    let smp = online_mask.count_ones() >= 2;
+
+    let shared = unsafe { mmap_anon(PAGE, true) };
+    if shared < 0 {
+        return 0xa0;
+    }
+    let st = unsafe {
+        let ptr = shared as *mut S6SharedStats;
+        ptr.write(S6SharedStats {
+            go: core::sync::atomic::AtomicU32::new(0),
+            ready: core::sync::atomic::AtomicU32::new(0),
+            cpu_mask: core::sync::atomic::AtomicU64::new(0),
+            completed: core::sync::atomic::AtomicU32::new(0),
+        });
+        &*ptr
+    };
+
+    let _ = s6_set_affinity(online_mask);
+    let mut pids = [0u64; WORKERS];
+    for slot in pids.iter_mut() {
+        let child = unsafe { sys_fork() };
+        if is_error(child) {
+            st.go.store(1, Ordering::Release);
+            let _ = unsafe { munmap(shared as usize, PAGE) };
+            return 0xa1;
+        }
+        if child == 0 {
+            st.ready.fetch_add(1, Ordering::AcqRel);
+            while st.go.load(Ordering::Acquire) == 0 {
+                unsafe { userspace::syscall::sys_yield() };
+            }
+            let mut local_mask = 0u64;
+            let mut acc = 1u64;
+            for iter in 0..800u32 {
+                // Keep workers genuinely CPU-bound so idle CPUs steal/run them.
+                for step in 0..256u64 {
+                    acc = acc.wrapping_mul(6364136223846793005).wrapping_add(step | 1);
+                }
+                let c = s8_current_cpu_id();
+                if c < 64 {
+                    local_mask |= 1u64 << c;
+                }
+                if iter & 63 == 0 {
+                    unsafe { userspace::syscall::sys_yield() };
+                }
+            }
+            core::hint::black_box(acc);
+            st.cpu_mask.fetch_or(local_mask, Ordering::AcqRel);
+            st.completed.fetch_add(1, Ordering::AcqRel);
+            unsafe { raw_exit(SYS_EXIT_GROUP, S4_LEG_OK) };
+        }
+        *slot = child;
+    }
+
+    for _ in 0..THREAD_POLL_YIELDS {
+        if st.ready.load(Ordering::Acquire) as usize == WORKERS {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    st.go.store(1, Ordering::Release);
+
+    let mut all_ok = true;
+    for &p in pids.iter() {
+        if reap_pid(p) != Some(S4_LEG_OK) {
+            all_ok = false;
+        }
+    }
+    let observed = st.cpu_mask.load(Ordering::Acquire);
+    let done = st.completed.load(Ordering::Acquire) as usize;
+    let _ = unsafe { munmap(shared as usize, PAGE) };
+
+    if !all_ok || done != WORKERS {
+        return 0xa2;
+    }
+    if smp && observed.count_ones() < 2 {
+        return 0xa3;
+    }
+    if !smp && observed == 0 {
+        return 0xa4;
+    }
+    S4_LEG_OK
+}
+
+/// Scheduler Load Balancing: verify unpinned runnable workers distribute across multiple CPUs.
+fn test_scheduler_load_balancing(results: &mut TestResult) {
+    print("Testing scheduler load balancing across CPUs... ");
+    let online_mask = s6_online_cpu_mask();
+    let smp = online_mask.count_ones() >= 2;
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("scheduler load balancing: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s6_load_balancing_leg(online_mask)) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => {
+            if smp {
+                results.pass(
+                    "scheduler load balancing: unpinned runnable workers distribute across multiple online CPUs",
+                );
+            } else {
+                results.pass(
+                    "scheduler load balancing on single CPU: runnable workers complete fairly on CPU 0",
+                );
+            }
+        }
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("scheduler load balancing: workers did not distribute cleanly");
+        }
+        None => results.fail("scheduler load balancing: could not reap host"),
+    }
+}
+
+fn s6_work_stealing_safety_leg(online_mask: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    const WAVES: usize = 4;
+    const PER_WAVE: usize = 8;
+    let smp = online_mask.count_ones() >= 2;
+
+    let shared = unsafe { mmap_anon(PAGE, true) };
+    if shared < 0 {
+        return 0xa8;
+    }
+    let st = unsafe {
+        let ptr = shared as *mut S6SharedStats;
+        ptr.write(S6SharedStats {
+            go: core::sync::atomic::AtomicU32::new(0),
+            ready: core::sync::atomic::AtomicU32::new(0),
+            cpu_mask: core::sync::atomic::AtomicU64::new(0),
+            completed: core::sync::atomic::AtomicU32::new(0),
+        });
+        &*ptr
+    };
+
+    let _ = s6_set_affinity(online_mask);
+    for wave in 0..WAVES {
+        st.go.store(0, Ordering::Release);
+        st.ready.store(0, Ordering::Release);
+        let mut pids = [0u64; PER_WAVE];
+        for (idx, slot) in pids.iter_mut().enumerate() {
+            let child = unsafe { sys_fork() };
+            if is_error(child) {
+                st.go.store(1, Ordering::Release);
+                let _ = unsafe { munmap(shared as usize, PAGE) };
+                return 0xa9;
+            }
+            if child == 0 {
+                let my_pid = unsafe { sys_getpid() };
+                let tls = S9TlsBlock {
+                    magic0: 0x57E4_0000_0000_0000u64
+                        ^ ((wave as u64) << 32)
+                        ^ ((idx as u64) << 16)
+                        ^ my_pid,
+                    magic1: 0x57E5_FFFF_0000_0000u64 ^ my_pid.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    pad: [0; 6],
+                };
+                let fs_base = &tls as *const S9TlsBlock as u64;
+                if is_error(unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, fs_base) }) {
+                    unsafe { raw_exit(SYS_EXIT_GROUP, 1) };
+                }
+                st.ready.fetch_add(1, Ordering::AcqRel);
+                while st.go.load(Ordering::Acquire) == 0 {
+                    unsafe { userspace::syscall::sys_yield() };
+                }
+                let mut local_mask = 0u64;
+                for iter in 0..32u32 {
+                    let mut got_fs = 0u64;
+                    if is_error(unsafe {
+                        syscall2(
+                            S9_SYS_ARCH_PRCTL,
+                            S9_ARCH_GET_FS,
+                            &mut got_fs as *mut u64 as u64,
+                        )
+                    }) || got_fs != fs_base
+                    {
+                        unsafe { raw_exit(SYS_EXIT_GROUP, 2) };
+                    }
+                    let fs0: u64;
+                    let fs1: u64;
+                    unsafe {
+                        core::arch::asm!(
+                            "mov {fs0}, qword ptr fs:[0]",
+                            "mov {fs1}, qword ptr fs:[8]",
+                            fs0 = out(reg) fs0,
+                            fs1 = out(reg) fs1,
+                            options(nostack, preserves_flags),
+                        );
+                    }
+                    if fs0 != tls.magic0 || fs1 != tls.magic1 || unsafe { sys_getpid() } != my_pid {
+                        unsafe { raw_exit(SYS_EXIT_GROUP, 3) };
+                    }
+                    let c = s8_current_cpu_id();
+                    if c < 64 {
+                        local_mask |= 1u64 << c;
+                    }
+                    if iter & 3 == 0 {
+                        unsafe { userspace::syscall::sys_yield() };
+                    }
+                }
+                let _ = unsafe { syscall2(S9_SYS_ARCH_PRCTL, S9_ARCH_SET_FS, 0) };
+                st.cpu_mask.fetch_or(local_mask, Ordering::AcqRel);
+                st.completed.fetch_add(1, Ordering::AcqRel);
+                unsafe { raw_exit(SYS_EXIT_GROUP, S4_LEG_OK) };
+            }
+            *slot = child;
+        }
+        for _ in 0..THREAD_POLL_YIELDS {
+            if st.ready.load(Ordering::Acquire) as usize == PER_WAVE {
+                break;
+            }
+            unsafe { userspace::syscall::sys_yield() };
+        }
+        st.go.store(1, Ordering::Release);
+        for &p in pids.iter() {
+            if reap_pid(p) != Some(S4_LEG_OK) {
+                let _ = unsafe { munmap(shared as usize, PAGE) };
+                return 0xaa;
+            }
+        }
+    }
+
+    let observed = st.cpu_mask.load(Ordering::Acquire);
+    let done = st.completed.load(Ordering::Acquire) as usize;
+    let _ = unsafe { munmap(shared as usize, PAGE) };
+
+    if done != WAVES * PER_WAVE {
+        return 0xab;
+    }
+    if smp && observed.count_ones() < 2 {
+        return 0xac;
+    }
+    S4_LEG_OK
+}
+
+/// R172-03: Verify SMP work stealing preserves per-task TLS and identity across concurrent waves.
+fn test_smp_work_stealing_safety(results: &mut TestResult) {
+    print("Testing R172-03 SMP work stealing safety across waves... ");
+    let online_mask = s6_online_cpu_mask();
+    let smp = online_mask.count_ones() >= 2;
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("SMP work stealing safety: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s6_work_stealing_safety_leg(online_mask)) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => {
+            if smp {
+                results.pass(
+                    "SMP work stealing safety: concurrent unpinned task waves preserve per-task TLS and identity across CPUs",
+                );
+            } else {
+                results.pass(
+                    "SMP work stealing safety on single CPU: concurrent task waves preserve per-task TLS and identity",
+                );
+            }
+        }
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("SMP work stealing safety: wave task failed TLS or identity check");
+        }
+        None => results.fail("SMP work stealing safety: could not reap host"),
+    }
 }

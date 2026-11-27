@@ -37,13 +37,21 @@ impl RuntimeTest for ContextSwitchRipRflagsTest {
         "r172_01_context_switch_rip_rflags"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 concurrent RIP/RFLAGS/CS/SS preservation leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "context switch RIP/RFLAGS: concurrent threads preserve Ring-3 CS/SS, callee registers and flags across yields and preemptions",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-01: Verify RIP/RFLAGS/CS/SS preserved across clone+yield (prevents privilege escalation)"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "The named guest regression workload and assertion oracle are not implemented",
+            "Covered by Ring-3 context switch RIP/RFLAGS/CS/SS leg in ring3-mm",
         ))
     }
 }
@@ -58,13 +66,21 @@ impl RuntimeTest for TlsIsolationTest {
         "r172_04_tls_isolation"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 concurrent FS_BASE/GS_BASE TLS isolation leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "TLS isolation: concurrent threads preserve distinct FS_BASE and GS_BASE across context switches",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-04: Verify FS_BASE/GS_BASE TLS isolation across context switches"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "The named guest regression workload and assertion oracle are not implemented",
+            "Covered by Ring-3 FS_BASE/GS_BASE TLS isolation leg in ring3-mm",
         ))
     }
 }
@@ -79,30 +95,21 @@ impl RuntimeTest for SyscallActiveLeakTest {
         "r172_05_syscall_active_leak"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 interleaved single-CPU blocking-syscall leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "syscall_active isolation: interleaved blocking syscalls on one CPU never leak EBUSY",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-05: Verify syscall_active per-CPU flag cleared on switch_out"
     }
 
     fn run(&self) -> TestResult {
-        use arch::max_cpus;
-
-        // Verify per-CPU infrastructure exists
-        let cpu_id = arch::current_cpu_id();
-
-        // This is a compile-time / boot-time structural test
-        // Runtime testing requires process creation (deferred)
-
-        let max = max_cpus();
-        if cpu_id >= max {
-            return TestResult::Fail(alloc::format!(
-                "Invalid CPU ID: {} >= max_cpus() ({})",
-                cpu_id,
-                max
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "Per-CPU infrastructure validated; full test requires process context switching",
+            "Covered by Ring-3 syscall_active isolation leg in ring3-mm",
         ))
     }
 }
@@ -118,6 +125,11 @@ impl RuntimeTest for WorkStealingOnCpuGateTest {
         "r172_03_work_stealing_on_cpu_gate"
     }
 
+    // STRICT-Q S6 (D1): cross-CPU work-stealing on_cpu gate probe requires 2+ CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
     fn description(&self) -> &'static str {
         "R172-03: Verify on_cpu gate prevents steal-before-context-save race"
     }
@@ -125,18 +137,16 @@ impl RuntimeTest for WorkStealingOnCpuGateTest {
     fn run(&self) -> TestResult {
         use arch::num_online_cpus;
 
-        // Verify SMP is configured
-        let num_cpus = num_online_cpus();
-        if num_cpus < 2 {
+        if num_online_cpus() < 2 {
             return TestResult::Deferred(String::from(
                 "Work-stealing test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Deferred(alloc::format!(
-            "SMP configured ({} CPUs); full test requires process stress testing",
-            num_cpus
-        ))
+        match sched::enhanced_scheduler::run_work_stealing_on_cpu_gate_probe() {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(String::from(msg)),
+        }
     }
 }
 
@@ -150,19 +160,21 @@ impl RuntimeTest for FpuStateIrqIsolationTest {
         "r174_a1_fpu_state_irq_isolation"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 concurrent SSE XMM0-XMM7 timer-IRQ preemption leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "FPU IRQ isolation: concurrent SSE XMM0-XMM7 state stays bit-exact across timer preemptions",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R174-A1: Verify FPU state isolation during timer IRQ nesting"
     }
 
     fn run(&self) -> TestResult {
-        // Verify FPU is available - architecture dependent check
-        // Most x86-64 systems have FPU, this is a placeholder for actual check
-
-        // Test FPU state save/restore infrastructure exists
-        // Full test requires IRQ injection during FPU operations (deferred)
-
         TestResult::Deferred(String::from(
-            "FPU subsystem placeholder; full isolation test requires IRQ simulation",
+            "Covered by Ring-3 FPU/SSE IRQ isolation leg in ring3-mm",
         ))
     }
 }
@@ -171,10 +183,100 @@ impl RuntimeTest for FpuStateIrqIsolationTest {
 // CATEGORY 2: MEMORY MANAGEMENT TESTS (5 tests)
 // ============================================================================
 
+/// Shared SMP state for `r23_1_cow_tlb_shootdown` (STRICT-Q S5).
+mod cow_tlb_state {
+    use core::sync::atomic::AtomicU64;
+
+    // Distinct user-half VA from `heavy_stress::heavy_tlb_state::VA_STRESS`
+    // (0x0000_0081_0000_0000): PML4[1], PDPT[8], PD[0], PT[0].
+    pub const VA_COW: u64 = 0x0000_0082_0000_0000;
+    pub const ROUNDS: u64 = 16;
+
+    pub static SCRATCH_CR3_PHYS: AtomicU64 = AtomicU64::new(0);
+    // Monotonic command counter: odd = (2*r - 1) prime RO TLB on shared frame;
+    // even = (2*r) verify post-COW RW remap on private frame & write AP sentinel;
+    // u64::MAX = exit worker and restore BOOT_CR3.
+    pub static STEP: AtomicU64 = AtomicU64::new(0);
+    pub static AP_READY: AtomicU64 = AtomicU64::new(0);
+    pub static AP_ACK_STEP: AtomicU64 = AtomicU64::new(0);
+    pub static AP_OBSERVED: AtomicU64 = AtomicU64::new(0);
+    pub static AP_WRITE_VAL: AtomicU64 = AtomicU64::new(0);
+    // Monotonic per-invocation run IDs (never reset to 0) so a late exit from a
+    // timed-out AP callback can never satisfy a subsequent rerun's exit check.
+    pub static ACTIVE_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static EXITED_RUN_ID: AtomicU64 = AtomicU64::new(0);
+}
+
+fn cow_tlb_ap_worker() {
+    use core::hint::spin_loop;
+    use core::sync::atomic::Ordering;
+    use cow_tlb_state::*;
+    use mm::tlb_shootdown::track_cr3_switch;
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PhysFrame, Size4KiB};
+    use x86_64::PhysAddr;
+
+    let my_run_id = ACTIVE_RUN_ID.load(Ordering::Acquire);
+    let scratch_phys = SCRATCH_CR3_PHYS.load(Ordering::Acquire);
+    if scratch_phys == 0 {
+        EXITED_RUN_ID.store(my_run_id, Ordering::Release);
+        return;
+    }
+
+    let (saved_frame, saved_raw) = Cr3::read_raw();
+    let scratch_frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(scratch_phys));
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        track_cr3_switch(scratch_phys);
+        unsafe {
+            Cr3::write_raw(scratch_frame, saved_raw & 0x0FFF);
+        }
+    });
+
+    // Prime TLB with initial read-only mapping and notify BSP.
+    let _ = unsafe { core::ptr::read_volatile(VA_COW as *const u64) };
+    AP_READY.store(1, Ordering::Release);
+
+    let mut last_step = 0u64;
+    loop {
+        let step = STEP.load(Ordering::Acquire);
+        if step == u64::MAX {
+            break;
+        }
+        if step == last_step {
+            spin_loop();
+            continue;
+        }
+        last_step = step;
+
+        let val = unsafe { core::ptr::read_volatile(VA_COW as *const u64) };
+        AP_OBSERVED.store(val, Ordering::Release);
+
+        // Even steps follow a COW RO->RW remap + shootdown: write through VA_COW
+        // to prove stale RO TLB permissions were invalidated and the write lands
+        // exclusively in the new private frame.
+        if step & 1 == 0 {
+            let write_val = AP_WRITE_VAL.load(Ordering::Acquire);
+            unsafe {
+                core::ptr::write_volatile(VA_COW as *mut u64, write_val);
+            }
+        }
+        AP_ACK_STEP.store(step, Ordering::Release);
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        track_cr3_switch(saved_frame.start_address().as_u64());
+        unsafe {
+            Cr3::write_raw(saved_frame, saved_raw & 0x0FFF);
+        }
+    });
+    EXITED_RUN_ID.store(my_run_id, Ordering::Release);
+}
+
 /// R23-1: Verifies that TLB shootdown IPIs are sent to all CPUs when a COW
 /// page is modified. Without proper shootdown, remote CPUs cache stale TLB
-/// entries pointing to the old (shared) physical frame, allowing reads to
-/// bypass copy-on-write isolation.
+/// entries pointing to the old (shared) physical frame, allowing reads or
+/// writes to bypass copy-on-write isolation.
 struct CowTlbShootdownTest;
 
 impl RuntimeTest for CowTlbShootdownTest {
@@ -182,23 +284,339 @@ impl RuntimeTest for CowTlbShootdownTest {
         "r23_1_cow_tlb_shootdown"
     }
 
+    // STRICT-Q S5 (D1): cross-CPU COW TLB shootdown requires 2+ online CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
     fn description(&self) -> &'static str {
         "R23-1: Verify TLB shootdown on COW modification (prevents stale permission bypass)"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
+        use arch::ipi::{send_ipi, IpiType};
+        use arch::{current_cpu_id, max_cpus, num_online_cpus, set_ap_test_probe};
+        use core::hint::spin_loop;
+        use core::sync::atomic::Ordering;
+        use cow_tlb_state::*;
+        use mm::memory::FrameAllocator;
+        use mm::page_table::phys_to_virt;
+        use mm::tlb_shootdown::{
+            flush_current_as_page, get_stats, handle_shootdown_ipi, is_cpu_online, track_cr3_switch,
+        };
+        use x86_64::registers::control::Cr3;
+        use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
+        use x86_64::VirtAddr;
 
-        // Requires SMP
         if num_online_cpus() < 2 {
             return TestResult::Deferred(String::from(
                 "TLB shootdown test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Deferred(String::from(
-            "SMP available; full COW test requires fork + concurrent memory access",
-        ))
+        let self_cpu = current_cpu_id();
+        let Some(target) = (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) else {
+            return TestResult::Fail(String::from("No online AP found for COW TLB shootdown"));
+        };
+
+        // Never reuse shared COW probe state while an earlier timed-out AP
+        // callback has not yet acknowledged exit.
+        if ACTIVE_RUN_ID.load(Ordering::Acquire) != EXITED_RUN_ID.load(Ordering::Acquire) {
+            return TestResult::Fail(String::from(
+                "previous COW TLB shootdown AP callback has not exited yet",
+            ));
+        }
+
+        let mut allocator = FrameAllocator::new();
+        let alloc_zeroed = |alloc: &mut FrameAllocator| -> Option<PhysFrame<Size4KiB>> {
+            let frame = alloc.allocate_frame()?;
+            let ptr = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+            unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
+            Some(frame)
+        };
+
+        let Some(shared_frame) = alloc_zeroed(&mut allocator) else {
+            return TestResult::Fail(String::from("Failed to allocate COW shared frame"));
+        };
+        let Some(private_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(shared_frame);
+            return TestResult::Fail(String::from("Failed to allocate COW private frame"));
+        };
+        let Some(pml4_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(private_frame);
+            allocator.deallocate_frame(shared_frame);
+            return TestResult::Fail(String::from("Failed to allocate COW scratch PML4"));
+        };
+        let Some(pdpt_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(private_frame);
+            allocator.deallocate_frame(shared_frame);
+            return TestResult::Fail(String::from("Failed to allocate COW scratch PDPT"));
+        };
+        let Some(pd_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(pdpt_frame);
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(private_frame);
+            allocator.deallocate_frame(shared_frame);
+            return TestResult::Fail(String::from("Failed to allocate COW scratch PD"));
+        };
+        let Some(pt_frame) = alloc_zeroed(&mut allocator) else {
+            allocator.deallocate_frame(pd_frame);
+            allocator.deallocate_frame(pdpt_frame);
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(private_frame);
+            allocator.deallocate_frame(shared_frame);
+            return TestResult::Fail(String::from("Failed to allocate COW scratch PT"));
+        };
+
+        let (boot_frame, boot_raw) = Cr3::read_raw();
+        let boot_cr3_phys = boot_frame.start_address().as_u64();
+        let scratch_phys = pml4_frame.start_address().as_u64();
+
+        // VA_COW = 0x0000_0082_0000_0000 -> PML4[1], PDPT[8], PD[0], PT[0]
+        let parent_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let ro_cow_flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+        let rw_private_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+
+        unsafe {
+            let boot_pml4 = &*phys_to_virt(boot_frame.start_address()).as_ptr::<PageTable>();
+            let scratch_pml4 =
+                &mut *phys_to_virt(pml4_frame.start_address()).as_mut_ptr::<PageTable>();
+            scratch_pml4[0] = boot_pml4[0].clone();
+            for i in 256..512 {
+                scratch_pml4[i] = boot_pml4[i].clone();
+            }
+            scratch_pml4[1].set_addr(pdpt_frame.start_address(), parent_flags);
+
+            let pdpt = &mut *phys_to_virt(pdpt_frame.start_address()).as_mut_ptr::<PageTable>();
+            pdpt[8].set_addr(pd_frame.start_address(), parent_flags);
+
+            let pd = &mut *phys_to_virt(pd_frame.start_address()).as_mut_ptr::<PageTable>();
+            pd[0].set_addr(pt_frame.start_address(), parent_flags);
+
+            let pt = &mut *phys_to_virt(pt_frame.start_address()).as_mut_ptr::<PageTable>();
+            pt[0].set_addr(shared_frame.start_address(), ro_cow_flags);
+
+            core::ptr::write_volatile(
+                phys_to_virt(shared_frame.start_address()).as_mut_ptr::<u64>(),
+                0xC000_0000_0000_0001,
+            );
+        }
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            track_cr3_switch(scratch_phys);
+            unsafe {
+                Cr3::write_raw(pml4_frame, boot_raw & 0x0FFF);
+            }
+        });
+
+        AP_READY.store(0, Ordering::Release);
+        AP_ACK_STEP.store(0, Ordering::Release);
+        AP_OBSERVED.store(0, Ordering::Release);
+        AP_WRITE_VAL.store(0, Ordering::Release);
+        STEP.store(0, Ordering::Release);
+        SCRATCH_CR3_PHYS.store(scratch_phys, Ordering::Release);
+        let run_id = ACTIVE_RUN_ID.fetch_add(1, Ordering::AcqRel) + 1;
+
+        let mut ap_may_hold_scratch = true;
+        let _ = set_ap_test_probe(target, Some(cow_tlb_ap_worker));
+        send_ipi(target, IpiType::Reschedule);
+
+        let wait_ap_step = |expected_step: u64| -> bool {
+            for _ in 0..100_000_000usize {
+                if AP_ACK_STEP.load(Ordering::Acquire) == expected_step {
+                    return true;
+                }
+                spin_loop();
+            }
+            false
+        };
+
+        let outcome: Result<(), String> = (|| {
+            let mut ready = false;
+            for _ in 0..100_000_000usize {
+                if AP_READY.load(Ordering::Acquire) != 0 {
+                    ready = true;
+                    break;
+                }
+                spin_loop();
+            }
+            if !ready {
+                return Err(alloc::format!(
+                    "AP {} timed out entering COW scratch CR3",
+                    target
+                ));
+            }
+
+            let stats_before = get_stats();
+            for round in 1..=ROUNDS {
+                let old_pattern =
+                    0xC05A_0000_0000_0000u64 ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let new_pattern =
+                    0xC0A5_0000_0000_0000u64 ^ round.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                let ap_write = 0xC0F0_0000_0000_0000u64 ^ round.wrapping_mul(0x94D0_49BB_1331_11EB);
+
+                // Phase A (fork COW arm): map VA_COW read-only to shared_frame
+                // and shoot down remote TLBs so AP populates a fresh RO entry.
+                unsafe {
+                    core::ptr::write_volatile(
+                        phys_to_virt(shared_frame.start_address()).as_mut_ptr::<u64>(),
+                        old_pattern,
+                    );
+                    let pt = &mut *phys_to_virt(pt_frame.start_address()).as_mut_ptr::<PageTable>();
+                    pt[0].set_addr(shared_frame.start_address(), ro_cow_flags);
+                }
+                flush_current_as_page(VirtAddr::new(VA_COW));
+
+                let ro_step = 2 * round - 1;
+                STEP.store(ro_step, Ordering::Release);
+                if !wait_ap_step(ro_step) {
+                    return Err(alloc::format!(
+                        "AP {} timed out priming RO COW TLB on round {}",
+                        target,
+                        round
+                    ));
+                }
+                let ap_saw_ro = AP_OBSERVED.load(Ordering::Acquire);
+                if ap_saw_ro != old_pattern {
+                    return Err(alloc::format!(
+                        "AP {} stale TLB read on RO arm round {}: got {:#x}, expected {:#x}",
+                        target,
+                        round,
+                        ap_saw_ro,
+                        old_pattern
+                    ));
+                }
+
+                // Phase B (COW break): populate private_frame, replace PTE with
+                // writable private_frame, and issue targeted TLB shootdown.
+                unsafe {
+                    core::ptr::write_volatile(
+                        phys_to_virt(private_frame.start_address()).as_mut_ptr::<u64>(),
+                        new_pattern,
+                    );
+                    let pt = &mut *phys_to_virt(pt_frame.start_address()).as_mut_ptr::<PageTable>();
+                    pt[0].set_addr(private_frame.start_address(), rw_private_flags);
+                }
+                flush_current_as_page(VirtAddr::new(VA_COW));
+
+                let local_after = unsafe { core::ptr::read_volatile(VA_COW as *const u64) };
+                if local_after != new_pattern {
+                    return Err(alloc::format!(
+                        "BSP stale TLB read after COW break round {}: got {:#x}, expected {:#x}",
+                        round,
+                        local_after,
+                        new_pattern
+                    ));
+                }
+
+                // AP reads VA_COW (must see new_pattern, never stale old_pattern)
+                // and writes ap_write through the newly writable PTE.
+                AP_WRITE_VAL.store(ap_write, Ordering::Release);
+                let rw_step = 2 * round;
+                STEP.store(rw_step, Ordering::Release);
+                if !wait_ap_step(rw_step) {
+                    return Err(alloc::format!(
+                        "AP {} timed out verifying COW break on round {}",
+                        target,
+                        round
+                    ));
+                }
+                let ap_saw_rw = AP_OBSERVED.load(Ordering::Acquire);
+                if ap_saw_rw != new_pattern {
+                    return Err(alloc::format!(
+                        "AP {} stale TLB read after COW shootdown round {}: got {:#x}, expected {:#x}",
+                        target,
+                        round,
+                        ap_saw_rw,
+                        new_pattern
+                    ));
+                }
+
+                let priv_after = unsafe {
+                    core::ptr::read_volatile(
+                        phys_to_virt(private_frame.start_address()).as_ptr::<u64>(),
+                    )
+                };
+                let shared_after = unsafe {
+                    core::ptr::read_volatile(
+                        phys_to_virt(shared_frame.start_address()).as_ptr::<u64>(),
+                    )
+                };
+                if priv_after != ap_write {
+                    return Err(alloc::format!(
+                        "COW private frame missed AP write on round {}: got {:#x}, expected {:#x}",
+                        round,
+                        priv_after,
+                        ap_write
+                    ));
+                }
+                if shared_after != old_pattern {
+                    return Err(alloc::format!(
+                        "COW isolation breach on round {}: shared frame mutated to {:#x}, expected {:#x}",
+                        round,
+                        shared_after,
+                        old_pattern
+                    ));
+                }
+            }
+
+            let stats_after = get_stats();
+            let ipi_delta = stats_after.shootdown_ipis - stats_before.shootdown_ipis;
+            let expected_ipis = 2 * ROUNDS;
+            if ipi_delta < expected_ipis {
+                return Err(alloc::format!(
+                    "expected >= {} COW shootdown IPIs, observed {}",
+                    expected_ipis,
+                    ipi_delta
+                ));
+            }
+            Ok(())
+        })();
+
+        STEP.store(u64::MAX, Ordering::Release);
+        let cancelled = set_ap_test_probe(target, None);
+        if cancelled {
+            EXITED_RUN_ID.store(run_id, Ordering::Release);
+            ap_may_hold_scratch = false;
+        } else {
+            for _ in 0..100_000_000usize {
+                x86_64::instructions::interrupts::without_interrupts(handle_shootdown_ipi);
+                if EXITED_RUN_ID.load(Ordering::Acquire) == run_id {
+                    ap_may_hold_scratch = false;
+                    break;
+                }
+                spin_loop();
+            }
+        }
+        SCRATCH_CR3_PHYS.store(0, Ordering::Release);
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            track_cr3_switch(boot_cr3_phys);
+            unsafe {
+                Cr3::write_raw(boot_frame, boot_raw & 0x0FFF);
+            }
+        });
+
+        if !ap_may_hold_scratch {
+            allocator.deallocate_frame(pt_frame);
+            allocator.deallocate_frame(pd_frame);
+            allocator.deallocate_frame(pdpt_frame);
+            allocator.deallocate_frame(pml4_frame);
+            allocator.deallocate_frame(private_frame);
+            allocator.deallocate_frame(shared_frame);
+        } else {
+            return TestResult::Fail(alloc::format!(
+                "AP {} timed out restoring BOOT_CR3 (retained COW scratch frames to avoid UAF)",
+                target
+            ));
+        }
+
+        match outcome {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(msg),
+        }
     }
 }
 
@@ -257,13 +675,21 @@ impl RuntimeTest for BrkVaReservationToctouTest {
         "r174_b4_brk_va_reservation_toctou"
     }
 
+    // STRICT-Q S5 (D5): Ring-3 concurrent CLONE_VM brk + MAP_FIXED_NOREPLACE leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "brk VA reservation TOCTOU: concurrent CLONE_VM brk and MAP_FIXED_NOREPLACE never overlap",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R174-B4: Verify brk() VA reservation atomicity (prevents heap overlap)"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "Test requires sys_brk() concurrent stress testing - placeholder",
+            "Covered by Ring-3 concurrent CLONE_VM brk VA reservation TOCTOU leg in ring3-mm",
         ))
     }
 }
@@ -315,27 +741,226 @@ impl RuntimeTest for OomGracefulHandlingTest {
     }
 
     fn run(&self) -> TestResult {
-        use mm::buddy_allocator;
+        use kernel_core::{
+            create_cgroup, delete_cgroup, try_charge_memory, uncharge_memory, CgroupControllers,
+            CgroupError, CgroupLimits,
+        };
+        use mm::buddy_allocator::{
+            alloc_physical_pages, free_physical_pages, get_allocator_stats,
+            try_alloc_physical_pages, AllocError,
+        };
+        use mm::{get_oom_stats, score_oom_process, OomProcessInfo};
 
-        // Get current memory stats
-        let stats = match buddy_allocator::get_allocator_stats() {
+        let stats = match get_allocator_stats() {
             Some(s) => s,
             None => {
                 return TestResult::Fail(String::from("Buddy allocator not initialized"));
             }
         };
-
-        // Verify OOM handling infrastructure exists
-        // Full test requires exhausting memory (dangerous in boot environment)
-
-        if stats.free_pages > 0 {
-            TestResult::Deferred(alloc::format!(
-                "OOM infrastructure present; {} pages available (full test would exhaust memory)",
+        if stats.total_pages == 0 || stats.free_pages == 0 {
+            return TestResult::Fail(alloc::format!(
+                "Invalid buddy allocator state: total={} free={}",
+                stats.total_pages,
                 stats.free_pages
-            ))
-        } else {
-            TestResult::Fail(String::from("Already out of memory during test"))
+            ));
         }
+
+        // 1. Oversized / invalid physical allocations must fail cleanly without
+        // panicking or wedging the OOM killer state machine.
+        for bad_count in [0usize, usize::MAX, 1usize << 20] {
+            match try_alloc_physical_pages(bad_count) {
+                Err(AllocError::InvalidOrder) => {}
+                other => {
+                    return TestResult::Fail(alloc::format!(
+                        "try_alloc_physical_pages({}) returned {:?}, expected InvalidOrder",
+                        bad_count,
+                        other
+                    ));
+                }
+            }
+        }
+        if alloc_physical_pages(usize::MAX).is_some() {
+            return TestResult::Fail(String::from(
+                "alloc_physical_pages(usize::MAX) unexpectedly succeeded",
+            ));
+        }
+        if get_oom_stats().is_running {
+            return TestResult::Fail(String::from(
+                "OOM killer unexpectedly stuck in is_running=true",
+            ));
+        }
+
+        // 2. OOM victim scoring invariants: PID 1, TGID 1, kernel threads,
+        // mm-less tasks, and oom_score_adj=-1000 must remain immune (i64::MIN),
+        // while eligible user tasks rank strictly by RSS, oom_score_adj, and nice.
+        let base = OomProcessInfo {
+            pid: 100,
+            generation: 1,
+            tgid: 100,
+            uid: 1000,
+            gid: 1000,
+            rss_pages: 64,
+            nice: 0,
+            oom_score_adj: 0,
+            has_mm: true,
+            is_kernel_thread: false,
+        };
+        let immune_cases = [
+            OomProcessInfo {
+                pid: 1,
+                tgid: 1,
+                rss_pages: 100_000,
+                oom_score_adj: 1000,
+                ..base
+            },
+            OomProcessInfo {
+                pid: 42,
+                tgid: 1,
+                rss_pages: 100_000,
+                oom_score_adj: 1000,
+                ..base
+            },
+            OomProcessInfo {
+                is_kernel_thread: true,
+                rss_pages: 100_000,
+                ..base
+            },
+            OomProcessInfo {
+                has_mm: false,
+                rss_pages: 100_000,
+                ..base
+            },
+            OomProcessInfo {
+                oom_score_adj: -1000,
+                rss_pages: 100_000,
+                ..base
+            },
+        ];
+        for (idx, info) in immune_cases.iter().enumerate() {
+            let score = score_oom_process(info);
+            if score != i64::MIN {
+                return TestResult::Fail(alloc::format!(
+                    "immune OOM case {} scored {}, expected i64::MIN",
+                    idx,
+                    score
+                ));
+            }
+        }
+        let s_base = score_oom_process(&base);
+        let s_big_rss = score_oom_process(&OomProcessInfo {
+            rss_pages: 512,
+            ..base
+        });
+        let s_high_adj = score_oom_process(&OomProcessInfo {
+            oom_score_adj: 250,
+            ..base
+        });
+        let s_high_nice = score_oom_process(&OomProcessInfo { nice: 15, ..base });
+        if !(s_base > i64::MIN && s_big_rss > s_base && s_high_adj > s_base && s_high_nice > s_base)
+        {
+            return TestResult::Fail(alloc::format!(
+                "OOM victim ranking violated: base={} big_rss={} high_adj={} high_nice={}",
+                s_base,
+                s_big_rss,
+                s_high_adj,
+                s_high_nice
+            ));
+        }
+
+        // 3. Cgroup v2 memory.max enforcement: verify bounded charge succeeds,
+        // over-limit charge fails cleanly with MemoryLimitExceeded (no partial
+        // charge leak, memory_events_max incremented), and uncharge + delete
+        // restore zero state.
+        let cg = match create_cgroup(0, CgroupControllers::MEMORY) {
+            Ok(c) => c,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "failed to create ephemeral OOM test cgroup: {:?}",
+                    e
+                ));
+            }
+        };
+        let cg_id = cg.id();
+        let mut charged = 0u64;
+        let cg_outcome: Result<(), String> = (|| {
+            cg.set_limit(CgroupLimits {
+                memory_max: Some(8192),
+                ..CgroupLimits::default()
+            })
+            .map_err(|e| alloc::format!("failed to set memory.max on test cgroup: {:?}", e))?;
+
+            try_charge_memory(cg_id, 4096)
+                .map_err(|e| alloc::format!("in-budget 4 KiB charge failed: {:?}", e))?;
+            charged = 4096;
+
+            let snap_mid = cg.get_stats();
+            if snap_mid.memory_current != 4096 {
+                return Err(alloc::format!(
+                    "expected memory_current=4096 after first charge, got {}",
+                    snap_mid.memory_current
+                ));
+            }
+
+            match try_charge_memory(cg_id, 8192) {
+                Err(CgroupError::MemoryLimitExceeded) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "over-limit charge returned {:?}, expected MemoryLimitExceeded",
+                        other
+                    ));
+                }
+            }
+
+            let snap_after = cg.get_stats();
+            if snap_after.memory_current != 4096 {
+                return Err(alloc::format!(
+                    "over-limit rejection leaked charge: memory_current={}, expected 4096",
+                    snap_after.memory_current
+                ));
+            }
+            if snap_after.memory_events_max == 0 {
+                return Err(String::from(
+                    "memory.max OOM rejection did not increment memory_events_max",
+                ));
+            }
+
+            uncharge_memory(cg_id, charged);
+            charged = 0;
+
+            let snap_zero = cg.get_stats();
+            if snap_zero.memory_current != 0 {
+                return Err(alloc::format!(
+                    "expected memory_current=0 after uncharge, got {}",
+                    snap_zero.memory_current
+                ));
+            }
+            Ok(())
+        })();
+
+        if charged > 0 {
+            uncharge_memory(cg_id, charged);
+        }
+        drop(cg);
+        if let Err(e) = delete_cgroup(cg_id) {
+            return TestResult::Fail(alloc::format!(
+                "failed to delete ephemeral OOM test cgroup {}: {:?}",
+                cg_id,
+                e
+            ));
+        }
+        if let Err(msg) = cg_outcome {
+            return TestResult::Fail(msg);
+        }
+
+        // 4. Verify physical allocator remains healthy after OOM negative checks.
+        let Some(probe_frame) = alloc_physical_pages(1) else {
+            return TestResult::Fail(String::from(
+                "buddy allocator failed 1-page allocation after OOM checks",
+            ));
+        };
+        free_physical_pages(probe_frame, 1);
+
+        TestResult::Pass
     }
 }
 
@@ -495,21 +1120,21 @@ impl RuntimeTest for SmpWorkStealingSafetyTest {
         "r172_03_smp_work_stealing_safety"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 SMP work-stealing multi-wave TLS safety leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "SMP work stealing safety: concurrent unpinned task waves preserve per-task TLS and identity across CPUs",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-03: Comprehensive SMP work stealing safety under load"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Work stealing test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires 100+ concurrent processes with TLS verification",
+            "Covered by Ring-3 SMP work stealing safety leg in ring3-mm",
         ))
     }
 }
@@ -528,9 +1153,10 @@ impl RuntimeTest for NonBlockingGetProcessInIrqTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires IRQ context verification - placeholder",
-        ))
+        match kernel_core::process::run_non_blocking_get_process_irq_self_test() {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(String::from(msg)),
+        }
     }
 }
 
@@ -544,21 +1170,21 @@ impl RuntimeTest for ProcessMigrationSafetyTest {
         "process_migration_safety"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 forced cross-CPU migration state consistency leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "process migration safety: forced cross-CPU hops preserve per-CPU state, FS/GS TLS and PID identity",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "Verify process migration maintains per-CPU state consistency"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Migration test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires forced migration with state verification",
+            "Covered by Ring-3 forced cross-CPU migration safety leg in ring3-mm",
         ))
     }
 }
@@ -572,21 +1198,21 @@ impl RuntimeTest for SchedulerLoadBalancingTest {
         "scheduler_load_balancing"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 multi-CPU runnable distribution leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "scheduler load balancing: unpinned runnable workers distribute across multiple online CPUs",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "Verify scheduler distributes work fairly across CPUs"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Load balancing test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires workload distribution metrics",
+            "Covered by Ring-3 SMP scheduler load balancing leg in ring3-mm",
         ))
     }
 }
@@ -601,21 +1227,21 @@ impl RuntimeTest for CpuAffinityEnforcementTest {
         "cpu_affinity_enforcement"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 per-CPU sched_setaffinity enforcement leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "CPU affinity enforcement: sched_setaffinity pins execution strictly to each online CPU and rejects invalid masks",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "Verify sched_setaffinity() restricts process to specified CPUs"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Affinity test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires sys_sched_setaffinity() + CPU pinning verification",
+            "Covered by Ring-3 CPU affinity enforcement leg in ring3-mm",
         ))
     }
 }
