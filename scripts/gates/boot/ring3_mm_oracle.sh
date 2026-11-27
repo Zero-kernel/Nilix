@@ -143,6 +143,7 @@ futex bucket TOCTOU: concurrent wait/wake/requeue across rotating words loses no
 pipe read wakes with EINTR on SIGUSR1 delivery and remains usable afterward
 signal delivery interrupts blocked nanosleep and futex_wait with EINTR and runs handler
 namespace teardown storm: unshare CLONE_NEWPID init SIGKILL cascades to stopped and running members across waves
+brk VA reservation TOCTOU: concurrent CLONE_VM brk and MAP_FIXED_NOREPLACE never overlap
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.

@@ -365,6 +365,8 @@ pub extern "C" fn _start() -> ! {
     test_signal_delivery_blocked_syscall(&mut results);
     test_rapid_signal_migration(&mut results);
     test_namespace_teardown_storm(&mut results);
+    // STRICT-Q S5: Ring-3 concurrent CLONE_VM brk + MAP_FIXED_NOREPLACE leg.
+    test_brk_va_reservation_toctou(&mut results);
 
     // Print summary
     println("");
@@ -10332,4 +10334,237 @@ fn test_namespace_teardown_storm(results: &mut TestResult) {
     results.pass(
         "namespace teardown storm: unshare CLONE_NEWPID init SIGKILL cascades to stopped and running members across waves",
     );
+}
+
+// ---------------------------------------------------------------------------
+// STRICT-Q S5 (R174-B4): Concurrent CLONE_VM brk() VA reservation TOCTOU test.
+// ---------------------------------------------------------------------------
+
+static S5_BRK_TARGET: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static S5_BRK_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_MMAP_WINS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_MMAP_EEXIST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S5_BRK_SMP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn s5_brk_mmap_racer() -> ! {
+    use core::sync::atomic::Ordering;
+    if S5_BRK_SMP.load(Ordering::Acquire) != 0 {
+        let _ = cow_test_pin(2);
+    }
+    let target = S5_BRK_TARGET.load(Ordering::Acquire);
+    S5_BRK_READY.store(1, Ordering::Release);
+
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
+    let mut seq = 0u64;
+    while S5_BRK_STOP.load(Ordering::Acquire) == 0 {
+        seq = seq.wrapping_add(1);
+        let got = unsafe { mmap_raw(target, PAGE, flags) };
+        if got == target as i64 {
+            // While this mapping is live at `target`, sys_brk MUST NOT have
+            // grown past `target` (neither previously nor concurrently).
+            let cur_brk = unsafe { syscall1(SYS_BRK, 0) as usize };
+            if cur_brk > target {
+                let _ = unsafe { munmap(target, PAGE) };
+                S5_BRK_ERR.store(1, Ordering::Release);
+                break;
+            }
+            let sentinel = 0x5B40_0000_0000_0000u64 | (seq & 0xFFFF_FFFF);
+            unsafe {
+                core::ptr::write_volatile(target as *mut u64, sentinel);
+                userspace::syscall::sys_yield();
+            }
+            let after_val = unsafe { core::ptr::read_volatile(target as *const u64) };
+            let after_brk = unsafe { syscall1(SYS_BRK, 0) as usize };
+            let unmap_rc = unsafe { munmap(target, PAGE) };
+            if after_val != sentinel || after_brk > target || unmap_rc != 0 {
+                S5_BRK_ERR.store(2, Ordering::Release);
+                break;
+            }
+            S5_BRK_MMAP_WINS.fetch_add(1, Ordering::Relaxed);
+        } else if got == -(EEXIST as i64) {
+            S5_BRK_MMAP_EEXIST.fetch_add(1, Ordering::Relaxed);
+        } else {
+            S5_BRK_ERR.store(3, Ordering::Release);
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    unsafe { raw_exit(SYS_EXIT, 0) }
+}
+
+fn s5_brk_va_reservation_toctou_leg() -> u64 {
+    use core::sync::atomic::Ordering;
+    const SPAN_PAGES: usize = 16;
+    const TARGET_PAGE_OFF: usize = 8;
+    const ROUNDS: u64 = 64;
+
+    let old = unsafe { syscall1(SYS_BRK, 0) as usize };
+    if old == 0 {
+        return 0x70;
+    }
+    let base = (old + PAGE - 1) & !(PAGE - 1);
+    let top = base + SPAN_PAGES * PAGE;
+    let target = base + TARGET_PAGE_OFF * PAGE;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
+
+    // 1. Deterministic boundary contract before spawning the sibling thread:
+    //    - mmap at `target` succeeds while heap is at `old`;
+    //    - brk(top) crossing `target` MUST refuse (return unchanged <= target);
+    //    - after munmap, brk(top) succeeds and MAP_FIXED_NOREPLACE at `target`
+    //      returns -EEXIST.
+    if unsafe { mmap_raw(target, PAGE, flags) } != target as i64 {
+        return 0x71;
+    }
+    unsafe { core::ptr::write_volatile(target as *mut u64, 0xB411_0001) };
+    let blocked_brk = unsafe { syscall1(SYS_BRK, top as u64) as usize };
+    let intact = unsafe { core::ptr::read_volatile(target as *const u64) } == 0xB411_0001;
+    let unmap_ok = unsafe { munmap(target, PAGE) } == 0;
+    if blocked_brk > target || !intact || !unmap_ok {
+        return 0x72;
+    }
+
+    if unsafe { syscall1(SYS_BRK, top as u64) as usize } != top {
+        return 0x73;
+    }
+    unsafe { core::ptr::write_volatile(target as *mut u64, 0xB422_0002) };
+    let eexist_rc = unsafe { mmap_raw(target, PAGE, flags) };
+    let heap_intact = unsafe { core::ptr::read_volatile(target as *const u64) } == 0xB422_0002;
+    let shrunk = unsafe { syscall1(SYS_BRK, base as u64) as usize } == base;
+    if eexist_rc != -(EEXIST as i64) || !heap_intact || !shrunk {
+        let _ = unsafe { syscall1(SYS_BRK, old as u64) };
+        return 0x74;
+    }
+
+    // 2. Concurrent CLONE_VM race: main thread repeatedly grows/verifies/shrinks
+    //    brk across [base, top) while sibling thread hammers MAP_FIXED_NOREPLACE
+    //    at `target` inside that exact grow window.
+    let cpus = unsafe { cow_test_command(0, 0) };
+    let smp = !is_error(cpus) && (cpus & 3) == 3;
+    if smp {
+        let _ = cow_test_pin(1);
+    }
+
+    S5_BRK_TARGET.store(target, Ordering::Release);
+    S5_BRK_STOP.store(0, Ordering::Release);
+    S5_BRK_READY.store(0, Ordering::Release);
+    S5_BRK_MMAP_WINS.store(0, Ordering::Release);
+    S5_BRK_MMAP_EEXIST.store(0, Ordering::Release);
+    S5_BRK_ERR.store(0, Ordering::Release);
+    S5_BRK_SMP.store(if smp { 1 } else { 0 }, Ordering::Release);
+    GROUP_TID_WORD.store(-1, Ordering::SeqCst);
+
+    let tid = unsafe {
+        raw_clone(
+            THREAD_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+            group_stack_top(),
+            core::ptr::null_mut(),
+            GROUP_TID_WORD.as_ptr(),
+            s5_brk_mmap_racer,
+        )
+    };
+    if is_error(tid) || tid == 0 {
+        let _ = unsafe { syscall1(SYS_BRK, old as u64) };
+        return 0x75;
+    }
+
+    for _ in 0..THREAD_POLL_YIELDS {
+        if S5_BRK_READY.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+    if S5_BRK_READY.load(Ordering::Acquire) == 0 {
+        S5_BRK_STOP.store(1, Ordering::Release);
+        let _ = g8_join_thread();
+        let _ = unsafe { syscall1(SYS_BRK, old as u64) };
+        return 0x76;
+    }
+
+    let mut brk_grows = 0u64;
+    let mut main_err = 0u64;
+    for round in 1..=ROUNDS {
+        if S5_BRK_ERR.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        let got = unsafe { syscall1(SYS_BRK, top as u64) as usize };
+        if got == top {
+            brk_grows += 1;
+            let p0 = base as *mut u64;
+            let pm = target as *mut u64;
+            let pe = (top - PAGE) as *mut u64;
+            let pat = 0xB400_0000_0000_0000u64 | round;
+            unsafe {
+                core::ptr::write_volatile(p0, pat);
+                core::ptr::write_volatile(pm, pat ^ 1);
+                core::ptr::write_volatile(pe, pat ^ 2);
+                userspace::syscall::sys_yield();
+            }
+            let v0 = unsafe { core::ptr::read_volatile(p0) };
+            let vm = unsafe { core::ptr::read_volatile(pm) };
+            let ve = unsafe { core::ptr::read_volatile(pe) };
+            if v0 != pat || vm != (pat ^ 1) || ve != (pat ^ 2) {
+                main_err = 0x77;
+                break;
+            }
+            let back = unsafe { syscall1(SYS_BRK, base as u64) as usize };
+            if back != base {
+                main_err = 0x78;
+                break;
+            }
+        } else if got != base {
+            main_err = 0x79;
+            break;
+        }
+        unsafe { userspace::syscall::sys_yield() };
+    }
+
+    S5_BRK_STOP.store(1, Ordering::Release);
+    let joined = g8_join_thread();
+    let restored = unsafe { syscall1(SYS_BRK, old as u64) as usize } == old;
+
+    if !joined {
+        return 0x7a;
+    }
+    if main_err != 0 {
+        return main_err;
+    }
+    let racer_err = S5_BRK_ERR.load(Ordering::Acquire);
+    if racer_err != 0 {
+        return 0x7b + racer_err as u64;
+    }
+    let racer_total =
+        S5_BRK_MMAP_WINS.load(Ordering::Relaxed) + S5_BRK_MMAP_EEXIST.load(Ordering::Relaxed);
+    if !restored || brk_grows == 0 || racer_total == 0 {
+        return 0x7f;
+    }
+    S4_LEG_OK
+}
+
+/// R174-B4: Verify concurrent CLONE_VM brk() and MAP_FIXED_NOREPLACE never overlap.
+fn test_brk_va_reservation_toctou(results: &mut TestResult) {
+    print("Testing R174-B4 concurrent CLONE_VM brk VA reservation TOCTOU... ");
+    let host = unsafe { sys_fork() };
+    if is_error(host) {
+        results.fail("brk VA reservation TOCTOU: fork failed");
+        return;
+    }
+    if host == 0 {
+        unsafe { raw_exit(SYS_EXIT_GROUP, s5_brk_va_reservation_toctou_leg()) };
+    }
+    match reap_pid(host) {
+        Some(S4_LEG_OK) => {
+            results.pass(
+                "brk VA reservation TOCTOU: concurrent CLONE_VM brk and MAP_FIXED_NOREPLACE never overlap",
+            );
+        }
+        Some(code) => {
+            print("exit ");
+            print_int(code as i64);
+            print(" ");
+            results.fail("brk VA reservation TOCTOU: concurrent overlap or corruption detected");
+        }
+        None => results.fail("brk VA reservation TOCTOU: could not reap host"),
+    }
 }
