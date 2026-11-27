@@ -997,6 +997,36 @@ impl BuddyAllocator {
         Ok((count, zeroed_mask))
     }
 
+    /// Allocate up to `out.len()` (max 32) order-0 frames directly in
+    /// `PAGE_ALLOC_ORDER0` state in a single buddy-lock acquisition.
+    /// Bit `i` of `zeroed_mask` is set iff `out[i]` was in `PAGE_FREE_ZEROED`
+    /// (already scrubbed when drained from PCP). Returns `Err(AllocError::Exhausted)`
+    /// only if zero frames could be allocated.
+    fn try_alloc_direct_batch(
+        &mut self,
+        out: &mut [PhysFrame],
+    ) -> Result<(usize, u32), AllocError> {
+        if out.is_empty() || out.len() > 32 {
+            return Err(AllocError::InvalidOrder);
+        }
+        let mut count = 0usize;
+        let mut zeroed_mask = 0u32;
+        while count < out.len() {
+            match self.try_alloc_pages_internal(0) {
+                Ok((frame, was_zeroed)) => {
+                    if was_zeroed {
+                        zeroed_mask |= 1u32 << count;
+                    }
+                    out[count] = frame;
+                    count += 1;
+                }
+                Err(AllocError::Exhausted) if count > 0 => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok((count, zeroed_mask))
+    }
+
     /// 释放内存块
     ///
     /// # Arguments
@@ -1814,6 +1844,265 @@ impl PcpBuddyPool {
         Ok(batch[0])
     }
 
+    /// Allocate up to `out.len()` pre-zeroed order-0 frames in batched PCP and
+    /// buddy holds, returning the number of frames filled (`0..=out.len()`).
+    ///
+    /// Preserves Invariant S2 (every returned frame is zeroed) and Invariant S3
+    /// (`buddy.free_pages + sum(pcp.cached_count)` conservation). On metadata
+    /// corruption or poisoned allocator, returns `Err(...)` immediately.
+    fn try_alloc_order0_batch_with<FScrub>(
+        &self,
+        out: &mut [PhysFrame],
+        cpu_id: usize,
+        cpu_limit: usize,
+        scrub: FScrub,
+        run_oom: bool,
+    ) -> Result<usize, AllocError>
+    where
+        FScrub: Fn(PhysFrame) + Copy,
+    {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(AllocError::AllocatorPoisoned);
+        }
+
+        let cpu = cpu_id % self.pcp.len();
+        let mut filled = 0usize;
+
+        // Fast path: pop as many pre-zeroed frames as possible from this CPU's
+        // PCP magazine in a single lock hold (zero global atomics per frame).
+        if let Some((base, states)) = self.page_state_view() {
+            let mut popped_phys = [0u64; PCP_HIGH_WATERMARK];
+            let max_pop = out.len().min(PCP_HIGH_WATERMARK);
+            let popped = with_irqs_disabled(|| {
+                let Some(mut mag) = self.pcp[cpu].lock.try_lock() else {
+                    return 0;
+                };
+                let take = mag.len.min(max_pop);
+                if take == 0 {
+                    return 0;
+                }
+                let start = mag.len - take;
+                popped_phys[..take].copy_from_slice(&mag.frames[start..mag.len]);
+                mag.len = start;
+                self.pcp[cpu].cached_count.fetch_sub(take, Ordering::AcqRel);
+                let prev_hits = self.pcp[cpu].hits.load(Ordering::Relaxed);
+                self.pcp[cpu]
+                    .hits
+                    .store(prev_hits.wrapping_add(take as u64), Ordering::Relaxed);
+                take
+            });
+
+            for &phys in &popped_phys[..popped] {
+                let idx = ((phys - base) / PAGE_SIZE as u64) as usize;
+                if states[idx]
+                    .compare_exchange(
+                        PAGE_PCP_CACHED,
+                        PAGE_ALLOC_ORDER0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    self.mark_poisoned();
+                    return Err(AllocError::MetadataCorrupt);
+                }
+                out[filled] = PhysFrame::containing_address(PhysAddr::new(phys));
+                filled += 1;
+            }
+        }
+
+        // Fill any remainder directly from buddy in up to `PCP_REFILL_BATCH`
+        // chunks (single buddy lock per chunk), delegating single-page tails
+        // to `try_alloc_order0_with` so the PCP magazine also gets topped up.
+        while filled < out.len() {
+            let remaining = out.len() - filled;
+            if remaining == 1 {
+                match self.try_alloc_order0_with(cpu_id, cpu_limit, scrub, run_oom) {
+                    Ok(frame) => {
+                        out[filled] = frame;
+                        filled += 1;
+                    }
+                    Err(AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned) => {
+                        return Err(AllocError::MetadataCorrupt);
+                    }
+                    Err(_) => break,
+                }
+                break;
+            }
+
+            let chunk_len = remaining.min(PCP_REFILL_BATCH);
+            let alloc_direct = |buf: &mut [PhysFrame]| -> Result<(usize, u32), AllocError> {
+                let mut guard = self.buddy.lock();
+                let allocator = guard.as_mut().ok_or(AllocError::AllocatorUnavailable)?;
+                let res = allocator.try_alloc_direct_batch(buf);
+                if matches!(
+                    res,
+                    Err(AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned)
+                ) {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+                res
+            };
+
+            let target = &mut out[filled..filled + chunk_len];
+            let mut result = alloc_direct(target);
+            let mut transient_busy = false;
+            let mut saw_busy = false;
+            for _ in 0..8 {
+                if !matches!(result, Err(AllocError::Exhausted)) {
+                    break;
+                }
+                let pcp_reclaimed = self.drain_all_pcp(cpu_limit);
+                let transient = oom_killer::reclaim_transient_caches_nonblocking();
+                transient_busy = transient.busy;
+                if transient.busy {
+                    saw_busy = true;
+                }
+                if pcp_reclaimed > 0 || transient.reclaimed_pages > 0 {
+                    if !transient.busy {
+                        saw_busy = false;
+                    }
+                    result = alloc_direct(target);
+                } else if transient.busy {
+                    core::hint::spin_loop();
+                } else {
+                    if saw_busy {
+                        let _ = self.drain_all_pcp(cpu_limit);
+                        result = alloc_direct(target);
+                    }
+                    break;
+                }
+            }
+            if matches!(result, Err(AllocError::Exhausted)) && transient_busy {
+                break;
+            }
+            if matches!(result, Err(AllocError::Exhausted)) && run_oom {
+                oom_killer::on_allocation_failure(remaining);
+                oom_killer::poll_and_handle_oom();
+                let _ = self.drain_all_pcp(cpu_limit);
+                result = alloc_direct(target);
+            }
+
+            match result {
+                Ok((got, zeroed_mask)) => {
+                    for (i, &frame) in target[..got].iter().enumerate() {
+                        if (zeroed_mask & (1u32 << i)) == 0 {
+                            scrub(frame);
+                        }
+                    }
+                    filled += got;
+                }
+                Err(AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned) => {
+                    return Err(AllocError::MetadataCorrupt);
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok(filled)
+    }
+
+    /// Free a slice of order-0 frames in batched PCP and buddy holds.
+    ///
+    /// Preserves Invariant S1 (refcount == 0 circuit-breaker), Invariant S2
+    /// (4 KiB scrub after claiming `PAGE_PCP_CACHED` and before exposing to
+    /// PCP/buddy), and Invariant S3 (`cached_count` conservation). Invalid
+    /// frames are rejected individually without poisoning unrelated allocations.
+    fn free_order0_batch_with<FRef, FScrub>(
+        &self,
+        frames: &[PhysFrame],
+        cpu_id: usize,
+        read_refcount: FRef,
+        scrub: FScrub,
+    ) where
+        FRef: Fn(usize) -> u32,
+        FScrub: Fn(PhysFrame),
+    {
+        if frames.is_empty() || self.poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let Some((base, states)) = self.page_state_view() else {
+            return;
+        };
+
+        let cpu = cpu_id % self.pcp.len();
+        let mut claimed = [0u64; PCP_HIGH_WATERMARK];
+
+        for chunk in frames.chunks(PCP_HIGH_WATERMARK) {
+            let mut claimed_len = 0usize;
+            for &frame in chunk {
+                let addr = frame.start_address().as_u64();
+                if addr < base {
+                    continue;
+                }
+                let offset = addr - base;
+                if offset % PAGE_SIZE as u64 != 0 {
+                    continue;
+                }
+                let idx = (offset / PAGE_SIZE as u64) as usize;
+                if idx >= states.len() {
+                    continue;
+                }
+                if read_refcount(idx) != 0 {
+                    self.stat_refcount_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if states[idx]
+                    .compare_exchange(
+                        PAGE_ALLOC_ORDER0,
+                        PAGE_PCP_CACHED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                // Invariant S2: zero before exposing to PCP or buddy.
+                scrub(frame);
+                claimed[claimed_len] = addr;
+                claimed_len += 1;
+            }
+
+            if claimed_len == 0 {
+                continue;
+            }
+
+            let pushed = with_irqs_disabled(|| {
+                let Some(mut mag) = self.pcp[cpu].lock.try_lock() else {
+                    return 0;
+                };
+                let space = PCP_HIGH_WATERMARK.saturating_sub(mag.len);
+                let to_push = claimed_len.min(space);
+                if to_push > 0 {
+                    let start = mag.len;
+                    mag.frames[start..start + to_push].copy_from_slice(&claimed[..to_push]);
+                    mag.len = start + to_push;
+                    self.pcp[cpu]
+                        .cached_count
+                        .fetch_add(to_push, Ordering::AcqRel);
+                    let prev_frees = self.pcp[cpu].frees_cached.load(Ordering::Relaxed);
+                    self.pcp[cpu]
+                        .frees_cached
+                        .store(prev_frees.wrapping_add(to_push as u64), Ordering::Relaxed);
+                }
+                to_push
+            });
+
+            if pushed < claimed_len {
+                // Overflow (or contended PCP lock): return the remaining
+                // pre-scrubbed `PAGE_PCP_CACHED` frames directly to buddy in
+                // one lock hold (`from_cached_count = false` since they were
+                // never added to `cached_count`).
+                self.return_pcp_frames_to_buddy(cpu, &claimed[pushed..claimed_len], false);
+            }
+        }
+    }
+
     fn refill_batch_from_buddy(
         &self,
         cpu: usize,
@@ -2417,6 +2706,35 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
         }
         Err(_) => None,
     }
+}
+
+/// Allocate up to `out.len()` pre-zeroed order-0 physical frames in batched
+/// PCP and buddy holds, returning how many slots in `out` were filled.
+pub fn alloc_physical_pages_batch(out: &mut [PhysFrame]) -> usize {
+    match GLOBAL_BUDDY.try_alloc_order0_batch_with(
+        out,
+        current_pcp_cpu_id(),
+        cpu_local::max_cpus(),
+        scrub_frame_phys,
+        true,
+    ) {
+        Ok(count) => count,
+        Err(AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned) => {
+            panic!("physical allocator metadata is corrupt/poisoned")
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Free a batch of order-0 physical frames, scrubbing each frame (Invariant S2)
+/// and returning them through this CPU's PCP magazine in batched lock holds.
+pub fn free_physical_pages_batch(frames: &[PhysFrame]) {
+    GLOBAL_BUDDY.free_order0_batch_with(
+        frames,
+        current_pcp_cpu_id(),
+        read_production_cow_refcount,
+        scrub_frame_phys,
+    );
 }
 
 /// Fallible physical allocation with error classification. OOM recovery runs
@@ -3289,6 +3607,83 @@ mod tests {
                 b.as_mut().unwrap().free_pages(frame, 0);
             }
         }
+        assert_eq!(
+            pool.buddy.lock().as_ref().unwrap().validate_metadata(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn pcp_batch_alloc_and_free_preserves_zeroing_and_conservation() {
+        let pool = make_test_pool(0x5000_0000, 128 * PAGE_SIZE, &[]);
+        let initial_free = pool.stats().unwrap().free_pages;
+        assert_eq!(initial_free, 128);
+
+        let mut frames = [PhysFrame::containing_address(PhysAddr::new(0)); 80];
+        let scrubbed = AtomicUsize::new(0);
+        let got = pool
+            .try_alloc_order0_batch_with(
+                &mut frames,
+                0,
+                4,
+                |_| {
+                    scrubbed.fetch_add(1, Ordering::Relaxed);
+                },
+                false,
+            )
+            .expect("batch alloc 80 frames");
+        assert_eq!(got, 80);
+        assert_eq!(scrubbed.load(Ordering::Relaxed), 80);
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free - 80);
+
+        // Batch-free all 80 frames: 64 enter PCP, 16 overflow directly to buddy
+        // as PAGE_FREE_ZEROED. Keep one frame referenced to verify Invariant S1.
+        let ref_frame = frames[10];
+        let ref_idx =
+            ((ref_frame.start_address().as_u64() - 0x5000_0000) / PAGE_SIZE as u64) as usize;
+        let free_scrubs = AtomicUsize::new(0);
+        pool.free_order0_batch_with(
+            &frames,
+            0,
+            |idx| if idx == ref_idx { 1 } else { 0 },
+            |_| {
+                free_scrubs.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(free_scrubs.load(Ordering::Relaxed), 79);
+        assert_eq!(pool.pcp_stats().cached_pages, PCP_HIGH_WATERMARK);
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free - 1);
+
+        // Re-allocating 79 frames hits PCP for 64 + buddy PAGE_FREE_ZEROED for 15:
+        // ZERO redundant scrubs needed!
+        let mut again = [PhysFrame::containing_address(PhysAddr::new(0)); 79];
+        let second_scrubs = AtomicUsize::new(0);
+        let got2 = pool
+            .try_alloc_order0_batch_with(
+                &mut again,
+                0,
+                4,
+                |_| {
+                    second_scrubs.fetch_add(1, Ordering::Relaxed);
+                },
+                false,
+            )
+            .expect("second batch alloc 79 frames");
+        assert_eq!(got2, 79);
+        assert_eq!(
+            second_scrubs.load(Ordering::Relaxed),
+            0,
+            "PCP hits and PCP-drained PAGE_FREE_ZEROED frames must skip redundant scrubs"
+        );
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free - 80);
+
+        // Free everything cleanly (refcount now 0) and verify full conservation.
+        pool.free_order0_batch_with(&again, 0, |_| 0, |_| {});
+        pool.free_order0_batch_with(&[ref_frame], 0, |_| 0, |_| {});
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
+        pool.drain_all_pcp(4);
+        assert_eq!(pool.pcp_stats().cached_pages, 0);
+        assert_eq!(pool.stats().unwrap().free_pages, initial_free);
         assert_eq!(
             pool.buddy.lock().as_ref().unwrap().validate_metadata(),
             Ok(())

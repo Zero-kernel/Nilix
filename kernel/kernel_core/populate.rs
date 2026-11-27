@@ -54,6 +54,18 @@ pub trait PopulateBackend {
     fn fatal_signal_pending(&mut self) -> bool;
     /// One zeroed data frame, allocated with no page-table lock held.
     fn alloc_zeroed(&mut self) -> Option<Self::Frame>;
+    /// Allocate up to `out.len()` zeroed data frames with no page-table lock
+    /// held, returning how many prefix slots in `out` were filled. Defaults to
+    /// calling [`Self::alloc_zeroed`] in a loop.
+    fn alloc_zeroed_batch(&mut self, out: &mut [Self::Frame]) -> usize {
+        for (index, slot) in out.iter_mut().enumerate() {
+            match self.alloc_zeroed() {
+                Some(frame) => *slot = frame,
+                None => return index,
+            }
+        }
+        out.len()
+    }
     /// Return a data frame that never became reachable through a PTE.
     fn free_unmapped(&mut self, frame: Self::Frame);
     /// Map `frames[i]` at page `first + i`, in holds of at most this chunk
@@ -90,16 +102,14 @@ pub fn populate<B: PopulateBackend>(backend: &mut B, pages: usize) -> Result<(),
         };
         // Staged on the stack: the forward path takes no kernel heap.
         let mut staged = [head; POPULATE_CHUNK_PAGES];
-        for index in 1..count {
-            match backend.alloc_zeroed() {
-                Some(frame) => staged[index] = frame,
-                None => {
-                    for &frame in &staged[..index] {
-                        backend.free_unmapped(frame);
-                    }
-                    rollback(backend, done);
-                    return Err(PopulateError::NoMemory(PopulateStage::DataFrame));
+        if count > 1 {
+            let extra = backend.alloc_zeroed_batch(&mut staged[1..count]);
+            if 1 + extra < count {
+                for &frame in &staged[..1 + extra] {
+                    backend.free_unmapped(frame);
                 }
+                rollback(backend, done);
+                return Err(PopulateError::NoMemory(PopulateStage::DataFrame));
             }
         }
 

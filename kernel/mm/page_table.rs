@@ -1785,6 +1785,356 @@ impl PageTableManager {
         Ok(())
     }
 
+    /// Map a contiguous range of fresh lower-half user 4 KiB pages to `frames`
+    /// in a single 4-level walk per 2 MiB PT, without per-page `invlpg`.
+    ///
+    /// Preserves every security and rollback invariant of [`Self::map_page`]:
+    /// - R192-2: refuses any supervisor-owned lower-half entry (`KernelOwned`)
+    ///   and any 1 GiB / 2 MiB huge-page parent (`ParentEntryHugePage`).
+    /// - LEAD-KPTI-PML4-1: creates lower-half parent entries with final
+    ///   `PRESENT | WRITABLE | USER_ACCESSIBLE` flags.
+    /// - LEAD-PT-ZERO-LINK-1: zeroes every newly allocated table frame before
+    ///   linking it (`ZeroedTableFrames`).
+    /// - R192-RES-2: checks missing table count against `available_tables`
+    ///   before linking any table for a 2 MiB span, returning
+    ///   `BatchMapUserError::Starved` with zero partially linked empty tables.
+    /// - Skips per-page `invlpg` because x86_64 never caches non-present PTEs
+    ///   in the TLB (Intel SDM Vol. 3A §4.10.2.3) and every target slot is
+    ///   verified unused before publishing with an atomic `Release` store.
+    pub fn map_user_pages_no_flush(
+        &mut self,
+        start_page: Page<Size4KiB>,
+        frames: &[PhysFrame<Size4KiB>],
+        flags: PageTableFlags,
+        available_tables: usize,
+        frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    ) -> Result<(), BatchMapUserError> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        if !flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+            || flags.contains(PageTableFlags::HUGE_PAGE)
+        {
+            return Err(BatchMapUserError::Failed {
+                mapped: 0,
+                error: MapError::InvalidRange,
+            });
+        }
+
+        let start_u = start_page.start_address().as_u64();
+        let Some(span_bytes) = (frames.len() as u64)
+            .checked_sub(1)
+            .and_then(|n| n.checked_mul(4096))
+        else {
+            return Err(BatchMapUserError::Failed {
+                mapped: 0,
+                error: MapError::InvalidRange,
+            });
+        };
+        let Some(last_u) = start_u.checked_add(span_bytes) else {
+            return Err(BatchMapUserError::Failed {
+                mapped: 0,
+                error: MapError::InvalidRange,
+            });
+        };
+        if start_u >= USER_HALF_END || last_u >= USER_HALF_END {
+            return Err(BatchMapUserError::Failed {
+                mapped: 0,
+                error: MapError::KernelOwned,
+            });
+        }
+        let last_page = Page::containing_address(VirtAddr::new(last_u));
+        self.assert_domain_allows_mutation(start_page);
+        self.assert_domain_allows_mutation(last_page);
+
+        let parent_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let phys_offset = self.mapper.phys_offset();
+        let phys_offset_u = phys_offset.as_u64();
+        let mut zeroed_alloc = ZeroedTableFrames {
+            inner: frame_allocator,
+            phys_offset,
+        };
+        let pml4 = self.mapper.level_4_table_mut();
+
+        #[inline]
+        fn ensure_user_child_table<'a, A: FrameAllocator<Size4KiB>>(
+            entry: &mut PageTableEntry,
+            parent_flags: PageTableFlags,
+            alloc: &mut ZeroedTableFrames<'_, A>,
+        ) -> Result<&'a mut PageTable, MapError> {
+            let phys_offset = alloc.phys_offset.as_u64();
+            if entry.is_unused() {
+                let frame = alloc
+                    .allocate_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                entry.set_frame(frame, parent_flags);
+                // SAFETY: `ZeroedTableFrames` zeroed the fresh offset-mapped frame.
+                return Ok(unsafe {
+                    &mut *(phys_offset.wrapping_add(frame.start_address().as_u64())
+                        as *mut PageTable)
+                });
+            }
+            let ef = entry.flags();
+            if !ef.contains(parent_flags) {
+                entry.set_addr(entry.addr(), ef | parent_flags);
+            }
+            // SAFETY: caller holds AS PT_LOCK; parent presence/address already validated.
+            Ok(
+                unsafe {
+                    &mut *(phys_offset.wrapping_add(entry.addr().as_u64()) as *mut PageTable)
+                },
+            )
+        }
+
+        let mut mapped = 0usize;
+        let mut cur_v = start_u;
+        let mut remaining_tables = available_tables;
+        let leaf_bits = flags.bits();
+
+        while mapped < frames.len() {
+            let addr = VirtAddr::new(cur_v);
+            let p4 = usize::from(addr.p4_index());
+            let p3 = usize::from(addr.p3_index());
+            let p2 = usize::from(addr.p2_index());
+            let p1 = usize::from(addr.p1_index());
+
+            // Pre-validate existing parents and count exact missing tables
+            // before allocating or linking any intermediate table.
+            let missing = {
+                let pml4e = &pml4[p4];
+                if pml4e.is_unused() {
+                    3usize
+                } else {
+                    let f4 = pml4e.flags();
+                    if !f4.contains(PageTableFlags::PRESENT) {
+                        return Err(BatchMapUserError::Failed {
+                            mapped,
+                            error: MapError::PageAlreadyMapped,
+                        });
+                    }
+                    if !f4.contains(PageTableFlags::USER_ACCESSIBLE) {
+                        return Err(BatchMapUserError::Failed {
+                            mapped,
+                            error: MapError::KernelOwned,
+                        });
+                    }
+                    if !page_table_frame_address_valid(pml4e.addr().as_u64()) {
+                        return Err(BatchMapUserError::Failed {
+                            mapped,
+                            error: MapError::InvalidRange,
+                        });
+                    }
+                    let pdpt = unsafe {
+                        &*(phys_offset_u.wrapping_add(pml4e.addr().as_u64()) as *const PageTable)
+                    };
+                    let pdpte = &pdpt[p3];
+                    if pdpte.is_unused() {
+                        2usize
+                    } else {
+                        let f3 = pdpte.flags();
+                        if !f3.contains(PageTableFlags::PRESENT) {
+                            return Err(BatchMapUserError::Failed {
+                                mapped,
+                                error: MapError::PageAlreadyMapped,
+                            });
+                        }
+                        if !f3.contains(PageTableFlags::USER_ACCESSIBLE) {
+                            return Err(BatchMapUserError::Failed {
+                                mapped,
+                                error: MapError::KernelOwned,
+                            });
+                        }
+                        if f3.contains(PageTableFlags::HUGE_PAGE) {
+                            return Err(BatchMapUserError::Failed {
+                                mapped,
+                                error: MapError::ParentEntryHugePage,
+                            });
+                        }
+                        if !page_table_frame_address_valid(pdpte.addr().as_u64()) {
+                            return Err(BatchMapUserError::Failed {
+                                mapped,
+                                error: MapError::InvalidRange,
+                            });
+                        }
+                        let pd = unsafe {
+                            &*(phys_offset_u.wrapping_add(pdpte.addr().as_u64())
+                                as *const PageTable)
+                        };
+                        let pde = &pd[p2];
+                        if pde.is_unused() {
+                            1usize
+                        } else {
+                            let f2 = pde.flags();
+                            if !f2.contains(PageTableFlags::PRESENT) {
+                                return Err(BatchMapUserError::Failed {
+                                    mapped,
+                                    error: MapError::PageAlreadyMapped,
+                                });
+                            }
+                            if !f2.contains(PageTableFlags::USER_ACCESSIBLE) {
+                                return Err(BatchMapUserError::Failed {
+                                    mapped,
+                                    error: MapError::KernelOwned,
+                                });
+                            }
+                            if f2.contains(PageTableFlags::HUGE_PAGE) {
+                                return Err(BatchMapUserError::Failed {
+                                    mapped,
+                                    error: MapError::ParentEntryHugePage,
+                                });
+                            }
+                            if !page_table_frame_address_valid(pde.addr().as_u64()) {
+                                return Err(BatchMapUserError::Failed {
+                                    mapped,
+                                    error: MapError::InvalidRange,
+                                });
+                            }
+                            0usize
+                        }
+                    }
+                }
+            };
+
+            if missing > remaining_tables {
+                return Err(BatchMapUserError::Starved {
+                    mapped,
+                    shortfall: missing - remaining_tables,
+                });
+            }
+
+            let pdpt = ensure_user_child_table(&mut pml4[p4], parent_flags, &mut zeroed_alloc)
+                .map_err(|error| BatchMapUserError::Failed { mapped, error })?;
+            let pd = ensure_user_child_table(&mut pdpt[p3], parent_flags, &mut zeroed_alloc)
+                .map_err(|error| BatchMapUserError::Failed { mapped, error })?;
+            let pt = ensure_user_child_table(&mut pd[p2], parent_flags, &mut zeroed_alloc)
+                .map_err(|error| BatchMapUserError::Failed { mapped, error })?;
+            remaining_tables -= missing;
+
+            let chunk = (frames.len() - mapped).min(512 - p1);
+            for offset in 0..chunk {
+                let slot = &mut pt[p1 + offset];
+                if !slot.is_unused() {
+                    return Err(BatchMapUserError::Failed {
+                        mapped,
+                        error: MapError::PageAlreadyMapped,
+                    });
+                }
+                const _: () = assert!(core::mem::size_of::<PageTableEntry>() == 8);
+                const _: () = assert!(core::mem::align_of::<PageTableEntry>() >= 8);
+                let phys = frames[mapped].start_address().as_u64();
+                let atomic_slot = unsafe { &*(slot as *mut PageTableEntry).cast::<AtomicU64>() };
+                atomic_slot.store(phys | leaf_bits, Ordering::Release);
+                mapped += 1;
+                cur_v = cur_v.wrapping_add(4096);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear all present user 4 KiB leaves and R141-9 non-present `PROT_NONE`
+    /// leaves in `[start, start + len)` in one walk per 2 MiB PT, without
+    /// per-page `invlpg`.
+    ///
+    /// Invokes `on_frame(page, frame)` for every reclaimed leaf frame. Callers
+    /// MUST issue a cross-CPU TLB shootdown before decrementing refcounts or
+    /// freeing any returned frame. Skips any supervisor-owned or huge-page
+    /// subtree (R192-2).
+    pub fn unmap_user_range_no_flush<F>(&mut self, start: VirtAddr, len: usize, mut on_frame: F)
+    where
+        F: FnMut(Page<Size4KiB>, PhysFrame<Size4KiB>),
+    {
+        if len == 0 || (start.as_u64() & 0xfff) != 0 || (len & 0xfff) != 0 {
+            return;
+        }
+        let start_u = start.as_u64();
+        let Some(end_u) = start_u.checked_add(len as u64) else {
+            return;
+        };
+        if end_u > USER_HALF_END {
+            return;
+        }
+        let first_page = Page::containing_address(start);
+        let last_page = Page::containing_address(VirtAddr::new(end_u - 4096));
+        self.assert_domain_allows_mutation(first_page);
+        self.assert_domain_allows_mutation(last_page);
+
+        #[inline]
+        fn user_parent(flags: PageTableFlags) -> bool {
+            flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+        }
+
+        const PT_SPAN: u64 = 0x20_0000;
+        let phys_offset = self.mapper.phys_offset().as_u64();
+        let pml4 = self.mapper.level_4_table_mut();
+
+        let mut cur_v = start_u;
+        while cur_v < end_u {
+            let addr = VirtAddr::new(cur_v);
+            let p4 = usize::from(addr.p4_index());
+            let p3 = usize::from(addr.p3_index());
+            let p2 = usize::from(addr.p2_index());
+            let p1 = usize::from(addr.p1_index());
+            let pt_end = ((cur_v & !(PT_SPAN - 1)).saturating_add(PT_SPAN)).min(end_u);
+            let chunk = ((pt_end - cur_v) / 4096) as usize;
+
+            let pml4e = &pml4[p4];
+            if user_parent(pml4e.flags()) && page_table_frame_address_valid(pml4e.addr().as_u64()) {
+                let pdpt = unsafe {
+                    &mut *(phys_offset.wrapping_add(pml4e.addr().as_u64()) as *mut PageTable)
+                };
+                let pdpte = &pdpt[p3];
+                let f3 = pdpte.flags();
+                if user_parent(f3)
+                    && !f3.contains(PageTableFlags::HUGE_PAGE)
+                    && page_table_frame_address_valid(pdpte.addr().as_u64())
+                {
+                    let pd = unsafe {
+                        &mut *(phys_offset.wrapping_add(pdpte.addr().as_u64()) as *mut PageTable)
+                    };
+                    let pde = &pd[p2];
+                    let f2 = pde.flags();
+                    if user_parent(f2)
+                        && !f2.contains(PageTableFlags::HUGE_PAGE)
+                        && page_table_frame_address_valid(pde.addr().as_u64())
+                    {
+                        let pt = unsafe {
+                            &mut *(phys_offset.wrapping_add(pde.addr().as_u64()) as *mut PageTable)
+                        };
+                        for offset in 0..chunk {
+                            let pte = &mut pt[p1 + offset];
+                            let flags = pte.flags();
+                            if flags.contains(PageTableFlags::PRESENT) {
+                                if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                                    continue;
+                                }
+                                let frame = PhysFrame::containing_address(pte.addr());
+                                pte.set_unused();
+                                let page = Page::containing_address(VirtAddr::new(
+                                    cur_v + (offset as u64) * 4096,
+                                ));
+                                on_frame(page, frame);
+                            } else {
+                                let phys = pte.addr();
+                                if phys.as_u64() != 0 {
+                                    let frame = PhysFrame::containing_address(phys);
+                                    pte.set_unused();
+                                    let page = Page::containing_address(VirtAddr::new(
+                                        cur_v + (offset as u64) * 4096,
+                                    ));
+                                    on_frame(page, frame);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            cur_v = pt_end;
+        }
+    }
+
     /// Replace a present 4 KiB leaf without ever making it non-present.
     ///
     /// LEAD-G8-CHILDREN-SEGV-1: readers do not acquire PT_LOCK. An unmap/map
@@ -1978,8 +2328,33 @@ impl PageTableManager {
         len: usize,
         frames_to_free: &mut Vec<PhysFrame>,
     ) {
+        if self.prune_empty_tables_in_range_no_flush(start, len, frames_to_free) {
+            // R169-L2 FIX: a collapsed PDE/PDPTE removes a paging-structure entry that
+            // spans up to 2 MiB / 1 GiB — beyond the caller's leaf-range flush. Issue a
+            // full TLB + paging-structure-cache shootdown (all CPUs) so no stale cached
+            // parent translation can reference a freed table frame once the caller
+            // returns it to the allocator.
+            crate::tlb_shootdown::flush_current_as_all();
+        }
+    }
+
+    /// Detach now-empty PT/PD tables in `[start, start + len)` without issuing
+    /// the post-prune TLB shootdown, returning `true` iff any parent PDE/PDPTE
+    /// was cleared.
+    ///
+    /// # Safety
+    /// Same caller contract as [`Self::prune_empty_tables_in_range`], plus:
+    /// whenever this returns `true`, the caller MUST invoke
+    /// `flush_current_as_all()` before releasing `PT_LOCK` or freeing any
+    /// frame in `frames_to_free`.
+    pub unsafe fn prune_empty_tables_in_range_no_flush(
+        &mut self,
+        start: VirtAddr,
+        len: usize,
+        frames_to_free: &mut Vec<PhysFrame>,
+    ) -> bool {
         if len == 0 {
-            return;
+            return false;
         }
 
         /// 2 MiB — virtual span covered by one PT (512 × 4 KiB).
@@ -2072,18 +2447,7 @@ impl PageTableManager {
             }
         }
 
-        // R169-L2 FIX: a collapsed PDE/PDPTE removes a paging-structure entry that
-        // spans up to 2 MiB / 1 GiB — beyond the caller's leaf-range flush. Issue a
-        // full TLB + paging-structure-cache shootdown (all CPUs) so no stale cached
-        // parent translation can reference a freed table frame once the caller
-        // returns it to the allocator. Runs under PT_LOCK like the caller's range
-        // flush; only on the rare OOM-rollback-that-reclaimed-a-table path, so the
-        // extra shootdown cost is irrelevant (Safety > Speed). The caller still
-        // frees `frames_to_free` after this returns, so the clear→flush→free order
-        // holds for the freed table frames too.
-        if reclaimed_any {
-            crate::tlb_shootdown::flush_current_as_all();
-        }
+        reclaimed_any
     }
 
     /// 转换虚拟地址到物理地址
@@ -2582,6 +2946,17 @@ pub enum MapError {
     InvalidRange,
     /// R192-2 FIX: a leaf under a kernel-owned (supervisor) lower-half entry.
     KernelOwned,
+}
+
+/// Outcome error of [`PageTableManager::map_user_pages_no_flush`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum BatchMapUserError {
+    /// Stopped at `mapped` pages because the next 2 MiB span needs `shortfall`
+    /// more intermediate page-table frames than `available_tables`. Zero
+    /// partial empty tables were linked for the starving span.
+    Starved { mapped: usize, shortfall: usize },
+    /// Mapping failed at page `mapped`.
+    Failed { mapped: usize, error: MapError },
 }
 
 /// Outcome of [`PageTableManager::verify_and_unmap_contiguous_4k_no_flush`].
@@ -4426,5 +4801,178 @@ mod tests {
             mgr.lookup_present_leaf_mut(kernel_low_page).err(),
             Some(ReplacePageError::KernelOwned)
         );
+    }
+
+    #[test]
+    fn map_user_pages_no_flush_maps_straddling_2m_and_reports_starvation_without_linking() {
+        let mut arena = HostedPtArena::new();
+        let mut alloc = HostedFrameAlloc {
+            next_idx: 2,
+            limit_idx: 6,
+        }; // 4 table frames (frames 2,3,4,5)
+        let straddle_base: u64 = 0x20_0000 - 3 * 4096;
+        let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(straddle_base));
+        let mut frames = [PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(0)); 7];
+        for (i, slot) in frames.iter_mut().enumerate() {
+            *slot = PhysFrame::containing_address(PhysAddr::new(0x10_0000 + (i as u64) * 4096));
+        }
+        let uflags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+
+        let mut mgr = unsafe { arena.manager(PtDomain::UserAddressSpace) };
+        // Available = 3 covers PML4->PDPT->PD->PT0 (3 tables), then starves on PT1
+        // after mapping the first 3 pages without linking any table for PT1.
+        assert_eq!(
+            mgr.map_user_pages_no_flush(start_page, &frames, uflags, 3, &mut alloc),
+            Err(BatchMapUserError::Starved {
+                mapped: 3,
+                shortfall: 1,
+            })
+        );
+        for i in 0..3u64 {
+            assert_eq!(
+                mgr.translate_with_flags(VirtAddr::new(straddle_base + i * 4096)),
+                Some((PhysAddr::new(0x10_0000 + i * 4096), uflags))
+            );
+        }
+        assert_eq!(mgr.translate_addr(VirtAddr::new(0x20_0000)), None);
+
+        // Provide the remaining 1 table and finish the tail [3..7].
+        let tail_page = Page::<Size4KiB>::containing_address(VirtAddr::new(0x20_0000));
+        mgr.map_user_pages_no_flush(tail_page, &frames[3..], uflags, 1, &mut alloc)
+            .expect("finish straddling user map");
+        for i in 0..7u64 {
+            assert_eq!(
+                mgr.translate_with_flags(VirtAddr::new(straddle_base + i * 4096)),
+                Some((PhysAddr::new(0x10_0000 + i * 4096), uflags))
+            );
+        }
+        // LEAD-KPTI-PML4-1: lower-half PML4E must have final P|W|U flags.
+        let pml4_flags = arena.tables[1][0].flags();
+        assert!(pml4_flags.contains(
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
+        ));
+    }
+
+    #[test]
+    fn map_user_pages_no_flush_rejects_kernel_owned_huge_and_occupied() {
+        let mut arena = HostedPtArena::new();
+        let user_parent =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let uflags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        // PML4[0] -> PDPT(2)[0] -> PD(3):
+        //   PD[1] = supervisor-only PT(4)
+        //   PD[2] = 2 MiB user huge leaf
+        //   PD[3] = user PT(5) with slot 1 occupied
+        arena.tables[1][0].set_addr(PhysAddr::new(0x2000), user_parent);
+        arena.tables[2][0].set_addr(PhysAddr::new(0x3000), user_parent);
+        arena.tables[3][1].set_addr(
+            PhysAddr::new(0x4000),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+        arena.tables[3][2].set_addr(
+            PhysAddr::new(0x40_0000),
+            user_parent | PageTableFlags::HUGE_PAGE,
+        );
+        arena.tables[3][3].set_addr(PhysAddr::new(0x5000), user_parent);
+        arena.tables[5][1].set_addr(PhysAddr::new(0x99_0000), uflags);
+
+        let frames = [
+            PhysFrame::containing_address(PhysAddr::new(0x10_0000)),
+            PhysFrame::containing_address(PhysAddr::new(0x10_1000)),
+        ];
+        let mut alloc = HostedFrameAlloc {
+            next_idx: 6,
+            limit_idx: 10,
+        };
+        let mut mgr = unsafe { arena.manager(PtDomain::UserAddressSpace) };
+
+        assert_eq!(
+            mgr.map_user_pages_no_flush(
+                Page::containing_address(VirtAddr::new(0x20_0000)),
+                &frames,
+                uflags,
+                3,
+                &mut alloc,
+            ),
+            Err(BatchMapUserError::Failed {
+                mapped: 0,
+                error: MapError::KernelOwned,
+            })
+        );
+        assert_eq!(
+            mgr.map_user_pages_no_flush(
+                Page::containing_address(VirtAddr::new(0x40_0000)),
+                &frames,
+                uflags,
+                3,
+                &mut alloc,
+            ),
+            Err(BatchMapUserError::Failed {
+                mapped: 0,
+                error: MapError::ParentEntryHugePage,
+            })
+        );
+        assert_eq!(
+            mgr.map_user_pages_no_flush(
+                Page::containing_address(VirtAddr::new(0x60_0000)),
+                &frames,
+                uflags,
+                3,
+                &mut alloc,
+            ),
+            Err(BatchMapUserError::Failed {
+                mapped: 1,
+                error: MapError::PageAlreadyMapped,
+            })
+        );
+    }
+
+    #[test]
+    fn unmap_user_range_no_flush_reclaims_present_and_nonpresent_leaves_across_2m() {
+        let mut arena = HostedPtArena::new();
+        let user_parent =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let uflags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        // PML4[0] -> PDPT(2)[0] -> PD(3):
+        //   PD[0] = PT(4): slot 510 present user, slot 511 PROT_NONE (non-present with phys)
+        //   PD[1] = PT(5): slot 0 present user, slot 1 supervisor-only (must NOT be cleared!)
+        arena.tables[1][0].set_addr(PhysAddr::new(0x2000), user_parent);
+        arena.tables[2][0].set_addr(PhysAddr::new(0x3000), user_parent);
+        arena.tables[3][0].set_addr(PhysAddr::new(0x4000), user_parent);
+        arena.tables[3][1].set_addr(PhysAddr::new(0x5000), user_parent);
+        arena.tables[4][510].set_addr(PhysAddr::new(0x11_0000), uflags);
+        arena.tables[4][511].set_addr(PhysAddr::new(0x12_0000), PageTableFlags::NO_EXECUTE);
+        arena.tables[5][0].set_addr(PhysAddr::new(0x13_0000), uflags);
+        arena.tables[5][1].set_addr(
+            PhysAddr::new(0x14_0000),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+
+        let mut mgr = unsafe { arena.manager(PtDomain::UserAddressSpace) };
+        let start = VirtAddr::new(0x20_0000 - 2 * 4096);
+        let mut reclaimed = alloc::vec::Vec::new();
+        mgr.unmap_user_range_no_flush(start, 4 * 4096, |page, frame| {
+            reclaimed.push((
+                page.start_address().as_u64(),
+                frame.start_address().as_u64(),
+            ));
+        });
+        assert_eq!(
+            reclaimed,
+            alloc::vec![
+                (0x1f_e000, 0x11_0000),
+                (0x1f_f000, 0x12_0000),
+                (0x20_0000, 0x13_0000),
+            ]
+        );
+        assert!(arena.tables[4][510].is_unused());
+        assert!(arena.tables[4][511].is_unused());
+        assert!(arena.tables[5][0].is_unused());
+        // Supervisor leaf must remain untouched (R192-2).
+        assert_eq!(arena.tables[5][1].addr(), PhysAddr::new(0x14_0000));
     }
 }
