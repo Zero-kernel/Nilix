@@ -3701,9 +3701,11 @@ impl Process {
                     .map_err(|_| ProcessCreateError::OutOfMemory)?,
             )
             .ok_or(ProcessCreateError::OutOfMemory)?;
-        reservation
-            .resize(actual_total)
-            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        if actual_total != estimated_total {
+            reservation
+                .resize(actual_total)
+                .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        }
         owned_name.push_str(name.as_str());
 
         // Fork/clone children (`!prealloc_cap_slots`, `ppid != 0`) unconditionally
@@ -4891,6 +4893,19 @@ impl Process {
         }
         let table = Arc::try_new(table).map_err(|_| ())?;
         Ok(CapabilityTableInheritance { table })
+    }
+
+    /// Populate an unpublished child's already-allocated empty `CapTable`
+    /// directly during `fork()`, avoiding allocating and immediately dropping
+    /// a second `Arc<CapTable>`.
+    pub(crate) fn try_populate_capability_table_for_fork(
+        &self,
+        child: &Process,
+        reconciled_refcounts: Option<&[(cap::CapId, usize)]>,
+    ) -> Result<(), ()> {
+        debug_assert_eq!(Arc::strong_count(&child.cap_table), 1);
+        self.cap_table
+            .try_clone_into_empty_for_fork(&child.cap_table, reconciled_refcounts)
     }
 
     #[inline]
@@ -9943,6 +9958,46 @@ pub fn current_is_host_root() -> bool {
     current_host_euid() == Some(0)
 }
 
+/// Single-lock snapshot of cgroup-governance authorization fields for the
+/// current process. Replaces separate `current_credentials()`,
+/// `current_has_cap_rights()`, `current_is_host_root()`, and
+/// `get_audit_subject()` lock roundtrips while preserving exact lock ordering
+/// (`PROCESS_TABLE -> PCB -> credentials/cap_table`, dropped before `user_ns`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CgroupGovernanceAuth {
+    pub pid: ProcessId,
+    pub ns_euid: u32,
+    pub ns_egid: u32,
+    pub host_euid: Option<u32>,
+    pub is_host_root: bool,
+    pub has_cap_rights: bool,
+}
+
+pub fn current_cgroup_governance_auth(rights: cap::CapRights) -> Option<CgroupGovernanceAuth> {
+    let pid = current_pid()?;
+    let (ns_euid, ns_egid, has_cap_rights, user_ns) = {
+        let table = PROCESS_TABLE.lock();
+        let proc = table.get(pid)?.as_ref()?.lock();
+        let creds = proc.credentials.try_read()?;
+        let ns_euid = creds.euid;
+        let ns_egid = creds.egid;
+        drop(creds);
+        let has_cap_rights = proc.cap_table.has_rights(rights);
+        let user_ns = proc.user_ns.clone();
+        (ns_euid, ns_egid, has_cap_rights, user_ns)
+    };
+    let host_euid = user_ns.map_uid_from_ns(ns_euid);
+    let is_host_root = host_euid == Some(0);
+    Some(CgroupGovernanceAuth {
+        pid,
+        ns_euid,
+        ns_egid,
+        host_euid,
+        is_host_root,
+        has_cap_rights,
+    })
+}
+
 /// 获取当前进程的有效组ID
 pub fn current_egid() -> Option<u32> {
     current_credentials().map(|c| c.egid)
@@ -11064,7 +11119,7 @@ mod thread_group_tests {
             let mut parent_proc = parent.lock();
             parent_proc.state = ProcessState::Running;
             let (woke, returned_group, single) =
-                notify_parent_pcb_for_child_exit(&mut parent_proc, 99, 1);
+                notify_parent_pcb_for_child_exit(&mut parent_proc, 99, 1, false);
             assert!(single);
             assert!(!woke, "running parent was not blocked yet");
             assert!(Arc::ptr_eq(&returned_group, &group));
@@ -12485,6 +12540,43 @@ pub fn terminate_group_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
     terminate_self_and_halt(pid, exit_code)
 }
 
+/// Maximum bounded spin-retry attempts in `terminate_self_and_halt()` before
+/// falling back to `sti; hlt` when `force_reschedule_from_irq()` bails on
+/// transient `PROCESS_TABLE` / PCB `try_lock` contention during SMP exit waves.
+const TERMINAL_SWITCH_SPIN_RETRIES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSwitchRetryAction {
+    SpinBriefly,
+    HaltUntilInterrupt,
+}
+
+#[inline]
+const fn terminal_switch_retry_action(attempt: usize) -> TerminalSwitchRetryAction {
+    if attempt < TERMINAL_SWITCH_SPIN_RETRIES {
+        TerminalSwitchRetryAction::SpinBriefly
+    } else {
+        TerminalSwitchRetryAction::HaltUntilInterrupt
+    }
+}
+
+/// Whether `notify_parent_of_group_exit()` should defer the single-threaded
+/// parent's `wake_for_child_exit()` to `finish_pending_prev()` ->
+/// `wake_reaper_after_switch()`.
+///
+/// Safe strictly when the exiting group leader is currently executing on THIS
+/// CPU (`self_exit_on_cpu == true`) and the parent is a single-member thread
+/// group (`single_member_parent == true`): `terminate_self_and_halt()` is about
+/// to switch off this CPU and run `finish_pending_prev()`, which clears
+/// `on_cpu`/`switch_reap_pending` and wakes the parent once the child is truly
+/// reapable. Deferring avoids a premature wake that forces a redundant `waitpid`
+/// iteration and double `halt_blocked_wait()` while `SIGCHLD` delivery and
+/// `child_events` accounting remain immediate.
+#[inline]
+const fn should_defer_parent_reap_wake(self_exit_on_cpu: bool, single_member_parent: bool) -> bool {
+    self_exit_on_cpu && single_member_parent
+}
+
 pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
     // GAP-5 PI review D2-1: run the teardown with interrupts enabled, as
     // `sys_exit` does. Exception exits (user #PF, #GP, ..., the #NM/#DB
@@ -12509,14 +12601,30 @@ pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
     // another CPU. Switching to BOOT_CR3 ensures no stale TLB entries reference
     // freed page table frames.
     activate_memory_space(0, Some(0));
-    // Bounded selection can legitimately miss a later queue window or a
-    // contended PCB. Retry from boot CR3 after every interrupt wake. Reaping
-    // is gated by on_cpu below, so this stack remains live until the scheduler
-    // has durably saved it and finish-task-switch clears the publication.
+    // Bounded selection can legitimately bail on transient `try_lock`
+    // contention (`PROCESS_TABLE`, PCB, ready queue, or `finish_pending_prev`).
+    // Spin-retry briefly with interrupts momentarily unmasked (so TLB shootdowns
+    // and reschedule IPIs are serviced promptly and cannot deadlock lock
+    // holders) before falling back to `sti; hlt`, avoiding a full 1 ms timer
+    // tick stall on every contended SMP exit wave. Reaping stays gated by
+    // `on_cpu`, so this stack remains live until the scheduler has durably
+    // saved it and `finish_pending_prev()` clears the publication.
+    let mut attempt = 0usize;
     loop {
         crate::force_reschedule_from_irq();
-        x86_64::instructions::interrupts::enable_and_hlt();
-        x86_64::instructions::interrupts::disable();
+        match terminal_switch_retry_action(attempt) {
+            TerminalSwitchRetryAction::SpinBriefly => {
+                attempt += 1;
+                x86_64::instructions::interrupts::enable();
+                core::hint::spin_loop();
+                x86_64::instructions::interrupts::disable();
+            }
+            TerminalSwitchRetryAction::HaltUntilInterrupt => {
+                attempt = 0;
+                x86_64::instructions::interrupts::enable_and_hlt();
+                x86_64::instructions::interrupts::disable();
+            }
+        }
     }
 }
 
@@ -12949,10 +13057,12 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // store, every reaper gate (wait_process / cleanup_zombie / sys_wait4) sees
         // `teardown_done == false` and refuses to free the PCB — closing the
         // IRQ-deferred early-reap / teardown-bypass leak (R169-9 BREAK #1).
-        let group = {
+        let (group, self_exit_on_cpu) = {
             let proc = process.lock();
             proc.teardown_done.store(true, Ordering::Release);
-            Arc::clone(&proc.thread_group)
+            let self_exit_on_cpu =
+                current_pid() == Some(pid) && proc.on_cpu.load(Ordering::Acquire);
+            (Arc::clone(&proc.thread_group), self_exit_on_cpu)
         };
 
         if tgid == pid {
@@ -12967,7 +13077,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 group.members() == 1 && group.claim_parent_notification()
             };
             if report {
-                notify_parent_of_group_exit(parent_pid, pid, &group);
+                notify_parent_of_group_exit(parent_pid, pid, &group, self_exit_on_cpu);
             }
         } else {
             // A non-leader thread has no parent to report to; the deferred
@@ -13025,6 +13135,7 @@ fn notify_parent_pcb_for_child_exit(
     parent_proc: &mut Process,
     leader_pid: ProcessId,
     now_tick: u64,
+    self_exit_on_cpu: bool,
 ) -> (bool, Arc<ThreadGroup>, bool) {
     let group = Arc::clone(&parent_proc.thread_group);
     let single = parent_proc.state != ProcessState::Terminated && group.members() <= 1;
@@ -13032,7 +13143,11 @@ fn notify_parent_pcb_for_child_exit(
         // lint-fetch-add: allow (a change counter, compared only for inequality)
         group.child_events.fetch_add(1, Ordering::SeqCst);
     }
-    let woke = parent_proc.wake_for_child_exit(leader_pid, now_tick);
+    let woke = if should_defer_parent_reap_wake(self_exit_on_cpu, single) {
+        false
+    } else {
+        parent_proc.wake_for_child_exit(leader_pid, now_tick)
+    };
     (woke, group, single)
 }
 
@@ -13041,6 +13156,7 @@ fn notify_parent_of_group_exit(
     reported_parent: ProcessId,
     leader_pid: ProcessId,
     leader_group: &Arc<ThreadGroup>,
+    self_exit_on_cpu: bool,
 ) {
     let (parent_pid, parent_arc) = {
         let table = PROCESS_TABLE.lock();
@@ -13070,8 +13186,12 @@ fn notify_parent_of_group_exit(
     // after `wake_for_child_exit` ran; then skip the O(PROCESS_TABLE) scan.
     let (mut wake_parent, parent_group, single_member) = if let Some(parent) = parent_arc {
         let mut parent_proc = parent.lock();
-        let (woke, group, single) =
-            notify_parent_pcb_for_child_exit(&mut parent_proc, leader_pid, crate::get_ticks());
+        let (woke, group, single) = notify_parent_pcb_for_child_exit(
+            &mut parent_proc,
+            leader_pid,
+            crate::get_ticks(),
+            self_exit_on_cpu,
+        );
         (woke, Some(group), single)
     } else {
         (false, None, false)
@@ -13511,6 +13631,7 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId, dying_group: &A
     // GAP-5 G8: a thread's children go to a surviving thread of its group
     // first (Linux find_alive_thread), so they stay the process's children.
     let sibling = live_group_member_locked(&table, dying_group, dying_pid);
+    let mut woke_adopter = false;
 
     for &child_pid in orphans {
         let child_arc = match table.get(child_pid).and_then(|s| s.clone()) {
@@ -13524,8 +13645,11 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId, dying_group: &A
             continue;
         }
         if let Some(sibling) = sibling {
-            if sibling != child_pid && try_commit_reaper(&table, &child_arc, child_pid, sibling) {
-                continue;
+            if sibling != child_pid {
+                if let Some(woke) = try_commit_reaper(&table, &child_arc, child_pid, sibling) {
+                    woke_adopter |= woke;
+                    continue;
+                }
             }
         }
 
@@ -13552,6 +13676,7 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId, dying_group: &A
         // STEP 2: commit to the first LIVE candidate that is neither the orphan
         // itself nor the dying parent.
         let mut committed = false;
+        let mut woke_any_adopter = false;
         for slot in cands.iter().take(n) {
             let cand = match *slot {
                 Some(c) => c,
@@ -13568,8 +13693,9 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId, dying_group: &A
             if reaper == child_pid || reaper == dying_pid {
                 continue;
             }
-            if try_commit_reaper(&table, &child_arc, child_pid, reaper) {
+            if let Some(woke) = try_commit_reaper(&table, &child_arc, child_pid, reaper) {
                 committed = true;
+                woke_any_adopter |= woke;
                 break;
             }
         }
@@ -13589,20 +13715,29 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId, dying_group: &A
             if child_pid == root_init {
                 // pid 1 can never be its own reaper.
                 reparent_logged_leak(&child_arc, child_pid, root_init);
-            } else if !resolve_reaper_locked(&table, root_init).is_some_and(|reaper| {
-                reaper != child_pid
-                    && reaper != dying_pid
-                    && try_commit_reaper(&table, &child_arc, child_pid, reaper)
+            } else if let Some(woke) = resolve_reaper_locked(&table, root_init).and_then(|reaper| {
+                (reaper != child_pid && reaper != dying_pid)
+                    .then(|| try_commit_reaper(&table, &child_arc, child_pid, reaper))
+                    .flatten()
             }) {
+                woke_any_adopter |= woke;
+            } else {
                 // root init absent / Zombie / Terminated: fail SAFE (deterministic
                 // ppid, no dead-slot push) rather than panic — a panic on the teardown
                 // path would re-open the abandonment class this slice closes.
                 reparent_logged_leak(&child_arc, child_pid, root_init);
             }
         }
+        if woke_any_adopter {
+            woke_adopter = true;
+        }
     }
 
     drop(table);
+
+    if woke_adopter {
+        let _ = crate::signal::kernel_kick_published();
+    }
 
     if !orphans.is_empty() {
         klog!(Info, "Reparented {} orphan process(es)", orphans.len());
@@ -13611,8 +13746,10 @@ fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId, dying_group: &A
 
 /// R171-S-R170-5-01 FIX (SLICE 3): link `child_pid` under live reaper `cand`, then
 /// set the child's ppid — each under its OWN PCB lock, NEVER both held at once (the
-/// residual-KILL fix). Returns false (⇒ advance the candidate cursor) if `cand` is
-/// absent from the table or is not a live reaper (Zombie/Terminated).
+/// residual-KILL fix). Returns `None` (⇒ advance the candidate cursor) if `cand` is
+/// absent from the table or is not a live reaper (Zombie/Terminated), or
+/// `Some(woke)` on adoption indicating whether an adopter waiter was woken for an
+/// already-reapable zombie.
 ///
 /// The liveness check and the children push are one adopter-lock hold, atomic
 /// against the adopter's own teardown (which sets Zombie and drains its children
@@ -13623,10 +13760,10 @@ fn try_commit_reaper(
     child_arc: &ProcessArc,
     child_pid: ProcessId,
     cand: ProcessId,
-) -> bool {
+) -> Option<bool> {
     let adopter = match table.get(cand) {
         Some(Some(a)) => a.clone(),
-        _ => return false,
+        _ => return None,
     };
     {
         let mut adopter_proc = adopter.lock();
@@ -13634,7 +13771,7 @@ fn try_commit_reaper(
             adopter_proc.state,
             ProcessState::Zombie | ProcessState::Terminated
         ) {
-            return false; // dead/Zombie adopter ⇒ advance the cursor
+            return None; // dead/Zombie adopter ⇒ advance the cursor
         }
         if !adopter_proc.children.contains(&child_pid) {
             if adopter_proc.children.try_reserve(1).is_ok() {
@@ -13647,11 +13784,66 @@ fn try_commit_reaper(
             }
         }
     } // adopter PCB lock dropped BEFORE the child lock — never both at once
-    {
+    let (zombie_reportable, still_switching_out) = {
         let mut child = child_arc.lock();
         child.ppid = cand;
+        let reportable = child.state == ProcessState::Zombie
+            && child.teardown_done.load(Ordering::Acquire)
+            && child.tgid == child_pid
+            && child.thread_group.members() == 1;
+        let switching = child.on_cpu.load(Ordering::Acquire)
+            || child.switch_reap_pending.load(Ordering::Acquire);
+        (reportable, switching)
+    };
+    if !zombie_reportable {
+        return Some(false);
     }
-    true
+
+    // Adoption of a torn-down zombie leader:
+    // - Single-member adopter: bump `child_events` under the adopter's PCB lock
+    //   so any concurrent `wait_reap_core_with_parent` re-snapshots `children`,
+    //   and wake the adopter immediately when the child is already off-CPU
+    //   (if `still_switching_out`, `wake_reaper_after_switch` retries after
+    //   seeing the updated `child.ppid` and wakes the adopter once reapable).
+    // - Multi-threaded adopter: bump `child_events` FIRST, then scan ALL group
+    //   members (including `adopter` itself) so neither `adopter` nor any
+    //   `wait_reap_group` sibling can observe the stale event counter and sleep
+    //   — even when `still_switching_out` is still set (since the scheduler's
+    //   switch-out handoff only wakes the direct adopter PCB).
+    let now_tick = crate::get_ticks();
+    let (mut woke, adopter_group, single_member) = {
+        let mut adopter_proc = adopter.lock();
+        let group = Arc::clone(&adopter_proc.thread_group);
+        let single = adopter_proc.state != ProcessState::Terminated && group.members() <= 1;
+        let woke = if single {
+            // lint-fetch-add: allow (a change counter, compared only for inequality)
+            group.child_events.fetch_add(1, Ordering::SeqCst);
+            if still_switching_out {
+                false
+            } else {
+                adopter_proc.wake_for_child_exit(child_pid, now_tick)
+            }
+        } else {
+            false
+        };
+        (woke, group, single)
+    };
+    if !single_member {
+        // lint-fetch-add: allow (a change counter, compared only for inequality)
+        adopter_group.child_events.fetch_add(1, Ordering::SeqCst);
+        if adopter_group.child_waiters.load(Ordering::SeqCst) > 0 {
+            for slot in table.iter() {
+                let Some(arc) = slot else {
+                    continue;
+                };
+                let mut proc = arc.lock();
+                if Arc::ptr_eq(&proc.thread_group, &adopter_group) {
+                    woke |= proc.wake_for_child_exit(child_pid, now_tick);
+                }
+            }
+        }
+    }
+    Some(woke)
 }
 
 /// R171-S-R170-5-01 FIX (SLICE 3): no live reaper exists. Set a deterministic ppid
@@ -14094,7 +14286,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
         // GAP-5 slice 4 G1: report the group only after this thread is fully
         // gone, so the parent's reap of the leader never overlaps it.
         if let (Some(parent_pid), Some(group)) = (group_report, report_group) {
-            notify_parent_of_group_exit(parent_pid, tgid, &group);
+            notify_parent_of_group_exit(parent_pid, tgid, &group, false);
         }
     }
 }
@@ -14413,6 +14605,7 @@ fn free_process_resources(
             &mut mm.shared_regions,
             mm::AdmittedMap::new(mm::HeapClass::CoreProcess),
         ));
+        let mut total_uncharge: u64 = 0;
         for (_base, len_with_flags) in mm.mmap_regions.iter() {
             // R172-22: annotate value type (opaque iter() + Borrow-generic map).
             let len_with_flags: &crate::syscall::MmapEntry = len_with_flags;
@@ -14420,9 +14613,7 @@ fn free_process_resources(
                 continue;
             }
             let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
-            if len > 0 {
-                crate::cgroup::uncharge_memory(cgroup_id, len);
-            }
+            total_uncharge = total_uncharge.saturating_add(len);
         }
 
         // R127-3 FIX: Uncharge brk heap allocations from cgroup as well.
@@ -14432,14 +14623,12 @@ fn free_process_resources(
             let brk_start_aligned = (mm.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
             brk_aligned.saturating_sub(brk_start_aligned) as u64
         };
-        if heap_bytes > 0 {
-            crate::cgroup::uncharge_memory(cgroup_id, heap_bytes);
-        }
+        total_uncharge = total_uncharge.saturating_add(heap_bytes);
 
         // R137-1 FIX: Uncharge ELF loader allocations (PT_LOAD segments + user stack).
         let elf_bytes = mm.elf_charged_bytes;
         if elf_bytes > 0 {
-            crate::cgroup::uncharge_memory(cgroup_id, elf_bytes);
+            total_uncharge = total_uncharge.saturating_add(elf_bytes);
             mm.elf_charged_bytes = 0;
         }
 
@@ -14461,8 +14650,11 @@ fn free_process_resources(
         // frame in the next process can never collide with a stale ledger entry.
         let pt_bytes = mm.pt_charged_bytes;
         if pt_bytes > 0 {
-            crate::cgroup::uncharge_memory(cgroup_id, pt_bytes);
+            total_uncharge = total_uncharge.saturating_add(pt_bytes);
             mm.pt_charged_bytes = 0;
+        }
+        if total_uncharge > 0 {
+            crate::cgroup::uncharge_memory(cgroup_id, total_uncharge);
         }
         mm.pt_charged_frames.clear();
         mm.shared_fault_pt_frames.clear();
@@ -14679,6 +14871,59 @@ pub fn free_kernel_stack(
     );
 }
 
+const AS_FREE_BATCH_CAPACITY: usize = 64;
+
+/// Stack-inline batch buffer for address-space frame teardown.
+///
+/// Accumulates leaf and intermediate page-table frames without heap allocation
+/// and returns them in batched PCP/buddy holds via `free_physical_pages_batch`.
+struct AddressSpaceFreeBatch {
+    frames: [PhysFrame<Size4KiB>; AS_FREE_BATCH_CAPACITY],
+    len: usize,
+}
+
+impl AddressSpaceFreeBatch {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            frames: [PhysFrame::containing_address(PhysAddr::new(0)); AS_FREE_BATCH_CAPACITY],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn push_with(
+        &mut self,
+        frame: PhysFrame<Size4KiB>,
+        mut flush: impl FnMut(&[PhysFrame<Size4KiB>]),
+    ) {
+        if self.len == AS_FREE_BATCH_CAPACITY {
+            flush(&self.frames[..self.len]);
+            self.len = 0;
+        }
+        self.frames[self.len] = frame;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn push(&mut self, frame: PhysFrame<Size4KiB>) {
+        self.push_with(frame, mm::buddy_allocator::free_physical_pages_batch);
+    }
+
+    #[inline]
+    fn finish_with(&mut self, mut flush: impl FnMut(&[PhysFrame<Size4KiB>])) {
+        if self.len > 0 {
+            flush(&self.frames[..self.len]);
+            self.len = 0;
+        }
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        self.finish_with(mm::buddy_allocator::free_physical_pages_batch);
+    }
+}
+
 /// 释放独立用户地址空间（PML4 物理地址）
 ///
 /// - 仅遍历用户空间映射 (PML4[0..255])
@@ -14692,16 +14937,17 @@ pub fn free_address_space(memory_space: usize) {
     }
 
     unsafe {
-        let mut frame_alloc = FrameAllocator::new();
+        let mut free_batch = AddressSpaceFreeBatch::new();
         let root_frame: PhysFrame<Size4KiB> =
             PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
         let root_table = phys_to_virt_table(root_frame.start_address());
 
         // 只遍历用户空间映射 (PML4 index 0-255)，内核高半区 (256-511) 共享无需处理
-        free_page_table_level(root_table, 4, &mut frame_alloc);
+        free_page_table_level(root_table, 4, &mut free_batch);
 
-        // 释放 PML4 帧本身
-        frame_alloc.deallocate_frame(root_frame);
+        // 释放 PML4 帧本身并批量归还物理帧
+        free_batch.push(root_frame);
+        free_batch.finish();
     }
 }
 
@@ -14717,7 +14963,7 @@ pub fn free_address_space(memory_space: usize) {
 unsafe fn free_page_table_level(
     table: &mut PageTable,
     level: u8,
-    frame_alloc: &mut FrameAllocator,
+    free_batch: &mut AddressSpaceFreeBatch,
 ) {
     // PML4 只处理用户空间条目 (0-255)，其他层级处理全部 512 条目。
     // Fast sparse scan: skip 4 zero 64-bit PTEs at a time.
@@ -14780,7 +15026,7 @@ unsafe fn free_page_table_level(
             // table structures are always present when valid).
             if level == 1 && !flags.contains(PageTableFlags::PRESENT) {
                 if entry_phys.as_u64() != 0 {
-                    free_leaf_frame(entry_phys, frame_alloc);
+                    free_leaf_frame(entry_phys, free_batch);
                     entry.set_unused();
                 }
                 continue;
@@ -14811,15 +15057,15 @@ unsafe fn free_page_table_level(
 
             if level == 1 {
                 // PT 层级的叶子节点：释放 4KB 物理帧
-                free_leaf_frame(entry_phys, frame_alloc);
+                free_leaf_frame(entry_phys, free_batch);
             } else {
                 // 中间节点：递归处理子页表
                 let next_table = phys_to_virt_table(entry_phys);
-                free_page_table_level(next_table, level - 1, frame_alloc);
+                free_page_table_level(next_table, level - 1, free_batch);
 
                 // 释放子页表帧本身
                 let next_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(entry_phys);
-                frame_alloc.deallocate_frame(next_frame);
+                free_batch.push(next_frame);
             }
         }
         base_idx += 4;
@@ -14828,16 +15074,16 @@ unsafe fn free_page_table_level(
 
 /// 释放叶子页物理帧
 ///
-/// 使用 COW 引用计数管理：减少引用计数，当计数归零时释放物理帧。
-/// 对于未被 COW 跟踪的页面（refcount=0），直接释放。
-fn free_leaf_frame(phys: PhysAddr, frame_alloc: &mut FrameAllocator) {
+/// 使用 COW 引用计数管理：减少引用计数，当计数归零时加入批量释放队列。
+/// 对于未被 COW 跟踪的页面（refcount=0），直接加入批量释放队列。
+fn free_leaf_frame(phys: PhysAddr, free_batch: &mut AddressSpaceFreeBatch) {
     let phys_usize = phys.as_u64() as usize;
 
     // RF178-31: one atomic operation decides ownership. An invalid physical
     // address is retained leak-safe instead of being returned to the buddy.
     if PAGE_REF_COUNT.release(phys_usize).should_free_unmapped() {
         let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
-        frame_alloc.deallocate_frame(frame);
+        free_batch.push(frame);
     }
 }
 
@@ -15883,5 +16129,60 @@ mod exclusive_address_space_retry_tests {
         assert_eq!(res.err(), Some(ExclusiveAddressSpaceError::Contended));
         assert_eq!(recount_calls, CGROUP_MIGRATE_SHARE_RETRIES);
         assert_eq!(backoff_calls, CGROUP_MIGRATE_SHARE_RETRIES - 1);
+    }
+}
+
+#[cfg(test)]
+mod process_hotpath_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn terminal_switch_retry_policy_spins_before_halt() {
+        for attempt in 0..TERMINAL_SWITCH_SPIN_RETRIES {
+            assert_eq!(
+                terminal_switch_retry_action(attempt),
+                TerminalSwitchRetryAction::SpinBriefly
+            );
+        }
+        assert_eq!(
+            terminal_switch_retry_action(TERMINAL_SWITCH_SPIN_RETRIES),
+            TerminalSwitchRetryAction::HaltUntilInterrupt
+        );
+    }
+
+    #[test]
+    fn defer_parent_reap_wake_only_for_self_exit_single_member() {
+        assert!(should_defer_parent_reap_wake(true, true));
+        assert!(!should_defer_parent_reap_wake(false, true));
+        assert!(!should_defer_parent_reap_wake(true, false));
+        assert!(!should_defer_parent_reap_wake(false, false));
+    }
+
+    #[test]
+    fn address_space_free_batch_flushes_on_capacity_and_finish() {
+        let mut batch = AddressSpaceFreeBatch::new();
+        let mut flushed_chunks: Vec<usize> = Vec::new();
+        let mut flushed_frames: Vec<u64> = Vec::new();
+
+        let total = AS_FREE_BATCH_CAPACITY + 7;
+        for i in 0..total {
+            let frame = PhysFrame::containing_address(PhysAddr::new(0x10_0000 + (i as u64) * 4096));
+            batch.push_with(frame, |chunk| {
+                flushed_chunks.push(chunk.len());
+                flushed_frames.extend(chunk.iter().map(|f| f.start_address().as_u64()));
+            });
+        }
+        assert_eq!(flushed_chunks, alloc::vec![AS_FREE_BATCH_CAPACITY]);
+
+        batch.finish_with(|chunk| {
+            flushed_chunks.push(chunk.len());
+            flushed_frames.extend(chunk.iter().map(|f| f.start_address().as_u64()));
+        });
+        assert_eq!(flushed_chunks, alloc::vec![AS_FREE_BATCH_CAPACITY, 7]);
+        assert_eq!(flushed_frames.len(), total);
+        for (i, &addr) in flushed_frames.iter().enumerate() {
+            assert_eq!(addr, 0x10_0000 + (i as u64) * 4096);
+        }
     }
 }

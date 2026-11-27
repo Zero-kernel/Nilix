@@ -2726,6 +2726,25 @@ pub fn alloc_physical_pages_batch(out: &mut [PhysFrame]) -> usize {
     }
 }
 
+/// Best-effort batched order-0 allocation for speculative frame caches (such as
+/// intermediate COW page-table pools): returns `0..=out.len()` pre-zeroed frames
+/// from PCP/buddy without invoking the global OOM killer for optional spares.
+pub fn alloc_physical_pages_batch_best_effort(out: &mut [PhysFrame]) -> usize {
+    match GLOBAL_BUDDY.try_alloc_order0_batch_with(
+        out,
+        current_pcp_cpu_id(),
+        cpu_local::max_cpus(),
+        scrub_frame_phys,
+        false,
+    ) {
+        Ok(count) => count,
+        Err(AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned) => {
+            panic!("physical allocator metadata is corrupt/poisoned")
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Free a batch of order-0 physical frames, scrubbing each frame (Invariant S2)
 /// and returning them through this CPU's PCP magazine in batched lock holds.
 pub fn free_physical_pages_batch(frames: &[PhysFrame]) {

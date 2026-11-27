@@ -739,6 +739,13 @@ fn wake_reaper_after_switch(
             return false;
         };
         if child.generation == generation {
+            // Revalidate parent identity under child's lock: if reparenting
+            // moved this child to a new adopter after the caller snapshotted
+            // `parent_pid`, keep `switch_reap_pending` set so `finish_pending_prev`
+            // retries and wakes the adopter instead of dropping the wake.
+            if child.ppid != parent_pid {
+                return false;
+            }
             child.switch_reap_pending.store(false, Ordering::Release);
         }
         return true;
@@ -753,6 +760,9 @@ fn wake_reaper_after_switch(
     };
     if child.generation != generation {
         return true;
+    }
+    if child.ppid != parent_pid {
+        return false;
     }
     // Publish reappability while the parent's guard still prevents it from
     // running. A parent made Ready below can therefore never observe the old

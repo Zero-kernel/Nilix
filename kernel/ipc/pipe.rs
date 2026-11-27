@@ -931,30 +931,32 @@ impl Pipe {
     fn close_read(&self) {
         // Under `inner`, where every zero check runs.
         let _inner = self.inner.lock();
-        saturating_step(&self.readers, false);
-        // 唤醒所有写者，让它们检测到EPIPE
-        self.write_wait.wake_all();
+        if should_wake_on_end_close(saturating_step(&self.readers, false)) {
+            // 唤醒所有写者，让它们检测到EPIPE（仅在最后一个读端关闭时唤醒，避免虚假惊群）
+            self.write_wait.wake_all();
+        }
     }
 
     /// 关闭写端
     fn close_write(&self) {
         // Under `inner`, where every zero check runs.
         let _inner = self.inner.lock();
-        saturating_step(&self.writers, false);
-        // 唤醒所有读者，让它们检测到EOF
-        self.read_wait.wake_all();
+        if should_wake_on_end_close(saturating_step(&self.writers, false)) {
+            // 唤醒所有读者，让它们检测到EOF（仅在最后一个写端关闭时唤醒，避免 fork 子进程关闭写端时触发惊群）
+            self.read_wait.wake_all();
+        }
     }
 
     /// 增加读端引用
     fn add_reader(&self) {
         // R161-14 FIX: saturating, like the decrement. No `inner`: see `readers`.
-        saturating_step(&self.readers, true);
+        let _ = saturating_step(&self.readers, true);
     }
 
     /// 增加写端引用
     fn add_writer(&self) {
         // R161-14 FIX: saturating, like the decrement. No `inner`: see `writers`.
-        saturating_step(&self.writers, true);
+        let _ = saturating_step(&self.writers, true);
     }
 
     /// 获取管道状态
@@ -969,15 +971,26 @@ impl Pipe {
     }
 }
 
-/// Saturating increment or decrement of an end count (R161-14).
-fn saturating_step(count: &AtomicUsize, up: bool) {
+/// Saturating increment or decrement of an end count (R161-14), returning the
+/// post-update count.
+fn saturating_step(count: &AtomicUsize, up: bool) -> usize {
+    let mut new_val = 0usize;
     let _ = count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-        Some(if up {
+        new_val = if up {
             n.saturating_add(1)
         } else {
             n.saturating_sub(1)
-        })
+        };
+        Some(new_val)
     });
+    new_val
+}
+
+/// Only wake peer waiters when closing an end drops its open count to zero
+/// (EOF for readers when `writers == 0`, EPIPE for writers when `readers == 0`).
+#[inline]
+const fn should_wake_on_end_close(remaining_ends: usize) -> bool {
+    remaining_ends == 0
 }
 
 /// M0-6 poll/select: non-consuming readiness probe for a pipe.
@@ -1638,6 +1651,27 @@ mod tests {
         assert_eq!(mm::heap_class_snapshot(HeapClass::Pipe), pipe_before);
         assert_eq!(mm::heap_class_snapshot(HeapClass::RamFs), ramfs_before);
         assert_eq!(mm::heap_admission_snapshot(), global_before);
+    }
+
+    #[test]
+    fn pipe_close_only_wakes_on_last_end() {
+        let count = AtomicUsize::new(3);
+        let after_first = saturating_step(&count, false);
+        assert_eq!(after_first, 2);
+        assert!(!should_wake_on_end_close(after_first));
+
+        let after_second = saturating_step(&count, false);
+        assert_eq!(after_second, 1);
+        assert!(!should_wake_on_end_close(after_second));
+
+        let after_last = saturating_step(&count, false);
+        assert_eq!(after_last, 0);
+        assert!(should_wake_on_end_close(after_last));
+
+        // Saturating floor at 0 remains idempotent and never underflows.
+        assert_eq!(saturating_step(&count, false), 0);
+        assert_eq!(saturating_step(&count, true), 1);
+        assert!(!should_wake_on_end_close(1));
     }
 
     // 基本管道测试（在内核环境中运行）

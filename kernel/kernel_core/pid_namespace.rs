@@ -1175,6 +1175,23 @@ impl PidNamespace {
         }
     }
 
+    /// Remove `global_pid` and reclaim now-empty map backing in a single
+    /// `pid_by_global -> pid_by_ns` lock acquisition.
+    fn remove_pid_and_take_empty_reserved(
+        &self,
+        global_pid: ProcessId,
+    ) -> RetiredPidMappingCapacity {
+        let mut by_global = self.pid_by_global.lock();
+        let mut by_ns = self.pid_by_ns.lock();
+        if let Some(ns_pid) = by_global.remove_retaining_capacity(&global_pid) {
+            by_ns.remove_retaining_capacity(&ns_pid);
+        }
+        RetiredPidMappingCapacity {
+            by_global: by_global.take_empty_capacity(),
+            by_ns: by_ns.take_empty_capacity(),
+        }
+    }
+
     /// Lookup global PID from namespace-local PID.
     ///
     /// # Arguments
@@ -1366,6 +1383,70 @@ pub fn assign_pid_chain(
     leaf: PidNamespaceArc,
     global_pid: ProcessId,
 ) -> Result<AdmittedVec<PidNamespaceMembership>, PidNamespaceError> {
+    // Fast path for the dominant root-namespace case when both PID maps already
+    // have spare capacity: collapses 4 double-lock roundtrips and 3 stack
+    // arrays into a single `PID_MAPPING_TRANSACTION -> pid_by_global -> pid_by_ns`
+    // hold with zero allocation under lock (RF180-43). Falls through to the
+    // detached-prepare transaction whenever either map is full.
+    if leaf.is_root() {
+        let mut chain: AdmittedVec<PidNamespaceMembership> =
+            AdmittedVec::new(HeapClass::CoreProcess);
+        chain
+            .try_reserve_exact(1)
+            .map_err(|_| PidNamespaceError::OutOfMemory)?;
+        let fast_result = {
+            let _transaction = PID_MAPPING_TRANSACTION.lock();
+            let inserted = {
+                let mut by_global = leaf.pid_by_global.lock();
+                let mut by_ns = leaf.pid_by_ns.lock();
+                if by_global.len() != by_ns.len() {
+                    Some(Err(PidNamespaceError::MappingConflict))
+                } else if by_global.len() < by_global.capacity() && by_ns.len() < by_ns.capacity() {
+                    if by_global.contains_key(&global_pid) || by_ns.contains_key(&global_pid) {
+                        Some(Err(PidNamespaceError::MappingConflict))
+                    } else if by_global
+                        .insert_unique_reserved(global_pid, global_pid)
+                        .is_err()
+                    {
+                        Some(Err(PidNamespaceError::OutOfMemory))
+                    } else if by_ns
+                        .insert_unique_reserved(global_pid, global_pid)
+                        .is_err()
+                    {
+                        by_global.remove_retaining_capacity(&global_pid);
+                        Some(Err(PidNamespaceError::OutOfMemory))
+                    } else {
+                        Some(Ok(()))
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(Ok(())) = inserted {
+                if global_pid == 1 {
+                    let _ = leaf.set_init(global_pid);
+                }
+                Some(Ok(()))
+            } else {
+                inserted
+            }
+        };
+        if let Some(res) = fast_result {
+            res?;
+            if chain
+                .push_reserved(PidNamespaceMembership {
+                    ns: leaf,
+                    pid: global_pid,
+                })
+                .is_err()
+            {
+                return Err(PidNamespaceError::OutOfMemory);
+            }
+            return Ok(chain);
+        }
+        drop(chain);
+    }
+
     // RF180-16 FIX: hierarchy discovery is bounded and heap-free. The retained
     // membership chain is admitted before the first PID-map mutation.
     let mut path: [Option<PidNamespaceArc>; PID_PATH_SLOTS] = core::array::from_fn(|_| None);
@@ -1545,6 +1626,19 @@ pub fn assign_pid_chain(
 /// * `chain` - The process's namespace membership chain
 /// * `global_pid` - The process's global PID
 pub fn detach_pid_chain(chain: &[PidNamespaceMembership], global_pid: ProcessId) {
+    if chain.is_empty() {
+        return;
+    }
+    if chain.len() == 1 {
+        let membership = &chain[0];
+        let retired = {
+            let _transaction = PID_MAPPING_TRANSACTION.lock();
+            membership.ns.clear_init(global_pid);
+            membership.ns.remove_pid_and_take_empty_reserved(global_pid)
+        };
+        drop(retired);
+        return;
+    }
     let transaction = PID_MAPPING_TRANSACTION.lock();
     let mut retired: [Option<RetiredPidMappingCapacity>; PID_PATH_SLOTS] =
         core::array::from_fn(|_| None);
@@ -1558,9 +1652,9 @@ pub fn detach_pid_chain(chain: &[PidNamespaceMembership], global_pid: ProcessId)
         // namespace's reaper by `reparent_orphans`. (No-op for the root namespace,
         // whose init mapping is never set.)
         membership.ns.clear_init(global_pid);
-        membership.ns.remove_pid_reserved(global_pid);
+        let removed_backing = membership.ns.remove_pid_and_take_empty_reserved(global_pid);
         if index < retired.len() {
-            retired[index] = Some(membership.ns.take_empty_mapping_capacity());
+            retired[index] = Some(removed_backing);
         }
     }
     drop(transaction);
@@ -1934,5 +2028,42 @@ impl Drop for PidNamespace {
             drop(removed);
             drop(retired);
         }
+    }
+}
+
+#[cfg(test)]
+mod root_fast_path_tests {
+    use super::*;
+
+    #[test]
+    fn root_pid_chain_fast_path_assign_and_detach() {
+        mm::publish_heap_budgets();
+        let root = Arc::clone(&ROOT_PID_NAMESPACE);
+        let pid_a = 0x190_1001usize;
+        let pid_b = 0x190_1002usize;
+
+        // First insert ensures backing exists; second exercises the spare-capacity
+        // single-lock fast path; duplicate must reject with MappingConflict.
+        let chain_a = assign_pid_chain(Arc::clone(&root), pid_a).expect("assign pid_a");
+        assert_eq!(chain_a.len(), 1);
+        assert_eq!(chain_a[0].pid, pid_a);
+        assert_eq!(root.lookup_ns_pid(pid_a), Some(pid_a));
+        assert_eq!(root.lookup_global(pid_a), Some(pid_a));
+
+        let chain_b = assign_pid_chain(Arc::clone(&root), pid_b).expect("assign pid_b");
+        assert_eq!(chain_b.len(), 1);
+        assert_eq!(chain_b[0].pid, pid_b);
+        assert_eq!(
+            assign_pid_chain(Arc::clone(&root), pid_b).err(),
+            Some(PidNamespaceError::MappingConflict)
+        );
+
+        detach_pid_chain(&chain_b, pid_b);
+        assert_eq!(root.lookup_ns_pid(pid_b), None);
+        assert_eq!(root.lookup_global(pid_b), None);
+
+        detach_pid_chain(&chain_a, pid_a);
+        assert_eq!(root.lookup_ns_pid(pid_a), None);
+        assert_eq!(root.lookup_global(pid_a), None);
     }
 }
