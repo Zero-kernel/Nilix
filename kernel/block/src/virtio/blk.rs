@@ -32,7 +32,9 @@ use crate::{Bio, BioOp, BioResult, BlockDevice, BlockError, BlockGeometry};
 
 #[path = "completion.rs"]
 mod completion;
-use completion::{copy_read_result, finish_request, CompletedIo, RequestCompletion, RequestKind};
+use completion::{
+    copy_read_result, finish_request_with_recycle, CompletedIo, RequestCompletion, RequestKind,
+};
 
 // ============================================================================
 // Constants
@@ -589,9 +591,32 @@ pub struct VirtioBlkDevice {
     device_failed: AtomicBool,
     /// Request buffers (header + status).
     req_buffers: Mutex<Vec<RequestBuffer>>,
+    /// Legacy-only (no IOMMU active) single-slot reusable DMA bounce buffers
+    /// avoiding per-I/O buddy alloc/scrub/free when `mm::dma::is_iommu_legacy()`.
+    /// Cleared and bypassed immediately whenever IOMMU is probing/active/failed (R94-13).
+    legacy_dma_pool: Mutex<LegacyDmaPool>,
     /// R180-27/D1: aggregate charge for every ordinary-heap allocation owned
     /// by this device. Kept last so owned buffers are destroyed first.
     _heap_charge: HeapCharge,
+}
+
+struct LegacyDmaPool {
+    header: Option<DmaBuffer>,
+    data_4k: Option<DmaBuffer>,
+}
+
+impl LegacyDmaPool {
+    const fn new() -> Self {
+        Self {
+            header: None,
+            data_4k: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.header = None;
+        self.data_4k = None;
+    }
 }
 
 /// Buffer for a single request.
@@ -987,6 +1012,7 @@ impl VirtioBlkDevice {
             lock: Mutex::new(()),
             device_failed: AtomicBool::new(false),
             req_buffers: Mutex::new(req_buffers),
+            legacy_dma_pool: Mutex::new(LegacyDmaPool::new()),
             _heap_charge: heap_charge,
         }) {
             Ok(device) => device,
@@ -1158,15 +1184,22 @@ impl VirtioBlkDevice {
 
         // KSA-018: only owned DMA leaves completion. Caller copy-back happens
         // later through do_request's still-live mutable slice, never a raw address.
-        let completion = finish_request(kind, status, abandoned);
+        let completion = finish_request_with_recycle(kind, status, abandoned, |data_dma| {
+            self.recycle_dma_buffer(data_dma, false);
+        });
 
         // Free descriptors back to the pool
         for idx in desc_chain.iter().take(desc_count) {
             self.queue.free_desc(*idx);
         }
 
-        // DmaBuffers (header_status_dma and data_dma if I/O) are automatically
-        // dropped here, which triggers IOMMU unmapping via DmaBuffer::drop()
+        // Recycle header DMA buffer in Legacy mode on clean completion; otherwise
+        // drop immediately so IOMMU unmapping + scrub run (R94-13).
+        if !abandoned && status == 0 {
+            self.recycle_dma_buffer(header_status_dma, true);
+        } else {
+            drop(header_status_dma);
+        }
 
         // Handle abandoned requests (late completions)
         if abandoned {
@@ -1256,6 +1289,7 @@ impl VirtioBlkDevice {
         }
 
         // Reclaim all in-use request buffers and their DMA resources.
+        self.legacy_dma_pool.lock().clear();
         let mut recovered_leaked = 0usize;
         {
             let mut buffers = self.req_buffers.lock();
@@ -1465,6 +1499,56 @@ impl VirtioBlkDevice {
         Ok(())
     }
 
+    /// Acquire a DMA bounce buffer, reusing a cached Legacy-mode page when
+    /// IOMMU is strictly inactive (`mm::dma::is_iommu_legacy()`). Any IOMMU
+    /// probing/active/failed state drops cached buffers and delegates to
+    /// on-demand `alloc_dma_buffer()` (R94-13).
+    fn acquire_dma_buffer(
+        &self,
+        size: usize,
+        is_header: bool,
+    ) -> Result<DmaBuffer, mm::dma::DmaError> {
+        if mm::dma::is_iommu_legacy() {
+            if size <= 4096 {
+                let mut pool = self.legacy_dma_pool.lock();
+                let slot = if is_header {
+                    &mut pool.header
+                } else {
+                    &mut pool.data_4k
+                };
+                if let Some(buf) = slot.take() {
+                    if !buf.is_iommu_mapped() && buf.size() >= size {
+                        return Ok(buf);
+                    }
+                    // Incompatible or IOMMU-mapped: drop immediately.
+                    drop(buf);
+                }
+            }
+        } else {
+            self.legacy_dma_pool.lock().clear();
+        }
+        alloc_dma_buffer(size)
+    }
+
+    /// Return a cleanly retired Legacy-mode 4 KiB DMA buffer to the single-slot
+    /// pool. IOMMU-mapped buffers or non-4 KiB buffers are always dropped so
+    /// `DmaBuffer::drop()` unmaps and scrubs them immediately (R94-13).
+    fn recycle_dma_buffer(&self, buf: DmaBuffer, is_header: bool) {
+        if !buf.is_iommu_mapped() && buf.size() == 4096 && mm::dma::is_iommu_legacy() {
+            let mut pool = self.legacy_dma_pool.lock();
+            let slot = if is_header {
+                &mut pool.header
+            } else {
+                &mut pool.data_4k
+            };
+            if slot.is_none() {
+                *slot = Some(buf);
+                return;
+            }
+        }
+        drop(buf);
+    }
+
     /// Process a single synchronous request.
     fn do_request(&self, sector: u64, mut data: SyncRequestData<'_>) -> Result<usize, BlockError> {
         // R106-3: Reject I/O immediately if device is failed/resetting.
@@ -1527,7 +1611,7 @@ impl VirtioBlkDevice {
         } else {
             header_size + 1
         };
-        let header_status_dma = match alloc_dma_buffer(header_status_dma_size) {
+        let header_status_dma = match self.acquire_dma_buffer(header_status_dma_size, true) {
             Ok(buf) => buf,
             Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;
@@ -1556,7 +1640,7 @@ impl VirtioBlkDevice {
         let status_phys = header_status_dma.phys() + header_size as u64;
 
         // DMA bounce buffer for data with on-demand IOMMU mapping (R94-13)
-        let data_dma = match alloc_dma_buffer(buf_len) {
+        let data_dma = match self.acquire_dma_buffer(buf_len, false) {
             Ok(dma) => dma,
             Err(_) => {
                 // header_status_dma is dropped automatically here, unmapping from IOMMU
@@ -1570,11 +1654,23 @@ impl VirtioBlkDevice {
             }
         };
 
-        // For writes: copy from caller buffer into DMA buffer before I/O
-        if let SyncRequestData::Write(buf) = &data {
-            unsafe {
+        // For writes: copy caller bytes and zero any unused tail bytes.
+        // For reads: zero the target range so a partial device write cannot
+        // expose prior sector data from a recycled Legacy buffer.
+        match &data {
+            SyncRequestData::Write(buf) => unsafe {
                 core::ptr::copy_nonoverlapping(buf.as_ptr(), data_dma.virt_ptr(), buf_len);
-            }
+                if buf_len < data_dma.size() {
+                    core::ptr::write_bytes(
+                        data_dma.virt_ptr().add(buf_len),
+                        0,
+                        data_dma.size() - buf_len,
+                    );
+                }
+            },
+            SyncRequestData::Read(_) => unsafe {
+                core::ptr::write_bytes(data_dma.virt_ptr(), 0, buf_len);
+            },
         }
 
         // Allocate 3 descriptors
@@ -1690,14 +1786,18 @@ impl VirtioBlkDevice {
                                 // SAFETY: the used chain retired before this owned
                                 // buffer was returned; no device/caller alias remains.
                                 let bytes = unsafe { data_dma.as_slice() };
-                                copy_read_result(destination, &bytes[..data_len]).inspect_err(|error| {
+                                let copied = copy_read_result(destination, &bytes[..data_len]).inspect_err(|error| {
                                     klog!(
                                         Error,
                                         "[virtio-blk] read completion length mismatch data_len={} expected={}",
                                         data_len,
                                         destination.len()
                                     );
-                                })
+                                });
+                                if copied.is_ok() {
+                                    self.recycle_dma_buffer(data_dma, false);
+                                }
+                                copied
                             }
                             (SyncRequestData::Write(_), CompletedIo::Write(count)) => Ok(count),
                             _ => {
@@ -2022,7 +2122,7 @@ impl BlockDevice for VirtioBlkDevice {
         } else {
             header_size + 1
         };
-        let header_status_dma = match alloc_dma_buffer(header_status_dma_size) {
+        let header_status_dma = match self.acquire_dma_buffer(header_status_dma_size, true) {
             Ok(buf) => buf,
             Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;

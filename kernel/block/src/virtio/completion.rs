@@ -45,6 +45,15 @@ pub(super) fn finish_request<B>(
     status: u8,
     abandoned: bool,
 ) -> Option<RequestCompletion<B>> {
+    finish_request_with_recycle(kind, status, abandoned, drop)
+}
+
+pub(super) fn finish_request_with_recycle<B>(
+    kind: RequestKind<B>,
+    status: u8,
+    abandoned: bool,
+    mut recycle_write: impl FnMut(B),
+) -> Option<RequestCompletion<B>> {
     if abandoned {
         return None;
     }
@@ -53,8 +62,13 @@ pub(super) fn finish_request<B>(
             status_result(status).map(|()| CompletedIo::Read { data_dma, data_len }),
         ),
         RequestKind::Write { data_dma, data_len } => {
-            drop(data_dma);
-            RequestCompletion::Io(status_result(status).map(|()| CompletedIo::Write(data_len)))
+            let res = status_result(status).map(|()| CompletedIo::Write(data_len));
+            if res.is_ok() {
+                recycle_write(data_dma);
+            } else {
+                drop(data_dma);
+            }
+            RequestCompletion::Io(res)
         }
         RequestKind::Flush => RequestCompletion::Flush(status_result(status)),
     })
@@ -155,6 +169,68 @@ mod tests {
         );
         assert_eq!(destination, [7; 512]);
         drop(data_dma);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn write_recycle_runs_only_on_clean_non_abandoned_completion() {
+        // 1. Clean non-abandoned write invokes recycle callback without dropping.
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut recycled: Option<OwnedPayload> = None;
+        let ok_write = RequestKind::Write {
+            data_dma: OwnedPayload {
+                bytes: vec![0x5a; 512],
+                drops: drops.clone(),
+            },
+            data_len: 512,
+        };
+        assert!(matches!(
+            finish_request_with_recycle(ok_write, blk_status::VIRTIO_BLK_S_OK, false, |b| {
+                recycled = Some(b);
+            }),
+            Some(RequestCompletion::Io(Ok(CompletedIo::Write(512))))
+        ));
+        assert!(recycled.is_some());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(recycled);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        // 2. Failed write drops payload immediately without recycling.
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut recycled_count = 0usize;
+        let err_write = RequestKind::Write {
+            data_dma: OwnedPayload {
+                bytes: vec![0x5a; 512],
+                drops: drops.clone(),
+            },
+            data_len: 512,
+        };
+        assert!(matches!(
+            finish_request_with_recycle(err_write, blk_status::VIRTIO_BLK_S_IOERR, false, |_| {
+                recycled_count += 1;
+            }),
+            Some(RequestCompletion::Io(Err(BlockError::Io)))
+        ));
+        assert_eq!(recycled_count, 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        // 3. Abandoned write never invokes recycle callback and drops cleanly.
+        let drops = Arc::new(AtomicUsize::new(0));
+        let abandoned_write = RequestKind::Write {
+            data_dma: OwnedPayload {
+                bytes: vec![0x5a; 512],
+                drops: drops.clone(),
+            },
+            data_len: 512,
+        };
+        assert!(finish_request_with_recycle(
+            abandoned_write,
+            blk_status::VIRTIO_BLK_S_OK,
+            true,
+            |_| recycled_count += 1,
+        )
+        .is_none());
+        assert_eq!(recycled_count, 0);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
