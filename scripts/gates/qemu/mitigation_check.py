@@ -410,6 +410,12 @@ MAP_FIELDS = {"shared_user": "true", "recursive_absent": "true", "private_island
               "heap_retained": "true", "stack_retained": "true", "full_isolation": "false"}
 
 
+def complete_serial_prefix(raw):
+    """Return only newline-terminated serial lines observed so far."""
+    end = raw.rfind(b"\n")
+    return raw[:end + 1] if end >= 0 else b""
+
+
 def parse_mapping_records(serial):
     records = []
     for line in serial.splitlines():
@@ -916,7 +922,7 @@ def runtime(args, output, sites, expected_kernel, linked, anchor_bytes):
                     raise EvidenceUnavailable("runtime relocation rendezvous was not observed")
                 serial_path = output / "serial.log"
                 prefix = serial_path.read_bytes() if serial_path.exists() else b""
-                complete = prefix[:prefix.rfind(b"\n") + 1]
+                complete = complete_serial_prefix(prefix)
                 if b"MITIGATION-ANCHOR" in complete:
                     break
                 if re.search(rb"KERNEL PANIC|panicked at", complete):
@@ -963,7 +969,11 @@ def runtime(args, output, sites, expected_kernel, linked, anchor_bytes):
                     repeats += 1
                     require(repeats <= MAX_PAIR_REPEATS,
                             "proof site never reached its remaining CPUs: " + site["name"])
-                prefix = (output / "serial.log").read_bytes()
+                # QEMU all-stop freezes every vCPU on a breakpoint, which can pause a
+                # peer mid-way through printing a newer constructor's MITIGATION-MAP
+                # line. Parse only complete lines here; the post-run pass still parses
+                # the entire serial log verbatim.
+                prefix = complete_serial_prefix((output / "serial.log").read_bytes())
                 mappings_before = parse_mapping_records(prefix.decode(errors="replace"))
                 # Remove this site's breakpoint before stepping through its instruction.
                 remote.ok(f"z1,{site['address']:x},1")
