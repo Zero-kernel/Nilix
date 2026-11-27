@@ -10484,10 +10484,14 @@ pub fn run_non_blocking_get_process_irq_self_test() -> Result<(), &'static str> 
         {
             let _held = PROCESS_TABLE.lock();
             if try_get_process(0).is_some() {
-                return Err("try_get_process(0) did not return None while PROCESS_TABLE was locked");
+                return Err(
+                    "try_get_process(0) did not return None while PROCESS_TABLE was locked",
+                );
             }
             if try_get_process(1).is_some() {
-                return Err("try_get_process(1) did not return None while PROCESS_TABLE was locked");
+                return Err(
+                    "try_get_process(1) did not return None while PROCESS_TABLE was locked",
+                );
             }
             if try_get_process(usize::MAX).is_some() {
                 return Err(
