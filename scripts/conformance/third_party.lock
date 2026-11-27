@@ -1,0 +1,8 @@
+# Pinned third-party conformance test suites for Nilix (N2.2, #66).
+#
+# External source archives are never committed to this repository.
+# scripts/conformance/fetch.sh verifies the exact SHA-256 before extraction
+# and exits 2 on any mismatch.
+#
+# Format: <suite> <version> <sha256> <url>
+libc-test 63e36e934e8f2bedf645303a90b64098e2af6c8f 1618dfc26618f9ca9a6e210404e282ccd4fa4fe4598344bada5c2ad40643aaa8 https://repo.or.cz/libc-test.git/snapshot/63e36e934e8f2bedf645303a90b64098e2af6c8f.tar.gz

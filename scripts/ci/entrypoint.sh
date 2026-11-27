@@ -264,6 +264,9 @@ PY
         gate build -- make build
         extended_ext3
         ;;
+    conformance)
+        gate conformance-libc-test -- make conformance-libc-test
+        ;;
     extended-stress)
         # EXT-CI: one profile per job. A failed 900-second soak is reported as it
         # is: a retry would double the job and mix two runs' evidence.

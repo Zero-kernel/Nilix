@@ -46,6 +46,8 @@ shared_fault_reentry_probe = ["musl_test", "kernel_core/shared_fault_reentry_pro
 # THREAD-HB C1: kernel-mode faults after the interrupt-trace switch marker.
 trace_phase_probe = []
 iommu_device_probe = ["iommu/device_probe", "arch/iommu_device_probe"]
+# N2.2 (#66): external conformance suite runner (libc-test / LTP).
+conformance_runner = []
 
 [dependencies]
 spin = "0.12"
