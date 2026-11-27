@@ -720,14 +720,14 @@ impl RuntimeTest for RamfsBasicOperationsTest {
         const DIR: &str = "/__sq_ramfs_basic";
         const FILE: &str = "/__sq_ramfs_basic/payload.bin";
 
-        // Best-effort cleanup of any leftover fixture from an earlier invocation.
-        let _ = VFS.unlink_trusted(FILE, Some(false));
-        let _ = VFS.unlink_trusted(DIR, Some(true));
+        // Exclusively claim the fixture root; if it already exists (or mkdir
+        // fails), abort immediately without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(DIR, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", DIR, e));
+        }
 
+        let mut created_file = false;
         let outcome: Result<(), String> = (|| {
-            VFS.create_trusted(DIR, FileMode::directory(0o755))
-                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", DIR, e))?;
-
             // Negative control: opening a missing file without O_CREAT must return NotFound.
             match VFS.open_trusted(FILE, OpenFlags::new(OpenFlags::O_RDONLY), 0) {
                 Err(FsError::NotFound) => {}
@@ -742,6 +742,7 @@ impl RuntimeTest for RamfsBasicOperationsTest {
             let inode = VFS
                 .create_trusted(FILE, FileMode::regular(0o644))
                 .map_err(|e| alloc::format!("create {} failed: {:?}", FILE, e))?;
+            created_file = true;
 
             // Negative control: duplicate create must return Exists.
             match VFS.create_trusted(FILE, FileMode::regular(0o644)) {
@@ -831,12 +832,16 @@ impl RuntimeTest for RamfsBasicOperationsTest {
             Ok(())
         })();
 
-        let unlink_file = VFS.unlink_trusted(FILE, Some(false));
+        let unlink_file = if created_file {
+            Some(VFS.unlink_trusted(FILE, Some(false)))
+        } else {
+            None
+        };
         let unlink_dir = VFS.unlink_trusted(DIR, Some(true));
         if let Err(msg) = outcome {
             return TestResult::Fail(msg);
         }
-        if let Err(e) = unlink_file {
+        if let Some(Err(e)) = unlink_file {
             return TestResult::Fail(alloc::format!("cleanup unlink {} failed: {:?}", FILE, e));
         }
         if let Err(e) = unlink_dir {
@@ -870,15 +875,18 @@ impl RuntimeTest for RamfsRenameSelfDeadlockTest {
         const B: &str = "/__sq_r172_14/a/b";
         const C: &str = "/__sq_r172_14/a/b/c";
 
-        let _ = VFS.unlink_trusted(C, Some(true));
-        let _ = VFS.unlink_trusted(B, Some(true));
-        let _ = VFS.unlink_trusted(A, Some(true));
-        let _ = VFS.unlink_trusted(ROOT, Some(true));
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
 
+        let subdirs = [A, B, C];
+        let mut created = [false; 3];
         let outcome: Result<(), String> = (|| {
-            for d in [ROOT, A, B, C] {
+            for (idx, d) in subdirs.iter().enumerate() {
                 VFS.create_trusted(d, FileMode::directory(0o755))
                     .map_err(|e| alloc::format!("mkdir {} failed: {:?}", d, e))?;
+                created[idx] = true;
             }
 
             // 1. Direct child cycle: rename(a -> a/sub) must fail with Invalid (EINVAL).
@@ -916,9 +924,11 @@ impl RuntimeTest for RamfsRenameSelfDeadlockTest {
             Ok(())
         })();
 
-        let _ = VFS.unlink_trusted(C, Some(true));
-        let _ = VFS.unlink_trusted(B, Some(true));
-        let _ = VFS.unlink_trusted(A, Some(true));
+        for idx in (0..subdirs.len()).rev() {
+            if created[idx] {
+                let _ = VFS.unlink_trusted(subdirs[idx], Some(true));
+            }
+        }
         let cleanup = VFS.unlink_trusted(ROOT, Some(true));
 
         match (outcome, cleanup) {
@@ -960,22 +970,20 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
         const A_IN_B: &str = "/__sq_r172_15/b/a";
         const B_IN_A: &str = "/__sq_r172_15/a/b";
 
-        let cleanup_all = || {
-            let _ = VFS.unlink_trusted(A_IN_B, Some(true));
-            let _ = VFS.unlink_trusted(B_IN_A, Some(true));
-            let _ = VFS.unlink_trusted(A, Some(true));
-            let _ = VFS.unlink_trusted(B, Some(true));
-            let _ = VFS.unlink_trusted(ROOT, Some(true));
-        };
-        cleanup_all();
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
 
+        let mut created_a = false;
+        let mut created_b = false;
         let outcome: Result<(), String> = (|| {
-            VFS.create_trusted(ROOT, FileMode::directory(0o755))
-                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", ROOT, e))?;
             VFS.create_trusted(A, FileMode::directory(0o755))
                 .map_err(|e| alloc::format!("mkdir {} failed: {:?}", A, e))?;
+            created_a = true;
             VFS.create_trusted(B, FileMode::directory(0o755))
                 .map_err(|e| alloc::format!("mkdir {} failed: {:?}", B, e))?;
+            created_b = true;
 
             // 1. Sequential ancestor inversion guard: move a -> b/a, then attempt b -> b/a/b.
             VFS.rename_trusted(A, A_IN_B, false)
@@ -1123,7 +1131,17 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
             Ok(())
         })();
 
-        cleanup_all();
+        if created_a && created_b {
+            let _ = VFS.unlink_trusted(A_IN_B, Some(true));
+            let _ = VFS.unlink_trusted(B_IN_A, Some(true));
+        }
+        if created_a {
+            let _ = VFS.unlink_trusted(A, Some(true));
+        }
+        if created_b {
+            let _ = VFS.unlink_trusted(B, Some(true));
+        }
+        let _ = VFS.unlink_trusted(ROOT, Some(true));
         if let Err(msg) = outcome {
             return TestResult::Fail(msg);
         }
@@ -1161,37 +1179,41 @@ impl RuntimeTest for VfsPathResolutionTest {
         const LOOP_A: &str = "/__sq_path_res/loop_a";
         const LOOP_B: &str = "/__sq_path_res/loop_b";
 
-        let cleanup_all = || {
-            for f in [LOOP_B, LOOP_A, LINK_CHAIN, LINK_REL, LINK_ABS, TARGET] {
-                let _ = VFS.unlink_trusted(f, Some(false));
-            }
-            let _ = VFS.unlink_trusted(SUB, Some(true));
-            let _ = VFS.unlink_trusted(ROOT, Some(true));
-        };
-        cleanup_all();
+        // 1. Path normalization & root-escape negative control (R32-VFS-1).
+        if normalize_path("///a//./b/../c").ok().as_deref() != Some("/a/c") {
+            return TestResult::Fail(String::from("normalize_path failed on ///a//./b/../c"));
+        }
+        if !matches!(
+            normalize_path("/../../etc/passwd"),
+            Err(FsError::PermDenied)
+        ) {
+            return TestResult::Fail(String::from(
+                "normalize_path failed to reject root traversal /../../etc/passwd",
+            ));
+        }
+
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
+
+        let mut created_sub = false;
+        let mut created_target = false;
+        let mut created_link_abs = false;
+        let mut created_link_rel = false;
+        let mut created_link_chain = false;
+        let mut created_loop_a = false;
+        let mut created_loop_b = false;
 
         let outcome: Result<(), String> = (|| {
-            // 1. Path normalization & root-escape negative control (R32-VFS-1).
-            if normalize_path("///a//./b/../c").ok().as_deref() != Some("/a/c") {
-                return Err(String::from("normalize_path failed on ///a//./b/../c"));
-            }
-            if !matches!(
-                normalize_path("/../../etc/passwd"),
-                Err(FsError::PermDenied)
-            ) {
-                return Err(String::from(
-                    "normalize_path failed to reject root traversal /../../etc/passwd",
-                ));
-            }
-
             // 2. Build directory + target file + absolute, relative, chained, and cyclic symlinks.
-            VFS.create_trusted(ROOT, FileMode::directory(0o755))
-                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", ROOT, e))?;
             VFS.create_trusted(SUB, FileMode::directory(0o755))
                 .map_err(|e| alloc::format!("mkdir {} failed: {:?}", SUB, e))?;
+            created_sub = true;
             let target_inode = VFS
                 .create_trusted(TARGET, FileMode::regular(0o644))
                 .map_err(|e| alloc::format!("create {} failed: {:?}", TARGET, e))?;
+            created_target = true;
             target_inode
                 .write_at(0, b"path-target")
                 .map_err(|e| alloc::format!("write target failed: {:?}", e))?;
@@ -1208,6 +1230,7 @@ impl RuntimeTest for VfsPathResolutionTest {
             // Absolute symlink -> target.
             VFS.symlink_trusted(LINK_ABS, TARGET)
                 .map_err(|e| alloc::format!("symlink {} failed: {:?}", LINK_ABS, e))?;
+            created_link_abs = true;
             let abs_stat = VFS
                 .stat_trusted(LINK_ABS)
                 .map_err(|e| alloc::format!("stat absolute symlink failed: {:?}", e))?;
@@ -1218,6 +1241,7 @@ impl RuntimeTest for VfsPathResolutionTest {
             // Relative symlink -> ../sub/target.txt.
             VFS.symlink_trusted(LINK_REL, "../sub/target.txt")
                 .map_err(|e| alloc::format!("symlink {} failed: {:?}", LINK_REL, e))?;
+            created_link_rel = true;
             let rel_stat = VFS
                 .stat_trusted(LINK_REL)
                 .map_err(|e| alloc::format!("stat relative symlink failed: {:?}", e))?;
@@ -1228,6 +1252,7 @@ impl RuntimeTest for VfsPathResolutionTest {
             // Chained symlink -> LINK_ABS -> TARGET.
             VFS.symlink_trusted(LINK_CHAIN, LINK_ABS)
                 .map_err(|e| alloc::format!("symlink {} failed: {:?}", LINK_CHAIN, e))?;
+            created_link_chain = true;
             let chain_stat = VFS
                 .stat_trusted(LINK_CHAIN)
                 .map_err(|e| alloc::format!("stat chained symlink failed: {:?}", e))?;
@@ -1238,8 +1263,10 @@ impl RuntimeTest for VfsPathResolutionTest {
             // Negative control: symlink cycle must return SymlinkLoop (ELOOP).
             VFS.symlink_trusted(LOOP_A, LOOP_B)
                 .map_err(|e| alloc::format!("symlink {} failed: {:?}", LOOP_A, e))?;
+            created_loop_a = true;
             VFS.symlink_trusted(LOOP_B, LOOP_A)
                 .map_err(|e| alloc::format!("symlink {} failed: {:?}", LOOP_B, e))?;
+            created_loop_b = true;
             match VFS.stat_trusted(LOOP_A) {
                 Err(FsError::SymlinkLoop) => {}
                 other => {
@@ -1253,7 +1280,22 @@ impl RuntimeTest for VfsPathResolutionTest {
             Ok(())
         })();
 
-        cleanup_all();
+        for (created, path) in [
+            (created_loop_b, LOOP_B),
+            (created_loop_a, LOOP_A),
+            (created_link_chain, LINK_CHAIN),
+            (created_link_rel, LINK_REL),
+            (created_link_abs, LINK_ABS),
+            (created_target, TARGET),
+        ] {
+            if created {
+                let _ = VFS.unlink_trusted(path, Some(false));
+            }
+        }
+        if created_sub {
+            let _ = VFS.unlink_trusted(SUB, Some(true));
+        }
+        let _ = VFS.unlink_trusted(ROOT, Some(true));
         if let Err(msg) = outcome {
             return TestResult::Fail(msg);
         }
@@ -1294,31 +1336,30 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
         const FILE_A: &str = "/__sq_dir_atom/a";
         const FILE_B: &str = "/__sq_dir_atom/b";
 
-        let cleanup_all = || {
-            for i in 0..4usize {
-                let p = alloc::format!("/__sq_dir_atom/race_{}", i);
-                let _ = VFS.unlink_trusted(&p, Some(false));
-            }
-            let _ = VFS.unlink_trusted(FILE_A, Some(false));
-            let _ = VFS.unlink_trusted(FILE_B, Some(false));
-            let _ = VFS.unlink_trusted(SUB, Some(true));
-            let _ = VFS.unlink_trusted(ROOT, Some(true));
-        };
-        cleanup_all();
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
+
+        let mut created_sub = false;
+        let mut created_file_a = false;
+        let mut created_file_b = false;
+        let mut ran_smp_race = false;
 
         let outcome: Result<(), String> = (|| {
-            VFS.create_trusted(ROOT, FileMode::directory(0o755))
-                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", ROOT, e))?;
             VFS.create_trusted(SUB, FileMode::directory(0o755))
                 .map_err(|e| alloc::format!("mkdir {} failed: {:?}", SUB, e))?;
+            created_sub = true;
             let f_a = VFS
                 .create_trusted(FILE_A, FileMode::regular(0o644))
                 .map_err(|e| alloc::format!("create {} failed: {:?}", FILE_A, e))?;
+            created_file_a = true;
             f_a.write_at(0, b"AAA")
                 .map_err(|e| alloc::format!("write a failed: {:?}", e))?;
             let f_b = VFS
                 .create_trusted(FILE_B, FileMode::regular(0o644))
                 .map_err(|e| alloc::format!("create {} failed: {:?}", FILE_B, e))?;
+            created_file_b = true;
             f_b.write_at(0, b"BBBBB")
                 .map_err(|e| alloc::format!("write b failed: {:?}", e))?;
 
@@ -1389,6 +1430,7 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
                     DIR_RACE_EXITED.store(0, Ordering::Release);
                     DIR_RACE_ERR.store(0, Ordering::Release);
 
+                    ran_smp_race = true;
                     let _ = set_ap_test_probe(target, Some(vfs_dir_atomicity_ap_worker));
                     send_ipi(target, IpiType::Reschedule);
 
@@ -1469,7 +1511,22 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
             Ok(())
         })();
 
-        cleanup_all();
+        if ran_smp_race {
+            for i in 0..4usize {
+                let p = alloc::format!("/__sq_dir_atom/race_{}", i);
+                let _ = VFS.unlink_trusted(&p, Some(false));
+            }
+        }
+        if created_file_a {
+            let _ = VFS.unlink_trusted(FILE_A, Some(false));
+        }
+        if created_file_b {
+            let _ = VFS.unlink_trusted(FILE_B, Some(false));
+        }
+        if created_sub {
+            let _ = VFS.unlink_trusted(SUB, Some(true));
+        }
+        let _ = VFS.unlink_trusted(ROOT, Some(true));
         if let Err(msg) = outcome {
             return TestResult::Fail(msg);
         }
