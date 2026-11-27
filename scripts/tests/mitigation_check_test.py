@@ -257,6 +257,17 @@ class ObservationTests(unittest.TestCase):
         with self.assertRaises(proof.EvidenceUnavailable):
             proof.parse_mapping_records("boot complete")
 
+    def test_complete_serial_prefix_ignores_in_flight_partial_mapping_line(self):
+        raw = (mapping(0x1000, 0x2000) + "\nMITIGATION-MAP PASS kernel=6c33000 ").encode()
+        complete = proof.complete_serial_prefix(raw)
+        self.assertEqual(complete, (mapping(0x1000, 0x2000) + "\n").encode())
+        parsed = proof.parse_mapping_records(complete.decode())
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual((parsed[0]["kernel"], parsed[0]["user"]), (0x1000, 0x2000))
+        self.assertEqual(proof.complete_serial_prefix(b"MITIGATION-MAP PASS kernel=1"), b"")
+        with self.assertRaises(proof.ProofFailure):
+            proof.parse_mapping_records((mapping(0x1000, 0x2000) + "\nMITIGATION-MAP PASS kernel=6c33000 \n"))
+
     def test_register_parser(self):
         parsed = proof.parse_registers("RAX=00001000 RDX=00002000\nRIP=ffffffff80123456 CR3=00001003 CS =0008 CPL=0")
         self.assertEqual(parsed["cr3"], 0x1003)

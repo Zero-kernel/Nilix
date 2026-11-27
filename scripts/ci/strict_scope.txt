@@ -33,6 +33,22 @@ RUNTIME wait_kick_one_ipi not_applicable needs_cpus:2
 # Issue #109 §1.2: targeted TLB shootdown negative/positive/zero-IPI control needs 2+ CPUs.
 RUNTIME tlb_shootdown_targeted_negative_control not_applicable needs_cpus:2
 
+# STRICT-Q S8 (D1 + D4): bounded heavy SMP runtime tests require 2+ CPUs.
+RUNTIME r175_heavy_tlb_contention not_applicable needs_cpus:2
+
+# STRICT-Q S3 (D4 + D5): verified COVERED-BY entries backed by ring3-mm and stress oracles.
+RUNTIME r174_b3_pt_charge_tracking covered covered_by:ring3-mm
+RUNTIME m0_7_stack_guard_page covered covered_by:ring3-mm
+RUNTIME futex_wait_wake_correctness covered covered_by:ring3-mm
+RUNTIME r175_extended_runtime_1hour covered covered_by:stress
+
+# STRICT-Q S4 & S8 (D5): Ring-3 IPC, signal-migration, and namespace-teardown legs verified by ring3-mm.
+RUNTIME r172_08_futex_bucket_toctou covered covered_by:ring3-mm
+RUNTIME r41_3_pipe_eintr_wake covered covered_by:ring3-mm
+RUNTIME m0_5_signal_delivery_blocked_syscall covered covered_by:ring3-mm
+RUNTIME r175_rapid_signal_migration covered covered_by:ring3-mm
+RUNTIME r175_namespace_teardown_storm covered covered_by:ring3-mm
+
 # D3: Spectre hardware mitigations and retpoline are N6.
 SECURITY spectre_mitigation_status out_of_scope out_of_scope:N6
 SECURITY spectre_v2_retpoline out_of_scope out_of_scope:N6

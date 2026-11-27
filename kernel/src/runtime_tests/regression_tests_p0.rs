@@ -18,7 +18,7 @@
 
 extern crate alloc;
 
-use crate::runtime_tests::{RuntimeTest, TestResult};
+use crate::runtime_tests::{RuntimeTest, TestResult, TestScope};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -212,6 +212,15 @@ impl RuntimeTest for PtChargeTrackingTest {
         "r174_b3_pt_charge_tracking"
     }
 
+    // STRICT-Q S3 (D5): exact memory.current and pruned PT charge symmetry verified in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker:
+                "private rollback beside a shared-fault page table: exact ENOMEM and memory.current",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R174-B3: Verify page table frame charge/uncharge symmetry"
     }
@@ -267,6 +276,17 @@ struct StackGuardPageTest;
 impl RuntimeTest for StackGuardPageTest {
     fn name(&self) -> &'static str {
         "m0_7_stack_guard_page"
+    }
+
+    // STRICT-Q S3 (D5): Ring-3 guard-page SIGSEGV and lazy stack growth verified in ring3-mm.
+    // Keep the marker free of the bare substring "page fault" so
+    // nilix-syz-fuzzer's boot serial fatal classifier does not trip on it;
+    // "user stack guard page" uniquely pins the ring3-mm stack-guard leg.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "user stack guard page",
+        }
     }
 
     fn description(&self) -> &'static str {
@@ -333,6 +353,14 @@ impl RuntimeTest for FutexWaitWakeCorrectnessTest {
         "futex_wait_wake_correctness"
     }
 
+    // STRICT-Q S3 (D5): FUTEX_WAIT/WAKE/WAKE_OP/REQUEUE/BITSET/CLONE_VM verified in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "futex WAKE_OP, requeue, partial bitsets and CLONE_VM keys match Linux",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R24-5: Verify FUTEX_WAIT blocks and FUTEX_WAKE unblocks (prevents deadlock)"
     }
@@ -359,9 +387,10 @@ impl RuntimeTest for FutexLockPiPriorityInheritanceTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires sys_futex(FUTEX_LOCK_PI) with priority manipulation - placeholder",
-        ))
+        match ipc::futex::run_pi_priority_inheritance_self_test() {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(String::from(msg)),
+        }
     }
 }
 
@@ -375,13 +404,21 @@ impl RuntimeTest for FutexBucketToctouTest {
         "r172_08_futex_bucket_toctou"
     }
 
+    // STRICT-Q S4 (D5): Ring-3 concurrent futex bucket TOCTOU stress leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "futex bucket TOCTOU: concurrent wait/wake/requeue across rotating words loses no wakeups",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-08: Verify futex bucket claim under FUTEX_TABLE lock (no TOCTOU)"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "Test requires concurrent sys_futex() stress testing - placeholder",
+            "Covered by Ring-3 concurrent futex bucket TOCTOU leg in ring3-mm",
         ))
     }
 }
@@ -396,13 +433,21 @@ impl RuntimeTest for PipeEintrWakeTest {
         "r41_3_pipe_eintr_wake"
     }
 
+    // STRICT-Q S4 (D5): Ring-3 blocking pipe read + SIGUSR1 EINTR leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "pipe read wakes with EINTR on SIGUSR1 delivery and remains usable afterward",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R41-3: Verify pipe read() wakes with -EINTR on signal delivery"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "Test requires sys_pipe() + sys_read() + signal delivery - placeholder",
+            "Covered by Ring-3 pipe EINTR signal wake leg in ring3-mm",
         ))
     }
 }
@@ -417,13 +462,21 @@ impl RuntimeTest for SignalDeliveryToBlockedSyscallTest {
         "m0_5_signal_delivery_blocked_syscall"
     }
 
+    // STRICT-Q S4 (D5): Ring-3 blocked nanosleep + futex_wait SIGUSR2 leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "signal delivery interrupts blocked nanosleep and futex_wait with EINTR and runs handler",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "M0-5: Verify signal delivery interrupts blocked syscalls (prevents signal loss)"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "Test requires signal infrastructure + blocking syscall - placeholder",
+            "Covered by Ring-3 blocked-syscall signal delivery leg in ring3-mm",
         ))
     }
 }
@@ -568,11 +621,118 @@ impl RuntimeTest for CpuAffinityEnforcementTest {
 }
 
 // ============================================================================
-// CATEGORY 5: VFS TESTS (5 tests)
+// CATEGORY 5: VFS TESTS (5 tests) — STRICT-Q S7
 // ============================================================================
 
-/// VFS Data Plane: Verifies basic RAMFS create/write/read operations. This is
-/// the first end-to-end test of the VFS data plane.
+/// Shared synchronization state for SMP concurrent VFS rename / directory tests.
+mod vfs_smp_race_state {
+    use core::sync::atomic::AtomicU64;
+
+    pub static RENAME_ACTIVE_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static RENAME_EXITED_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static RENAME_ROUND: AtomicU64 = AtomicU64::new(0);
+    pub static RENAME_AP_DONE: AtomicU64 = AtomicU64::new(0);
+    pub static RENAME_AP_RESULT: AtomicU64 = AtomicU64::new(0); // 1 = Ok, 2 = expected Err, 3 = unexpected
+
+    pub static DIR_ACTIVE_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_EXITED_RUN_ID: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_AP_STARTED: AtomicU64 = AtomicU64::new(0);
+    // Synchronized two-phase competing create / unlink protocol per round.
+    // u64::MAX in either round atomic signals immediate abort/exit.
+    pub static DIR_CREATE_ROUND: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_AP_CREATE_RES: AtomicU64 = AtomicU64::new(0); // 1 = Ok, 2 = Exists, 3 = unexpected
+    pub static DIR_AP_CREATE_DONE: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_UNLINK_ROUND: AtomicU64 = AtomicU64::new(0);
+    pub static DIR_AP_UNLINK_RES: AtomicU64 = AtomicU64::new(0); // 1 = Ok, 2 = NotFound, 3 = unexpected
+    pub static DIR_AP_UNLINK_DONE: AtomicU64 = AtomicU64::new(0);
+}
+
+fn vfs_rename_race_ap_worker() {
+    use core::hint::spin_loop;
+    use core::sync::atomic::Ordering;
+    use vfs::{FsError, VFS};
+    use vfs_smp_race_state::*;
+
+    let my_run_id = RENAME_ACTIVE_RUN_ID.load(Ordering::Acquire);
+    let mut seen = 0u64;
+    loop {
+        let round = RENAME_ROUND.load(Ordering::Acquire);
+        if round == u64::MAX {
+            break;
+        }
+        if round == seen {
+            spin_loop();
+            continue;
+        }
+        seen = round;
+        // Opposing rename against BSP's `a -> b/a`: try `b -> a/b`.
+        let res = VFS.rename_trusted("/__sq_r172_15/b", "/__sq_r172_15/a/b", false);
+        let code = match res {
+            Ok(()) => 1,
+            Err(FsError::Invalid | FsError::NotFound | FsError::Again | FsError::Exists) => 2,
+            Err(_) => 3,
+        };
+        RENAME_AP_RESULT.store(code, Ordering::Release);
+        RENAME_AP_DONE.store(round, Ordering::Release);
+    }
+    RENAME_EXITED_RUN_ID.store(my_run_id, Ordering::Release);
+}
+
+fn vfs_dir_atomicity_ap_worker() {
+    use core::hint::spin_loop;
+    use core::sync::atomic::Ordering;
+    use vfs::{FileMode, FsError, VFS};
+    use vfs_smp_race_state::*;
+
+    let my_run_id = DIR_ACTIVE_RUN_ID.load(Ordering::Acquire);
+    DIR_AP_STARTED.store(my_run_id, Ordering::Release);
+
+    let mut last_round = 0u64;
+    loop {
+        let round = DIR_CREATE_ROUND.load(Ordering::Acquire);
+        if round == u64::MAX {
+            break;
+        }
+        if round == last_round {
+            spin_loop();
+            continue;
+        }
+        last_round = round;
+
+        let name = alloc::format!("/__sq_dir_atom/race_{}", round % 4);
+        let create_code = match VFS.create_trusted(&name, FileMode::regular(0o644)) {
+            Ok(_) => 1,
+            Err(FsError::Exists) => 2,
+            Err(_) => 3,
+        };
+        DIR_AP_CREATE_RES.store(create_code, Ordering::Release);
+        DIR_AP_CREATE_DONE.store(round, Ordering::Release);
+
+        // Wait for BSP to verify Phase A create exclusivity and arm Phase B unlink.
+        loop {
+            let uround = DIR_UNLINK_ROUND.load(Ordering::Acquire);
+            if uround == u64::MAX {
+                DIR_EXITED_RUN_ID.store(my_run_id, Ordering::Release);
+                return;
+            }
+            if uround >= round {
+                break;
+            }
+            spin_loop();
+        }
+
+        let unlink_code = match VFS.unlink_trusted(&name, Some(false)) {
+            Ok(()) => 1,
+            Err(FsError::NotFound) => 2,
+            Err(_) => 3,
+        };
+        DIR_AP_UNLINK_RES.store(unlink_code, Ordering::Release);
+        DIR_AP_UNLINK_DONE.store(round, Ordering::Release);
+    }
+    DIR_EXITED_RUN_ID.store(my_run_id, Ordering::Release);
+}
+
+/// VFS Data Plane: Verifies basic RAMFS create/write/read/truncate/unlink operations.
 struct RamfsBasicOperationsTest;
 
 impl RuntimeTest for RamfsBasicOperationsTest {
@@ -585,9 +745,143 @@ impl RuntimeTest for RamfsBasicOperationsTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires sys_open/write/read/close - placeholder",
-        ))
+        use kernel_core::FileOps;
+        use vfs::{FileHandle, FileMode, FileType, FsError, OpenFlags, VFS};
+
+        const DIR: &str = "/__sq_ramfs_basic";
+        const FILE: &str = "/__sq_ramfs_basic/payload.bin";
+
+        // Exclusively claim the fixture root; if it already exists (or mkdir
+        // fails), abort immediately without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(DIR, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", DIR, e));
+        }
+
+        let mut created_file = false;
+        let outcome: Result<(), String> = (|| {
+            // Negative control: opening a missing file without O_CREAT must return NotFound.
+            match VFS.open_trusted(FILE, OpenFlags::new(OpenFlags::O_RDONLY), 0) {
+                Err(FsError::NotFound) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "missing file open expected NotFound, got {:?}",
+                        other.is_ok()
+                    ));
+                }
+            }
+
+            let inode = VFS
+                .create_trusted(FILE, FileMode::regular(0o644))
+                .map_err(|e| alloc::format!("create {} failed: {:?}", FILE, e))?;
+            created_file = true;
+
+            // Negative control: duplicate create must return Exists.
+            match VFS.create_trusted(FILE, FileMode::regular(0o644)) {
+                Err(FsError::Exists) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "duplicate create expected Exists, got {:?}",
+                        other.is_ok()
+                    ));
+                }
+            }
+
+            // Write via VFS FileHandle, then verify via direct read_at and a second open handle.
+            let payload = b"STRICT-Q S7 RAMFS data-plane verification payload!";
+            {
+                let fd = VFS
+                    .open_trusted(FILE, OpenFlags::new(OpenFlags::O_WRONLY), 0)
+                    .map_err(|e| alloc::format!("open WRONLY failed: {:?}", e))?;
+                let handle = fd
+                    .as_any()
+                    .downcast_ref::<FileHandle>()
+                    .ok_or_else(|| String::from("FileDescriptor is not FileHandle"))?;
+                let written = handle
+                    .write(payload)
+                    .map_err(|e| alloc::format!("FileHandle::write failed: {:?}", e))?;
+                if written != payload.len() {
+                    return Err(alloc::format!(
+                        "short write: {} != {}",
+                        written,
+                        payload.len()
+                    ));
+                }
+            }
+
+            let st = VFS
+                .stat_trusted(FILE)
+                .map_err(|e| alloc::format!("stat {} failed: {:?}", FILE, e))?;
+            if st.mode.file_type != FileType::Regular || st.size as usize != payload.len() {
+                return Err(alloc::format!(
+                    "unexpected stat: type={:?} size={}",
+                    st.mode.file_type,
+                    st.size
+                ));
+            }
+
+            {
+                let fd = VFS
+                    .open_trusted(FILE, OpenFlags::new(OpenFlags::O_RDONLY), 0)
+                    .map_err(|e| alloc::format!("open RDONLY failed: {:?}", e))?;
+                let handle = fd
+                    .as_any()
+                    .downcast_ref::<FileHandle>()
+                    .ok_or_else(|| String::from("FileDescriptor is not FileHandle"))?;
+                let mut buf = [0u8; 64];
+                let n = handle
+                    .read(&mut buf)
+                    .map_err(|e| alloc::format!("FileHandle::read failed: {:?}", e))?;
+                if n != payload.len() || &buf[..n] != payload {
+                    return Err(alloc::format!(
+                        "readback mismatch: len={} (exp {})",
+                        n,
+                        payload.len()
+                    ));
+                }
+            }
+
+            // Overwrite at non-zero offset + shrink truncate + extend zero-fill.
+            inode
+                .write_at(7, b"VFS")
+                .map_err(|e| alloc::format!("write_at offset failed: {:?}", e))?;
+            inode
+                .truncate(12)
+                .map_err(|e| alloc::format!("truncate shrink failed: {:?}", e))?;
+            inode
+                .truncate(16)
+                .map_err(|e| alloc::format!("truncate extend failed: {:?}", e))?;
+            let mut extended = [0xAAu8; 16];
+            let n = inode
+                .read_at(0, &mut extended)
+                .map_err(|e| alloc::format!("read_at after truncate failed: {:?}", e))?;
+            if n != 16 || &extended[7..10] != b"VFS" || extended[12..16] != [0, 0, 0, 0] {
+                return Err(String::from(
+                    "offset overwrite or truncate zero-fill mismatch",
+                ));
+            }
+
+            Ok(())
+        })();
+
+        let unlink_file = if created_file {
+            Some(VFS.unlink_trusted(FILE, Some(false)))
+        } else {
+            None
+        };
+        let unlink_dir = VFS.unlink_trusted(DIR, Some(true));
+        if let Err(msg) = outcome {
+            return TestResult::Fail(msg);
+        }
+        if let Some(Err(e)) = unlink_file {
+            return TestResult::Fail(alloc::format!("cleanup unlink {} failed: {:?}", FILE, e));
+        }
+        if let Err(e) = unlink_dir {
+            return TestResult::Fail(alloc::format!("cleanup rmdir {} failed: {:?}", DIR, e));
+        }
+        if !matches!(VFS.stat_trusted(DIR), Err(FsError::NotFound)) {
+            return TestResult::Fail(String::from("removed fixture directory still visible"));
+        }
+        TestResult::Pass
     }
 }
 
@@ -605,9 +899,106 @@ impl RuntimeTest for RamfsRenameSelfDeadlockTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires sys_rename() with cycle detection verification - placeholder",
-        ))
+        use vfs::{FileMode, FsError, VFS};
+
+        const ROOT: &str = "/__sq_r172_14";
+        const A: &str = "/__sq_r172_14/a";
+        const B: &str = "/__sq_r172_14/a/b";
+        const C: &str = "/__sq_r172_14/a/b/c";
+
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
+
+        let subdirs = [A, B, C];
+        let mut created = [false; 3];
+        let outcome: Result<(), String> = (|| {
+            for (idx, d) in subdirs.iter().enumerate() {
+                VFS.create_trusted(d, FileMode::directory(0o755))
+                    .map_err(|e| alloc::format!("mkdir {} failed: {:?}", d, e))?;
+                created[idx] = true;
+            }
+
+            let a_ino = VFS
+                .stat_trusted(A)
+                .map_err(|e| alloc::format!("stat {} failed: {:?}", A, e))?
+                .ino;
+            let b_ino = VFS
+                .stat_trusted(B)
+                .map_err(|e| alloc::format!("stat {} failed: {:?}", B, e))?
+                .ino;
+
+            // 1. Direct child cycle: rename(a -> a/sub) must fail with Invalid (EINVAL).
+            match VFS.rename_trusted(A, "/__sq_r172_14/a/sub", false) {
+                Err(FsError::Invalid) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "direct self-subtree rename expected Invalid, got {:?}",
+                        other
+                    ));
+                }
+            }
+
+            // 2. Deep descendant cycle: rename(a -> a/b/c/loop) must fail with Invalid.
+            match VFS.rename_trusted(A, "/__sq_r172_14/a/b/c/loop", false) {
+                Err(FsError::Invalid) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "deep descendant rename expected Invalid, got {:?}",
+                        other
+                    ));
+                }
+            }
+
+            // 3. Parent-overwrite check (R172-14 `rename_decide` parent identity guard):
+            //    renaming existing child `B` onto its parent `A` must fail with Invalid
+            //    (not NotEmpty) and leave both inodes intact.
+            match VFS.rename_trusted(B, A, false) {
+                Err(FsError::Invalid) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "parent-overwrite rename(b -> a) expected Invalid, got {:?}",
+                        other
+                    ));
+                }
+            }
+
+            // 4. Same-path rename(a -> a) must succeed as a no-op without deadlocking.
+            VFS.rename_trusted(A, A, false)
+                .map_err(|e| alloc::format!("same-path rename(a -> a) failed: {:?}", e))?;
+
+            // 5. All original nodes must remain intact and reachable with unchanged inodes.
+            let a_after = VFS
+                .stat_trusted(A)
+                .map_err(|e| alloc::format!("tree node {} lost after cycle guard: {:?}", A, e))?;
+            let b_after = VFS
+                .stat_trusted(B)
+                .map_err(|e| alloc::format!("tree node {} lost after cycle guard: {:?}", B, e))?;
+            VFS.stat_trusted(C)
+                .map_err(|e| alloc::format!("tree node {} lost after cycle guard: {:?}", C, e))?;
+            if a_after.ino != a_ino || b_after.ino != b_ino {
+                return Err(String::from(
+                    "parent-overwrite guard altered inode identity of A or B",
+                ));
+            }
+            Ok(())
+        })();
+
+        for idx in (0..subdirs.len()).rev() {
+            if created[idx] {
+                let _ = VFS.unlink_trusted(subdirs[idx], Some(true));
+            }
+        }
+        let cleanup = VFS.unlink_trusted(ROOT, Some(true));
+
+        match (outcome, cleanup) {
+            (Err(msg), _) => TestResult::Fail(msg),
+            (Ok(()), Err(e)) => {
+                TestResult::Fail(alloc::format!("cleanup {} failed: {:?}", ROOT, e))
+            }
+            (Ok(()), Ok(())) => TestResult::Pass,
+        }
     }
 }
 
@@ -626,9 +1017,223 @@ impl RuntimeTest for RamfsRenameAncestorToctouTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires sys_rename() concurrent stress testing - placeholder",
-        ))
+        use arch::ipi::{send_ipi, IpiType};
+        use arch::{current_cpu_id, max_cpus, num_online_cpus, set_ap_test_probe};
+        use core::hint::spin_loop;
+        use core::sync::atomic::Ordering;
+        use mm::tlb_shootdown::is_cpu_online;
+        use vfs::{FileMode, FsError, VFS};
+        use vfs_smp_race_state::*;
+
+        const ROOT: &str = "/__sq_r172_15";
+        const A: &str = "/__sq_r172_15/a";
+        const B: &str = "/__sq_r172_15/b";
+        const A_IN_B: &str = "/__sq_r172_15/b/a";
+        const B_IN_A: &str = "/__sq_r172_15/a/b";
+
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
+
+        let mut created_a = false;
+        let mut created_b = false;
+        let mut ap_still_active = false;
+        let outcome: Result<(), String> = (|| {
+            VFS.create_trusted(A, FileMode::directory(0o755))
+                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", A, e))?;
+            created_a = true;
+            VFS.create_trusted(B, FileMode::directory(0o755))
+                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", B, e))?;
+            created_b = true;
+
+            // 1. Sequential ancestor inversion guard: move a -> b/a, then attempt b -> b/a/b.
+            VFS.rename_trusted(A, A_IN_B, false)
+                .map_err(|e| alloc::format!("rename a -> b/a failed: {:?}", e))?;
+            match VFS.rename_trusted(B, "/__sq_r172_15/b/a/b", false) {
+                Err(FsError::Invalid) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "inverted ancestor rename expected Invalid, got {:?}",
+                        other
+                    ));
+                }
+            }
+            VFS.rename_trusted(A_IN_B, A, false)
+                .map_err(|e| alloc::format!("restore b/a -> a failed: {:?}", e))?;
+
+            // 2. On SMP (2+ CPUs), race BSP `rename(a -> b/a)` directly against AP
+            //    `rename(b -> a/b)` across 24 rounds. Under RAMFS_TOPOLOGY_LOCK at most
+            //    one opposing rename may win; if both ever succeeded, a disconnected
+            //    a <-> b directory cycle would form.
+            if num_online_cpus() >= 2 {
+                let self_cpu = current_cpu_id();
+                if let Some(target) =
+                    (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id))
+                {
+                    if RENAME_ACTIVE_RUN_ID.load(Ordering::Acquire)
+                        != RENAME_EXITED_RUN_ID.load(Ordering::Acquire)
+                    {
+                        return Err(String::from(
+                            "previous rename race AP worker has not exited yet",
+                        ));
+                    }
+                    RENAME_ROUND.store(0, Ordering::Release);
+                    RENAME_AP_DONE.store(0, Ordering::Release);
+                    RENAME_AP_RESULT.store(0, Ordering::Release);
+                    let run_id = RENAME_ACTIVE_RUN_ID.fetch_add(1, Ordering::AcqRel) + 1;
+
+                    ap_still_active = true;
+                    let _ = set_ap_test_probe(target, Some(vfs_rename_race_ap_worker));
+                    send_ipi(target, IpiType::Reschedule);
+
+                    let mut race_err: Option<String> = None;
+                    for round in 1..=24u64 {
+                        RENAME_AP_RESULT.store(0, Ordering::Release);
+                        RENAME_ROUND.store(round, Ordering::Release);
+
+                        let bsp_res = VFS.rename_trusted(A, A_IN_B, false);
+                        let mut done = false;
+                        for _ in 0..50_000_000usize {
+                            if RENAME_AP_DONE.load(Ordering::Acquire) == round {
+                                done = true;
+                                break;
+                            }
+                            spin_loop();
+                        }
+                        if !done {
+                            race_err = Some(alloc::format!(
+                                "AP {} timed out on opposing rename round {}",
+                                target,
+                                round
+                            ));
+                            break;
+                        }
+                        let ap_code = RENAME_AP_RESULT.load(Ordering::Acquire);
+                        if ap_code == 3 {
+                            race_err = Some(alloc::format!(
+                                "AP {} hit unexpected rename error on round {}",
+                                target,
+                                round
+                            ));
+                            break;
+                        }
+                        let bsp_won = bsp_res.is_ok();
+                        let ap_won = ap_code == 1;
+                        if bsp_won && ap_won {
+                            race_err = Some(alloc::format!(
+                                "R172-15 VIOLATION: opposing renames BOTH succeeded on round {} (directory cycle!)",
+                                round
+                            ));
+                            break;
+                        }
+                        if !bsp_won {
+                            match bsp_res {
+                                Err(
+                                    FsError::Invalid
+                                    | FsError::NotFound
+                                    | FsError::Again
+                                    | FsError::Exists,
+                                ) => {}
+                                Err(e) => {
+                                    race_err = Some(alloc::format!(
+                                        "BSP unexpected rename error on round {}: {:?}",
+                                        round,
+                                        e
+                                    ));
+                                    break;
+                                }
+                                Ok(()) => unreachable!(),
+                            }
+                        }
+                        // Restore canonical layout for next round and prove both directories stay reachable.
+                        if bsp_won {
+                            if let Err(e) = VFS.rename_trusted(A_IN_B, A, false) {
+                                race_err = Some(alloc::format!(
+                                    "restore b/a -> a failed after round {}: {:?}",
+                                    round,
+                                    e
+                                ));
+                                break;
+                            }
+                        } else if ap_won {
+                            if let Err(e) = VFS.rename_trusted(B_IN_A, B, false) {
+                                race_err = Some(alloc::format!(
+                                    "restore a/b -> b failed after round {}: {:?}",
+                                    round,
+                                    e
+                                ));
+                                break;
+                            }
+                        }
+                        if VFS.stat_trusted(A).is_err() || VFS.stat_trusted(B).is_err() {
+                            race_err = Some(alloc::format!(
+                                "directory tree broken after round {}",
+                                round
+                            ));
+                            break;
+                        }
+                    }
+
+                    RENAME_ROUND.store(u64::MAX, Ordering::Release);
+                    let cancelled = set_ap_test_probe(target, None);
+                    if cancelled {
+                        RENAME_EXITED_RUN_ID.store(run_id, Ordering::Release);
+                        ap_still_active = false;
+                    } else {
+                        for _ in 0..50_000_000usize {
+                            if RENAME_EXITED_RUN_ID.load(Ordering::Acquire) == run_id {
+                                ap_still_active = false;
+                                break;
+                            }
+                            spin_loop();
+                        }
+                    }
+                    if let Some(msg) = race_err {
+                        return Err(msg);
+                    }
+                    if ap_still_active {
+                        return Err(alloc::format!(
+                            "AP {} timed out exiting rename race worker",
+                            target
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        // Never unlink the fixture directory while a timed-out AP worker may
+        // still be executing rename operations inside it.
+        if ap_still_active {
+            return match outcome {
+                Err(msg) => TestResult::Fail(msg),
+                Ok(()) => TestResult::Fail(String::from(
+                    "rename race AP worker still active; fixture retained",
+                )),
+            };
+        }
+
+        if created_a && created_b {
+            let _ = VFS.unlink_trusted(A_IN_B, Some(true));
+            let _ = VFS.unlink_trusted(B_IN_A, Some(true));
+        }
+        if created_a {
+            let _ = VFS.unlink_trusted(A, Some(true));
+        }
+        if created_b {
+            let _ = VFS.unlink_trusted(B, Some(true));
+        }
+        let _ = VFS.unlink_trusted(ROOT, Some(true));
+        if let Err(msg) = outcome {
+            return TestResult::Fail(msg);
+        }
+        if !matches!(VFS.stat_trusted(ROOT), Err(FsError::NotFound)) {
+            return TestResult::Fail(String::from(
+                "rename ancestor TOCTOU cleanup left fixture directory behind",
+            ));
+        }
+        TestResult::Pass
     }
 }
 
@@ -646,9 +1251,143 @@ impl RuntimeTest for VfsPathResolutionTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires VFS path lookup with symbolic links - placeholder",
-        ))
+        use vfs::{normalize_path, FileMode, FileType, FsError, VFS};
+
+        const ROOT: &str = "/__sq_path_res";
+        const SUB: &str = "/__sq_path_res/sub";
+        const TARGET: &str = "/__sq_path_res/sub/target.txt";
+        const LINK_ABS: &str = "/__sq_path_res/link_abs";
+        const LINK_REL: &str = "/__sq_path_res/sub/link_rel";
+        const LINK_CHAIN: &str = "/__sq_path_res/link_chain";
+        const LOOP_A: &str = "/__sq_path_res/loop_a";
+        const LOOP_B: &str = "/__sq_path_res/loop_b";
+
+        // 1. Path normalization & root-escape negative control (R32-VFS-1).
+        if normalize_path("///a//./b/../c").ok().as_deref() != Some("/a/c") {
+            return TestResult::Fail(String::from("normalize_path failed on ///a//./b/../c"));
+        }
+        if !matches!(
+            normalize_path("/../../etc/passwd"),
+            Err(FsError::PermDenied)
+        ) {
+            return TestResult::Fail(String::from(
+                "normalize_path failed to reject root traversal /../../etc/passwd",
+            ));
+        }
+
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
+
+        let mut created_sub = false;
+        let mut created_target = false;
+        let mut created_link_abs = false;
+        let mut created_link_rel = false;
+        let mut created_link_chain = false;
+        let mut created_loop_a = false;
+        let mut created_loop_b = false;
+
+        let outcome: Result<(), String> = (|| {
+            // 2. Build directory + target file + absolute, relative, chained, and cyclic symlinks.
+            VFS.create_trusted(SUB, FileMode::directory(0o755))
+                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", SUB, e))?;
+            created_sub = true;
+            let target_inode = VFS
+                .create_trusted(TARGET, FileMode::regular(0o644))
+                .map_err(|e| alloc::format!("create {} failed: {:?}", TARGET, e))?;
+            created_target = true;
+            target_inode
+                .write_at(0, b"path-target")
+                .map_err(|e| alloc::format!("write target failed: {:?}", e))?;
+            let target_ino = target_inode.ino();
+
+            // Traversal with redundant slashes, `.` and `..` resolves to the exact target inode.
+            let dotdot_stat = VFS
+                .stat_trusted("/__sq_path_res///sub/./../sub/target.txt")
+                .map_err(|e| alloc::format!("dot/dotdot stat failed: {:?}", e))?;
+            if dotdot_stat.ino != target_ino || dotdot_stat.size != 11 {
+                return Err(String::from("dot/dotdot stat resolved to wrong inode"));
+            }
+
+            // Absolute symlink -> target.
+            VFS.symlink_trusted(LINK_ABS, TARGET)
+                .map_err(|e| alloc::format!("symlink {} failed: {:?}", LINK_ABS, e))?;
+            created_link_abs = true;
+            let abs_stat = VFS
+                .stat_trusted(LINK_ABS)
+                .map_err(|e| alloc::format!("stat absolute symlink failed: {:?}", e))?;
+            if abs_stat.ino != target_ino || abs_stat.mode.file_type != FileType::Regular {
+                return Err(String::from("absolute symlink did not resolve to target"));
+            }
+
+            // Relative symlink -> ../sub/target.txt.
+            VFS.symlink_trusted(LINK_REL, "../sub/target.txt")
+                .map_err(|e| alloc::format!("symlink {} failed: {:?}", LINK_REL, e))?;
+            created_link_rel = true;
+            let rel_stat = VFS
+                .stat_trusted(LINK_REL)
+                .map_err(|e| alloc::format!("stat relative symlink failed: {:?}", e))?;
+            if rel_stat.ino != target_ino {
+                return Err(String::from("relative symlink did not resolve to target"));
+            }
+
+            // Chained symlink -> LINK_ABS -> TARGET.
+            VFS.symlink_trusted(LINK_CHAIN, LINK_ABS)
+                .map_err(|e| alloc::format!("symlink {} failed: {:?}", LINK_CHAIN, e))?;
+            created_link_chain = true;
+            let chain_stat = VFS
+                .stat_trusted(LINK_CHAIN)
+                .map_err(|e| alloc::format!("stat chained symlink failed: {:?}", e))?;
+            if chain_stat.ino != target_ino {
+                return Err(String::from("chained symlink did not resolve to target"));
+            }
+
+            // Negative control: symlink cycle must return SymlinkLoop (ELOOP).
+            VFS.symlink_trusted(LOOP_A, LOOP_B)
+                .map_err(|e| alloc::format!("symlink {} failed: {:?}", LOOP_A, e))?;
+            created_loop_a = true;
+            VFS.symlink_trusted(LOOP_B, LOOP_A)
+                .map_err(|e| alloc::format!("symlink {} failed: {:?}", LOOP_B, e))?;
+            created_loop_b = true;
+            match VFS.stat_trusted(LOOP_A) {
+                Err(FsError::SymlinkLoop) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "symlink loop expected SymlinkLoop, got {:?}",
+                        other
+                    ));
+                }
+            }
+
+            Ok(())
+        })();
+
+        for (created, path) in [
+            (created_loop_b, LOOP_B),
+            (created_loop_a, LOOP_A),
+            (created_link_chain, LINK_CHAIN),
+            (created_link_rel, LINK_REL),
+            (created_link_abs, LINK_ABS),
+            (created_target, TARGET),
+        ] {
+            if created {
+                let _ = VFS.unlink_trusted(path, Some(false));
+            }
+        }
+        if created_sub {
+            let _ = VFS.unlink_trusted(SUB, Some(true));
+        }
+        let _ = VFS.unlink_trusted(ROOT, Some(true));
+        if let Err(msg) = outcome {
+            return TestResult::Fail(msg);
+        }
+        if !matches!(VFS.stat_trusted(ROOT), Err(FsError::NotFound)) {
+            return TestResult::Fail(String::from(
+                "VFS path resolution cleanup left fixture directory behind",
+            ));
+        }
+        TestResult::Pass
     }
 }
 
@@ -667,9 +1406,348 @@ impl RuntimeTest for VfsDirectoryAtomicityTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires concurrent sys_mkdir/rmdir/unlink operations - placeholder",
-        ))
+        use arch::ipi::{send_ipi, IpiType};
+        use arch::{current_cpu_id, max_cpus, num_online_cpus, set_ap_test_probe};
+        use core::hint::spin_loop;
+        use core::sync::atomic::Ordering;
+        use mm::tlb_shootdown::is_cpu_online;
+        use vfs::{FileMode, FsError, VFS};
+        use vfs_smp_race_state::*;
+
+        const ROOT: &str = "/__sq_dir_atom";
+        const SUB: &str = "/__sq_dir_atom/sub";
+        const FILE_A: &str = "/__sq_dir_atom/a";
+        const FILE_B: &str = "/__sq_dir_atom/b";
+
+        // Exclusively claim the fixture root without touching any pre-existing entries.
+        if let Err(e) = VFS.create_trusted(ROOT, FileMode::directory(0o755)) {
+            return TestResult::Fail(alloc::format!("mkdir {} failed: {:?}", ROOT, e));
+        }
+
+        let mut created_sub = false;
+        let mut created_file_a = false;
+        let mut created_file_b = false;
+        let mut ran_smp_race = false;
+        let mut ap_still_active = false;
+
+        let outcome: Result<(), String> = (|| {
+            VFS.create_trusted(SUB, FileMode::directory(0o755))
+                .map_err(|e| alloc::format!("mkdir {} failed: {:?}", SUB, e))?;
+            created_sub = true;
+            let f_a = VFS
+                .create_trusted(FILE_A, FileMode::regular(0o644))
+                .map_err(|e| alloc::format!("create {} failed: {:?}", FILE_A, e))?;
+            created_file_a = true;
+            f_a.write_at(0, b"AAA")
+                .map_err(|e| alloc::format!("write a failed: {:?}", e))?;
+            let f_b = VFS
+                .create_trusted(FILE_B, FileMode::regular(0o644))
+                .map_err(|e| alloc::format!("create {} failed: {:?}", FILE_B, e))?;
+            created_file_b = true;
+            f_b.write_at(0, b"BBBBB")
+                .map_err(|e| alloc::format!("write b failed: {:?}", e))?;
+
+            // 1. Non-empty rmdir must fail with NotEmpty and preserve children.
+            match VFS.unlink_trusted(ROOT, Some(true)) {
+                Err(FsError::NotEmpty) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "rmdir on non-empty dir expected NotEmpty, got {:?}",
+                        other
+                    ));
+                }
+            }
+            // 2. Type enforcement on unlink vs rmdir.
+            match VFS.unlink_trusted(FILE_A, Some(true)) {
+                Err(FsError::NotDir) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "rmdir on regular file expected NotDir, got {:?}",
+                        other
+                    ));
+                }
+            }
+            match VFS.unlink_trusted(SUB, Some(false)) {
+                Err(FsError::IsDir) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "unlink on directory expected IsDir, got {:?}",
+                        other
+                    ));
+                }
+            }
+            // 3. RENAME_NOREPLACE refuses overwrite without disturbing either file;
+            //    atomic replace swaps dst cleanly to src's inode/contents.
+            match VFS.rename_trusted(FILE_A, FILE_B, true) {
+                Err(FsError::Exists) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "rename_noreplace over existing expected Exists, got {:?}",
+                        other
+                    ));
+                }
+            }
+            let a_ino = f_a.ino();
+            VFS.rename_trusted(FILE_A, FILE_B, false)
+                .map_err(|e| alloc::format!("atomic rename replace failed: {:?}", e))?;
+            if !matches!(VFS.stat_trusted(FILE_A), Err(FsError::NotFound)) {
+                return Err(String::from("source entry survived atomic rename"));
+            }
+            let replaced = VFS
+                .stat_trusted(FILE_B)
+                .map_err(|e| alloc::format!("stat replaced {} failed: {:?}", FILE_B, e))?;
+            if replaced.ino != a_ino || replaced.size != 3 {
+                return Err(String::from(
+                    "atomic rename destination inode/size mismatch",
+                ));
+            }
+
+            // 4. On SMP (2+ CPUs), run 32 synchronized two-phase competing
+            //    BSP + AP create/unlink rounds on the same absent name:
+            //    - Phase A: both compete on create; exactly one succeeds, the
+            //      other gets Exists, and stat confirms the entry is present.
+            //    - Phase B: both compete on unlink; exactly one succeeds, the
+            //      other gets NotFound, and stat confirms the entry is absent.
+            if num_online_cpus() >= 2 {
+                let self_cpu = current_cpu_id();
+                if let Some(target) =
+                    (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id))
+                {
+                    if DIR_ACTIVE_RUN_ID.load(Ordering::Acquire)
+                        != DIR_EXITED_RUN_ID.load(Ordering::Acquire)
+                    {
+                        return Err(String::from(
+                            "previous directory atomicity AP worker has not exited yet",
+                        ));
+                    }
+
+                    DIR_AP_STARTED.store(0, Ordering::Release);
+                    DIR_CREATE_ROUND.store(0, Ordering::Release);
+                    DIR_AP_CREATE_RES.store(0, Ordering::Release);
+                    DIR_AP_CREATE_DONE.store(0, Ordering::Release);
+                    DIR_UNLINK_ROUND.store(0, Ordering::Release);
+                    DIR_AP_UNLINK_RES.store(0, Ordering::Release);
+                    DIR_AP_UNLINK_DONE.store(0, Ordering::Release);
+                    let run_id = DIR_ACTIVE_RUN_ID.fetch_add(1, Ordering::AcqRel) + 1;
+
+                    ran_smp_race = true;
+                    ap_still_active = true;
+                    let _ = set_ap_test_probe(target, Some(vfs_dir_atomicity_ap_worker));
+                    send_ipi(target, IpiType::Reschedule);
+
+                    let mut ap_started = false;
+                    for _ in 0..50_000_000usize {
+                        if DIR_AP_STARTED.load(Ordering::Acquire) == run_id {
+                            ap_started = true;
+                            break;
+                        }
+                        spin_loop();
+                    }
+
+                    let mut race_err: Option<String> = None;
+                    if !ap_started {
+                        race_err = Some(alloc::format!(
+                            "AP {} failed to start directory atomicity worker",
+                            target
+                        ));
+                    } else {
+                        for round in 1..=32u64 {
+                            let name = alloc::format!("/__sq_dir_atom/race_{}", round % 4);
+
+                            // Phase A: competing create of the same absent entry.
+                            DIR_AP_CREATE_RES.store(0, Ordering::Release);
+                            DIR_CREATE_ROUND.store(round, Ordering::Release);
+                            let bsp_create = VFS.create_trusted(&name, FileMode::regular(0o644));
+
+                            let mut ap_create_done = false;
+                            for _ in 0..50_000_000usize {
+                                if DIR_AP_CREATE_DONE.load(Ordering::Acquire) == round {
+                                    ap_create_done = true;
+                                    break;
+                                }
+                                spin_loop();
+                            }
+                            if !ap_create_done {
+                                race_err = Some(alloc::format!(
+                                    "AP {} timed out on competing create round {}",
+                                    target,
+                                    round
+                                ));
+                                break;
+                            }
+                            let ap_create = DIR_AP_CREATE_RES.load(Ordering::Acquire);
+                            let bsp_created = match bsp_create {
+                                Ok(_) => true,
+                                Err(FsError::Exists) => false,
+                                Err(e) => {
+                                    race_err = Some(alloc::format!(
+                                        "BSP unexpected create error on round {}: {:?}",
+                                        round,
+                                        e
+                                    ));
+                                    break;
+                                }
+                            };
+                            let ap_created = match ap_create {
+                                1 => true,
+                                2 => false,
+                                _ => {
+                                    race_err = Some(alloc::format!(
+                                        "AP unexpected create error on round {}",
+                                        round
+                                    ));
+                                    break;
+                                }
+                            };
+                            if bsp_created == ap_created {
+                                race_err = Some(alloc::format!(
+                                    "directory create atomicity violation on round {}: bsp={} ap={}",
+                                    round,
+                                    bsp_created,
+                                    ap_created
+                                ));
+                                break;
+                            }
+                            if VFS.stat_trusted(&name).is_err() {
+                                race_err = Some(alloc::format!(
+                                    "created entry {} missing at Phase A boundary (round {})",
+                                    name,
+                                    round
+                                ));
+                                break;
+                            }
+
+                            // Phase B: competing unlink of the created entry.
+                            DIR_AP_UNLINK_RES.store(0, Ordering::Release);
+                            DIR_UNLINK_ROUND.store(round, Ordering::Release);
+                            let bsp_unlink = VFS.unlink_trusted(&name, Some(false));
+
+                            let mut ap_unlink_done = false;
+                            for _ in 0..50_000_000usize {
+                                if DIR_AP_UNLINK_DONE.load(Ordering::Acquire) == round {
+                                    ap_unlink_done = true;
+                                    break;
+                                }
+                                spin_loop();
+                            }
+                            if !ap_unlink_done {
+                                race_err = Some(alloc::format!(
+                                    "AP {} timed out on competing unlink round {}",
+                                    target,
+                                    round
+                                ));
+                                break;
+                            }
+                            let ap_unlink = DIR_AP_UNLINK_RES.load(Ordering::Acquire);
+                            let bsp_unlinked = match bsp_unlink {
+                                Ok(()) => true,
+                                Err(FsError::NotFound) => false,
+                                Err(e) => {
+                                    race_err = Some(alloc::format!(
+                                        "BSP unexpected unlink error on round {}: {:?}",
+                                        round,
+                                        e
+                                    ));
+                                    break;
+                                }
+                            };
+                            let ap_unlinked = match ap_unlink {
+                                1 => true,
+                                2 => false,
+                                _ => {
+                                    race_err = Some(alloc::format!(
+                                        "AP unexpected unlink error on round {}",
+                                        round
+                                    ));
+                                    break;
+                                }
+                            };
+                            if bsp_unlinked == ap_unlinked {
+                                race_err = Some(alloc::format!(
+                                    "directory unlink atomicity violation on round {}: bsp={} ap={}",
+                                    round,
+                                    bsp_unlinked,
+                                    ap_unlinked
+                                ));
+                                break;
+                            }
+                            if !matches!(VFS.stat_trusted(&name), Err(FsError::NotFound)) {
+                                race_err = Some(alloc::format!(
+                                    "unlinked entry {} still present at Phase B boundary (round {})",
+                                    name,
+                                    round
+                                ));
+                                break;
+                            }
+                        }
+                    }
+
+                    // Signal abort/exit to AP and require either probe cancellation
+                    // or a matching run-ID exit ack before releasing the fixture.
+                    DIR_CREATE_ROUND.store(u64::MAX, Ordering::Release);
+                    DIR_UNLINK_ROUND.store(u64::MAX, Ordering::Release);
+                    let cancelled = set_ap_test_probe(target, None);
+                    if cancelled {
+                        DIR_EXITED_RUN_ID.store(run_id, Ordering::Release);
+                        ap_still_active = false;
+                    } else {
+                        for _ in 0..50_000_000usize {
+                            if DIR_EXITED_RUN_ID.load(Ordering::Acquire) == run_id {
+                                ap_still_active = false;
+                                break;
+                            }
+                            spin_loop();
+                        }
+                    }
+                    if let Some(msg) = race_err {
+                        return Err(msg);
+                    }
+                    if ap_still_active {
+                        return Err(alloc::format!(
+                            "AP {} timed out exiting directory atomicity worker",
+                            target
+                        ));
+                    }
+                }
+            }
+
+            Ok(())
+        })();
+
+        // Never remove the fixture directory while a timed-out AP worker may
+        // still be operating on entries inside it.
+        if ap_still_active {
+            return match outcome {
+                Err(msg) => TestResult::Fail(msg),
+                Ok(()) => TestResult::Fail(String::from(
+                    "directory atomicity AP worker still active; fixture retained",
+                )),
+            };
+        }
+
+        if ran_smp_race {
+            for i in 0..4usize {
+                let p = alloc::format!("/__sq_dir_atom/race_{}", i);
+                let _ = VFS.unlink_trusted(&p, Some(false));
+            }
+        }
+        if created_file_a {
+            let _ = VFS.unlink_trusted(FILE_A, Some(false));
+        }
+        if created_file_b {
+            let _ = VFS.unlink_trusted(FILE_B, Some(false));
+        }
+        if created_sub {
+            let _ = VFS.unlink_trusted(SUB, Some(true));
+        }
+        let _ = VFS.unlink_trusted(ROOT, Some(true));
+        if let Err(msg) = outcome {
+            return TestResult::Fail(msg);
+        }
+        if !matches!(VFS.stat_trusted(ROOT), Err(FsError::NotFound)) {
+            return TestResult::Fail(String::from("directory atomicity cleanup left root behind"));
+        }
+        TestResult::Pass
     }
 }
 
