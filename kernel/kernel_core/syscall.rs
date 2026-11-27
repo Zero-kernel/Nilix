@@ -17114,6 +17114,34 @@ impl crate::populate::PopulateBackend for EagerPopulator {
         Some(frame)
     }
 
+    fn alloc_zeroed_batch(&mut self, out: &mut [Self::Frame]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
+        // Preserve exact per-frame fault injection ordering when a test probe
+        // is armed.
+        #[cfg(feature = "syscall_test")]
+        if self.fail_at.is_some() {
+            for (index, slot) in out.iter_mut().enumerate() {
+                match self.alloc_zeroed() {
+                    Some(frame) => *slot = frame,
+                    None => return index,
+                }
+            }
+            return out.len();
+        }
+        let filled = mm::buddy_allocator::alloc_physical_pages_batch(out);
+        #[cfg(feature = "syscall_test")]
+        {
+            self.allocated += filled;
+            self.live += filled;
+        }
+        // Issue #109 §1.3 (Invariant S2): all frames returned by the batch
+        // allocator are already scrubbed to zero before publication.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        filled
+    }
+
     fn free_unmapped(&mut self, frame: Self::Frame) {
         #[cfg(feature = "syscall_test")]
         {
@@ -17127,6 +17155,8 @@ impl crate::populate::PopulateBackend for EagerPopulator {
 
         let start = self.base + first * PAGE_SIZE;
         let flags = self.flags;
+        let use_batch = flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+            && !flags.contains(PageTableFlags::HUGE_PAGE);
         let mut done = 0;
         let failed = loop {
             // Stage spare page tables, and the record slots for them, before
@@ -17151,6 +17181,36 @@ impl crate::populate::PopulateBackend for EagerPopulator {
             // interrupts off.
             let outcome = unsafe {
                 mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+                    if use_batch {
+                        let staged = tables.pool.iter().flatten().count();
+                        let start_page = Page::containing_address(VirtAddr::new(
+                            (start + done * PAGE_SIZE) as u64,
+                        ));
+                        match manager.map_user_pages_no_flush(
+                            start_page,
+                            &frames[done..],
+                            flags,
+                            staged,
+                            &mut tables,
+                        ) {
+                            Ok(()) => return MapHold::Done,
+                            Err(mm::BatchMapUserError::Starved { mapped, shortfall }) => {
+                                return MapHold::Starved(done + mapped, shortfall);
+                            }
+                            Err(mm::BatchMapUserError::Failed { mapped, .. }) => {
+                                let index = done + mapped;
+                                let freed = unmap_populated_pages(
+                                    manager,
+                                    data,
+                                    start,
+                                    index,
+                                    index + 1,
+                                    pruned,
+                                );
+                                return MapHold::Failed(index, freed);
+                            }
+                        }
+                    }
                     for index in done..frames.len() {
                         let page = Page::containing_address(VirtAddr::new(
                             (start + index * PAGE_SIZE) as u64,
@@ -17326,31 +17386,44 @@ unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::pagin
 /// one chunk and the pages belong to this population's reservation.
 unsafe fn unmap_populated_pages(
     manager: &mut mm::page_table::PageTableManager,
-    data: &mut mm::memory::FrameAllocator,
+    _data: &mut mm::memory::FrameAllocator,
     start: usize,
     count: usize,
     prune: usize,
     pruned: &mut Vec<x86_64::structures::paging::PhysFrame>,
 ) -> usize {
-    use x86_64::structures::paging::Page;
+    use x86_64::structures::paging::PhysFrame;
+    use x86_64::PhysAddr;
 
     debug_assert!(count <= crate::populate::POPULATE_CHUNK_PAGES);
-    let mut frames = [None; crate::populate::POPULATE_CHUNK_PAGES];
-    let mut removed = 0;
-    for index in 0..count {
-        let page = Page::containing_address(VirtAddr::new((start + index * PAGE_SIZE) as u64));
-        if let Ok(frame) = manager.unmap_page(page) {
-            frames[removed] = Some(frame);
-            removed += 1;
-        }
+    let mut frames =
+        [PhysFrame::containing_address(PhysAddr::new(0)); crate::populate::POPULATE_CHUNK_PAGES];
+    let mut removed = 0usize;
+    if count != 0 {
+        manager.unmap_user_range_no_flush(
+            VirtAddr::new(start as u64),
+            count * PAGE_SIZE,
+            |_page, frame| {
+                if removed < frames.len() {
+                    frames[removed] = frame;
+                    removed += 1;
+                }
+            },
+        );
+    }
+    let pruned_any = manager.prune_empty_tables_in_range_no_flush(
+        VirtAddr::new(start as u64),
+        prune * PAGE_SIZE,
+        pruned,
+    );
+    if pruned_any {
+        mm::flush_current_as_all();
+    } else if removed != 0 {
+        mm::flush_current_as_range(VirtAddr::new(start as u64), count * PAGE_SIZE);
     }
     if removed != 0 {
-        mm::flush_current_as_range(VirtAddr::new(start as u64), count * PAGE_SIZE);
-        for frame in frames.iter().flatten() {
-            data.deallocate_frame(*frame);
-        }
+        mm::buddy_allocator::free_physical_pages_batch(&frames[..removed]);
     }
-    manager.prune_empty_tables_in_range(VirtAddr::new(start as u64), prune * PAGE_SIZE, pruned);
     removed
 }
 
@@ -18380,96 +18453,107 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     }; // Process lock + MmState lock dropped here — Phase 1 complete
 
     // 使用基于当前 CR3 的页表管理器进行取消映射
-    // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
-    // 使用基于当前 CR3 的页表管理器进行取消映射
-    // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
-    // R171-CG1x0 FIX (M2-1 SLICE-0): the closure now yields the reclaimed empty
-    // PT/PD TABLE frames (NOT freed here) so Phase 3 can remove them from the per-AS
-    // ledger BEFORE they are published to the buddy (free-after-remove).
-    let unmap_result: Result<alloc::vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
-        with_current_manager(VirtAddr::new(0), |manager| -> Result<alloc::vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> {
-            use alloc::vec::Vec;
-            use x86_64::structures::paging::PhysFrame;
+    // R23-3 / R159-1 / Issue #109 §1.1 (H1) + R171-CG1x0 FIX (M2-1 SLICE-0):
+    // Clear all leaf PTEs (batched per 2 MiB PT, zero per-page invlpg) and
+    // detach any now-empty PT/PD tables under PT_LOCK, perform ONE combined
+    // cross-CPU TLB/paging-structure shootdown BEFORE dropping PT_LOCK, then
+    // release PAGE_REF_COUNT and batch-free last-reference data frames OUTSIDE
+    // PT_LOCK (with interrupts enabled). Reclaimed PT/PD frames are published
+    // to the buddy strictly AFTER Phase 3 removes them from the per-AS ledger.
+    const UNMAP_INLINE_CAP: usize = crate::populate::POPULATE_CHUNK_PAGES;
+    struct UnmappedFrameBuf {
+        inline: [x86_64::structures::paging::PhysFrame; UNMAP_INLINE_CAP],
+        inline_len: usize,
+        overflow: alloc::vec::Vec<x86_64::structures::paging::PhysFrame>,
+    }
 
-            let mut frame_alloc = FrameAllocator::new();
-            // R159-1 + Issue #109 §1.1 (H1): collect ALL unmapped leaf frames first,
-            // complete the cross-CPU TLB shootdown BEFORE calling PAGE_REF_COUNT.release(),
-            // and only then release refcounts and free last-reference frames.
-            let mut unmapped_frames: Vec<PhysFrame> = Vec::new();
-            let _ = unmapped_frames.try_reserve(length_aligned / 0x1000);
+    let unmap_result: Result<
+        (
+            UnmappedFrameBuf,
+            alloc::vec::Vec<x86_64::structures::paging::PhysFrame>,
+        ),
+        SyscallError,
+    > = unsafe {
+        with_current_manager(
+            VirtAddr::new(0),
+            |manager| -> Result<
+                (
+                    UnmappedFrameBuf,
+                    alloc::vec::Vec<x86_64::structures::paging::PhysFrame>,
+                ),
+                SyscallError,
+            > {
+                use alloc::vec::Vec;
+                use x86_64::structures::paging::PhysFrame;
+                use x86_64::PhysAddr;
 
-            let mut removed_leaf = false;
-
-            for offset in (0..length_aligned).step_by(0x1000) {
-                let page = Page::containing_address(VirtAddr::new((addr + offset) as u64));
-
-                // R141-9 FIX: Try normal unmap first. If the page is non-present
-                // (e.g. after mprotect(PROT_NONE)), fall back to reclaiming the
-                // frame from the raw PTE.
-                let frame_opt = match manager.unmap_page(page) {
-                    Ok(frame) => Some(frame),
-                    Err(mm::page_table::UnmapError::PageNotMapped) => {
-                        manager.take_nonpresent_leaf_frame(page)
-                    }
-                    Err(_) => None,
+                let mut frame_alloc = FrameAllocator::new();
+                let pages = length_aligned / 0x1000;
+                let mut unmapped = UnmappedFrameBuf {
+                    inline: [PhysFrame::containing_address(PhysAddr::new(0)); UNMAP_INLINE_CAP],
+                    inline_len: 0,
+                    overflow: Vec::new(),
                 };
+                if pages > UNMAP_INLINE_CAP {
+                    let _ = unmapped.overflow.try_reserve(pages - UNMAP_INLINE_CAP);
+                }
 
-                if let Some(frame) = frame_opt {
-                    removed_leaf = true;
-                    if unmapped_frames.try_reserve(1).is_ok() {
-                        unmapped_frames.push(frame);
-                    } else {
-                        // OOM fallback: flush this page FIRST, then release & free.
-                        mm::flush_current_as_page(page.start_address());
-                        let phys_addr = frame.start_address().as_u64() as usize;
-                        if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
-                            frame_alloc.deallocate_frame(frame);
+                let mut removed_leaf = false;
+                manager.unmap_user_range_no_flush(
+                    VirtAddr::new(addr as u64),
+                    length_aligned,
+                    |page, frame| {
+                        removed_leaf = true;
+                        if unmapped.inline_len < UNMAP_INLINE_CAP {
+                            unmapped.inline[unmapped.inline_len] = frame;
+                            unmapped.inline_len += 1;
+                        } else if unmapped.overflow.try_reserve(1).is_ok() {
+                            unmapped.overflow.push(frame);
+                        } else {
+                            // OOM fallback: flush this page FIRST, then release & free.
+                            mm::flush_current_as_page(page.start_address());
+                            let phys_addr = frame.start_address().as_u64() as usize;
+                            if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
+                                frame_alloc.deallocate_frame(frame);
+                            }
                         }
+                    },
+                );
+
+                // Detach now-empty PT/PD tables BEFORE the flush so that when a
+                // table is collapsed, ONE `flush_current_as_all()` invalidates
+                // both the cleared leaves and the cleared parent PDE/PDPTEs.
+                let mut table_frames: Vec<PhysFrame> = Vec::new();
+                let pruned_any = manager.prune_empty_tables_in_range_no_flush(
+                    VirtAddr::new(addr as u64),
+                    length_aligned,
+                    &mut table_frames,
+                );
+
+                // Shared and COW leaves retain peer references, so every removed leaf
+                // and detached table must be invalidated across all participating CPUs
+                // BEFORE releasing PAGE_REF_COUNT or dropping any Phase-3 pin.
+                if removed_leaf || pruned_any {
+                    // ST-K2-P2(b): the remote-holder oracle pauses here, holding
+                    // the AS PT lock, until a sibling's IF=0 shared fault is spinning.
+                    #[cfg(feature = "syscall_test")]
+                    crate::fork::shared_fault_test::before_unmap_flush(pid, addr);
+                    if pruned_any {
+                        mm::flush_current_as_all();
+                    } else {
+                        mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
                     }
+                    #[cfg(feature = "syscall_test")]
+                    crate::fork::shared_fault_test::after_unmap_flush(pid, addr);
                 }
-            }
 
-            // Shared and COW leaves retain peer references, so every removed leaf
-            // must be invalidated across all participating CPUs BEFORE releasing
-            // PAGE_REF_COUNT or dropping any Phase-3 shared-region pin.
-            if removed_leaf {
-                // ST-K2-P2(b): the remote-holder oracle pauses here, holding
-                // the AS PT lock, until a sibling's IF=0 shared fault is spinning.
-                #[cfg(feature = "syscall_test")]
-                crate::fork::shared_fault_test::before_unmap_flush(pid, addr);
-                mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
-                #[cfg(feature = "syscall_test")]
-                crate::fork::shared_fault_test::after_unmap_flush(pid, addr);
-            }
-            for frame in unmapped_frames {
-                let phys_addr = frame.start_address().as_u64() as usize;
-                if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
-                    frame_alloc.deallocate_frame(frame);
-                }
-            }
-
-            // R171-CG1x0 FIX (M2-1 SLICE-0): reclaim the now-empty intermediate
-            // PT/PD tables this unmap left behind — but DO NOT free them to the buddy
-            // here. prune clears the parent PDE/PDPTE entries and issues the
-            // all-CPU paging-structure shootdown UNDER PT_LOCK (clear→flush stays in
-            // Phase 2); the carried frames are published to the buddy strictly AFTER
-            // Phase 3 removes them from the per-AS ledger (free-after-remove). Note:
-            // this fires prune on the COMMON munmap-empties-a-table path (previously
-            // only on the rare OOM-rollback paths) — accepted per Safety > Speed.
-            let mut table_frames: Vec<PhysFrame> = Vec::new();
-            let _ = table_frames.try_reserve((length_aligned / 0x20_0000) + 2);
-            manager.prune_empty_tables_in_range(
-                VirtAddr::new(addr as u64),
-                length_aligned,
-                &mut table_frames,
-            );
-
-            Ok(table_frames)
-        })
+                Ok((unmapped, table_frames))
+            },
+        )
     };
 
-    let table_frames = match unmap_result {
-        Ok(tf) => tf,
+    let (unmapped_frames, table_frames) = match unmap_result {
+        Ok(pair) => pair,
         Err(e) => {
             // Roll back the PENDING_UNMAP marker so the region remains usable.
             // Preserve committed per-region flags (e.g. PROT_NONE).
@@ -18483,6 +18567,34 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             return Err(e);
         }
     };
+
+    // Release PAGE_REF_COUNT and batch-scrub/free last-reference data frames
+    // OUTSIDE PT_LOCK (with interrupts enabled), strictly after the cross-CPU
+    // TLB shootdown completed above.
+    {
+        use x86_64::structures::paging::PhysFrame;
+        use x86_64::PhysAddr;
+
+        let mut free_batch = [PhysFrame::containing_address(PhysAddr::new(0)); UNMAP_INLINE_CAP];
+        let mut free_len = 0usize;
+        for &frame in unmapped_frames.inline[..unmapped_frames.inline_len]
+            .iter()
+            .chain(unmapped_frames.overflow.iter())
+        {
+            let phys_addr = frame.start_address().as_u64() as usize;
+            if PAGE_REF_COUNT.release(phys_addr).should_free_unmapped() {
+                free_batch[free_len] = frame;
+                free_len += 1;
+                if free_len == UNMAP_INLINE_CAP {
+                    mm::buddy_allocator::free_physical_pages_batch(&free_batch);
+                    free_len = 0;
+                }
+            }
+        }
+        if free_len > 0 {
+            mm::buddy_allocator::free_physical_pages_batch(&free_batch[..free_len]);
+        }
+    }
 
     // R171-CG1x0 FIX (M2-1 SLICE-0): a leak-safe carrier for the reclaimed PT/PD
     // table frames. The frames are published to the buddy ONLY after Phase 3 removes
