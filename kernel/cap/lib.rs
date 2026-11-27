@@ -661,12 +661,56 @@ impl CapTable {
     // with_capacity used vec![None; capacity] which panics under OOM
     // with up to MAX_CAP_SLOTS=65535 entries.
     pub fn try_clone_for_fork(&self) -> Result<Self, ()> {
+        let arc_bytes = arc_charge_bytes::<CapTable>().map_err(|_| ())?;
+        let arc_reservation = try_reserve_heap(HeapClass::Capability, arc_bytes).map_err(|_| ())?;
+        let new_inner = self.build_cloned_inner_for_fork(None)?;
+        let arc_charge = arc_reservation.commit().map_err(|_| ())?;
+        Ok(Self {
+            inner: Mutex::new(new_inner),
+            _arc_charge: Some(arc_charge),
+        })
+    }
+
+    /// Populate an already-allocated unpublished empty child `CapTable` directly
+    /// for `fork()`, avoiding a second `Arc<CapTable>` allocation/charge cycle
+    /// and skipping all vector allocations when no capability is inheritable.
+    pub fn try_clone_into_empty_for_fork(
+        &self,
+        target: &CapTable,
+        reconciled_refcounts: Option<&[(CapId, usize)]>,
+    ) -> Result<(), ()> {
+        let new_inner = self.build_cloned_inner_for_fork(reconciled_refcounts)?;
+        let old_inner = interrupts::without_interrupts(|| {
+            let mut dst = target.inner.lock();
+            core::mem::replace(&mut *dst, new_inner)
+        });
+        drop(old_inner);
+        Ok(())
+    }
+
+    fn build_cloned_inner_for_fork(
+        &self,
+        reconciled_refcounts: Option<&[(CapId, usize)]>,
+    ) -> Result<CapTableInner, ()> {
         interrupts::without_interrupts(|| {
             let inner = self.inner.lock();
             let capacity = inner.slots.len().min(MAX_CAP_SLOTS);
-            let arc_bytes = arc_charge_bytes::<CapTable>().map_err(|_| ())?;
-            let arc_reservation =
-                try_reserve_heap(HeapClass::Capability, arc_bytes).map_err(|_| ())?;
+            let has_inheritable = inner.slots[..capacity].iter().any(|slot_opt| {
+                slot_opt
+                    .as_ref()
+                    .is_some_and(|s| s.entry.inherits_on_fork())
+            });
+            if !has_inheritable {
+                return Ok(CapTableInner {
+                    slots: Vec::new(),
+                    free: Vec::new(),
+                    slots_charge: None,
+                    free_charge: None,
+                    next_generation: inner.next_generation,
+                    reserved_allocations: 0,
+                });
+            }
+
             let mut slots_prepared =
                 prepare_cap_vec::<Option<CapSlot>>(capacity).map_err(|_| ())?;
             for _ in 0..capacity {
@@ -683,7 +727,7 @@ impl CapTable {
                 reserved_allocations: 0,
             };
 
-            for (idx, slot_opt) in inner.slots.iter().enumerate() {
+            for (idx, slot_opt) in inner.slots[..capacity].iter().enumerate() {
                 if let Some(slot) = slot_opt {
                     if slot.entry.inherits_on_fork() {
                         new_inner.slots[idx] = Some(slot.clone());
@@ -692,18 +736,16 @@ impl CapTable {
             }
 
             new_inner.rebuild_free_list();
+            if let Some(child_counts) = reconciled_refcounts {
+                Self::reconcile_inner_after_fork(&mut new_inner, child_counts);
+            } else {
+                // A CLOFORK-only parent can yield a completely empty child table.
+                // Return all unused backing rather than retaining a high-water
+                // allocation that no child capability owns.
+                new_inner.reclaim_if_unused();
+            }
 
-            // A CLOFORK-only parent can yield a completely empty child table.
-            // Return all unused backing rather than retaining a high-water
-            // allocation that no child capability owns.
-            new_inner.reclaim_if_unused();
-
-            let arc_charge = arc_reservation.commit().map_err(|_| ())?;
-
-            Ok(Self {
-                inner: Mutex::new(new_inner),
-                _arc_charge: Some(arc_charge),
-            })
+            Ok(new_inner)
         })
     }
 
@@ -752,58 +794,62 @@ impl CapTable {
     pub fn reconcile_refcounts_after_fork(&mut self, child_counts: &[(CapId, usize)]) {
         interrupts::without_interrupts(|| {
             let mut inner = self.inner.lock();
-            // Index loop (the apply_cloexec style) — ZERO allocation under the
-            // lock: a collect-then-revoke Vec would infallibly push under the
-            // table spinlock on the FORK path, re-introducing the fatal-OOM
-            // class R161-4/R157-3 eliminated from fork. `revoke`'s `free.push`
-            // is allocation-free by INV-CAP-FREELIST-CAP (R172-06).
-            for idx in 0..inner.slots.len() {
-                let action = match &inner.slots[idx] {
-                    // BV-3: only fd-lifecycle-managed caps are reconciled.
-                    Some(slot) if slot.entry.object.is_fd_backed() => {
-                        let cid = CapId::from_parts(idx as u16, slot.generation);
-                        let child_fd_count = child_counts
-                            .binary_search_by_key(&cid, |entry| entry.0)
-                            .ok()
-                            .map(|index| child_counts[index].1)
-                            .unwrap_or(0);
-                        if child_fd_count == 0 {
-                            // CRITICAL-9: no child fd references this cap →
-                            // orphan → revoke (below, outside this borrow).
-                            Some((cid, 0))
-                        } else {
-                            Some((cid, child_fd_count))
-                        }
-                    }
-                    _ => None,
-                };
-                match action {
-                    Some((cid, 0)) => {
-                        // Revoke in-lock: the table is private (no observer
-                        // can race) and the fd-backed scope guarantees a
-                        // plain-data drop — no wakeup/re-lock side effect
-                        // (the design-v3 Fix 2b "revoke outside lock" concern
-                        // does not apply to a private table).
-                        let _ = inner.revoke_retaining_capacity(cid);
-                    }
-                    Some((_, child_fd_count)) => {
-                        // Overwrite the verbatim-copied refcount with the
-                        // child's actual count.
-                        if let Some(slot) = &mut inner.slots[idx] {
-                            slot.entry
-                                .refcount
-                                .store(child_fd_count, core::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                    None => {}
-                }
-            }
-            // RF180-37 defense in depth: reclaim only after the fixed-range
-            // index walk. Reclaiming from the final in-loop revoke would empty
-            // `slots` and make the next loop index panic; live reservations also
-            // veto reclamation through `reclaim_if_unused`.
-            inner.reclaim_if_unused();
+            Self::reconcile_inner_after_fork(&mut inner, child_counts);
         });
+    }
+
+    fn reconcile_inner_after_fork(inner: &mut CapTableInner, child_counts: &[(CapId, usize)]) {
+        // Index loop (the apply_cloexec style) — ZERO allocation under the
+        // lock: a collect-then-revoke Vec would infallibly push under the
+        // table spinlock on the FORK path, re-introducing the fatal-OOM
+        // class R161-4/R157-3 eliminated from fork. `revoke`'s `free.push`
+        // is allocation-free by INV-CAP-FREELIST-CAP (R172-06).
+        for idx in 0..inner.slots.len() {
+            let action = match &inner.slots[idx] {
+                // BV-3: only fd-lifecycle-managed caps are reconciled.
+                Some(slot) if slot.entry.object.is_fd_backed() => {
+                    let cid = CapId::from_parts(idx as u16, slot.generation);
+                    let child_fd_count = child_counts
+                        .binary_search_by_key(&cid, |entry| entry.0)
+                        .ok()
+                        .map(|index| child_counts[index].1)
+                        .unwrap_or(0);
+                    if child_fd_count == 0 {
+                        // CRITICAL-9: no child fd references this cap →
+                        // orphan → revoke (below, outside this borrow).
+                        Some((cid, 0))
+                    } else {
+                        Some((cid, child_fd_count))
+                    }
+                }
+                _ => None,
+            };
+            match action {
+                Some((cid, 0)) => {
+                    // Revoke in-lock: the table is private (no observer
+                    // can race) and the fd-backed scope guarantees a
+                    // plain-data drop — no wakeup/re-lock side effect
+                    // (the design-v3 Fix 2b "revoke outside lock" concern
+                    // does not apply to a private table).
+                    let _ = inner.revoke_retaining_capacity(cid);
+                }
+                Some((_, child_fd_count)) => {
+                    // Overwrite the verbatim-copied refcount with the
+                    // child's actual count.
+                    if let Some(slot) = &mut inner.slots[idx] {
+                        slot.entry
+                            .refcount
+                            .store(child_fd_count, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                None => {}
+            }
+        }
+        // RF180-37 defense in depth: reclaim only after the fixed-range
+        // index walk. Reclaiming from the final in-loop revoke would empty
+        // `slots` and make the next loop index panic; live reservations also
+        // veto reclamation through `reclaim_if_unused`.
+        inner.reclaim_if_unused();
     }
 
     /// Revoke all capabilities with CLOEXEC flag (for exec).

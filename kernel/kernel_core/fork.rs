@@ -789,7 +789,7 @@ fn fork_prepare_child_state(
     // group) has cap refcounts that already equal its own fd count, so the
     // verbatim copy is correct. Checking `> 1` avoids the O(fds × caps) scan
     // on the common non-threaded fork path.
-    let cap_table = if parent.capability_table_is_shared() {
+    if parent.capability_table_is_shared() {
         // Build a histogram: CapId → count of child fds carrying it.
         let mut child_cap_counts = [(cap::CapId::INVALID, 0usize); crate::process::MAX_FD as usize];
         let mut child_cap_count_len = 0usize;
@@ -819,15 +819,13 @@ fn fork_prepare_child_state(
             }
         }
         parent
-            .try_clone_capability_table_for_fork(Some(&child_cap_counts[..unique_len]))
-            .map_err(|_| ForkError::MemoryAllocationFailed)?
+            .try_populate_capability_table_for_fork(&child, Some(&child_cap_counts[..unique_len]))
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
     } else {
         parent
-            .try_clone_capability_table_for_fork(None)
-            .map_err(|_| ForkError::MemoryAllocationFailed)?
-    };
-
-    child.install_capability_table(cap_table);
+            .try_populate_capability_table_for_fork(&child, None)
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+    }
 
     child.time_slice = parent.time_slice;
     child.cpu_time = 0;
@@ -1436,19 +1434,22 @@ pub unsafe fn copy_page_table_cow_with_shared(
         // clears child PML4[0..256] and returns all private frames cleanly.
         let mut plan = CowClonePlan::new();
         let mut table_frames = InlineTableFrames::new();
+        let mut table_pool = CowTableFramePool::new();
         if let Err(error) = clone_child_level(
             parent_pml4,
             child_pml4,
-            &mut frame_alloc,
+            &mut table_pool,
             &mut table_frames,
             &mut plan,
             4,
             0,
             shared_ranges,
         ) {
+            drop(table_pool);
             rollback_prepared_child_clone(child_pml4, &mut table_frames, &mut frame_alloc);
             return Err(error);
         }
+        drop(table_pool);
         #[cfg(debug_assertions)]
         kprintln!(
             "[FORKDIAG] FD5 child-built leaves={} tables={}",
@@ -2929,6 +2930,75 @@ impl CowClonePlan {
     }
 }
 
+const COW_TABLE_POOL_REFILL: usize = 8;
+
+/// Stack-inline pre-zeroed frame pool for intermediate COW page-table frames.
+///
+/// Refills up to `COW_TABLE_POOL_REFILL` frames in one best-effort batched
+/// PCP/buddy call (`alloc_physical_pages_batch_best_effort`) so optional spares
+/// never trigger the global OOM killer, falling back to a single mandatory
+/// OOM-capable allocation (`alloc_physical_pages(1)`) only when zero frames
+/// could be obtained. Returns any unused remainder on `Drop` in one
+/// `free_physical_pages_batch` call so fork never leaks frames on early
+/// completion or rollback.
+struct CowTableFramePool {
+    frames: [PhysFrame<Size4KiB>; COW_TABLE_POOL_REFILL],
+    next: usize,
+    len: usize,
+}
+
+impl CowTableFramePool {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            frames: [PhysFrame::containing_address(PhysAddr::new(0)); COW_TABLE_POOL_REFILL],
+            next: 0,
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn alloc_with_fallback(
+        &mut self,
+        mut refill_best_effort: impl FnMut(&mut [PhysFrame<Size4KiB>]) -> usize,
+        mut alloc_mandatory_one: impl FnMut() -> Option<PhysFrame<Size4KiB>>,
+    ) -> Option<PhysFrame<Size4KiB>> {
+        if self.next == self.len {
+            self.next = 0;
+            self.len = refill_best_effort(&mut self.frames).min(COW_TABLE_POOL_REFILL);
+            if self.len == 0 {
+                return alloc_mandatory_one();
+            }
+        }
+        let frame = self.frames[self.next];
+        self.next += 1;
+        Some(frame)
+    }
+
+    #[inline]
+    fn alloc(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        self.alloc_with_fallback(
+            mm::buddy_allocator::alloc_physical_pages_batch_best_effort,
+            || mm::buddy_allocator::alloc_physical_pages(1),
+        )
+    }
+
+    #[inline]
+    fn drain_unused_with(&mut self, mut free_batch: impl FnMut(&[PhysFrame<Size4KiB>])) {
+        if self.next < self.len {
+            free_batch(&self.frames[self.next..self.len]);
+            self.next = 0;
+            self.len = 0;
+        }
+    }
+}
+
+impl Drop for CowTableFramePool {
+    fn drop(&mut self) {
+        self.drain_unused_with(mm::buddy_allocator::free_physical_pages_batch);
+    }
+}
+
 /// R180-19 PREPARE: single-pass child page-table tree construction without
 /// touching any parent PTE. Uses 4x u64 zero-skipping and pre-zeroed order-0
 /// table frames (Buddy Invariant S2). On any allocation failure, callers roll
@@ -2936,7 +3006,7 @@ impl CowClonePlan {
 fn clone_child_level(
     parent: &mut PageTable,
     child: &mut PageTable,
-    frame_alloc: &mut FrameAllocator,
+    table_pool: &mut CowTableFramePool,
     table_frames: &mut InlineTableFrames,
     plan: &mut CowClonePlan,
     level: u8,
@@ -3005,11 +3075,11 @@ fn clone_child_level(
                 build_child_leaf(&mut child[idx], &planned);
             } else {
                 // Allocate pre-zeroed intermediate table frame (Buddy Invariant S2).
-                let frame = frame_alloc
-                    .allocate_frame()
+                let frame = table_pool
+                    .alloc()
                     .ok_or(ForkError::MemoryAllocationFailed)?;
                 if let Err(err) = table_frames.try_push(frame) {
-                    frame_alloc.deallocate_frame(frame);
+                    mm::buddy_allocator::free_physical_pages_batch(&[frame]);
                     return Err(err);
                 }
                 unsafe {
@@ -3023,7 +3093,7 @@ fn clone_child_level(
                 clone_child_level(
                     parent_next,
                     child_next,
-                    frame_alloc,
+                    table_pool,
                     table_frames,
                     plan,
                     level - 1,
@@ -3843,23 +3913,15 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
 pub fn create_kpti_user_pml4(
     kernel_pml4_phys: usize,
 ) -> Result<(PhysFrame<Size4KiB>, usize), ForkError> {
-    let mut frame_alloc = FrameAllocator::new();
-
     // Mask low 12 bits defensively (PCID bits may be present in raw CR3 values)
     let kernel_pml4_phys = kernel_pml4_phys & !0xFFF;
     if kernel_pml4_phys == 0 {
         return Err(ForkError::PageTableCopyFailed);
     }
 
-    // Allocate user PML4 root (pre-zeroed by Buddy Invariant S2)
-    let user_pml4_frame = frame_alloc
-        .allocate_frame()
-        .ok_or(ForkError::MemoryAllocationFailed)?;
-    unsafe {
-        debug_assert_table_zeroed(user_pml4_frame);
-    }
-
-    // R118-5 FIX: Allocate a dedicated PDPT for the entry island (PML4[511]).
+    // Allocate both the user PML4 root and the R118-5 dedicated entry-island
+    // PDPT frame (PML4[511]) in a single batched PCP/buddy call (pre-zeroed by
+    // Buddy Invariant S2).
     //
     // Instead of copying the kernel's full PML4[511] (which maps 512 GiB),
     // we create a fresh PDPT and copy only its top 6 GiB
@@ -3870,15 +3932,18 @@ pub fn create_kpti_user_pml4(
     //   - Kernel text/data (.text at 0xffffffff80100000)
     //   - Per-CPU syscall metadata (SyscallPerCpu)
     //   - IDT/GDT/TSS and scratch stacks
-    let entry_island_pdpt_frame = match frame_alloc.allocate_frame() {
-        Some(f) => f,
-        None => {
-            // Roll back: free the PML4 frame that was already allocated above.
-            frame_alloc.deallocate_frame(user_pml4_frame);
-            return Err(ForkError::MemoryAllocationFailed);
+    let mut kpti_frames = [PhysFrame::containing_address(PhysAddr::new(0)); 2];
+    let got = mm::buddy_allocator::alloc_physical_pages_batch(&mut kpti_frames);
+    if got < 2 {
+        if got > 0 {
+            mm::buddy_allocator::free_physical_pages_batch(&kpti_frames[..got]);
         }
-    };
+        return Err(ForkError::MemoryAllocationFailed);
+    }
+    let user_pml4_frame = kpti_frames[0];
+    let entry_island_pdpt_frame = kpti_frames[1];
     unsafe {
+        debug_assert_table_zeroed(user_pml4_frame);
         debug_assert_table_zeroed(entry_island_pdpt_frame);
     }
 
@@ -3986,8 +4051,7 @@ pub fn create_kpti_user_pml4(
     // in the copied entries. Fail closed rather than build a root whose first
     // interrupt would double-fault.
     if !stacks_reachable {
-        frame_alloc.deallocate_frame(entry_island_pdpt_frame);
-        frame_alloc.deallocate_frame(user_pml4_frame);
+        mm::buddy_allocator::free_physical_pages_batch(&[entry_island_pdpt_frame, user_pml4_frame]);
         return Err(ForkError::PageTableCopyFailed);
     }
 
@@ -4032,23 +4096,27 @@ pub fn free_kpti_user_pml4(user_memory_space: usize) {
         return;
     }
 
-    let mut frame_alloc = FrameAllocator::new();
     let root_frame: PhysFrame<Size4KiB> =
         PhysFrame::containing_address(PhysAddr::new(user_memory_space as u64));
+    let mut frames = [PhysFrame::containing_address(PhysAddr::new(0)); 2];
+    let mut count = 0usize;
 
-    // R118-5 FIX: Free the privately-owned entry-island PDPT frame (PML4[511]).
+    // R118-5 FIX: Free the privately-owned entry-island PDPT frame (PML4[511])
+    // and user PML4 root in a single batched PCP/buddy release.
     unsafe {
         const ENTRY_ISLAND_INDEX: usize = 511;
         let user_pml4 = phys_to_virt_table(root_frame.start_address());
         if !user_pml4[ENTRY_ISLAND_INDEX].is_unused() {
             let pdpt_phys = user_pml4[ENTRY_ISLAND_INDEX].addr();
             user_pml4[ENTRY_ISLAND_INDEX].set_unused();
-            let pdpt_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(pdpt_phys);
-            frame_alloc.deallocate_frame(pdpt_frame);
+            frames[count] = PhysFrame::containing_address(pdpt_phys);
+            count += 1;
         }
     }
 
-    frame_alloc.deallocate_frame(root_frame);
+    frames[count] = root_frame;
+    count += 1;
+    mm::buddy_allocator::free_physical_pages_batch(&frames[..count]);
 }
 
 /// D0-ISO-1 Approach A (R192-RES-1): give a fresh user address space a
@@ -4184,5 +4252,92 @@ mod tests {
                 VirtAddr::new((0x50_0000 + i * 4096) as u64)
             );
         }
+    }
+
+    #[test]
+    fn cow_table_frame_pool_serves_and_returns_unused_frames() {
+        use core::cell::Cell;
+
+        let mut pool = CowTableFramePool::new();
+        let next_phys = Cell::new(0x20_0000u64);
+        let refill_calls = Cell::new(0usize);
+        let oom_fallback_calls = Cell::new(0usize);
+        let alloc_fn = |out: &mut [PhysFrame<Size4KiB>]| -> usize {
+            let call = refill_calls.get() + 1;
+            refill_calls.set(call);
+            let give = if call == 1 {
+                out.len()
+            } else if call == 2 {
+                3
+            } else {
+                0
+            };
+            for slot in out.iter_mut().take(give) {
+                let p = next_phys.get();
+                *slot = PhysFrame::containing_address(PhysAddr::new(p));
+                next_phys.set(p + 4096);
+            }
+            give
+        };
+        let oom_fallback = || -> Option<PhysFrame<Size4KiB>> {
+            let calls = oom_fallback_calls.get() + 1;
+            oom_fallback_calls.set(calls);
+            if calls == 1 {
+                let p = next_phys.get();
+                next_phys.set(p + 4096);
+                Some(PhysFrame::containing_address(PhysAddr::new(p)))
+            } else {
+                None
+            }
+        };
+
+        // First refill serves COW_TABLE_POOL_REFILL frames with one batch call.
+        for i in 0..COW_TABLE_POOL_REFILL {
+            let f = pool
+                .alloc_with_fallback(alloc_fn, oom_fallback)
+                .expect("first batch frame");
+            assert_eq!(f.start_address().as_u64(), 0x20_0000 + (i as u64) * 4096);
+        }
+        assert_eq!(refill_calls.get(), 1);
+        assert_eq!(oom_fallback_calls.get(), 0);
+
+        // Partial best-effort refill (3 < 8) must NOT invoke OOM fallback.
+        let extra = pool
+            .alloc_with_fallback(alloc_fn, oom_fallback)
+            .expect("second batch frame");
+        assert_eq!(
+            extra.start_address().as_u64(),
+            0x20_0000 + (COW_TABLE_POOL_REFILL as u64) * 4096
+        );
+        assert_eq!(refill_calls.get(), 2);
+        assert_eq!(oom_fallback_calls.get(), 0);
+
+        let mut returned: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        pool.drain_unused_with(|slice| {
+            returned.extend(slice.iter().map(|f| f.start_address().as_u64()));
+        });
+        assert_eq!(
+            returned,
+            alloc::vec![
+                0x20_0000 + ((COW_TABLE_POOL_REFILL + 1) as u64) * 4096,
+                0x20_0000 + ((COW_TABLE_POOL_REFILL + 2) as u64) * 4096,
+            ]
+        );
+
+        // Only zero-frame best-effort exhaustion invokes the single mandatory OOM fallback.
+        let rescued = pool
+            .alloc_with_fallback(alloc_fn, oom_fallback)
+            .expect("mandatory single-frame fallback");
+        assert_eq!(
+            rescued.start_address().as_u64(),
+            0x20_0000 + ((COW_TABLE_POOL_REFILL + 3) as u64) * 4096
+        );
+        assert_eq!(refill_calls.get(), 3);
+        assert_eq!(oom_fallback_calls.get(), 1);
+
+        // Full exhaustion returns None cleanly.
+        assert!(pool.alloc_with_fallback(alloc_fn, oom_fallback).is_none());
+        assert_eq!(refill_calls.get(), 4);
+        assert_eq!(oom_fallback_calls.get(), 2);
     }
 }

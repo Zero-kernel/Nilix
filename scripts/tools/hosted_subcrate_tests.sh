@@ -225,11 +225,11 @@ run_suite net 142 0 \
 # Robust-list and futex decision tests only: the remaining ipc tests reach
 # wakes or other privileged paths (one pipe admission test crashes a hosted
 # process at HEAD too). Futex parity/PI tests defer every wake.
-run_suite ipc-robust-futex 30 17 \
+run_suite ipc-robust-futex 31 17 \
     --manifest-path kernel/ipc/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
-    --lib --locked -- robust_ futex_parity_ futex_pi_
+    --lib --locked -- robust_ futex_parity_ futex_pi_ pipe_close_
 
 run_suite vfs 87 0 \
     --manifest-path kernel/vfs/Cargo.toml \
@@ -246,7 +246,7 @@ run_suite cgroup-access 1 0 \
 
 # Includes the C3 aligned TID store and concurrent word tests, the C3
 # work-stealing hint with its model, and P2 wake-affine / placement / voluntary-yield policy tests.
-run_suite kernel-core 216 0 \
+run_suite kernel-core 221 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -286,7 +286,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 216 \
+run_suite mitigation-mappings 5 221 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

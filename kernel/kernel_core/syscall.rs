@@ -9011,6 +9011,18 @@ fn prepare_child_wait(
     target: WaitTarget,
     children: &[ProcessId],
     namespace: &crate::pid_namespace::PidNamespaceArc,
+    lookup: impl FnMut(ProcessId) -> Option<crate::process::ProcessArc>,
+) -> Result<bool, SyscallError> {
+    prepare_child_wait_checked(parent, pid, target, children, namespace, None, lookup)
+}
+
+fn prepare_child_wait_checked(
+    parent: &crate::process::ProcessArc,
+    pid: ProcessId,
+    target: WaitTarget,
+    children: &[ProcessId],
+    namespace: &crate::pid_namespace::PidNamespaceArc,
+    expected_child_events: Option<u64>,
     mut lookup: impl FnMut(ProcessId) -> Option<crate::process::ProcessArc>,
 ) -> Result<bool, SyscallError> {
     let wake_pid = match target {
@@ -9030,14 +9042,20 @@ fn prepare_child_wait(
         proc.waiting_child = None;
         return Err(SyscallError::EINTR);
     }
-    if let Some(global) = wake_pid {
+    // If an already-reapable zombie was adopted (or a child exited) after
+    // `children` was snapshotted, decline to publish Blocked on the stale
+    // snapshot so the wait loop re-snapshots `proc.children` before halting.
+    let stale_snapshot =
+        expected_child_events.is_some_and(|seen| proc.thread_group.child_events() != seen);
+    if let Some(global) = wake_pid.filter(|_| !stale_snapshot) {
         proc.enter_blocked_at(crate::get_ticks());
         proc.waiting_child = Some(global);
+        Ok(true)
     } else {
         proc.enter_ready_at(crate::get_ticks());
         proc.waiting_child = None;
+        Ok(false)
     }
-    Ok(wake_pid.is_some())
 }
 
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
@@ -9646,10 +9664,27 @@ where
         // handler that this drain posts ends the wait with EINTR (pre-existing;
         // Linux scans first and reports the child).
         crate::process::run_blocked_wait_drains();
-        // Snapshot the children before resolving the wake filter. Publication
-        // follows identity resolution and still precedes the reapability scan.
-        let child_list = {
+        // Snapshot the children and owning PID namespace in ONE parent lock.
+        // For `WaitTarget::Pid(want)` in the root PID namespace where `want`
+        // is already listed in `proc.children`, avoid heap-allocating the full
+        // sibling list and avoid locking unrelated sibling PCBs during
+        // `prepare_child_wait` and the reapability scan.
+        enum WaitChildList {
+            Single([ProcessId; 1]),
+            Many(Vec<ProcessId>),
+        }
+        impl WaitChildList {
+            #[inline]
+            fn as_slice(&self) -> &[ProcessId] {
+                match self {
+                    Self::Single(one) => one,
+                    Self::Many(many) => many.as_slice(),
+                }
+            }
+        }
+        let (child_list, parent_namespace, events_before_snapshot) = {
             let mut proc = parent.lock();
+            let events_before = proc.thread_group.child_events();
             if proc.children.is_empty() {
                 if !proc.children_incomplete {
                     // ST-K3 FIX (W-1 Blocked-leak class): on iteration >= 2 a
@@ -9664,6 +9699,8 @@ where
                     return Err(SyscallError::ECHILD);
                 }
                 // R158-4 Phase 2: children_incomplete is set — do PROCESS_TABLE fallback scan.
+                let parent_ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+                    .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone());
                 drop(proc);
                 let mut found = Vec::new();
                 // R180-14 FIX: track whether a matching child was seen but skipped
@@ -9728,37 +9765,50 @@ where
                     return Err(SyscallError::ENOMEM);
                 }
                 drop(table);
-                found
+                (WaitChildList::Many(found), parent_ns, events_before)
             } else {
-                // Normal fast path: snapshot first; prepare_child_wait will
-                // recheck signals under the PCB lock before publishing Blocked.
-                let mut snapshot = Vec::new();
-                if snapshot.try_reserve_exact(proc.children.len()).is_err() {
-                    // ST-K3 FIX (W-1): the "nothing is committed yet" rationale
-                    // holds only on iteration 1; on a re-loop a prior iteration's
-                    // Blocked is still published. Restore before failing.
-                    proc.enter_ready_at(crate::get_ticks());
-                    proc.waiting_child = None;
-                    return Err(SyscallError::ENOMEM);
+                let parent_ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+                    .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone());
+                if let WaitTarget::Pid(want) = target {
+                    if Arc::ptr_eq(&parent_ns, &crate::pid_namespace::ROOT_PID_NAMESPACE)
+                        && proc.children.contains(&want)
+                    {
+                        (WaitChildList::Single([want]), parent_ns, events_before)
+                    } else {
+                        let mut snapshot = Vec::new();
+                        if snapshot.try_reserve_exact(proc.children.len()).is_err() {
+                            proc.enter_ready_at(crate::get_ticks());
+                            proc.waiting_child = None;
+                            return Err(SyscallError::ENOMEM);
+                        }
+                        snapshot.extend_from_slice(&proc.children);
+                        (WaitChildList::Many(snapshot), parent_ns, events_before)
+                    }
+                } else {
+                    // Normal fast path: snapshot first; prepare_child_wait will
+                    // recheck signals under the PCB lock before publishing Blocked.
+                    let mut snapshot = Vec::new();
+                    if snapshot.try_reserve_exact(proc.children.len()).is_err() {
+                        // ST-K3 FIX (W-1): the "nothing is committed yet" rationale
+                        // holds only on iteration 1; on a re-loop a prior iteration's
+                        // Blocked is still published. Restore before failing.
+                        proc.enter_ready_at(crate::get_ticks());
+                        proc.waiting_child = None;
+                        return Err(SyscallError::ENOMEM);
+                    }
+                    snapshot.extend_from_slice(&proc.children);
+                    (WaitChildList::Many(snapshot), parent_ns, events_before)
                 }
-                snapshot.extend_from_slice(&proc.children);
-                snapshot
             }
         };
 
-        // Match the caller's view against each child's immutable identity.
-        // Live namespace maps are detached before a zombie becomes reapable.
-        let parent_namespace = {
-            let proc = parent.lock();
-            crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
-                .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone())
-        };
-        let prepared = prepare_child_wait(
+        let prepared = prepare_child_wait_checked(
             &parent,
             pid,
             target,
-            &child_list,
+            child_list.as_slice(),
             &parent_namespace,
+            Some(events_before_snapshot),
             get_process,
         )?;
         let mut selected_exists = false;
@@ -9768,7 +9818,7 @@ where
         let mut zombie_child: Option<(ProcessId, i32, ProcessId)> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
 
-        for child_pid in child_list.iter() {
+        for child_pid in child_list.as_slice().iter() {
             match get_process(*child_pid) {
                 Some(child_proc) => {
                     let child = child_proc.lock();
@@ -24810,16 +24860,19 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     let pid = crate::process::current_pid().ok_or(SyscallError::ESRCH)?;
     let process = crate::process::get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    let old_cgroup_id = {
+    let (old_cgroup_id, memory_space) = {
         let proc = process.lock();
-        proc.cgroup_id
+        (proc.cgroup_id, proc.memory_space)
     };
 
-    // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-    let is_root = crate::current_is_host_root();
-    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
-    // R134-2: host-mapped euid for delegation identity.
-    let host_euid = crate::process::current_host_euid();
+    // R133-1 + R134-2 FIX: Snapshot host-mapped root, CAP_ADMIN, and host euid
+    // in a single PROCESS_TABLE + PCB hold (falls back fail-closed if creds are
+    // transiently busy).
+    let (is_root, has_cap_admin, host_euid) =
+        match crate::process::current_cgroup_governance_auth(cap::CapRights::ADMIN) {
+            Some(auth) => (auth.is_host_root, auth.has_cap_rights, auth.host_euid),
+            None => (false, false, None),
+        };
 
     // R180-3: preflight auth (cheap reject). Authoritative re-auth under Process
     // lock uses the locked `proc.cgroup_id` so concurrent re-homes cannot swap
@@ -24837,7 +24890,6 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // deadlock. address_space_share_count() acquires PROCESS_TABLE then
     // iterates locking Process::inner — holding our Process::inner first
     // inverts the documented Level 5 ordering with create_process().
-    let memory_space = { process.lock().memory_space };
     if memory_space != 0 && crate::process::address_space_share_count(memory_space) > 1 {
         return Err(SyscallError::EBUSY);
     }
@@ -25010,9 +25062,12 @@ fn sys_cgroup_set_limit(
     // R93-17 FIX: Capability-based access control for setting limits
     // P1-3: Delegated owners may set limits bounded by parent ceilings
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
-    let is_host_root = crate::current_is_host_root();
+    // Single PROCESS_TABLE + PCB snapshot avoids 4 separate lock roundtrips
+    // and redundant Credentials Vec clones on the cgroup control hot path.
+    let auth = crate::process::current_cgroup_governance_auth(cap::CapRights::ADMIN)
+        .ok_or(SyscallError::ESRCH)?;
+    let has_cap_admin = auth.has_cap_rights;
+    let is_host_root = auth.is_host_root;
 
     let is_delegated = !has_cap_admin && !is_host_root && is_cgroup_delegated_to_caller(cgroup_id);
     if !has_cap_admin && !is_host_root && !is_delegated {
@@ -25110,7 +25165,7 @@ fn sys_cgroup_set_limit(
     match cgroup_node.set_limit(limits) {
         Ok(()) => {
             let _ = audit::emit_cgroup_governance_event(
-                get_audit_subject(),
+                AuditSubject::new(auth.pid as u32, auth.ns_euid, auth.ns_egid, None),
                 audit::AuditCgroupGovernanceOp::SetLimit,
                 cgroup_id,
                 old_value,
@@ -25191,10 +25246,9 @@ fn cgroup_stats_collect_and_copy(
 
     // P1-3: Stats access should respect delegation boundaries.
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let has_cap_admin = current_has_cap_rights(cap::CapRights::ADMIN);
-    if !crate::current_is_host_root() && !has_cap_admin && !is_cgroup_delegated_to_caller(cgroup_id)
-    {
+    let auth = crate::process::current_cgroup_governance_auth(cap::CapRights::ADMIN)
+        .ok_or(SyscallError::ESRCH)?;
+    if !auth.is_host_root && !auth.has_cap_rights && !is_cgroup_delegated_to_caller(cgroup_id) {
         return Err(SyscallError::EPERM);
     }
 
