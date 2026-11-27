@@ -6141,6 +6141,14 @@ unsafe fn rollback_mmap_cycle() -> Result<(), &'static str> {
     let base = read_memory_current().ok_or("memory.current")?;
     rollback_shared_page()?;
     let with_shared = read_memory_current().ok_or("memory.current")?;
+    // R174-B3: touching 1 data page in a fresh 2 MiB window must charge both
+    // the data frame (PAGE) AND at least one positive page-table frame (>= PAGE).
+    let shared_delta = with_shared
+        .checked_sub(base)
+        .ok_or("mmap: memory.current decreased after shared fault")?;
+    if shared_delta < (2 * PAGE) as u64 {
+        return Err("mmap: fresh page-table frame charge missing from memory.current");
+    }
     if shared_fault_test(7, ROLLBACK_PAGES as u64, 0) != 0 {
         return Err("mmap: arming the population failure");
     }
@@ -6167,12 +6175,31 @@ unsafe fn rollback_mremap_cycle() -> Result<(), &'static str> {
     const WORD: u64 = 0x4d52_454d_4150;
     let base = read_memory_current().ok_or("memory.current")?;
     rollback_shared_page()?;
+    let with_shared = read_memory_current().ok_or("memory.current")?;
+    let shared_delta = with_shared
+        .checked_sub(base)
+        .ok_or("mremap: memory.current decreased after shared fault")?;
     let private = ROLLBACK_BASE + PAGE;
     if mmap_hint(private, PAGE, false) != private as i64 {
         return Err("mremap: private page hint unavailable");
     }
     core::ptr::write_volatile(private as *mut u64, WORD);
     let with_private = read_memory_current().ok_or("memory.current")?;
+    // R174-B3: touching a second page inside the same leaf page table charges
+    // exactly 1 data frame (PAGE), isolating the positive page-table frame
+    // charge (`shared_delta - data_delta >= PAGE`) from the data charge.
+    let data_delta = with_private
+        .checked_sub(with_shared)
+        .ok_or("mremap: memory.current decreased after private fault")?;
+    if data_delta != PAGE as u64 {
+        return Err("mremap: second page in existing PT did not charge exactly 1 data frame");
+    }
+    let pt_charge = shared_delta
+        .checked_sub(data_delta)
+        .ok_or("mremap: shared fault charged less than data page")?;
+    if pt_charge < PAGE as u64 {
+        return Err("mremap: positive page-table frame charge missing from memory.current");
+    }
     if shared_fault_test(7, ROLLBACK_PAGES as u64, 0) != 0 {
         return Err("mremap: arming the population failure");
     }
@@ -6182,11 +6209,11 @@ unsafe fn rollback_mremap_cycle() -> Result<(), &'static str> {
     {
         return Err("mremap: the failed tail changed memory.current or the page");
     }
-    if munmap(private, PAGE) != 0
-        || munmap(ROLLBACK_BASE, PAGE) != 0
-        || read_memory_current() != Some(base)
-    {
-        return Err("mremap: unmapping both pages did not restore the baseline");
+    if munmap(private, PAGE) != 0 || read_memory_current() != Some(with_shared) {
+        return Err("mremap: unmapping private page did not release exactly its data frame");
+    }
+    if munmap(ROLLBACK_BASE, PAGE) != 0 || read_memory_current() != Some(base) {
+        return Err("mremap: unmapping shared page did not release data + page-table frames");
     }
     Ok(())
 }
@@ -9001,6 +9028,55 @@ extern "C" fn s4_pipe_reader_thread() -> ! {
     unsafe { raw_exit(SYS_EXIT, 0) }
 }
 
+fn s4_proc_task_is_sleeping(tgid: u64, tid: u64) -> bool {
+    let mut path = [0u8; 48];
+    let mut len = 0usize;
+    let push_bytes = |dst: &mut [u8; 48], len: &mut usize, src: &[u8]| {
+        for &b in src {
+            dst[*len] = b;
+            *len += 1;
+        }
+    };
+    let push_u64 = |dst: &mut [u8; 48], len: &mut usize, mut n: u64| {
+        let mut digits = [0u8; 20];
+        let mut dlen = 0usize;
+        if n == 0 {
+            digits[0] = b'0';
+            dlen = 1;
+        } else {
+            while n > 0 {
+                digits[dlen] = b'0' + (n % 10) as u8;
+                dlen += 1;
+                n /= 10;
+            }
+        }
+        while dlen > 0 {
+            dlen -= 1;
+            dst[*len] = digits[dlen];
+            *len += 1;
+        }
+    };
+    push_bytes(&mut path, &mut len, b"/proc/");
+    push_u64(&mut path, &mut len, tgid);
+    push_bytes(&mut path, &mut len, b"/task/");
+    push_u64(&mut path, &mut len, tid);
+    push_bytes(&mut path, &mut len, b"/status\0");
+
+    let fd = unsafe { sys_open(path.as_ptr(), 0, 0) };
+    if is_error(fd) {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let nread = unsafe { syscall3(SYS_READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    unsafe { sys_close(fd) };
+    if is_error(nread) || nread == 0 {
+        return false;
+    }
+    let data = &buf[..(nread as usize).min(buf.len())];
+    let needle = b"State:\tS (sleeping)";
+    data.windows(needle.len()).any(|w| w == needle)
+}
+
 fn s4_pipe_eintr_leg() -> u64 {
     use core::sync::atomic::Ordering;
     let tgid = unsafe { sys_getpid() };
@@ -9072,9 +9148,9 @@ fn s4_pipe_eintr_leg() -> u64 {
         return 0x24;
     }
 
-    // Hold for >= 30 ms of monotonic time while confirming the reader stays
-    // blocked inside sys_read, then send a single SIGUSR1 to wake it.
-    let settle = [0i64, 30_000_000i64]; // 30 ms
+    // Wait with a bounded deadline for the kernel's /proc/<tgid>/task/<tid>/status
+    // to report State: S (sleeping) so we prove the reader actually entered the
+    // blocking pipe wait queue before sending SIGUSR1.
     let Some(t0) = monotonic_ns() else {
         unsafe {
             sys_close(fds[1] as u64);
@@ -9085,12 +9161,30 @@ fn s4_pipe_eintr_leg() -> u64 {
         }
         return 0x2a;
     };
-    unsafe {
-        let _ = syscall2(SYS_NANOSLEEP, settle.as_ptr() as u64, 0);
+    let deadline = t0 + 500_000_000; // 500 ms
+    let poll_sleep = [0i64, 1_000_000i64]; // 1 ms
+    let mut observed_sleeping = false;
+    let mut attempt = 0u32;
+    while monotonic_ns().is_some_and(|now| now < deadline) {
+        if S4_PIPE_RET.load(Ordering::Acquire) != FUTEX_WAIT_PENDING {
+            break;
+        }
+        if s4_proc_task_is_sleeping(tgid, reader) {
+            observed_sleeping = true;
+            break;
+        }
+        if attempt < 32 {
+            unsafe { userspace::syscall::sys_yield() };
+        } else {
+            unsafe {
+                let _ = syscall2(SYS_NANOSLEEP, poll_sleep.as_ptr() as u64, 0);
+            }
+        }
+        attempt = attempt.wrapping_add(1);
     }
-    let stayed_blocked = S4_PIPE_RET.load(Ordering::Acquire) == FUTEX_WAIT_PENDING
-        && S4_SIG_COUNT.load(Ordering::SeqCst) == 0
-        && monotonic_ns().is_some_and(|now| now >= t0 + 20_000_000);
+    let stayed_blocked = observed_sleeping
+        && S4_PIPE_RET.load(Ordering::Acquire) == FUTEX_WAIT_PENDING
+        && S4_SIG_COUNT.load(Ordering::SeqCst) == 0;
 
     let mut woke = false;
     if stayed_blocked && unsafe { syscall3(SYS_TGKILL, tgid, reader, SIGUSR1_NR) } == 0 {
@@ -9391,6 +9485,7 @@ fn test_signal_delivery_blocked_syscall(results: &mut TestResult) {
 static S8_MIG_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static S8_MIG_READY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static S8_MIG_CANARY_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S8_MIG_SYSCALL_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static S8_MIG_TID: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 static S8_MIG_SEED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static S8_MIG_CPUS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -9398,6 +9493,13 @@ static S8_SIG_CPUS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 static S8_MIG_LAST_CPU: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 static S8_SIG_LAST_CPU: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+static S8_MIG_FUTEX: FutexWord = FutexWord(core::sync::atomic::AtomicU32::new(0));
+static S8_MIG_ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S8_MIG_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S8_MIG_BLOCK_CPU: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+static S8_MIG_POST_CPU: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 static S8_RDTSCP_CAP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
@@ -9473,17 +9575,34 @@ extern "C" fn s8_migration_signal_handler(signo: i32) {
 
 extern "C" fn s8_signal_migration_worker() -> ! {
     use core::sync::atomic::Ordering;
-    let mut step = 0u64;
+    let mut seen_round = 0u32;
     S8_MIG_READY.store(1, Ordering::Release);
     while S8_MIG_STOP.load(Ordering::Acquire) == 0 {
         let cpu = s8_current_cpu_id();
         S8_MIG_LAST_CPU.store(cpu, Ordering::Release);
         S8_MIG_CPUS_SEEN.fetch_or(1u64 << cpu, Ordering::SeqCst);
 
-        // Derive runtime-seeded callee-saved register canaries and hold them in
-        // r12-r15 across an inline SYS_YIELD syscall where SIGUSR1 delivery and
-        // cross-CPU migration occur; LLVM cannot constant-fold across `syscall`.
-        let seed = S8_MIG_SEED.load(Ordering::Acquire).wrapping_add(step);
+        let round = S8_MIG_ARMED.load(Ordering::Acquire);
+        if round == u32::MAX {
+            break;
+        }
+        if round == seen_round {
+            unsafe { userspace::syscall::sys_yield() };
+            continue;
+        }
+        seen_round = round;
+
+        // Record the CPU entering SYS_FUTEX (FUTEX_WAIT). On SMP the parent
+        // waits for this thread to sleep in the kernel futex queue, migrates
+        // its affinity to the OTHER CPU, then sends SIGUSR1 so the syscall
+        // frame created on `entry_cpu` is interrupted, delivered, and restored
+        // via rt_sigreturn on the destination CPU.
+        let entry_cpu = s8_current_cpu_id();
+        S8_MIG_BLOCK_CPU.store(entry_cpu, Ordering::Release);
+
+        let seed = S8_MIG_SEED
+            .load(Ordering::Acquire)
+            .wrapping_add(round as u64);
         let e12 = seed ^ 0x1122_3344_5566_7788u64;
         let e13 = seed.rotate_left(13) ^ 0x8877_6655_4433_2211u64;
         let e14 = seed.rotate_left(29) ^ 0xA5A5_5A5A_F0F0_0F0Fu64;
@@ -9492,10 +9611,17 @@ extern "C" fn s8_signal_migration_worker() -> ! {
         let mut r13 = e13;
         let mut r14 = e14;
         let mut r15 = e15;
+        let mut ret: u64 = 202; // SYS_FUTEX
         unsafe {
             core::arch::asm!(
                 "syscall",
-                inout("rax") userspace::syscall::SYS_YIELD => _,
+                inout("rax") ret,
+                in("rdi") S8_MIG_FUTEX.0.as_ptr() as u64,
+                in("rsi") (FUTEX_WAIT_OP | FUTEX_PRIVATE),
+                in("rdx") round as u64,
+                in("r10") 0u64,
+                in("r8") 0u64,
+                in("r9") 0u64,
                 inout("r12") r12,
                 inout("r13") r13,
                 inout("r14") r14,
@@ -9507,9 +9633,15 @@ extern "C" fn s8_signal_migration_worker() -> ! {
         }
         if r12 != e12 || r13 != e13 || r14 != e14 || r15 != e15 {
             S8_MIG_CANARY_ERR.fetch_add(1, Ordering::SeqCst);
-            break;
         }
-        step = step.wrapping_add(1);
+        if errno(ret) != S4_EINTR {
+            S8_MIG_SYSCALL_ERR.fetch_add(1, Ordering::SeqCst);
+        }
+        let post_cpu = s8_current_cpu_id();
+        S8_MIG_POST_CPU.store(post_cpu, Ordering::Release);
+        S8_MIG_LAST_CPU.store(post_cpu, Ordering::Release);
+        S8_MIG_CPUS_SEEN.fetch_or(1u64 << post_cpu, Ordering::SeqCst);
+        S8_MIG_DONE.store(round, Ordering::Release);
     }
     unsafe { raw_exit(SYS_EXIT, 0) }
 }
@@ -9522,11 +9654,17 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     S8_MIG_STOP.store(0, Ordering::SeqCst);
     S8_MIG_READY.store(0, Ordering::SeqCst);
     S8_MIG_CANARY_ERR.store(0, Ordering::SeqCst);
+    S8_MIG_SYSCALL_ERR.store(0, Ordering::SeqCst);
     S8_MIG_TID.store(-1, Ordering::SeqCst);
     S8_MIG_CPUS_SEEN.store(0, Ordering::SeqCst);
     S8_SIG_CPUS_SEEN.store(0, Ordering::SeqCst);
     S8_MIG_LAST_CPU.store(u32::MAX, Ordering::SeqCst);
     S8_SIG_LAST_CPU.store(u32::MAX, Ordering::SeqCst);
+    S8_MIG_FUTEX.0.store(0, Ordering::SeqCst);
+    S8_MIG_ARMED.store(0, Ordering::SeqCst);
+    S8_MIG_DONE.store(0, Ordering::SeqCst);
+    S8_MIG_BLOCK_CPU.store(u32::MAX, Ordering::SeqCst);
+    S8_MIG_POST_CPU.store(u32::MAX, Ordering::SeqCst);
     // Probe CPUID once on the parent thread before spawning the worker/handler.
     let _ = s8_has_rdtscp();
     let seed = monotonic_ns()
@@ -9574,6 +9712,7 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     }
     if !ready {
         S8_MIG_STOP.store(1, Ordering::Release);
+        S8_MIG_ARMED.store(u32::MAX, Ordering::Release);
         if s4_await_tid_zero(&S8_MIG_TID) {
             unsafe { munmap(stack as usize, S4_STACK_BYTES) };
         }
@@ -9583,49 +9722,117 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     let mut migrations = 0u32;
     let mut signals_observed = 0u32;
     let mut signals_on_target = 0u32;
+    let mut cross_cpu_syscalls = 0u32;
     for iter in 0..24u32 {
-        let target_cpu = iter & 1;
+        let round = iter + 1;
+        let src_cpu = iter & 1;
+        let dst_cpu = (iter + 1) & 1;
         if smp {
-            let mask: u64 = 1u64 << target_cpu;
-            if unsafe { syscall3(S4_SYS_SCHED_SETAFFINITY, tid, 8, &mask as *const u64 as u64) }
-                != 0
+            // 1. Pin the worker exclusively to src_cpu and confirm fresh
+            //    execution there BEFORE arming its blocking SYS_FUTEX.
+            let src_mask: u64 = 1u64 << src_cpu;
+            if unsafe {
+                syscall3(
+                    S4_SYS_SCHED_SETAFFINITY,
+                    tid,
+                    8,
+                    &src_mask as *const u64 as u64,
+                )
+            } != 0
             {
                 break;
             }
-            // Require a FRESH observation on target_cpu for every single round
-            // (never count a timed-out migration request as completed).
             S8_MIG_LAST_CPU.store(u32::MAX, Ordering::SeqCst);
-            let mut arrived = false;
+            let mut on_src = false;
             for _ in 0..THREAD_POLL_YIELDS {
-                if S8_MIG_LAST_CPU.load(Ordering::Acquire) == target_cpu {
-                    arrived = true;
+                if S8_MIG_LAST_CPU.load(Ordering::Acquire) == src_cpu {
+                    on_src = true;
                     break;
                 }
                 unsafe { userspace::syscall::sys_yield() };
             }
-            if !arrived {
+            if !on_src {
                 break;
             }
-            migrations += 1;
         }
+
+        // 2. Arm the blocking SYS_FUTEX round and deterministically wait until
+        //    the worker is queued inside the kernel futex wait queue.
+        S8_MIG_BLOCK_CPU.store(u32::MAX, Ordering::SeqCst);
+        S8_MIG_POST_CPU.store(u32::MAX, Ordering::SeqCst);
         S8_SIG_LAST_CPU.store(u32::MAX, Ordering::SeqCst);
+        S8_MIG_FUTEX.0.store(round, Ordering::SeqCst);
+        S8_MIG_ARMED.store(round, Ordering::Release);
+
+        if !parity_await_sleepers(&S8_MIG_FUTEX, 1) {
+            break;
+        }
+        let entered_on = S8_MIG_BLOCK_CPU.load(Ordering::Acquire);
+        if smp && entered_on != src_cpu {
+            break;
+        }
+
+        // 3. Migrate the blocked thread to dst_cpu (dst_cpu != src_cpu) BEFORE
+        //    sending SIGUSR1 so its syscall frame created on src_cpu crosses
+        //    CPUs for signal delivery and rt_sigreturn restoration on dst_cpu.
+        if smp {
+            let dst_mask: u64 = 1u64 << dst_cpu;
+            if unsafe {
+                syscall3(
+                    S4_SYS_SCHED_SETAFFINITY,
+                    tid,
+                    8,
+                    &dst_mask as *const u64 as u64,
+                )
+            } != 0
+            {
+                break;
+            }
+        }
+
         let before = S4_SIG_COUNT.load(Ordering::SeqCst);
         if unsafe { syscall3(SYS_TGKILL, tgid, tid, SIGUSR1_NR) } != 0 {
             break;
         }
+        let mut round_completed = false;
         for _ in 0..THREAD_POLL_YIELDS {
-            if S4_SIG_COUNT.load(Ordering::SeqCst) > before {
-                signals_observed += 1;
-                if !smp || S8_SIG_LAST_CPU.load(Ordering::Acquire) == target_cpu {
-                    signals_on_target += 1;
-                }
+            if S8_MIG_DONE.load(Ordering::Acquire) == round {
+                round_completed = true;
                 break;
             }
             unsafe { userspace::syscall::sys_yield() };
         }
+        if !round_completed {
+            break;
+        }
+        if S4_SIG_COUNT.load(Ordering::SeqCst) > before {
+            signals_observed += 1;
+        }
+        if smp {
+            let sig_cpu = S8_SIG_LAST_CPU.load(Ordering::Acquire);
+            let post_cpu = S8_MIG_POST_CPU.load(Ordering::Acquire);
+            if sig_cpu == dst_cpu {
+                signals_on_target += 1;
+            }
+            if entered_on == src_cpu && sig_cpu == dst_cpu && post_cpu == dst_cpu {
+                migrations += 1;
+                cross_cpu_syscalls += 1;
+            }
+        }
     }
 
     S8_MIG_STOP.store(1, Ordering::Release);
+    S8_MIG_ARMED.store(u32::MAX, Ordering::Release);
+    unsafe {
+        let _ = futex(
+            &S8_MIG_FUTEX,
+            FUTEX_WAKE_OP | FUTEX_PRIVATE,
+            FUTEX_ALL,
+            0,
+            0,
+            0,
+        );
+    }
     let joined = s4_await_tid_zero(&S8_MIG_TID);
     if joined {
         unsafe { munmap(stack as usize, S4_STACK_BYTES) };
@@ -9637,10 +9844,13 @@ fn s8_rapid_signal_migration_leg(smp: bool) -> u64 {
     if S8_MIG_CANARY_ERR.load(Ordering::SeqCst) != 0 {
         return 0x45;
     }
+    if S8_MIG_SYSCALL_ERR.load(Ordering::SeqCst) != 0 {
+        return 0x4a;
+    }
     if signals_observed < 24 || S4_SIG_LAST.load(Ordering::SeqCst) != SIGUSR1_NR as i32 {
         return 0x46;
     }
-    if smp && migrations < 24 {
+    if smp && (migrations < 24 || cross_cpu_syscalls < 24) {
         return 0x47;
     }
     if smp && (S8_MIG_CPUS_SEEN.load(Ordering::SeqCst) & 3) != 3 {
@@ -9737,6 +9947,28 @@ fn s8_proc_status_is_stopped(pid: u64) -> bool {
     let data = &buf[..(nread as usize).min(buf.len())];
     let needle = b"State:\tT (stopped)";
     data.windows(needle.len()).any(|w| w == needle)
+}
+
+fn s8_reap_pid_bounded(pid: u64, max_ms: u32) -> Option<u64> {
+    let poll_sleep = [0i64, 1_000_000i64]; // 1 ms
+    for attempt in 0..(64 + max_ms) {
+        let mut info = SigInfo::poisoned();
+        let r = waitid(P_PID, pid, &mut info, WEXITED | WNOHANG);
+        if is_error(r) {
+            return None;
+        }
+        if info.pid() as u64 == pid {
+            return Some(info.status() as u64);
+        }
+        if attempt < 64 {
+            unsafe { userspace::syscall::sys_yield() };
+        } else {
+            unsafe {
+                let _ = syscall2(SYS_NANOSLEEP, poll_sleep.as_ptr() as u64, 0);
+            }
+        }
+    }
+    None
 }
 
 fn s8_namespace_teardown_wave(desc_pipe: [i32; 2]) -> u64 {
@@ -9857,11 +10089,11 @@ fn s8_namespace_teardown_wave(desc_pipe: [i32; 2]) -> u64 {
         let b = [b'R'];
         let _ = unsafe { syscall3(SYS_WRITE, ready_pipe[1] as u64, b.as_ptr() as u64, 1) };
         unsafe { sys_close(ready_pipe[1] as u64) };
-        let long_sleep = [30i64, 0i64];
-        loop {
-            unsafe {
-                let _ = syscall2(SYS_NANOSLEEP, long_sleep.as_ptr() as u64, 0);
-            }
+        // Finite fallback exit so a failed SIGKILL never leaves ns_init looping forever.
+        let fallback_sleep = [5i64, 0i64];
+        unsafe {
+            let _ = syscall2(SYS_NANOSLEEP, fallback_sleep.as_ptr() as u64, 0);
+            raw_exit(SYS_EXIT_GROUP, 0x65);
         }
     }
 
@@ -9900,11 +10132,11 @@ fn s8_namespace_teardown_wave(desc_pipe: [i32; 2]) -> u64 {
             sys_close(desc_pipe[0] as u64);
             userspace::syscall::sys_kill(ns_init, SIGKILL_NR);
         }
-        let _ = reap_pid(ns_init);
+        let _ = s8_reap_pid_bounded(ns_init, 500);
         return 0x53;
     }
 
-    // Hold 15 ms so stopped_child completes its self-SIGSTOP, then confirm
+    // Hold 15 ms after ns_init confirmed State: T (stopped), then confirm
     // desc_pipe[0] still reports EAGAIN (descendants are live before SIGKILL).
     let settle = [0i64, 15_000_000i64];
     unsafe {
@@ -9916,15 +10148,15 @@ fn s8_namespace_teardown_wave(desc_pipe: [i32; 2]) -> u64 {
     unsafe { sys_close(desc_pipe[0] as u64) };
     if errno(before_kill) != EAGAIN {
         unsafe { userspace::syscall::sys_kill(ns_init, SIGKILL_NR) };
-        let _ = reap_pid(ns_init);
+        let _ = s8_reap_pid_bounded(ns_init, 500);
         return 0x59;
     }
 
     if unsafe { userspace::syscall::sys_kill(ns_init, SIGKILL_NR) } != 0 {
-        let _ = reap_pid(ns_init);
+        let _ = s8_reap_pid_bounded(ns_init, 500);
         return 0x54;
     }
-    if reap_pid(ns_init) != Some(128 + SIGKILL_NR) {
+    if s8_reap_pid_bounded(ns_init, 2000) != Some(128 + SIGKILL_NR) {
         return 0x55;
     }
     S4_LEG_OK

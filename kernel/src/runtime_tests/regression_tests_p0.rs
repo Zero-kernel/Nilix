@@ -889,6 +889,15 @@ impl RuntimeTest for RamfsRenameSelfDeadlockTest {
                 created[idx] = true;
             }
 
+            let a_ino = VFS
+                .stat_trusted(A)
+                .map_err(|e| alloc::format!("stat {} failed: {:?}", A, e))?
+                .ino;
+            let b_ino = VFS
+                .stat_trusted(B)
+                .map_err(|e| alloc::format!("stat {} failed: {:?}", B, e))?
+                .ino;
+
             // 1. Direct child cycle: rename(a -> a/sub) must fail with Invalid (EINVAL).
             match VFS.rename_trusted(A, "/__sq_r172_14/a/sub", false) {
                 Err(FsError::Invalid) => {}
@@ -911,15 +920,36 @@ impl RuntimeTest for RamfsRenameSelfDeadlockTest {
                 }
             }
 
-            // 3. Same-path rename(a -> a) must succeed as a no-op without deadlocking.
+            // 3. Parent-overwrite check (R172-14 `rename_decide` parent identity guard):
+            //    renaming existing child `B` onto its parent `A` must fail with Invalid
+            //    (not NotEmpty) and leave both inodes intact.
+            match VFS.rename_trusted(B, A, false) {
+                Err(FsError::Invalid) => {}
+                other => {
+                    return Err(alloc::format!(
+                        "parent-overwrite rename(b -> a) expected Invalid, got {:?}",
+                        other
+                    ));
+                }
+            }
+
+            // 4. Same-path rename(a -> a) must succeed as a no-op without deadlocking.
             VFS.rename_trusted(A, A, false)
                 .map_err(|e| alloc::format!("same-path rename(a -> a) failed: {:?}", e))?;
 
-            // 4. All original nodes must remain intact and reachable.
-            for d in [A, B, C] {
-                VFS.stat_trusted(d).map_err(|e| {
-                    alloc::format!("tree node {} lost after cycle guard: {:?}", d, e)
-                })?;
+            // 5. All original nodes must remain intact and reachable with unchanged inodes.
+            let a_after = VFS
+                .stat_trusted(A)
+                .map_err(|e| alloc::format!("tree node {} lost after cycle guard: {:?}", A, e))?;
+            let b_after = VFS
+                .stat_trusted(B)
+                .map_err(|e| alloc::format!("tree node {} lost after cycle guard: {:?}", B, e))?;
+            VFS.stat_trusted(C)
+                .map_err(|e| alloc::format!("tree node {} lost after cycle guard: {:?}", C, e))?;
+            if a_after.ino != a_ino || b_after.ino != b_ino {
+                return Err(String::from(
+                    "parent-overwrite guard altered inode identity of A or B",
+                ));
             }
             Ok(())
         })();

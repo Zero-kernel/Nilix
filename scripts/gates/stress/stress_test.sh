@@ -830,4 +830,16 @@ if [ "$qualified" -gt 0 ]; then
     exit "$TEST_QUALIFIED"
 fi
 echo "STRESS-TEST STABLE: $passed passed"
+if [ "$passed" -eq 7 ] && [ "$total" -eq 7 ] \
+    && [ "${STRESS_DURATION:-0}" -ge 900 ] \
+    && [ "${STRESS_CPUS:-0}" -ge 4 ] \
+    && [ -n "${SEEN_PROFILES[memory]:-}" ] \
+    && [ -n "${SEEN_PROFILES[cpu]:-}" ] \
+    && [ -n "${SEEN_PROFILES[smp]:-}" ] \
+    && [ -n "${SEEN_PROFILES[thread]:-}" ] \
+    && [ -n "${SEEN_PROFILES[process]:-}" ] \
+    && [ -n "${SEEN_PROFILES[block]:-}" ] \
+    && [ -n "${SEEN_PROFILES[combined]:-}" ]; then
+    echo "STRESS-7 FULL-SUITE STABLE: 7/7 profiles duration>=900s cpus>=4"
+fi
 exit 0

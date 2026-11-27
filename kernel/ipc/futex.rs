@@ -5082,50 +5082,36 @@ pub fn run_pi_priority_inheritance_self_test() -> Result<(), &'static str> {
         }
     }
 
+    // Enforce boot-only execution before touching PROCESS_TABLE so a live
+    // debug-shell invocation can never collide with an in-flight fork holding
+    // NEXT_PID_HINT while its selected PROCESS_TABLE slot is still empty.
+    if process::current_pid().is_some() {
+        return Err("futex PI self-test requires boot-only context (current_pid is active)");
+    }
+
     let mut guard = PiSelfTestGuard {
         pids: [None, None],
         buckets: [None, None],
     };
 
-    // Pick two free slots in PROCESS_TABLE (>= 1) without touching NEXT_PID_HINT
-    // or allocating kernel stacks.
-    let (pid_owner, pid_mid) = {
-        let table = process::PROCESS_TABLE.lock();
-        let mut found = [0usize; 2];
-        let mut count = 0usize;
-        for idx in 1..table.len() {
-            if table[idx].is_none() {
-                found[count] = idx;
-                count += 1;
-                if count == 2 {
-                    break;
-                }
-            }
-        }
-        let mut next_idx = table.len().max(1);
-        while count < 2 {
-            found[count] = next_idx;
-            next_idx += 1;
-            count += 1;
-        }
-        (found[0], found[1])
-    };
+    const PID_OWNER: ProcessId = 1;
+    const PID_MID: ProcessId = 2;
     let owner_arc = process::Process::try_new_pcb(
-        pid_owner,
+        PID_OWNER,
         0,
         process::ProcessNameSnapshot::from_parts("pi_owner", ""),
         80,
     )
     .map_err(|_| "try_new_pcb(owner) failed")?;
     let mid_arc = process::Process::try_new_pcb(
-        pid_mid,
+        PID_MID,
         0,
         process::ProcessNameSnapshot::from_parts("pi_mid", ""),
         70,
     )
     .map_err(|_| "try_new_pcb(mid) failed")?;
 
-    let target_len = pid_owner.max(pid_mid) + 1;
+    let target_len = PID_MID + 1;
     let prepared = mm::PreparedAdmittedVecCapacity::<Option<process::ProcessArc>>::try_new(
         HeapClass::CoreProcess,
         target_len,
@@ -5133,6 +5119,11 @@ pub fn run_pi_priority_inheritance_self_test() -> Result<(), &'static str> {
     .map_err(|_| "prepare PROCESS_TABLE capacity failed")?;
     let retired_grow = {
         let mut table = process::PROCESS_TABLE.lock();
+        if process::current_pid().is_some() || !table.iter().all(Option::is_none) {
+            drop(table);
+            drop(prepared);
+            return Err("futex PI self-test requires boot-only empty PROCESS_TABLE");
+        }
         let retired = if table.capacity() < target_len {
             Some(
                 table
@@ -5148,15 +5139,13 @@ pub fn run_pi_priority_inheritance_self_test() -> Result<(), &'static str> {
                 .push_reserved(None)
                 .map_err(|_| "PROCESS_TABLE push_reserved failed")?;
         }
-        if table[pid_owner].is_some() || table[pid_mid].is_some() {
-            return Err("PROCESS_TABLE test slots unexpectedly occupied");
-        }
-        table[pid_owner] = Some(owner_arc.clone());
-        table[pid_mid] = Some(mid_arc.clone());
-        guard.pids = [Some(pid_owner), Some(pid_mid)];
+        table[PID_OWNER] = Some(owner_arc.clone());
+        table[PID_MID] = Some(mid_arc.clone());
+        guard.pids = [Some(PID_OWNER), Some(PID_MID)];
         retired
     };
     drop(retired_grow);
+    let (pid_owner, pid_mid) = (PID_OWNER, PID_MID);
 
     let permit =
         FutexPreparePermit::try_acquire(TEST_SPACE).map_err(|_| "FutexPreparePermit failed")?;
