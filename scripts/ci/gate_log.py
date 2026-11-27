@@ -64,6 +64,14 @@ SCOPE_KEYS = ("not_applicable", "out_of_scope", "covered")
 SCOPE_PREFIX = {"not_applicable": "needs_cpus:", "out_of_scope": "out_of_scope:", "covered": "covered_by:"}
 QUALIFIED_KEYS = ("warning", "deferred", "skipped")
 STRICT_SCOPE = Path(__file__).with_name("strict_scope.txt")
+# STRICT-Q D3 (#64): when strict_scope explicitly declares retpoline out of
+# scope until N6, strict mode exempts at most one occurrence of the matching
+# boot-time RetpolineRequired diagnostic while keeping non-strict mode QUALIFIED
+# and rejecting every other warning line.
+D3_RETPOLINE_SCOPE = ("SECURITY-BOOT", "spectre_v2_retpoline", "out_of_scope", "out_of_scope:N6")
+D3_RETPOLINE_BOOT_WARNING = re.compile(
+    r"^\s*WARNING: Spectre mitigations failed: RetpolineRequired\s*$"
+)
 COUNTS = re.compile(
     r"(RUNTIME|SECURITY|SECURITY-BOOT)-COUNTS " + " ".join(rf"{key}=([0-9]+)" for key in OUTCOME_KEYS)
     + "(?: " + " ".join(rf"{key}=([0-9]+)" for key in SCOPE_KEYS) + ")?"
@@ -216,7 +224,27 @@ def evaluate(
     # Structured counters have their own exact parser: "passed=9 warning=0"
     # must not be mistaken for a prose "9 warnings" observation.
     diagnostic_lines = [line for line in lines if not line.startswith(("RUNTIME-", "SECURITY-"))]
-    warning_markers = sum(bool(WARNING.search(line)) for line in diagnostic_lines)
+    effective_strict_scope = strict_scope
+    strict_scope_error = None
+    if strict and effective_strict_scope is None:
+        try:
+            effective_strict_scope = load_strict_scope()
+        except (OSError, ValueError) as error:
+            effective_strict_scope = frozenset()
+            strict_scope_error = f"strict scope list unavailable: {error}"
+
+    allow_d3_retpoline = bool(
+        strict and effective_strict_scope and D3_RETPOLINE_SCOPE in effective_strict_scope
+    )
+    warning_markers = 0
+    declared_strict_warnings = 0
+    for line in diagnostic_lines:
+        if not WARNING.search(line):
+            continue
+        if allow_d3_retpoline and declared_strict_warnings == 0 and D3_RETPOLINE_BOOT_WARNING.fullmatch(line):
+            declared_strict_warnings += 1
+            continue
+        warning_markers += 1
     skipped_markers = sum(bool(SKIPPED.search(line)) for line in diagnostic_lines)
 
     if SERIAL_FATAL.search(serial) or SERIAL_FATAL.search(qemu_stderr):
@@ -281,8 +309,11 @@ def evaluate(
         elif active[0] >= enabled[0] or (counts is not None and enabled[0] >= summaries[0][0]):
             failures.append("IOMMU activation and enabled state must precede runtime completion")
 
-    details, evidence_errors = outcome_evidence(lines, counts, strict, strict_scope)
+    details, evidence_errors = outcome_evidence(lines, counts, strict, effective_strict_scope)
+    if strict_scope_error is not None:
+        incomplete.append(strict_scope_error)
     incomplete.extend(evidence_errors)
+    details["declared_strict_warnings"] = declared_strict_warnings
     failures.extend(f"strict mode: undeclared scope {entry}" for entry in details["scope_violations"])
     runtime_counts = details["suites"].get("RUNTIME")
     if counts is not None and not sum(runtime_counts.values() if runtime_counts else counts):
