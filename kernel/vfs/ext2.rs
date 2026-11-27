@@ -645,6 +645,8 @@ pub fn run_ext2_mutation_scratch_self_test() {
             start: 0,
             uuid: [0xA5; 16],
             feature_incompat: 0,
+            superblock_image: Vec::new(),
+            tx_images: Vec::new(),
         };
         let entry = JournalOverlayEntry {
             home: 3,
@@ -766,7 +768,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     const JOURNAL_INO: u32 = 8;
     const JOURNAL_FIRST_PHYS: u32 = 8;
     const FIRST_FREE_BLOCK: u32 = 16;
-    const MUTATION_OPS: u64 = 19;
+    const MUTATION_OPS: u64 = 17;
 
     struct CrashState {
         live: Vec<u8>,
@@ -2109,14 +2111,14 @@ pub fn run_ext2_journal_transaction_self_test() {
         let (device, _fs, file) = mount_image(base.clone());
         device.arm(fail_at, 0);
         let result = file.write_at(0, payload);
-        if fail_at <= 12 {
+        if fail_at <= 10 {
             assert_eq!(result, Err(FsError::Io));
         } else {
             assert_eq!(result, Ok(payload.len()));
         }
         let crashed = device.durable_snapshot();
         let (_recovery_device, recovered_fs, recovered_file) = mount_image(crashed);
-        if fail_at <= 12 {
+        if fail_at <= 10 {
             assert_unallocated(&recovered_fs, &recovered_file);
         } else {
             assert_recovered_state(&recovered_fs, &recovered_file, payload, 1);
@@ -2127,7 +2129,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     // reached stable media. The syscall reports no bytes, the live mount is
     // poisoned, and remount recovery is authoritative.
     let (device, _fs, file) = mount_image(base.clone());
-    device.arm(12, 11);
+    device.arm(10, 9);
     assert_eq!(file.write_at(0, payload), Err(FsError::Io));
     let ambiguous_commit = device.durable_snapshot();
     assert_ne!(journal_start(&ambiguous_commit), 0);
@@ -2144,7 +2146,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     // Persist exactly the first checkpoint home write, then fail the second.
     // The crash image is intentionally inconsistent before recovery.
     let (device, _fs, file) = mount_image(base.clone());
-    device.arm(14, 13);
+    device.arm(12, 11);
     assert_eq!(file.write_at(0, payload), Ok(payload.len()));
     let partial_home = device.durable_snapshot();
     assert!(bitmap_allocated(&partial_home, FIRST_FREE_BLOCK));
@@ -2165,7 +2167,7 @@ pub fn run_ext2_journal_transaction_self_test() {
 
     // Both the clear write and its flush can fail after checkpoint. The
     // durable start pointer keeps the committed transaction replayable.
-    for fail_at in [18u64, 19] {
+    for fail_at in [16u64, 17] {
         let (device, _fs, file) = mount_image(base.clone());
         device.arm(fail_at, 0);
         assert_eq!(file.write_at(0, payload), Ok(payload.len()));
@@ -2184,7 +2186,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     two_blocks.resize(2 * BLOCK_SIZE, 0x31);
     two_blocks[BLOCK_SIZE..].fill(0x52);
     let (device, _fs, file) = mount_image(base.clone());
-    device.arm(MUTATION_OPS + 11, 0);
+    device.arm(MUTATION_OPS + 9, 0);
     assert_eq!(file.write_at(0, &two_blocks), Ok(BLOCK_SIZE));
     let second_uncommitted = device.durable_snapshot();
     assert_ne!(journal_start(&second_uncommitted), 0);
@@ -2200,9 +2202,10 @@ pub fn run_ext2_journal_transaction_self_test() {
 
     // Mapped-block appends must journal the inode-table after-image as well;
     // otherwise a power cut can tear i_size or a neighboring inode even though
-    // the data block itself was ordered. One metadata image yields 13 mutation
-    // operations with the same commit-flush PONR at operation 9.
-    const MAPPED_MUTATION_OPS: u64 = 13;
+    // the data block itself was ordered. One metadata image yields 11 mutation
+    // operations (ordered data write folded before the journal pre-commit flush)
+    // with the commit-flush PONR at operation 7.
+    const MAPPED_MUTATION_OPS: u64 = 11;
     let mut mapped_payload = Vec::new();
     mapped_payload
         .try_reserve_exact(payload.len() + 1)
@@ -2235,22 +2238,22 @@ pub fn run_ext2_journal_transaction_self_test() {
     device.arm(0, 0);
     assert_eq!(file.write_at(100, b"Z"), Ok(1));
     assert_recovered_state(&fs, &file, &sparse_payload, 1);
-    assert_eq!(device.operation.load(Ordering::Acquire), 15);
+    assert_eq!(device.operation.load(Ordering::Acquire), 13);
     drop(file);
     drop(fs);
     drop(device);
-    for fail_at in 1..=15u64 {
+    for fail_at in 1..=13u64 {
         let (device, _fs, file) = mount_image(allocated_base.clone());
         device.arm(fail_at, 0);
         let result = file.write_at(100, b"Z");
-        if fail_at <= 11 {
+        if fail_at <= 9 {
             assert_eq!(result, Err(FsError::Io));
         } else {
             assert_eq!(result, Ok(1));
         }
         let crashed = device.durable_snapshot();
         let (_device, recovered_fs, recovered_file) = mount_image(crashed);
-        if fail_at <= 11 {
+        if fail_at <= 9 {
             assert_recovered_state_with_tail(&recovered_fs, &recovered_file, payload, 1, false);
         } else {
             assert_recovered_state(&recovered_fs, &recovered_file, &sparse_payload, 1);
@@ -2262,14 +2265,14 @@ pub fn run_ext2_journal_transaction_self_test() {
         let (device, _fs, file) = mount_image(allocated_base.clone());
         device.arm(fail_at, 0);
         let result = file.append_write(b"!");
-        if fail_at <= 9 {
+        if fail_at <= 7 {
             assert_eq!(result, Err(FsError::Io));
         } else {
             assert_eq!(result, Ok((1, mapped_payload.len() as u64)));
         }
         let crashed = device.durable_snapshot();
         let (_device, recovered_fs, recovered_file) = mount_image(crashed);
-        if fail_at <= 9 {
+        if fail_at <= 7 {
             assert_recovered_state_with_tail(&recovered_fs, &recovered_file, payload, 1, false);
         } else {
             assert_recovered_state(&recovered_fs, &recovered_file, &mapped_payload, 1);
@@ -2279,7 +2282,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     // A block driver may complete a commit write to stable media and still
     // return EIO. Recovery, not the syscall return, owns that ambiguity.
     let (device, _fs, file) = mount_image(allocated_base.clone());
-    device.arm_write_then_error(8, true);
+    device.arm_write_then_error(6, true);
     assert_eq!(file.append_write(b"!"), Err(FsError::Io));
     let committed_after_error = device.durable_snapshot();
     assert_ne!(journal_start(&committed_after_error), 0);
@@ -2296,7 +2299,7 @@ pub fn run_ext2_journal_transaction_self_test() {
     // recovery-side home/flush/clear failure. The active tail must survive and
     // make the next mount converge to the committed state.
     let (device, _fs, file) = mount_image(allocated_base.clone());
-    device.arm(9, 8);
+    device.arm(7, 6);
     assert_eq!(file.append_write(b"!"), Err(FsError::Io));
     let active_mapped_log = device.durable_snapshot();
     assert_ne!(journal_start(&active_mapped_log), 0);
@@ -4602,6 +4605,14 @@ struct Ext2Journal {
     start: u32,
     uuid: [u8; 16],
     feature_incompat: u32,
+    /// Cached logical block 0 (JBD2 superblock) so `write_journal_state`
+    /// updates `sequence`/`start` in memory instead of re-reading block 0
+    /// twice per transaction.
+    superblock_image: Vec<u8>,
+    /// Pre-allocated staging buffer for up to `JOURNAL_MAX_METADATA_BLOCKS`
+    /// post-images inside `commit_metadata_transaction_inner`, so Pass 1 builds
+    /// each metadata image once and Passes 2/3 reuse it without re-reading disk.
+    tx_images: Vec<u8>,
 }
 
 impl Ext2Journal {
@@ -4619,6 +4630,8 @@ impl Ext2Journal {
             start: 0,
             uuid: [0; 16],
             feature_incompat: 0,
+            superblock_image: Vec::new(),
+            tx_images: Vec::new(),
         }
     }
 
@@ -8279,6 +8292,22 @@ impl Ext2Fs {
         }
         self.validate_sorted_allocated_blocks(&unique, &mut scratch)?;
 
+        let block_len = self.block_size as usize;
+        let tx_images_bytes = block_len
+            .checked_mul(JOURNAL_MAX_METADATA_BLOCKS)
+            .ok_or(FsError::Invalid)?;
+        let mut tx_images = Vec::new();
+        tx_images
+            .try_reserve_exact(tx_images_bytes)
+            .map_err(|_| FsError::NoMem)?;
+        tx_images.resize(tx_images_bytes, 0u8);
+
+        let mut superblock_image = Vec::new();
+        superblock_image
+            .try_reserve_exact(block_len)
+            .map_err(|_| FsError::NoMem)?;
+        superblock_image.resize(block_len, 0u8);
+
         Ok(Ext2Journal {
             blocks,
             mapping_blocks,
@@ -8289,6 +8318,8 @@ impl Ext2Fs {
             start,
             uuid,
             feature_incompat,
+            superblock_image,
+            tx_images,
         })
     }
 
@@ -8406,7 +8437,7 @@ impl Ext2Fs {
 
     fn write_journal_state(
         &self,
-        journal: &Ext2Journal,
+        journal: &mut Ext2Journal,
         sequence: u32,
         start: u32,
         scratch: &mut Ext2MutationScratch,
@@ -8414,14 +8445,28 @@ impl Ext2Fs {
         if journal.first != 1 || (start != 0 && start != journal.first) {
             return Err(FsError::NotSupported);
         }
-        self.read_journal_block(journal, 0, scratch.block_mut())?;
+        let block_len = self.block_size as usize;
+        let cached_valid = journal.superblock_image.len() == block_len
+            && read_be_u32(&journal.superblock_image, 0).ok() == Some(JBD2_MAGIC)
+            && read_be_u32(&journal.superblock_image, 4).ok() == Some(JBD2_SUPERBLOCK_V2);
+        if cached_valid {
+            scratch.block_mut()[..block_len].copy_from_slice(&journal.superblock_image);
+        } else {
+            self.read_journal_block(journal, 0, scratch.block_mut())?;
+        }
         let block = scratch.block_mut();
         if read_be_u32(block, 0)? != JBD2_MAGIC || read_be_u32(block, 4)? != JBD2_SUPERBLOCK_V2 {
             return Err(FsError::Invalid);
         }
         write_be_u32(block, JBD2_SUPER_SEQUENCE_OFFSET, sequence)?;
         write_be_u32(block, JBD2_SUPER_START_OFFSET, start)?;
-        self.write_journal_block(journal, 0, block)
+        self.write_journal_block(journal, 0, block)?;
+        if journal.superblock_image.len() == block_len {
+            journal
+                .superblock_image
+                .copy_from_slice(&block[..block_len]);
+        }
+        Ok(())
     }
 
     fn ensure_journal_intent_feature(
@@ -13373,6 +13418,8 @@ impl Ext2Fs {
         }
 
         let sequence = journal.next_sequence;
+        let block_len = self.block_size as usize;
+        let use_staged_images = journal.tx_images.len() >= metadata_blocks * block_len;
         let mut escaped = [false; JOURNAL_MAX_METADATA_BLOCKS];
         let mut homes = [0u32; JOURNAL_MAX_METADATA_BLOCKS];
         let mut preimage_hashes = [[0u8; 32]; JOURNAL_MAX_METADATA_BLOCKS];
@@ -13392,8 +13439,16 @@ impl Ext2Fs {
                     committed: false,
                     poison: false,
                 })?;
+            if use_staged_images {
+                let dst = &mut journal.tx_images[index * block_len..(index + 1) * block_len];
+                dst.copy_from_slice(&scratch.block()[..block_len]);
+            }
         }
 
+        // Write journal superblock (start=first), descriptor, and metadata
+        // payload before one single flush barrier prior to the commit block:
+        // crash before that barrier leaves no commit block on media, while any
+        // crash at/after the commit write observes durable start+descriptor+data.
         if let Err(error) = self.write_journal_state(journal, sequence, journal.first, scratch) {
             return Err(JournalTxFailure {
                 error,
@@ -13402,13 +13457,6 @@ impl Ext2Fs {
             });
         }
         journal.start = journal.first;
-        if let Err(error) = self.flush_device() {
-            return Err(JournalTxFailure {
-                error,
-                committed: false,
-                poison: true,
-            });
-        }
 
         let descriptor = scratch.block_mut();
         descriptor.fill(0);
@@ -13465,13 +13513,6 @@ impl Ext2Fs {
         }
         let mut transaction_hasher = Self::transaction_hasher(journal, sequence, descriptor);
         for (index, escape) in escaped[..metadata_blocks].iter().copied().enumerate() {
-            if let Err(error) = self.build_metadata_image(plan, index, scratch) {
-                return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
-            }
-            if escape {
-                scratch.block_mut()[..4].fill(0);
-            }
-            transaction_hasher.update(scratch.block());
             let logical = journal
                 .advance(journal.first, index as u32 + 1)
                 .map_err(|error| JournalTxFailure {
@@ -13479,8 +13520,26 @@ impl Ext2Fs {
                     committed: false,
                     poison: true,
                 })?;
-            if let Err(error) = self.write_journal_block(journal, logical, scratch.block()) {
-                return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
+            if use_staged_images && !escape {
+                let staged = &journal.tx_images[index * block_len..(index + 1) * block_len];
+                transaction_hasher.update(staged);
+                if let Err(error) = self.write_journal_block(journal, logical, staged) {
+                    return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
+                }
+            } else {
+                if use_staged_images {
+                    let staged = &journal.tx_images[index * block_len..(index + 1) * block_len];
+                    scratch.block_mut()[..block_len].copy_from_slice(staged);
+                } else if let Err(error) = self.build_metadata_image(plan, index, scratch) {
+                    return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
+                }
+                if escape {
+                    scratch.block_mut()[..4].fill(0);
+                }
+                transaction_hasher.update(scratch.block());
+                if let Err(error) = self.write_journal_block(journal, logical, scratch.block()) {
+                    return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
+                }
             }
         }
         if let Err(error) = self.flush_device() {
@@ -13545,22 +13604,33 @@ impl Ext2Fs {
         }
 
         for index in 0..metadata_blocks {
-            let home = match self.build_metadata_image(plan, index, scratch) {
-                Ok(home) => home,
-                Err(error) => {
+            if use_staged_images {
+                let staged = &journal.tx_images[index * block_len..(index + 1) * block_len];
+                if let Err(error) = self.write_physical_block(homes[index], staged) {
                     return Err(JournalTxFailure {
                         error,
                         committed: true,
                         poison: true,
-                    })
+                    });
                 }
-            };
-            if let Err(error) = self.write_physical_block(home, scratch.block()) {
-                return Err(JournalTxFailure {
-                    error,
-                    committed: true,
-                    poison: true,
-                });
+            } else {
+                let home = match self.build_metadata_image(plan, index, scratch) {
+                    Ok(home) => home,
+                    Err(error) => {
+                        return Err(JournalTxFailure {
+                            error,
+                            committed: true,
+                            poison: true,
+                        })
+                    }
+                };
+                if let Err(error) = self.write_physical_block(home, scratch.block()) {
+                    return Err(JournalTxFailure {
+                        error,
+                        committed: true,
+                        poison: true,
+                    });
+                }
             }
         }
         if let Err(error) = self.flush_device() {
@@ -15573,10 +15643,11 @@ impl Ext2Inode {
                     fs.io_faulted.store(true, Ordering::Release);
                     return fail(error, written);
                 }
-                if let Err(error) = fs.flush_device() {
-                    fs.io_faulted.store(true, Ordering::Release);
-                    return fail(error, written);
-                }
+                // Ordered-data barrier: `commit_metadata_transaction` flushes
+                // the device after writing `s_start`, descriptor, and metadata
+                // images and strictly before writing the JBD2 commit block, so
+                // `phys_block` is stabilized before any commit can become
+                // durable without a separate pre-transaction flush.
                 let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
                 let transaction_failure = match fs.commit_metadata_transaction(
                     journal,
@@ -15591,8 +15662,8 @@ impl Ext2Inode {
                     Ok(()) => None,
                     Err(failure) if failure.committed => Some(failure),
                     Err(failure) => {
-                        // Ordered data is already durable. Even a cleanly
-                        // aborted metadata transaction can leave an
+                        // The ordered data write has already been issued. Even
+                        // a cleanly aborted metadata transaction can leave an
                         // existing-size overwrite visible on disk while the
                         // page cache still contains old bytes, so continuing
                         // the mount would be incoherent.
@@ -15673,16 +15744,16 @@ impl Ext2Inode {
                 JournalMetadataPlan::DirectAllocation(&plan)
             };
 
-            // Ordered-data rule: initialize and durably flush the complete new
-            // block before any metadata transaction can make it reachable.
+            // Ordered-data rule: initialize the complete new block before the
+            // metadata transaction runs; `commit_metadata_transaction` issues
+            // its pre-commit `flush_device()` strictly before writing the JBD2
+            // commit block, stabilizing the new data block before any metadata
+            // can make it reachable.
             let block_buf = scratch.block_mut();
             block_buf.fill(0);
             block_buf[offset_in_block..offset_in_block + to_copy]
                 .copy_from_slice(&data[written..written + to_copy]);
             if let Err(error) = fs.write_block(plan.phys_block, block_buf) {
-                return fail(error, written);
-            }
-            if let Err(error) = fs.flush_device() {
                 return fail(error, written);
             }
 

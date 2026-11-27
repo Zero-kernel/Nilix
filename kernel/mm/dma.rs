@@ -278,6 +278,16 @@ pub fn is_iommu_enabled() -> bool {
     matches!(gate.state, IommuGateState::Active) && IOMMU_OPS.get().is_some()
 }
 
+/// Check if the DMA gate is strictly in `Legacy` mode with no IOMMU operations
+/// registered. Drivers may reuse non-IOMMU-mapped bounce buffers only while
+/// this returns `true`; any transition to `Probing`, `Active`, or `Failed`
+/// forces on-demand per-request `alloc_dma_buffer` / `Drop` unmapping (R94-13).
+#[inline]
+pub fn is_iommu_legacy() -> bool {
+    let gate = IOMMU_GATE.lock();
+    matches!(gate.state, IommuGateState::Legacy) && IOMMU_OPS.get().is_none()
+}
+
 // ============================================================================
 // DmaBuffer
 // ============================================================================
@@ -358,6 +368,12 @@ impl DmaBuffer {
     #[inline]
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Returns `true` if this buffer owns an active IOMMU mapping.
+    #[inline]
+    pub fn is_iommu_mapped(&self) -> bool {
+        self.iommu_mapped
     }
 
     /// Domain ID this buffer is mapped in.
@@ -753,5 +769,12 @@ mod tests {
         assert!(expected.same_identity(&same));
         assert!(!expected.same_identity(&wrong_domain));
         assert!(!expected.same_identity(&wrong_map));
+    }
+
+    #[test]
+    fn is_iommu_legacy_matches_initial_gate_state() {
+        // Default hosted state starts in Legacy with no IOMMU hooks installed.
+        assert!(super::is_iommu_legacy());
+        assert!(!super::is_iommu_enabled());
     }
 }
