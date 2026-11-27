@@ -4345,10 +4345,20 @@ fn unlink_first_dead_space_bucket() -> Option<FutexQueueRef> {
 /// cleared. If a live PCB at `pid` has a different generation, skip all
 /// PID-keyed waiter/owner mutations for that pid (successor already owns it).
 /// The dead-address-space sweep still runs: it depends on no PID.
+/// Monotonic latch set before any bucket is inserted into `FUTEX_TABLE`.
+/// Lets `cleanup_process_futexes` skip both `PROCESS_TABLE` and `FUTEX_TABLE`
+/// locks on workloads that never touch futexes.
+static FUTEX_EVER_PUBLISHED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId, generation: u64) {
     // GAP-5 futex parity: the key space is the address space, not the TGID;
     // the TGID is no longer needed here.
     let _ = tgid;
+
+    if !FUTEX_EVER_PUBLISHED.load(Ordering::Acquire) {
+        return;
+    }
 
     // R180-5: if a successor already occupies this PID, do not strip its
     // waiters / PI / ownership. Still drain process-gen-stamped WaitQueue
@@ -4493,6 +4503,7 @@ fn publish_futex_bucket_candidate(
     let owner = candidate
         .take()
         .expect("futex bucket candidate consumed once");
+    FUTEX_EVER_PUBLISHED.store(true, Ordering::Release);
     match table.insert_unique_reserved(key, owner) {
         Ok(()) => FutexBucketPublish::Ready(
             table

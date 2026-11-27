@@ -892,7 +892,16 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
             arch::apic::init();
         }
         let bsp_lapic_id = arch::apic::bsp_lapic_id();
-        klog_always!("      ✓ BSP LAPIC initialized (ID: {})", bsp_lapic_id);
+        let apic_mode = if arch::apic::x2apic_enabled() {
+            "x2APIC"
+        } else {
+            "xAPIC"
+        };
+        klog_always!(
+            "      ✓ BSP LAPIC initialized (ID: {}, mode: {})",
+            bsp_lapic_id,
+            apic_mode
+        );
 
         // E.1: Initialize HPET (High Precision Event Timer) if available
         // HPET provides a high-resolution counter for precise timing and

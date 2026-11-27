@@ -326,15 +326,18 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         // This defers FXSAVE/FXRSTOR until actually needed, saving overhead
         // when processes don't use FPU between context switches
         "mov rax, cr0",
+        "test rax, {cr0_ts}",
+        "jnz 8f",
         "or rax, {cr0_ts}",
         "mov cr0, rax",
+        "8:",
 
-        // R158-12 FIX: Zero DR7 to disable all hardware breakpoints.
-        // R159-11 FIX: Also zero DR0-DR3 (breakpoint addresses) and DR6
-        // (debug status). DR6 is sticky (Intel SDM Vol 3A §17.4.1) and
-        // must be cleared to prevent stale condition bits leaking to the
-        // next #DB handler invocation. DR0-DR3 could trigger spurious
-        // watchpoints if a future process hits the same virtual address.
+        // R158-12 / R159-11 FIX: Zero DR0-DR3, DR6, DR7 whenever `dr_dirty != 0`
+        // (initialized to 1 at boot, cleared after boot scrub, re-armed on every `#DB`).
+        // Skipping redundant `mov dr*, 0` when hardware DRs are provably zero avoids
+        // six KVM `EXIT_REASON_DR_ACCESS` VM-exits per context switch.
+        "cmp qword ptr gs:[{percpu_dr_dirty}], 0",
+        "je 9f",
         "xor eax, eax",
         "mov dr0, rax",
         "mov dr1, rax",
@@ -342,6 +345,8 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "mov dr3, rax",
         "mov dr6, rax",
         "mov dr7, rax",
+        "mov qword ptr gs:[{percpu_dr_dirty}], 0",
+        "9:",
 
         // 加载新上下文从 new_ctx (rcx)
         "mov rax, [rcx + 0x00]",   // 恢复rax
@@ -383,6 +388,7 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         // compile-time assertions in syscall.rs will catch the mismatch at build time.
         percpu_frame_ptr = const crate::syscall::PERCPU_FRAME_PTR_OFFSET,
         percpu_syscall_active = const crate::syscall::PERCPU_SYSCALL_ACTIVE_OFFSET,
+        percpu_dr_dirty = const crate::syscall::PERCPU_DR_DIRTY_OFFSET,
     )
 }
 
@@ -488,11 +494,16 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         // R172-05 / R102-3: clear per-CPU syscall_active + frame_ptr on switch-out.
         "mov qword ptr gs:[{percpu_syscall_active}], 0",
         "mov qword ptr gs:[{percpu_frame_ptr}], 0",
-        // Lazy-FPU: arm #NM for the incoming task.
+        // Lazy-FPU: arm #NM for the incoming task (skip CR0 write if TS already set).
         "mov rax, cr0",
+        "test rax, {cr0_ts}",
+        "jnz 8f",
         "or rax, {cr0_ts}",
         "mov cr0, rax",
-        // Zero all debug registers (R158-12/R159-11 parity).
+        "8:",
+        // Zero all debug registers when `dr_dirty != 0` (R158-12/R159-11 parity).
+        "cmp qword ptr gs:[{percpu_dr_dirty}], 0",
+        "je 9f",
         "xor eax, eax",
         "mov dr0, rax",
         "mov dr1, rax",
@@ -500,6 +511,8 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "mov dr3, rax",
         "mov dr6, rax",
         "mov dr7, rax",
+        "mov qword ptr gs:[{percpu_dr_dirty}], 0",
+        "9:",
 
         // ================= ENTER-HALF (byte-identical to enter_usermode) =================
         // Point rdi at new_ctx for the enter-half (which dereferences [rdi + ...]).
@@ -578,6 +591,7 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
         percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
         percpu_kpti_tmp = const crate::syscall::PERCPU_KPTI_TMP_OFFSET,
+        percpu_dr_dirty = const crate::syscall::PERCPU_DR_DIRTY_OFFSET,
         user_cs = const USER_CODE_SELECTOR,
         user_ss = const USER_DATA_SELECTOR,
     )
@@ -705,11 +719,10 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         // IRETQ pops RFLAGS (with IF=1) to re-enable on usermode entry.
         "cli",
 
-        // R160-6 FIX: Zero all debug registers before entering usermode,
-        // matching the switch_context pattern (R159-11). Without this, the
-        // first process to enter Ring 3 could inherit kernel debug register
-        // values (DR0-DR3 breakpoint addresses, DR6 status, DR7 control),
-        // leaking kernel virtual addresses and defeating KASLR.
+        // R160-6 FIX: Zero all debug registers before entering usermode when
+        // `dr_dirty != 0`, matching `switch_context`/`switch_to_user`.
+        "cmp qword ptr gs:[{percpu_dr_dirty}], 0",
+        "je 9f",
         "push rdi",
         "xor eax, eax",
         "mov dr0, rax",
@@ -718,7 +731,9 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         "mov dr3, rax",
         "mov dr6, rax",
         "mov dr7, rax",
+        "mov qword ptr gs:[{percpu_dr_dirty}], 0",
         "pop rdi",
+        "9:",
 
         "fxrstor64 [rdi + {fxoff}]",
 
@@ -810,6 +825,7 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
         percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
         percpu_kpti_tmp = const crate::syscall::PERCPU_KPTI_TMP_OFFSET,
+        percpu_dr_dirty = const crate::syscall::PERCPU_DR_DIRTY_OFFSET,
         user_cs = const USER_CODE_SELECTOR,
         user_ss = const USER_DATA_SELECTOR,
     );

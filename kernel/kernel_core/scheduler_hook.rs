@@ -208,6 +208,11 @@ pub fn drain_requested_soft_progress() {
     }
     assert_kernel_entry_state();
 
+    // Fast path: skip `try_enter_soft_progress()` atomic RMW when nothing is pending.
+    if !IRQ_SOFT_PROGRESS_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+
     // RF187-5 FIX: IRQ return enables IF before reaching this shared drain,
     // but the interrupted task is still not an ordinary task-context owner.
     // Mark the whole snapshot/invocation window so KCOV admission remains
@@ -446,8 +451,10 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>, forced_origin: Option<Re
     // E.4 RCU: Drain callbacks in process context.
     crate::rcu::poll();
 
-    // R67-4 FIX: Consume this CPU's IRQ-triggered reschedule request
-    let irq_pending = IRQ_RESCHED_PENDING.with(|flag| flag.swap(false, Ordering::SeqCst));
+    // R67-4 FIX: Consume this CPU's IRQ-triggered reschedule request (load-first
+    // avoids an unconditional `xchg` SeqCst RMW on every syscall return).
+    let irq_pending = IRQ_RESCHED_PENDING
+        .with(|flag| flag.load(Ordering::Acquire) && flag.swap(false, Ordering::SeqCst));
 
     // RF180-54: this is the exact completion boundary for one full deferred
     // drain. Run the AP acknowledgement before a scheduler callback can switch

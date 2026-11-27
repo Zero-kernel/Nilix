@@ -53,8 +53,21 @@ struct PipeArcChargeSlot {
     charge: HeapCharge,
 }
 
-static PIPE_ARC_CHARGES: Mutex<[Option<PipeArcChargeSlot>; PIPE_ARC_CHARGE_SLOTS]> =
-    Mutex::new([const { None }; PIPE_ARC_CHARGE_SLOTS]);
+struct PipeArcChargeTable {
+    slots: [Option<PipeArcChargeSlot>; PIPE_ARC_CHARGE_SLOTS],
+    next_hint: usize,
+}
+
+impl PipeArcChargeTable {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; PIPE_ARC_CHARGE_SLOTS],
+            next_hint: 0,
+        }
+    }
+}
+
+static PIPE_ARC_CHARGES: Mutex<PipeArcChargeTable> = Mutex::new(PipeArcChargeTable::new());
 static NEXT_PIPE_ARC_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Allocator token carried by every Pipe Arc/Weak owner. The committed Arc
@@ -78,14 +91,18 @@ impl PipeArcAllocator {
         };
 
         let mut charge = Some(charge);
-        let mut slots = PIPE_ARC_CHARGES.lock();
-        for (index, slot) in slots.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(PipeArcChargeSlot {
+        let mut table = PIPE_ARC_CHARGES.lock();
+        let len = table.slots.len();
+        let start = table.next_hint % len;
+        for offset in 0..len {
+            let index = (start + offset) % len;
+            if table.slots[index].is_none() {
+                table.slots[index] = Some(PipeArcChargeSlot {
                     generation,
                     allocated: false,
                     charge: charge.take().expect("pipe Arc charge moved once"),
                 });
+                table.next_hint = (index + 1) % len;
                 return Ok(Self {
                     slot: index as u16,
                     generation,
@@ -96,18 +113,23 @@ impl PipeArcAllocator {
     }
 
     fn take_charge(self) -> HeapCharge {
-        let mut slots = PIPE_ARC_CHARGES.lock();
-        let slot = slots
-            .get_mut(self.slot as usize)
+        let mut table = PIPE_ARC_CHARGES.lock();
+        let idx = self.slot as usize;
+        let slot = table
+            .slots
+            .get_mut(idx)
             .expect("RF180-42 pipe Arc allocator slot out of range");
         match slot.as_ref() {
             Some(entry) if entry.generation == self.generation => {}
             Some(_) => panic!("RF180-42 stale pipe Arc allocator generation"),
             None => panic!("RF180-42 pipe Arc charge released twice"),
         }
-        slot.take()
+        let charge = slot
+            .take()
             .expect("validated pipe Arc charge disappeared")
-            .charge
+            .charge;
+        table.next_hint = idx;
+        charge
     }
 
     fn cancel_failed_allocation(self) {
@@ -118,6 +140,7 @@ impl PipeArcAllocator {
     fn charge_is_live_for_test(self) -> bool {
         PIPE_ARC_CHARGES
             .lock()
+            .slots
             .get(self.slot as usize)
             .and_then(Option::as_ref)
             .is_some_and(|entry| entry.generation == self.generation)
@@ -127,8 +150,12 @@ impl PipeArcAllocator {
 unsafe impl Allocator for PipeArcAllocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         {
-            let mut slots = PIPE_ARC_CHARGES.lock();
-            let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) else {
+            let mut table = PIPE_ARC_CHARGES.lock();
+            let Some(entry) = table
+                .slots
+                .get_mut(self.slot as usize)
+                .and_then(Option::as_mut)
+            else {
                 return Err(AllocError);
             };
             if entry.generation != self.generation || entry.allocated {
@@ -140,8 +167,12 @@ unsafe impl Allocator for PipeArcAllocator {
         match Global.allocate(layout) {
             Ok(allocation) => Ok(allocation),
             Err(error) => {
-                let mut slots = PIPE_ARC_CHARGES.lock();
-                if let Some(entry) = slots.get_mut(self.slot as usize).and_then(Option::as_mut) {
+                let mut table = PIPE_ARC_CHARGES.lock();
+                if let Some(entry) = table
+                    .slots
+                    .get_mut(self.slot as usize)
+                    .and_then(Option::as_mut)
+                {
                     if entry.generation == self.generation {
                         entry.allocated = false;
                     }
@@ -595,10 +626,13 @@ impl Pipe {
                     match committed {
                         Ok(()) => {
                             inner.finish_read_transaction(count, true);
+                            let data_left = inner.len > 0 && !inner.read_inflight;
                             drop(inner);
                             self.write_wait.wake_all();
                             // Another reader may have slept on the reservation.
-                            self.pass_on_read_wake();
+                            if data_left {
+                                self.read_wait.wake_one();
+                            }
                             return Ok(count);
                         }
                         Err(error) => {
@@ -637,10 +671,13 @@ impl Pipe {
                     match committed {
                         Ok(()) => {
                             inner.finish_read_transaction(count, true);
+                            let data_left = inner.len > 0 && !inner.read_inflight;
                             drop(inner);
                             self.write_wait.wake_all();
                             // Another reader may have slept on the reservation.
-                            self.pass_on_read_wake();
+                            if data_left {
+                                self.read_wait.wake_one();
+                            }
                             return Ok(count);
                         }
                         Err(error) => {
@@ -1373,13 +1410,15 @@ pub fn create_pipe_with_capacity(
         try_reserve_heap(HeapClass::Pipe, estimated_buffer).map_err(|_| PipeError::NoMemory)?;
 
     // Allocation is fallible and remains private. Reconcile the allocator's
-    // actual capacity before the object can become reachable.
+    // actual capacity before the object can become reachable (skip when exact).
     let inner = PipeInner::new(capacity)?;
     let actual_buffer =
         vec_charge_bytes::<u8>(inner.buffer.capacity()).map_err(|_| PipeError::NoMemory)?;
-    buffer_reservation
-        .resize(actual_buffer)
-        .map_err(|_| PipeError::NoMemory)?;
+    if actual_buffer != estimated_buffer {
+        buffer_reservation
+            .resize(actual_buffer)
+            .map_err(|_| PipeError::NoMemory)?;
+    }
 
     // R111-3 FIX: Use fetch_update + checked_add to prevent wrapping to 0
     // on usize overflow.  Follows the R105-5 pattern established for IPC

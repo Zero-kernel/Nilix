@@ -44,6 +44,33 @@ type TimestampFn = fn() -> u64;
 /// R106-8: Callback for emitting tamper-evident audit events.
 /// Args: (pid: u64, uid: u32, nr_pages_needed: u64, rss_pages: u64, oom_score_adj: i64, timestamp: u64)
 type AuditEmitFn = fn(u64, u32, u64, u64, i64, u64);
+/// Result of a strictly non-blocking transient frame-cache reclaim attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheReclaimResult {
+    /// Number of 4 KiB pages returned to Buddy during this pass.
+    pub reclaimed_pages: usize,
+    /// `true` if either the cache lock or Buddy lock was contended while
+    /// reclaimable blocks remained cached (caller must treat as retryable `Busy`
+    /// even if `reclaimed_pages > 0`, because another CPU may consume the
+    /// partial reclaim while retained blocks remain).
+    pub busy: bool,
+}
+
+impl CacheReclaimResult {
+    pub const EMPTY: Self = Self {
+        reclaimed_pages: 0,
+        busy: false,
+    };
+
+    pub const BUSY: Self = Self {
+        reclaimed_pages: 0,
+        busy: true,
+    };
+}
+
+/// Non-blocking, lock-safe reclaim hook for transient frame caches (e.g.
+/// pre-zeroed post-shootdown kernel-stack reuse cache).
+type CacheReclaimFn = fn() -> CacheReclaimResult;
 
 struct Callbacks {
     snapshot: Option<SnapshotFn>,
@@ -59,6 +86,11 @@ static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
     timestamp: None,
     audit_emit: None,
 });
+
+/// Lock-free registered callback for reclaiming transient frame caches on
+/// physical allocation pressure (callable outside buddy locks even when IRQs
+/// are masked or `run_oom == false`).
+static CACHE_RECLAIM_CB: spin::Once<CacheReclaimFn> = spin::Once::new();
 
 /// Prevent re-entrant OOM handling
 static OOM_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -88,6 +120,30 @@ pub fn register_callbacks(snapshot: SnapshotFn, kill: KillFn, timestamp: Timesta
 pub fn register_audit_callback(audit_emit: AuditEmitFn) {
     let mut cb = CALLBACKS.lock();
     cb.audit_emit = Some(audit_emit);
+}
+
+/// Register a non-blocking transient frame-cache reclaim hook (e.g. kstack reuse
+/// cache) invoked on physical allocation exhaustion and before OOM victim
+/// selection. Must NEVER acquire allocator locks while holding its own lock and
+/// must NEVER wait on RCU or TLB shootdowns.
+pub fn register_cache_reclaim_callback(reclaim: CacheReclaimFn) {
+    CACHE_RECLAIM_CB.call_once(|| reclaim);
+}
+
+/// Whether a transient frame-cache reclaim callback has been registered.
+#[inline]
+pub fn has_transient_cache_reclaim() -> bool {
+    CACHE_RECLAIM_CB.is_completed()
+}
+
+/// Strictly non-blocking transient cache reclaim for fault and allocation paths
+/// (outside buddy locks). Reports both pages reclaimed and whether contention
+/// left additional reclaimable blocks behind (`busy == true`).
+#[inline]
+pub fn reclaim_transient_caches_nonblocking() -> CacheReclaimResult {
+    CACHE_RECLAIM_CB
+        .get()
+        .map_or(CacheReclaimResult::EMPTY, |reclaim| reclaim())
 }
 
 /// Allocation-free phase-1 entry point used by the physical allocator.
@@ -133,11 +189,23 @@ pub fn poll_and_handle_oom() {
         return;
     }
 
-    // Try to reclaim from the page cache first
+    // Try to reclaim transient frame caches and page cache pages first.
     let reclaim_target = cmp::max(nr_pages_needed, MIN_RECLAIM_PAGES);
-    let reclaimed = PRESSURE_HANDLER.on_memory_pressure(reclaim_target);
+    let transient = reclaim_transient_caches_nonblocking();
+    let reclaimed = transient
+        .reclaimed_pages
+        .saturating_add(PRESSURE_HANDLER.on_memory_pressure(reclaim_target));
 
     if !still_under_pressure(nr_pages_needed) {
+        OOM_RUNNING.store(false, Ordering::Release);
+        return;
+    }
+
+    if transient.busy {
+        // Reclaimable blocks remained behind a contended transient-cache or
+        // buddy lock; rearm and defer victim selection rather than killing a
+        // task prematurely on transient lock contention.
+        rearm_pending(nr_pages_needed);
         OOM_RUNNING.store(false, Ordering::Release);
         return;
     }

@@ -224,12 +224,22 @@ pub fn run_pipe_second_cap_failure_self_test() {
 ///   funnel.
 /// - **R170-6**: every rollback `PipeHandle` Drop (close → wake) runs OUTSIDE
 ///   the Process lock via `rollback_outside`.
-fn pipe_create_callback(flags: u32) -> Result<(i32, i32), SyscallError> {
-    use process::{current_pid, get_process};
+fn resolve_current_process(
+    entry_proc: Option<&process::ProcessArc>,
+) -> Result<process::ProcessArc, SyscallError> {
+    if let Some(proc_arc) = entry_proc {
+        return Ok(proc_arc.clone());
+    }
+    let pid = process::current_pid().ok_or(SyscallError::ESRCH)?;
+    process::get_process(pid).ok_or(SyscallError::ESRCH)
+}
 
-    // 获取当前进程
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+fn pipe_create_callback(
+    flags: u32,
+    entry_proc: Option<&process::ProcessArc>,
+) -> Result<(i32, i32), SyscallError> {
+    // 获取当前进程（复用 syscall 入口已持有的 ProcessArc，避免重复锁 PROCESS_TABLE）
+    let process = resolve_current_process(entry_proc)?;
 
     // R190-1 FIX: MAC-mediate pipe creation (both pipe and pipe2 land here)
     // before any pipe object, capability or descriptor exists.
@@ -412,12 +422,11 @@ fn fd_read_callback(
     buf: &mut [u8],
     user_dst: *mut u8,
     copyout: kernel_core::syscall::FdReadCopyout,
+    entry_proc: Option<&process::ProcessArc>,
 ) -> Result<usize, SyscallError> {
-    use process::{current_pid, get_process};
     use vfs::traits::FileHandle;
 
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let process = resolve_current_process(entry_proc)?;
 
     // Single lock acquisition for both type checks
     let proc = process.lock();
@@ -541,12 +550,14 @@ fn fd_read_callback(
 /// R41-3 FIX: Clone file handle and drop process lock before I/O.
 /// This prevents holding the lock during potentially blocking device I/O,
 /// avoiding DoS vectors and deadlock risks.
-fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
-    use process::{current_pid, get_process};
+fn fd_write_callback(
+    fd: i32,
+    buf: &[u8],
+    entry_proc: Option<&process::ProcessArc>,
+) -> Result<usize, SyscallError> {
     use vfs::traits::FileHandle;
 
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let process = resolve_current_process(entry_proc)?;
 
     // Single lock acquisition for both type checks
     let proc = process.lock();
@@ -578,11 +589,11 @@ fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
 /// 文件描述符关闭回调
 ///
 /// 关闭指定的文件描述符（触发 Drop 清理资源）
-fn fd_close_callback(fd: i32) -> Result<(), SyscallError> {
-    use process::{current_pid, get_process};
-
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+fn fd_close_callback(
+    fd: i32,
+    entry_proc: Option<&process::ProcessArc>,
+) -> Result<(), SyscallError> {
+    let process = resolve_current_process(entry_proc)?;
 
     // R155-3 FIX: Extract the FileDescriptor under lock, then drop OUTSIDE
     // to avoid lock inversion (Process → socket waiters → Process).
