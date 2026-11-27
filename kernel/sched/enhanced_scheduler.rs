@@ -4971,6 +4971,103 @@ fn steal_hint_probe() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// R172-03 runtime probe (STRICT-Q S6): verify that `Scheduler::steal_pass`
+/// refuses to steal a Ready task on another CPU while its `on_cpu` gate is
+/// still `true` (mid-switch-out context save in flight), and immediately steals
+/// the same task once `on_cpu` is cleared to `false`.
+pub fn run_work_stealing_on_cpu_gate_probe() -> Result<(), &'static str> {
+    interrupts::without_interrupts(work_stealing_on_cpu_gate_probe)
+}
+
+fn work_stealing_on_cpu_gate_probe() -> Result<(), &'static str> {
+    const PROBE_PID: Pid = steal_hint::PROBE_PID;
+    const PASSES: usize = 16;
+
+    let thief = current_cpu_id();
+    let Some(source) = Scheduler::online_cpu_ids().find(|&cpu_id| cpu_id != thief) else {
+        return Err("no second online CPU");
+    };
+    let hint = steal_hint::hint();
+    if hint.queue_cpu(PROBE_PID).is_some() {
+        return Err("another scheduler probe is already active");
+    }
+    let source_queue =
+        Scheduler::ready_queue_for_cpu(source).ok_or("the source CPU has no ready queue")?;
+
+    let pcb = Process::try_new_pcb(
+        PROBE_PID,
+        1,
+        ProcessNameSnapshot::from_parts("on-cpu-gate-probe", ""),
+        120,
+    )
+    .map_err(|_| "no memory for on_cpu gate probe PCB")?;
+    let generation = {
+        let mut proc = pcb.lock();
+        proc.allowed_cpus = 1u64 << thief;
+        proc.enter_ready_at(kernel_core::get_ticks());
+        // Simulate an outgoing task whose context save has not yet completed.
+        proc.on_cpu.store(true, Ordering::Release);
+        proc.generation
+    };
+
+    Scheduler::insert_ready_detached(source_queue, source, 120, PROBE_PID, Arc::clone(&pcb))
+        .map_err(|_| "failed to enqueue on_cpu gate probe")?;
+
+    let pass = || Scheduler::steal_pass(thief, core::iter::once(source), None, false);
+    let give_back = |stolen: (Pid, ProcessControlBlock, Priority, usize, Priority)| {
+        let (pid, pcb, _, source_cpu, source_priority) = stolen;
+        Scheduler::restore_to_source(source_cpu, source_priority, pid, pcb);
+    };
+
+    let result = (|| {
+        // Phase 1: with on_cpu == true, steal_pass MUST NEVER steal PROBE_PID.
+        for _ in 0..PASSES {
+            if let Some(stolen) = pass() {
+                let was_probe = stolen.0 == PROBE_PID && Arc::ptr_eq(&stolen.1, &pcb);
+                give_back(stolen);
+                if was_probe {
+                    return Err("task with on_cpu=true was stolen before context save completed");
+                }
+            }
+        }
+
+        // Phase 2: once finish_task_switch clears on_cpu -> false and publishes
+        // the queue, steal_pass MUST be able to steal PROBE_PID.
+        pcb.lock().on_cpu.store(false, Ordering::Release);
+        hint.publish_cpu(source);
+
+        let mut stolen_after_clear = false;
+        for _ in 0..PASSES {
+            let Some(stolen) = pass() else {
+                continue;
+            };
+            let was_probe = stolen.0 == PROBE_PID && Arc::ptr_eq(&stolen.1, &pcb);
+            give_back(stolen);
+            if was_probe {
+                stolen_after_clear = true;
+                break;
+            }
+        }
+        if !stolen_after_clear {
+            return Err("task was not stolen after on_cpu gate cleared to false");
+        }
+        Ok(())
+    })();
+
+    // Always clear on_cpu, block, and remove probe PCB from all queues.
+    {
+        let mut proc = pcb.lock();
+        proc.on_cpu.store(false, Ordering::Release);
+        proc.enter_blocked_at(kernel_core::get_ticks());
+    }
+    Scheduler::remove_identity_from_all_queues(PROBE_PID, generation);
+    result?;
+    if hint.queue_cpu(PROBE_PID).is_some() {
+        return Err("probe cleanup did not clear steal_hint queue record");
+    }
+    Ok(())
+}
+
 /// RF178-36 executable probe for identity-bound stopped/fatal resume.
 pub fn run_identity_resume_self_test() {
     let mut proc = Process::new(

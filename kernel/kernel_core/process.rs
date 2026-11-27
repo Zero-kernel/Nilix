@@ -10473,6 +10473,47 @@ pub fn try_get_process(pid: ProcessId) -> Option<Option<ProcessArc>> {
     Some(table.get(pid).and_then(|slot| slot.clone()))
 }
 
+/// R171-G5-1 runtime probe: verify `try_get_process` never blocks when
+/// `PROCESS_TABLE` is held (as on a timer IRQ interrupting a table writer on
+/// the same CPU) and distinguishes contended (`None`) from absent (`Some(None)`).
+pub fn run_non_blocking_get_process_irq_self_test() -> Result<(), &'static str> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // 1. Contended path: hold PROCESS_TABLE on this CPU and call
+        //    try_get_process without releasing the lock. A blocking lookup
+        //    would self-deadlock immediately; try_get_process must return None.
+        {
+            let _held = PROCESS_TABLE.lock();
+            if try_get_process(0).is_some() {
+                return Err("try_get_process(0) did not return None while PROCESS_TABLE was locked");
+            }
+            if try_get_process(1).is_some() {
+                return Err("try_get_process(1) did not return None while PROCESS_TABLE was locked");
+            }
+            if try_get_process(usize::MAX).is_some() {
+                return Err(
+                    "try_get_process(usize::MAX) did not distinguish contended lock from absent PID",
+                );
+            }
+        }
+
+        // 2. Uncontended path: after releasing PROCESS_TABLE, an absent PID
+        //    must return Some(None) and any live current_pid must return Some(Some(_)).
+        match try_get_process(usize::MAX) {
+            Some(None) => {}
+            None => return Err("try_get_process(usize::MAX) reported contended after unlock"),
+            Some(Some(_)) => return Err("try_get_process(usize::MAX) returned a live PCB"),
+        }
+        if let Some(pid) = current_pid() {
+            match try_get_process(pid) {
+                Some(Some(_)) => {}
+                Some(None) => return Err("try_get_process(current_pid) missed live process"),
+                None => return Err("try_get_process(current_pid) contended unexpectedly"),
+            }
+        }
+        Ok(())
+    })
+}
+
 /// 注册调度器的清理回调，用于在 PCB 删除时同步调度器状态
 pub fn register_cleanup_notifier(callback: SchedulerCleanupCallback) {
     *SCHEDULER_CLEANUP.lock() = Some(callback);

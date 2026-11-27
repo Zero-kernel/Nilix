@@ -37,13 +37,21 @@ impl RuntimeTest for ContextSwitchRipRflagsTest {
         "r172_01_context_switch_rip_rflags"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 concurrent RIP/RFLAGS/CS/SS preservation leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "context switch RIP/RFLAGS: concurrent threads preserve Ring-3 CS/SS, callee registers and flags across yields and preemptions",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-01: Verify RIP/RFLAGS/CS/SS preserved across clone+yield (prevents privilege escalation)"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "The named guest regression workload and assertion oracle are not implemented",
+            "Covered by Ring-3 context switch RIP/RFLAGS/CS/SS leg in ring3-mm",
         ))
     }
 }
@@ -58,13 +66,21 @@ impl RuntimeTest for TlsIsolationTest {
         "r172_04_tls_isolation"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 concurrent FS_BASE/GS_BASE TLS isolation leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "TLS isolation: concurrent threads preserve distinct FS_BASE and GS_BASE across context switches",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-04: Verify FS_BASE/GS_BASE TLS isolation across context switches"
     }
 
     fn run(&self) -> TestResult {
         TestResult::Deferred(String::from(
-            "The named guest regression workload and assertion oracle are not implemented",
+            "Covered by Ring-3 FS_BASE/GS_BASE TLS isolation leg in ring3-mm",
         ))
     }
 }
@@ -79,30 +95,21 @@ impl RuntimeTest for SyscallActiveLeakTest {
         "r172_05_syscall_active_leak"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 interleaved single-CPU blocking-syscall leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "syscall_active isolation: interleaved blocking syscalls on one CPU never leak EBUSY",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-05: Verify syscall_active per-CPU flag cleared on switch_out"
     }
 
     fn run(&self) -> TestResult {
-        use arch::max_cpus;
-
-        // Verify per-CPU infrastructure exists
-        let cpu_id = arch::current_cpu_id();
-
-        // This is a compile-time / boot-time structural test
-        // Runtime testing requires process creation (deferred)
-
-        let max = max_cpus();
-        if cpu_id >= max {
-            return TestResult::Fail(alloc::format!(
-                "Invalid CPU ID: {} >= max_cpus() ({})",
-                cpu_id,
-                max
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "Per-CPU infrastructure validated; full test requires process context switching",
+            "Covered by Ring-3 syscall_active isolation leg in ring3-mm",
         ))
     }
 }
@@ -118,6 +125,11 @@ impl RuntimeTest for WorkStealingOnCpuGateTest {
         "r172_03_work_stealing_on_cpu_gate"
     }
 
+    // STRICT-Q S6 (D1): cross-CPU work-stealing on_cpu gate probe requires 2+ CPUs.
+    fn scope(&self) -> TestScope {
+        TestScope::NeedsCpus(2)
+    }
+
     fn description(&self) -> &'static str {
         "R172-03: Verify on_cpu gate prevents steal-before-context-save race"
     }
@@ -125,18 +137,16 @@ impl RuntimeTest for WorkStealingOnCpuGateTest {
     fn run(&self) -> TestResult {
         use arch::num_online_cpus;
 
-        // Verify SMP is configured
-        let num_cpus = num_online_cpus();
-        if num_cpus < 2 {
+        if num_online_cpus() < 2 {
             return TestResult::Deferred(String::from(
                 "Work-stealing test requires 2+ CPUs (only 1 online)",
             ));
         }
 
-        TestResult::Deferred(alloc::format!(
-            "SMP configured ({} CPUs); full test requires process stress testing",
-            num_cpus
-        ))
+        match sched::enhanced_scheduler::run_work_stealing_on_cpu_gate_probe() {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(String::from(msg)),
+        }
     }
 }
 
@@ -150,19 +160,21 @@ impl RuntimeTest for FpuStateIrqIsolationTest {
         "r174_a1_fpu_state_irq_isolation"
     }
 
+    // STRICT-Q S9 (D5): Ring-3 concurrent SSE XMM0-XMM7 timer-IRQ preemption leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "FPU IRQ isolation: concurrent SSE XMM0-XMM7 state stays bit-exact across timer preemptions",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R174-A1: Verify FPU state isolation during timer IRQ nesting"
     }
 
     fn run(&self) -> TestResult {
-        // Verify FPU is available - architecture dependent check
-        // Most x86-64 systems have FPU, this is a placeholder for actual check
-
-        // Test FPU state save/restore infrastructure exists
-        // Full test requires IRQ injection during FPU operations (deferred)
-
         TestResult::Deferred(String::from(
-            "FPU subsystem placeholder; full isolation test requires IRQ simulation",
+            "Covered by Ring-3 FPU/SSE IRQ isolation leg in ring3-mm",
         ))
     }
 }
@@ -1108,21 +1120,21 @@ impl RuntimeTest for SmpWorkStealingSafetyTest {
         "r172_03_smp_work_stealing_safety"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 SMP work-stealing multi-wave TLS safety leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "SMP work stealing safety: concurrent unpinned task waves preserve per-task TLS and identity across CPUs",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "R172-03: Comprehensive SMP work stealing safety under load"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Work stealing test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires 100+ concurrent processes with TLS verification",
+            "Covered by Ring-3 SMP work stealing safety leg in ring3-mm",
         ))
     }
 }
@@ -1141,9 +1153,10 @@ impl RuntimeTest for NonBlockingGetProcessInIrqTest {
     }
 
     fn run(&self) -> TestResult {
-        TestResult::Deferred(String::from(
-            "Test requires IRQ context verification - placeholder",
-        ))
+        match kernel_core::process::run_non_blocking_get_process_irq_self_test() {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(String::from(msg)),
+        }
     }
 }
 
@@ -1157,21 +1170,21 @@ impl RuntimeTest for ProcessMigrationSafetyTest {
         "process_migration_safety"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 forced cross-CPU migration state consistency leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "process migration safety: forced cross-CPU hops preserve per-CPU state, FS/GS TLS and PID identity",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "Verify process migration maintains per-CPU state consistency"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Migration test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires forced migration with state verification",
+            "Covered by Ring-3 forced cross-CPU migration safety leg in ring3-mm",
         ))
     }
 }
@@ -1185,21 +1198,21 @@ impl RuntimeTest for SchedulerLoadBalancingTest {
         "scheduler_load_balancing"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 multi-CPU runnable distribution leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "scheduler load balancing: unpinned runnable workers distribute across multiple online CPUs",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "Verify scheduler distributes work fairly across CPUs"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Load balancing test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires workload distribution metrics",
+            "Covered by Ring-3 SMP scheduler load balancing leg in ring3-mm",
         ))
     }
 }
@@ -1214,21 +1227,21 @@ impl RuntimeTest for CpuAffinityEnforcementTest {
         "cpu_affinity_enforcement"
     }
 
+    // STRICT-Q S6 (D5): Ring-3 per-CPU sched_setaffinity enforcement leg in ring3-mm.
+    fn scope(&self) -> TestScope {
+        TestScope::CoveredBy {
+            gate: "ring3-mm",
+            marker: "CPU affinity enforcement: sched_setaffinity pins execution strictly to each online CPU and rejects invalid masks",
+        }
+    }
+
     fn description(&self) -> &'static str {
         "Verify sched_setaffinity() restricts process to specified CPUs"
     }
 
     fn run(&self) -> TestResult {
-        use arch::num_online_cpus;
-
-        if num_online_cpus() < 2 {
-            return TestResult::Deferred(String::from(
-                "Affinity test requires 2+ CPUs (only 1 online)",
-            ));
-        }
-
         TestResult::Deferred(String::from(
-            "SMP available; full test requires sys_sched_setaffinity() + CPU pinning verification",
+            "Covered by Ring-3 CPU affinity enforcement leg in ring3-mm",
         ))
     }
 }
