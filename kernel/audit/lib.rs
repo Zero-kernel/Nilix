@@ -599,80 +599,134 @@ struct PayloadBuf {
 
 impl PayloadBuf {
     #[inline]
-    fn new() -> Self {
-        Self {
-            buf: [0u8; MAX_SERIALIZED_EVENT_BYTES],
-            len: 0,
-        }
-    }
-
-    #[inline]
-    fn write_bytes(&mut self, data: &[u8]) {
-        let end = self.len + data.len();
-        self.buf[self.len..end].copy_from_slice(data);
-        self.len = end;
-    }
-
-    #[inline]
-    fn write_u8(&mut self, v: u8) {
-        self.buf[self.len] = v;
-        self.len += 1;
-    }
-
-    #[inline]
-    fn write_u16(&mut self, v: u16) {
-        self.write_bytes(&v.to_le_bytes());
-    }
-
-    #[inline]
-    fn write_u32(&mut self, v: u32) {
-        self.write_bytes(&v.to_le_bytes());
-    }
-
-    #[inline]
-    fn write_u64(&mut self, v: u64) {
-        self.write_bytes(&v.to_le_bytes());
-    }
-
-    #[inline]
-    fn write_i32(&mut self, v: i32) {
-        self.write_u32(v as u32);
-    }
-
-    #[inline]
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
 }
 
-/// Serialize an AuditObject into `out` using canonical little-endian framing.
-fn write_object_payload(out: &mut PayloadBuf, obj: &AuditObject) {
-    match obj {
+/// Pre-serialized and SHA-256-padded keyed audit payload constructed OUTSIDE
+/// `AUDIT_RING.lock()`. Only the three chain-dependent fields (`prev_hash` at
+/// `20..52`, `id` at `52..60`, and `dropped` at `dropped_offset..dropped_offset+8`)
+/// are patched inside the lock before compressing directly from `buf[..padded_len]`.
+struct PreSerializedKeyedEvent {
+    buf: [u8; MAX_SERIALIZED_EVENT_BYTES],
+    padded_len: usize,
+    dropped_offset: usize,
+}
+
+impl PreSerializedKeyedEvent {
+    #[inline]
+    fn build(event: &AuditEvent) -> Self {
+        let mut buf = [0u8; MAX_SERIALIZED_EVENT_BYTES];
+        let len = serialize_event_payload_raw(&mut buf, b"AUDIT-HMAC-SHA256-V1", [0u8; 32], event);
+        let arg_count = core::cmp::min(event.arg_count as usize, MAX_ARGS);
+        // prefix(20) + prev_hash(32) + header(39) + args(8*arg_count) + errno(4)
+        let dropped_offset = 20 + 32 + 39 + arg_count * 8 + 4;
+        // Pad in place for inner HMAC-SHA256 (64-byte ipad block already compressed).
+        buf[len] = 0x80;
+        let padded_len = ((len + 9) + 63) & !63;
+        debug_assert!(padded_len <= MAX_SERIALIZED_EVENT_BYTES);
+        let inner_bits = (64u64).wrapping_add(len as u64).wrapping_mul(8);
+        buf[padded_len - 8..padded_len].copy_from_slice(&inner_bits.to_be_bytes());
+        Self {
+            buf,
+            padded_len,
+            dropped_offset,
+        }
+    }
+
+    #[inline(always)]
+    fn patch_chain_fields(&mut self, prev_hash: [u8; 32], id: u64, dropped: u64) {
+        self.buf[20..52].copy_from_slice(&prev_hash);
+        self.buf[52..60].copy_from_slice(&id.to_le_bytes());
+        self.buf[self.dropped_offset..self.dropped_offset + 8]
+            .copy_from_slice(&dropped.to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn padded_bytes(&self) -> &[u8] {
+        &self.buf[..self.padded_len]
+    }
+}
+
+/// Serialize `prefix` + `prev_hash` + `event` directly into `buf` using a
+/// register-local cursor so LLVM folds fixed-offset writes into straight-line
+/// stores without per-field `len` reloads or byte loops.
+#[inline]
+fn serialize_event_payload_raw(
+    buf: &mut [u8; MAX_SERIALIZED_EVENT_BYTES],
+    prefix: &[u8],
+    prev_hash: [u8; 32],
+    event: &AuditEvent,
+) -> usize {
+    let p_len = prefix.len();
+    // Worst-case size: prefix (<=20) + prev_hash (32) + header (39) + args (56)
+    // + errno/dropped (12) + object (<=22) = 181 <= MAX_SERIALIZED_EVENT_BYTES (256).
+    assert!(p_len <= 32);
+
+    let mut pos = 0usize;
+    buf[..p_len].copy_from_slice(prefix);
+    pos += p_len;
+
+    buf[pos..pos + 32].copy_from_slice(&prev_hash);
+    pos += 32;
+
+    // Fixed 39-byte metadata + subject header
+    buf[pos..pos + 8].copy_from_slice(&event.id.to_le_bytes());
+    buf[pos + 8..pos + 16].copy_from_slice(&event.timestamp.to_le_bytes());
+    buf[pos + 16] = event.kind as u8;
+    buf[pos + 17] = event.outcome as u8;
+    buf[pos + 18..pos + 22].copy_from_slice(&event.subject.pid.to_le_bytes());
+    buf[pos + 22..pos + 26].copy_from_slice(&event.subject.uid.to_le_bytes());
+    buf[pos + 26..pos + 30].copy_from_slice(&event.subject.gid.to_le_bytes());
+    buf[pos + 30..pos + 38].copy_from_slice(&event.subject.cap_id.unwrap_or(0).to_le_bytes());
+    buf[pos + 38] = event.arg_count;
+    pos += 39;
+
+    // Arguments (0..=MAX_ARGS)
+    let arg_count = core::cmp::min(event.arg_count as usize, MAX_ARGS);
+    for &arg in &event.args[..arg_count] {
+        buf[pos..pos + 8].copy_from_slice(&arg.to_le_bytes());
+        pos += 8;
+    }
+
+    // Error and dropped count
+    buf[pos..pos + 4].copy_from_slice(&(event.errno as u32).to_le_bytes());
+    buf[pos + 4..pos + 12].copy_from_slice(&event.dropped.to_le_bytes());
+    pos += 12;
+
+    // Object
+    match &event.object {
         AuditObject::None => {
-            out.write_u8(0);
+            buf[pos] = 0;
+            pos += 1;
         }
         AuditObject::Path {
             inode,
             mode,
             path_hash,
         } => {
-            out.write_u8(1);
-            out.write_u64(*inode);
-            out.write_u32(*mode);
-            out.write_u64(*path_hash);
+            buf[pos] = 1;
+            buf[pos + 1..pos + 9].copy_from_slice(&inode.to_le_bytes());
+            buf[pos + 9..pos + 13].copy_from_slice(&mode.to_le_bytes());
+            buf[pos + 13..pos + 21].copy_from_slice(&path_hash.to_le_bytes());
+            pos += 21;
         }
         AuditObject::Endpoint { id } => {
-            out.write_u8(2);
-            out.write_u64(*id);
+            buf[pos] = 2;
+            buf[pos + 1..pos + 9].copy_from_slice(&id.to_le_bytes());
+            pos += 9;
         }
         AuditObject::Process { pid, signal } => {
-            out.write_u8(3);
-            out.write_u32(*pid);
-            out.write_u32(signal.unwrap_or(0));
+            buf[pos] = 3;
+            buf[pos + 1..pos + 5].copy_from_slice(&pid.to_le_bytes());
+            buf[pos + 5..pos + 9].copy_from_slice(&signal.unwrap_or(0).to_le_bytes());
+            pos += 9;
         }
         AuditObject::Capability { cap_id } => {
-            out.write_u8(4);
-            out.write_u64(*cap_id);
+            buf[pos] = 4;
+            buf[pos + 1..pos + 9].copy_from_slice(&cap_id.to_le_bytes());
+            pos += 9;
         }
         AuditObject::Socket {
             proto,
@@ -681,69 +735,44 @@ fn write_object_payload(out: &mut PayloadBuf, obj: &AuditObject) {
             remote_addr,
             remote_port,
         } => {
-            out.write_u8(5);
-            out.write_u8(*proto);
-            out.write_u64(*local_addr);
-            out.write_u16(*local_port);
-            out.write_u64(*remote_addr);
-            out.write_u16(*remote_port);
+            buf[pos] = 5;
+            buf[pos + 1] = *proto;
+            buf[pos + 2..pos + 10].copy_from_slice(&local_addr.to_le_bytes());
+            buf[pos + 10..pos + 12].copy_from_slice(&local_port.to_le_bytes());
+            buf[pos + 12..pos + 20].copy_from_slice(&remote_addr.to_le_bytes());
+            buf[pos + 20..pos + 22].copy_from_slice(&remote_port.to_le_bytes());
+            pos += 22;
         }
         AuditObject::Memory { vaddr, size, prot } => {
-            out.write_u8(6);
-            out.write_u64(*vaddr);
-            out.write_u64(*size);
-            out.write_u32(*prot);
+            buf[pos] = 6;
+            buf[pos + 1..pos + 9].copy_from_slice(&vaddr.to_le_bytes());
+            buf[pos + 9..pos + 17].copy_from_slice(&size.to_le_bytes());
+            buf[pos + 17..pos + 21].copy_from_slice(&prot.to_le_bytes());
+            pos += 21;
         }
         AuditObject::Namespace {
             ns_id,
             ns_type,
             parent_id,
         } => {
-            out.write_u8(7);
-            out.write_u64(*ns_id);
-            out.write_u32(*ns_type);
-            out.write_u64(*parent_id);
+            buf[pos] = 7;
+            buf[pos + 1..pos + 9].copy_from_slice(&ns_id.to_le_bytes());
+            buf[pos + 9..pos + 13].copy_from_slice(&ns_type.to_le_bytes());
+            buf[pos + 13..pos + 21].copy_from_slice(&parent_id.to_le_bytes());
+            pos += 21;
         }
     }
+
+    pos
 }
 
-/// Serialize domain separator + `prev_hash` + `event` into a contiguous buffer.
-///
-/// Shared by plain SHA-256, keyed HMAC-SHA256 verification, and the hot
-/// precomputed-midstate HMAC ring path so all three hash the exact same bytes.
 #[inline]
 fn serialize_event_payload(prefix: &[u8], prev_hash: [u8; 32], event: &AuditEvent) -> PayloadBuf {
-    let mut out = PayloadBuf::new();
-    out.write_bytes(prefix);
-
-    // Chain to previous event
-    out.write_bytes(&prev_hash);
-
-    // Event metadata
-    out.write_u64(event.id);
-    out.write_u64(event.timestamp);
-    out.write_u8(event.kind as u8);
-    out.write_u8(event.outcome as u8);
-
-    // Subject
-    out.write_u32(event.subject.pid);
-    out.write_u32(event.subject.uid);
-    out.write_u32(event.subject.gid);
-    out.write_u64(event.subject.cap_id.unwrap_or(0));
-
-    // Arguments
-    out.write_u8(event.arg_count);
-    let arg_count = core::cmp::min(event.arg_count as usize, MAX_ARGS);
-    for i in 0..arg_count {
-        out.write_u64(event.args[i]);
-    }
-
-    // Error and dropped count
-    out.write_i32(event.errno);
-    out.write_u64(event.dropped);
-
-    // Object
-    write_object_payload(&mut out, &event.object);
+    let mut out = PayloadBuf {
+        buf: [0u8; MAX_SERIALIZED_EVENT_BYTES],
+        len: 0,
+    };
+    out.len = serialize_event_payload_raw(&mut out.buf, prefix, prev_hash, event);
     out
 }
 
@@ -891,15 +920,16 @@ fn hash_event_prefixed(prev_hash: [u8; 32], event: &AuditEvent, key: Option<&[u8
 /// to avoid allocation and repeated key-block hashing in the syscall hot path.
 /// `ipad_state` is the SHA-256 state after compressing `(K' ^ 0x36)` (64 bytes);
 /// `opad_state` is the SHA-256 state after compressing `(K' ^ 0x5c)` (64 bytes).
+#[repr(align(64))]
 struct HmacKey {
-    /// Key data (padded with zeros if shorter than MAX_HMAC_KEY_SIZE)
-    data: [u8; MAX_HMAC_KEY_SIZE],
-    /// Actual key length (0 means no key set)
-    len: usize,
     /// Precomputed SHA-256 midstate after the 64-byte HMAC inner pad block.
     ipad_state: [u32; 8],
     /// Precomputed SHA-256 midstate after the 64-byte HMAC outer pad block.
     opad_state: [u32; 8],
+    /// Actual key length (0 means no key set)
+    len: usize,
+    /// Key data (padded with zeros if shorter than MAX_HMAC_KEY_SIZE)
+    data: [u8; MAX_HMAC_KEY_SIZE],
 }
 
 impl HmacKey {
@@ -955,20 +985,9 @@ impl HmacKey {
     #[inline]
     fn hash_event(&self, prev_hash: [u8; 32], event: &AuditEvent) -> [u8; 32] {
         debug_assert!(self.is_set());
-        let payload = serialize_event_payload(b"AUDIT-HMAC-SHA256-V1", prev_hash, event);
-        let mut inner_digest = Sha256::digest_from_midstate(
-            &self.ipad_state,
-            SHA256_BLOCK_SIZE as u64,
-            payload.as_bytes(),
-        );
-        let digest = Sha256::digest_single_block_from_midstate(
-            &self.opad_state,
-            SHA256_BLOCK_SIZE as u64,
-            &inner_digest,
-        );
-        // R94-10: scrub intermediate HMAC inner digest before returning.
-        secure_zeroize(&mut inner_digest);
-        digest
+        let mut buf = [0u8; MAX_SERIALIZED_EVENT_BYTES];
+        let len = serialize_event_payload_raw(&mut buf, b"AUDIT-HMAC-SHA256-V1", prev_hash, event);
+        Sha256::hmac_from_midstates(&self.ipad_state, &self.opad_state, &buf[..len])
     }
 }
 
@@ -1155,6 +1174,54 @@ impl AuditRing {
         (self.len, self.buf.len())
     }
 
+    /// Push an event using a pre-serialized, pre-padded keyed buffer built
+    /// outside `AUDIT_RING.lock()`, returning `true` if the keyed HMAC path ran
+    /// (so caller runs `scrub_crypto_stack()` immediately after unlocking).
+    fn push_preserialized(
+        &mut self,
+        event: AuditEvent,
+        preser: &mut PreSerializedKeyedEvent,
+    ) -> bool {
+        if self.buf.is_empty() {
+            return false;
+        }
+        if !self.hmac_key.is_set() {
+            self.push(event);
+            return false;
+        }
+
+        if self.len == self.buf.len() {
+            self.dropped_total = self.dropped_total.saturating_add(1);
+            self.dropped_since_snapshot = self.dropped_since_snapshot.saturating_add(1);
+            self.dropped_pending = self.dropped_pending.saturating_add(1);
+            self.head = (self.head + 1) % self.buf.len();
+            self.len -= 1;
+        }
+
+        let tail = (self.head + self.len) % self.buf.len();
+        let slot = self.buf[tail].insert(event);
+        let id = self.next_id;
+        slot.id = id;
+        self.next_id = id.wrapping_add(1);
+        let prev_hash = self.prev_hash;
+        slot.prev_hash = prev_hash;
+        let dropped = core::mem::take(&mut self.dropped_pending);
+        slot.dropped = dropped;
+
+        preser.patch_chain_fields(prev_hash, id, dropped);
+        let hash = Sha256::hmac_from_midstates_padded(
+            &self.hmac_key.ipad_state,
+            &self.hmac_key.opad_state,
+            preser.padded_bytes(),
+        );
+        slot.hash = hash;
+        self.prev_hash = hash;
+
+        self.len += 1;
+        self.content_version = self.content_version.wrapping_add(1);
+        true
+    }
+
     /// Push an event into the ring buffer
     ///
     /// # R65-15 FIX: HMAC Support
@@ -1162,41 +1229,43 @@ impl AuditRing {
     /// When an HMAC key is set, events are hashed with HMAC-SHA256 instead
     /// of plain SHA-256. This provides cryptographic proof of integrity and
     /// authenticity that cannot be forged without the key.
-    fn push(&mut self, mut event: AuditEvent) {
+    fn push(&mut self, event: AuditEvent) {
         if self.buf.is_empty() {
             return;
         }
 
-        // Evict oldest event if buffer is full
+        // Evict oldest event if buffer is full (the evicted slot is immediately
+        // overwritten by `self.buf[tail] = Some(event)` below, so avoid a
+        // redundant 168-byte `None` store before overwriting the exact same slot).
         if self.len == self.buf.len() {
             // R186-14 FIX: Increment all three counters on drop
             self.dropped_total = self.dropped_total.saturating_add(1);
             self.dropped_since_snapshot = self.dropped_since_snapshot.saturating_add(1);
             self.dropped_pending = self.dropped_pending.saturating_add(1);
-            self.buf[self.head] = None;
             self.head = (self.head + 1) % self.buf.len();
             self.len -= 1;
         }
 
-        // Fill in event metadata
-        event.id = self.next_id;
+        // Insert directly into the ring slot and fill chain metadata in place
+        // (avoids a second 168-byte move after computing the HMAC/SHA-256 digest).
+        let tail = (self.head + self.len) % self.buf.len();
+        let slot = self.buf[tail].insert(event);
+        slot.id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        event.prev_hash = self.prev_hash;
+        slot.prev_hash = self.prev_hash;
         // R186-14 FIX: Transfer only dropped_pending into event, leaving
         // dropped_total and dropped_since_snapshot intact for stats/snapshot
-        event.dropped = core::mem::take(&mut self.dropped_pending);
+        slot.dropped = core::mem::take(&mut self.dropped_pending);
 
         // R65-15 FIX: Use HMAC-SHA256 when key is set, otherwise plain SHA-256
-        event.hash = if self.hmac_key.is_set() {
-            self.hmac_key.hash_event(event.prev_hash, &event)
+        let hash = if self.hmac_key.is_set() {
+            self.hmac_key.hash_event(slot.prev_hash, slot)
         } else {
-            hash_event(event.prev_hash, &event)
+            hash_event(slot.prev_hash, slot)
         };
-        self.prev_hash = event.hash;
+        slot.hash = hash;
+        self.prev_hash = hash;
 
-        // Insert at tail
-        let tail = (self.head + self.len) % self.buf.len();
-        self.buf[tail] = Some(event);
         self.len += 1;
         self.content_version = self.content_version.wrapping_add(1);
     }
@@ -2102,24 +2171,19 @@ static AUDIT_TOTAL_EMITTED: AtomicU64 = AtomicU64::new(0);
 /// R148-I8 FIX: Registered timestamp callback for auto-filling audit event
 /// timestamps when callers pass 0.  Set via `register_timestamp_callback()` once
 /// kernel_core::time is available.  When unset, TSC-based fallback is used.
-static AUDIT_TIMESTAMP_CB: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+/// Lock-free `spin::Once` avoids a global mutex lock on every cap-grant audit.
+static AUDIT_TIMESTAMP_CB: spin::Once<fn() -> u64> = spin::Once::new();
 
 /// R148-I8 FIX: Register a timestamp provider (typically kernel_core::time::current_timestamp_ms).
 /// Called once during kernel init after the timer subsystem is ready.
 pub fn register_timestamp_callback(cb: fn() -> u64) {
-    interrupts::without_interrupts(|| {
-        *AUDIT_TIMESTAMP_CB.lock() = Some(cb);
-    });
+    AUDIT_TIMESTAMP_CB.call_once(|| cb);
 }
 
 /// R148-I8 FIX: Get current timestamp via registered callback, or fall back to
 /// TSC (raw cycles) if no callback is registered yet.
-///
-/// Takes the callback pointer under IRQ-disabled lock, then calls it unlocked
-/// to avoid holding the Mutex across an arbitrary function call.
 fn current_audit_timestamp() -> u64 {
-    let cb = interrupts::without_interrupts(|| *AUDIT_TIMESTAMP_CB.lock());
-    if let Some(cb) = cb {
+    if let Some(&cb) = AUDIT_TIMESTAMP_CB.get() {
         let ts = cb();
         // Early boot: timer ticks may still be 0 even after registration.
         if ts != 0 {
@@ -2133,8 +2197,19 @@ fn current_audit_timestamp() -> u64 {
     }
 }
 
+/// Cache-line aligned wrapper isolating `AUDIT_RING`'s mutex from neighboring globals.
+#[repr(align(64))]
+struct AlignedAuditRing(Mutex<Option<AuditRing>>);
+
+impl AlignedAuditRing {
+    #[inline]
+    fn lock(&self) -> spin::MutexGuard<'_, Option<AuditRing>> {
+        self.0.lock()
+    }
+}
+
 /// Global audit ring buffer (protected by Mutex with IRQ disable)
-static AUDIT_RING: Mutex<Option<AuditRing>> = Mutex::new(None);
+static AUDIT_RING: AlignedAuditRing = AlignedAuditRing(Mutex::new(None));
 
 /// Initialize the audit subsystem
 ///
@@ -2356,17 +2431,25 @@ pub fn emit(
         errno,
     );
 
-    // Emit with interrupts disabled to prevent deadlock
-    interrupts::without_interrupts(|| {
+    // Pre-serialize and SHA-256-pad the event payload OUTSIDE `AUDIT_RING.lock()`
+    // so the global lock critical section only patches chain metadata and runs
+    // the 4 spill-free SHA-256 compressions.
+    let mut preser = PreSerializedKeyedEvent::build(&event);
+
+    // Emit with interrupts disabled to prevent deadlock.
+    let emitted = interrupts::without_interrupts(|| {
         let mut ring = AUDIT_RING.lock();
         if let Some(ref mut r) = *ring {
-            r.push(event);
-            AUDIT_TOTAL_EMITTED.fetch_add(1, Ordering::Relaxed);
+            r.push_preserialized(event, &mut preser);
             Ok(())
         } else {
             Err(AuditError::Uninitialized)
         }
-    })
+    });
+    if emitted.is_ok() {
+        AUDIT_TOTAL_EMITTED.fetch_add(1, Ordering::Relaxed);
+    }
+    emitted
 }
 
 // ============================================================================
@@ -3627,5 +3710,133 @@ mod tests {
             verify_chain_hmac(&drained, &key),
             "ring chain hashed via precomputed HMAC midstates must pass verify_chain_hmac"
         );
+    }
+
+    #[test]
+    fn test_preserialized_keyed_event_matches_reference_across_all_objects_and_lengths() {
+        let objects = [
+            AuditObject::None,
+            AuditObject::Path {
+                inode: 0x1122_3344_5566_7788,
+                mode: 0o100644,
+                path_hash: 0xfeed_face_cafe_beef,
+            },
+            AuditObject::Endpoint { id: 42 },
+            AuditObject::Process {
+                pid: 123,
+                signal: Some(9),
+            },
+            AuditObject::Capability {
+                cap_id: 0xabcd_0001,
+            },
+            AuditObject::Socket {
+                proto: 6,
+                local_addr: 0x7f00_0001,
+                local_port: 8080,
+                remote_addr: 0x0a00_0002,
+                remote_port: 443,
+            },
+            AuditObject::Memory {
+                vaddr: 0x0000_7fff_0000_1000,
+                size: 0x2000,
+                prot: 3,
+            },
+            AuditObject::Namespace {
+                ns_id: 7,
+                ns_type: 2,
+                parent_id: 1,
+            },
+        ];
+        let keys: [&[u8]; 2] = [&[0x24u8; 32], &[0xc3u8; MAX_HMAC_KEY_SIZE]];
+        let all_args: [u64; MAX_ARGS] = [0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76];
+
+        for key in keys {
+            let mut hmac_key = HmacKey::empty();
+            hmac_key.set(key);
+
+            for (obj_idx, obj) in objects.iter().copied().enumerate() {
+                for argc in 0..=MAX_ARGS {
+                    let event = AuditEvent::new(
+                        5000 + (obj_idx * 16 + argc) as u64,
+                        AuditKind::Syscall,
+                        AuditOutcome::Success,
+                        AuditSubject::new(10 + obj_idx as u32, 1000, 1000, Some(argc as u64)),
+                        obj,
+                        &all_args[..argc],
+                        -(argc as i32),
+                    );
+                    let mut preser = PreSerializedKeyedEvent::build(&event);
+                    let prev_hash = [(obj_idx as u8).wrapping_mul(17).wrapping_add(argc as u8); 32];
+                    let id = 100 + (obj_idx * 10 + argc) as u64;
+                    let dropped = (obj_idx as u64) * 5 + (argc as u64);
+
+                    preser.patch_chain_fields(prev_hash, id, dropped);
+                    let fast = Sha256::hmac_from_midstates_padded(
+                        &hmac_key.ipad_state,
+                        &hmac_key.opad_state,
+                        preser.padded_bytes(),
+                    );
+
+                    let mut expected_event = event;
+                    expected_event.id = id;
+                    expected_event.prev_hash = prev_hash;
+                    expected_event.dropped = dropped;
+                    let reference = hash_event_prefixed(prev_hash, &expected_event, Some(key));
+                    assert_eq!(
+                        fast,
+                        reference,
+                        "PreSerializedKeyedEvent diverged for key len={} obj={} argc={}",
+                        key.len(),
+                        obj_idx,
+                        argc
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_push_preserialized_chain_and_eviction_verifies_hmac() {
+        let key = [0x9du8; 32];
+        let mut ring_fast = AuditRing::with_capacity(4).expect("fast ring");
+        let mut ring_ref = AuditRing::with_capacity(4).expect("ref ring");
+        ring_fast.set_key(&key).expect("set fast key");
+        ring_ref.set_key(&key).expect("set ref key");
+
+        for i in 0..12u64 {
+            let event = AuditEvent::new(
+                200 + i,
+                AuditKind::Syscall,
+                AuditOutcome::Success,
+                AuditSubject::new(1 + (i as u32), 0, 0, None),
+                AuditObject::Process {
+                    pid: (i as u32) + 10,
+                    signal: None,
+                },
+                &[i, i.wrapping_mul(3), i.wrapping_add(7)],
+                0,
+            );
+            let mut preser = PreSerializedKeyedEvent::build(&event);
+            assert!(ring_fast.push_preserialized(event, &mut preser));
+            ring_ref.push(event);
+        }
+
+        assert_eq!(ring_fast.stats().dropped_events, 8);
+        assert_eq!(ring_fast.tail_hash(), ring_ref.tail_hash());
+
+        let mut drained_fast = alloc::vec::Vec::with_capacity(4);
+        let mut drained_ref = alloc::vec::Vec::with_capacity(4);
+        let meta_fast = ring_fast.drain_into(&mut drained_fast).expect("drain fast");
+        let meta_ref = ring_ref.drain_into(&mut drained_ref).expect("drain ref");
+        assert_eq!(drained_fast.len(), 4);
+        assert_eq!(meta_fast.dropped, meta_ref.dropped);
+        assert_eq!(meta_fast.tail_hash, meta_ref.tail_hash);
+        for (a, b) in drained_fast.iter().zip(drained_ref.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.dropped, b.dropped);
+            assert_eq!(a.prev_hash, b.prev_hash);
+            assert_eq!(a.hash, b.hash);
+        }
+        assert!(verify_chain_hmac(&drained_fast, &key));
     }
 }

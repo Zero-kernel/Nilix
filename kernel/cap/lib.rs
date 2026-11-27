@@ -385,6 +385,32 @@ impl CapTable {
         .map_err(|_| CapError::OutOfMemory)
     }
 
+    /// Fallible empty constructor for newly created child PCBs whose capability
+    /// table will be immediately populated/replaced by `fork` or `clone`.
+    /// Allocates zero slot/free-list backing upfront; any subsequent capability
+    /// allocation grows cleanly to `DEFAULT_CAP_SLOTS` via `cap_growth_target`.
+    pub fn try_new_empty_arc() -> Result<Arc<Self>, CapError> {
+        let arc_bytes = arc_charge_bytes::<CapTable>().map_err(|_| CapError::OutOfMemory)?;
+        let arc_reservation = try_reserve_heap(HeapClass::Capability, arc_bytes)
+            .map_err(|_| CapError::OutOfMemory)?;
+        let inner = CapTableInner {
+            slots: Vec::new(),
+            free: Vec::new(),
+            slots_charge: None,
+            free_charge: None,
+            next_generation: 1,
+            reserved_allocations: 0,
+        };
+        let arc_charge = arc_reservation
+            .commit()
+            .map_err(|_| CapError::OutOfMemory)?;
+        Arc::try_new(Self {
+            inner: Mutex::new(inner),
+            _arc_charge: Some(arc_charge),
+        })
+        .map_err(|_| CapError::OutOfMemory)
+    }
+
     /// Create an empty capability table with explicit initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.min(MAX_CAP_SLOTS);
@@ -1474,6 +1500,18 @@ mod tests {
         inner.revoke(live).expect("release backing pin");
         assert_eq!(inner.reserved_allocations, 0);
         assert!(inner.slots.is_empty() && inner.free.is_empty());
+    }
+
+    #[test]
+    fn rf186_23_try_new_empty_arc_allocates_zero_backing_until_growth() {
+        let table = CapTable::try_new_empty_arc().expect("empty CapTable Arc allocation");
+        let inner = table.inner.lock();
+        assert!(inner.slots.is_empty());
+        assert_eq!(inner.slots.capacity(), 0);
+        assert!(inner.free.is_empty());
+        assert_eq!(inner.free.capacity(), 0);
+        assert_eq!(inner.reserved_allocations, 0);
+        assert_eq!(cap_growth_target(0, 1), DEFAULT_CAP_SLOTS);
     }
 
     #[test]

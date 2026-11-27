@@ -630,6 +630,10 @@ pub fn destroy_endpoint(endpoint_id: EndpointId) -> Result<(), IpcError> {
 /// 在下一次 receive_message 时立即看到 EndpointNotFound，避免重新创建
 /// 新的等待队列导致再次阻塞。
 pub fn cleanup_process_endpoints(ns_id: NamespaceId, pid: ProcessId, generation: u64) {
+    // Fast path: no endpoint has ever been registered in the system.
+    if NEXT_ENDPOINT_ID.load(Ordering::Acquire) == 1 {
+        return;
+    }
     // X-6 + R180-5 + RF180-3: remove registry state before each wake/close,
     // without any heap snapshot.  Successor-generation endpoints remain.
     loop {
@@ -953,7 +957,14 @@ fn detach_endpoint_wait_queue_from(
 /// # X-6 安全增强
 ///
 /// 返回 Arc<WaitQueue> 而非裸指针，确保引用计数正确管理内存。
+/// Monotonic latch set before any endpoint wait queue is inserted into
+/// `ENDPOINT_WAIT_QUEUES`, allowing `cleanup_waitqueues_for_pid` to return
+/// lock-free when no endpoint wait queue has ever been created.
+static ENDPOINT_WQS_EVER_CREATED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 fn get_or_create_wait_queue(endpoint_id: EndpointId) -> Result<EndpointWaitQueueArc, IpcError> {
+    ENDPOINT_WQS_EVER_CREATED.store(true, Ordering::Release);
     if let Some(existing) = ENDPOINT_WAIT_QUEUES.lock().get(endpoint_id).cloned() {
         return Ok(existing);
     }
@@ -1151,6 +1162,9 @@ pub fn receive_message_with_retries(
 /// entries for `pid` are removed only when no live successor owns the PID
 /// (or the live PCB generation still matches).
 pub fn cleanup_waitqueues_for_pid(pid: ProcessId, generation: u64) {
+    if !ENDPOINT_WQS_EVER_CREATED.load(Ordering::Acquire) {
+        return;
+    }
     // RF180-3 FIX: bound the allocation-free walk to queues that existed at
     // entry. Endpoint IDs are monotonic and never reused, so a cursor through
     // this upper bound cannot miss an old queue or loop on concurrent creation.

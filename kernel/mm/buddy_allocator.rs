@@ -85,6 +85,9 @@ pub enum BuddyInitError {
 pub enum AllocError {
     InvalidOrder,
     Exhausted,
+    /// Allocation or transient-cache reclaim saw lock contention while
+    /// reclaimable frames remained; fault callers should retry (`Busy`/`EAGAIN`).
+    Busy,
     AllocatorUnavailable,
     AddressOverflow,
     MetadataCorrupt,
@@ -108,6 +111,8 @@ pub enum FreeError {
     /// Issue #109 §1.3: COW/shared-anon `PAGE_REF_COUNT` slot is still non-zero;
     /// refusing reclamation closes any UAF window before the frame can enter PCP.
     PageStillReferenced,
+    /// Non-blocking free could not acquire the buddy allocator lock without spinning.
+    Busy,
     MetadataCorrupt,
     AllocatorPoisoned,
 }
@@ -1728,10 +1733,37 @@ impl PcpBuddyPool {
         let mut batch = [PhysFrame::containing_address(PhysAddr::new(0)); PCP_REFILL_BATCH];
 
         let mut refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
-        if matches!(refill_result, Err(AllocError::Exhausted)) {
-            if self.drain_all_pcp(cpu_limit) > 0 {
-                refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
+        let mut transient_busy = false;
+        let mut saw_busy = false;
+        for _ in 0..8 {
+            if !matches!(refill_result, Err(AllocError::Exhausted)) {
+                break;
             }
+            let pcp_reclaimed = self.drain_all_pcp(cpu_limit);
+            let transient = oom_killer::reclaim_transient_caches_nonblocking();
+            transient_busy = transient.busy;
+            if transient.busy {
+                saw_busy = true;
+            }
+            if pcp_reclaimed > 0 || transient.reclaimed_pages > 0 {
+                if !transient.busy {
+                    saw_busy = false;
+                }
+                refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
+            } else if transient.busy {
+                core::hint::spin_loop();
+            } else {
+                if saw_busy {
+                    // A concurrent drain finished while we waited; re-check
+                    // Buddy once before escalating to OOM.
+                    let _ = self.drain_all_pcp(cpu_limit);
+                    refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
+                }
+                break;
+            }
+        }
+        if matches!(refill_result, Err(AllocError::Exhausted)) && transient_busy {
+            return Err(AllocError::Busy);
         }
         if matches!(refill_result, Err(AllocError::Exhausted)) && run_oom {
             oom_killer::on_allocation_failure(1);
@@ -1842,14 +1874,45 @@ impl PcpBuddyPool {
             Err(err) => return Err(err),
         }
 
-        // Drain all CPUs' PCP caches first so cached order-0 halves can coalesce
-        // into the requested higher-order block before triggering OOM.
-        if self.drain_all_pcp(cpu_limit) > 0 {
-            match alloc_once() {
-                Ok(frame) => return Ok(frame),
-                Err(AllocError::Exhausted) => {}
-                Err(err) => return Err(err),
+        // Drain all CPUs' PCP caches and registered transient frame caches
+        // (e.g. post-shootdown kstack reuse cache) first so cached blocks can
+        // satisfy or coalesce into the request before triggering OOM.
+        let mut transient_busy = false;
+        let mut saw_busy = false;
+        for _ in 0..8 {
+            let pcp_reclaimed = self.drain_all_pcp(cpu_limit);
+            let transient = oom_killer::reclaim_transient_caches_nonblocking();
+            transient_busy = transient.busy;
+            if transient.busy {
+                saw_busy = true;
             }
+            if pcp_reclaimed > 0 || transient.reclaimed_pages > 0 {
+                if !transient.busy {
+                    saw_busy = false;
+                }
+                match alloc_once() {
+                    Ok(frame) => return Ok(frame),
+                    Err(AllocError::Exhausted) => {}
+                    Err(err) => return Err(err),
+                }
+            } else if transient.busy {
+                core::hint::spin_loop();
+            } else {
+                if saw_busy {
+                    // A concurrent drain finished while we waited; re-check
+                    // Buddy once before escalating to OOM.
+                    let _ = self.drain_all_pcp(cpu_limit);
+                    match alloc_once() {
+                        Ok(frame) => return Ok(frame),
+                        Err(AllocError::Exhausted) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                break;
+            }
+        }
+        if transient_busy {
+            return Err(AllocError::Busy);
         }
 
         if !run_oom {
@@ -1985,6 +2048,31 @@ impl PcpBuddyPool {
     where
         FRef: Fn(usize) -> u32,
     {
+        self.try_free_multi_impl(frame, order, read_refcount, false)
+    }
+
+    fn try_free_multi_nonblocking_with<FRef>(
+        &self,
+        frame: PhysFrame,
+        order: usize,
+        read_refcount: FRef,
+    ) -> Result<(), FreeError>
+    where
+        FRef: Fn(usize) -> u32,
+    {
+        self.try_free_multi_impl(frame, order, read_refcount, true)
+    }
+
+    fn try_free_multi_impl<FRef>(
+        &self,
+        frame: PhysFrame,
+        order: usize,
+        read_refcount: FRef,
+        nonblocking: bool,
+    ) -> Result<(), FreeError>
+    where
+        FRef: Fn(usize) -> u32,
+    {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(FreeError::AllocatorPoisoned);
         }
@@ -2007,7 +2095,11 @@ impl PcpBuddyPool {
                 }
             }
         }
-        let mut guard = self.buddy.lock();
+        let mut guard = if nonblocking {
+            self.buddy.try_lock().ok_or(FreeError::Busy)?
+        } else {
+            self.buddy.lock()
+        };
         let allocator = guard.as_mut().ok_or(FreeError::AllocatorUnavailable)?;
         let res = allocator.try_free_pages(frame, order);
         if let Err(err) = res {
@@ -2070,67 +2162,169 @@ impl PcpBuddyPool {
     /// holds a PCP magazine lock while acquiring `buddy`). If magazines were
     /// contended and buddy remains below `PCP_REFILL_BATCH`, fail closed with
     /// `None` (`Busy`/`EAGAIN`) rather than reporting spurious `ENOMEM`.
+    /// Non-blocking bounded PCP recovery while `allocator` is held under
+    /// `self.buddy`. Returns `true` when contention or in-flight PCP pages
+    /// remain while `allocator.free_pages < PCP_REFILL_BATCH`, signaling the
+    /// caller to fail closed with `None` (`Busy`/`EAGAIN`).
+    fn drain_pcp_into_locked_buddy(
+        &self,
+        allocator: &mut BuddyAllocator,
+        cpu_limit: usize,
+    ) -> bool {
+        if allocator.free_pages >= PCP_HIGH_WATERMARK || self.total_cached_pages() == 0 {
+            return false;
+        }
+        let limit = core::cmp::min(cpu_limit, self.pcp.len());
+        let mut buf = [0u64; PCP_HIGH_WATERMARK];
+        let mut total_drained = 0usize;
+        let mut saw_contention = false;
+
+        for cpu in 0..limit {
+            if self.pcp[cpu].cached_count.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            let drained = with_irqs_disabled(|| {
+                let Some(mut mag) = self.pcp[cpu].lock.try_lock() else {
+                    return None;
+                };
+                let n = mag.len;
+                if n > 0 {
+                    buf[..n].copy_from_slice(&mag.frames[..n]);
+                    mag.len = 0;
+                }
+                Some(n)
+            });
+            match drained {
+                None => {
+                    saw_contention = true;
+                }
+                Some(0) => {}
+                Some(n) => {
+                    self.pcp[cpu].cached_count.fetch_sub(n, Ordering::AcqRel);
+                    for &phys in &buf[..n] {
+                        let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+                        if let Err(err) = allocator.try_free_pcp_page(frame) {
+                            if err.is_metadata_corruption() {
+                                allocator.poisoned = true;
+                                self.poisoned.store(true, Ordering::Release);
+                            }
+                            kprintln!("[buddy][pcp] fault drain return failed: {:?}", err);
+                        }
+                    }
+                    total_drained += n;
+                }
+            }
+        }
+
+        if total_drained > 0 {
+            self.stat_cross_cpu_drains.fetch_add(1, Ordering::Relaxed);
+        }
+        // Also treat still-nonzero `total_cached_pages()` (frames in flight
+        // inside another CPU's `drain_all_pcp` or `refill_batch_from_buddy`
+        // awaiting `buddy.lock`) as retryable contention when buddy remains
+        // below `PCP_REFILL_BATCH`, releasing `buddy` so they can land.
+        (saw_contention || self.total_cached_pages() > 0) && allocator.free_pages < PCP_REFILL_BATCH
+    }
+
+    /// Strictly non-blocking order-0 frame allocation for interrupt/exception
+    /// paths (e.g. CoW `#PF`). Pops from the local PCP magazine with `try_lock`
+    /// on the fast path; on miss, borrows Buddy via `try_with_allocator_with`
+    /// (performing non-blocking PCP and transient-cache recovery outside the
+    /// buddy lock) and reports any contention as `Err(AllocError::Busy)`.
+    fn try_alloc_order0_nonblocking_with<FScrub>(
+        &self,
+        cpu_id: usize,
+        cpu_limit: usize,
+        scrub: FScrub,
+    ) -> Result<PhysFrame, AllocError>
+    where
+        FScrub: Fn(PhysFrame),
+    {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(AllocError::AllocatorPoisoned);
+        }
+        let cpu = cpu_id % self.pcp.len();
+        if let Some((base, states)) = self.page_state_view() {
+            let popped = with_irqs_disabled(|| {
+                let mut mag = self.pcp[cpu].lock.try_lock()?;
+                if mag.len == 0 {
+                    return None;
+                }
+                mag.len -= 1;
+                let idx = mag.len;
+                let phys = mag.frames[idx];
+                self.pcp[cpu].cached_count.fetch_sub(1, Ordering::AcqRel);
+                let prev_hits = self.pcp[cpu].hits.load(Ordering::Relaxed);
+                self.pcp[cpu]
+                    .hits
+                    .store(prev_hits.wrapping_add(1), Ordering::Relaxed);
+                Some(phys)
+            });
+            if let Some(phys) = popped {
+                let idx = ((phys - base) / PAGE_SIZE as u64) as usize;
+                match states[idx].compare_exchange(
+                    PAGE_PCP_CACHED,
+                    PAGE_ALLOC_ORDER0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Ok(PhysFrame::containing_address(PhysAddr::new(phys))),
+                    Err(_) => {
+                        self.mark_poisoned();
+                        return Err(AllocError::MetadataCorrupt);
+                    }
+                }
+            }
+        }
+
+        let res = match self.try_with_allocator_with(cpu_limit, |alloc| alloc.try_alloc_pages(0)) {
+            None => return Err(AllocError::Busy),
+            Some(res) => res,
+        };
+        match res {
+            Ok(frame) => {
+                scrub(frame);
+                Ok(frame)
+            }
+            Err(err) => {
+                if matches!(
+                    err,
+                    AllocError::MetadataCorrupt | AllocError::AllocatorPoisoned
+                ) {
+                    self.mark_poisoned();
+                }
+                Err(err)
+            }
+        }
+    }
+
     fn try_with_allocator_with<T, F>(&self, cpu_limit: usize, f: F) -> Option<T>
     where
         F: FnOnce(&mut BuddyAllocator) -> T,
     {
         let mut guard = self.buddy.try_lock()?;
         let allocator = guard.as_mut()?;
-        if allocator.free_pages < PCP_HIGH_WATERMARK && self.total_cached_pages() > 0 {
-            let limit = core::cmp::min(cpu_limit, self.pcp.len());
-            let mut buf = [0u64; PCP_HIGH_WATERMARK];
-            let mut total_drained = 0usize;
-            let mut saw_contention = false;
-
-            for cpu in 0..limit {
-                if self.pcp[cpu].cached_count.load(Ordering::Acquire) == 0 {
-                    continue;
-                }
-                let drained = with_irqs_disabled(|| {
-                    let Some(mut mag) = self.pcp[cpu].lock.try_lock() else {
-                        return None;
-                    };
-                    let n = mag.len;
-                    if n > 0 {
-                        buf[..n].copy_from_slice(&mag.frames[..n]);
-                        mag.len = 0;
-                    }
-                    Some(n)
-                });
-                match drained {
-                    None => {
-                        saw_contention = true;
-                    }
-                    Some(0) => {}
-                    Some(n) => {
-                        self.pcp[cpu].cached_count.fetch_sub(n, Ordering::AcqRel);
-                        for &phys in &buf[..n] {
-                            let frame = PhysFrame::containing_address(PhysAddr::new(phys));
-                            if let Err(err) = allocator.try_free_pcp_page(frame) {
-                                if err.is_metadata_corruption() {
-                                    allocator.poisoned = true;
-                                    self.poisoned.store(true, Ordering::Release);
-                                }
-                                kprintln!("[buddy][pcp] fault drain return failed: {:?}", err);
-                            }
-                        }
-                        total_drained += n;
-                    }
-                }
-            }
-
-            if total_drained > 0 {
-                self.stat_cross_cpu_drains.fetch_add(1, Ordering::Relaxed);
-            }
-            // Also treat still-nonzero `total_cached_pages()` (frames in flight
-            // inside another CPU's `drain_all_pcp` or `refill_batch_from_buddy`
-            // awaiting `buddy.lock`) as retryable contention when buddy remains
-            // below `PCP_REFILL_BATCH`, releasing `buddy` so they can land.
-            if (saw_contention || self.total_cached_pages() > 0)
-                && allocator.free_pages < PCP_REFILL_BATCH
-            {
+        if self.drain_pcp_into_locked_buddy(allocator, cpu_limit) {
+            return None;
+        }
+        // If buddy is still below `PCP_REFILL_BATCH` and a transient cache
+        // reclaim hook (e.g. post-shootdown kstack reuse cache) is registered,
+        // drop the buddy guard first, run strictly non-blocking cache reclaim
+        // outside the buddy lock, then re-try-lock buddy and repeat bounded
+        // PCP recovery (closing the race where another CPU refills its PCP
+        // from the reclaimed pages before we reacquire buddy).
+        if allocator.free_pages < PCP_REFILL_BATCH && oom_killer::has_transient_cache_reclaim() {
+            drop(guard);
+            let reclaim = oom_killer::reclaim_transient_caches_nonblocking();
+            if reclaim.busy {
                 return None;
             }
+            let mut retry_guard = self.buddy.try_lock()?;
+            let retry_allocator = retry_guard.as_mut()?;
+            if self.drain_pcp_into_locked_buddy(retry_allocator, cpu_limit) {
+                return None;
+            }
+            return Some(f(retry_allocator));
         }
         Some(f(allocator))
     }
@@ -2252,6 +2446,17 @@ pub fn try_alloc_physical_pages(count: usize) -> Result<PhysFrame, AllocError> {
     GLOBAL_BUDDY.try_alloc_multi_with(order, pages_needed, cpu_local::max_cpus(), true)
 }
 
+/// Strictly non-blocking order-0 allocation for exception paths (such as CoW
+/// `#PF`). Never spins on PCP, buddy, or transient-cache locks and propagates
+/// contention as `Err(AllocError::Busy)` so fault handlers can retry via `IRETQ`.
+pub fn try_alloc_order0_nonblocking() -> Result<PhysFrame, AllocError> {
+    GLOBAL_BUDDY.try_alloc_order0_nonblocking_with(
+        current_pcp_cpu_id(),
+        cpu_local::max_cpus(),
+        scrub_frame_phys,
+    )
+}
+
 /// Checked counterpart to `free_physical_pages`.
 ///
 /// Validates exact buddy-relative base, allocation order, `PAGE_REF_COUNT == 0`,
@@ -2277,6 +2482,26 @@ pub fn try_free_physical_pages(frame: PhysFrame, count: usize) -> Result<(), Fre
         );
     }
     GLOBAL_BUDDY.try_free_multi_with(frame, order, read_production_cow_refcount)
+}
+
+/// Strictly non-blocking checked deallocation for interrupt-masked or
+/// fault-path transient-cache reclaim. Returns `Err(FreeError::Busy)` without
+/// spinning whenever the global buddy lock is contended.
+pub fn try_free_physical_pages_nonblocking(
+    frame: PhysFrame,
+    count: usize,
+) -> Result<(), FreeError> {
+    if count == 0 {
+        return Err(FreeError::InvalidCount);
+    }
+    let pages = count
+        .checked_next_power_of_two()
+        .ok_or(FreeError::InvalidCount)?;
+    if pages != count {
+        return Err(FreeError::InvalidCount);
+    }
+    let order = pages.trailing_zeros() as usize;
+    GLOBAL_BUDDY.try_free_multi_nonblocking_with(frame, order, read_production_cow_refcount)
 }
 
 pub fn free_physical_pages(frame: PhysFrame, count: usize) {

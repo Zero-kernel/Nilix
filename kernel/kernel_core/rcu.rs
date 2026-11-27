@@ -247,6 +247,15 @@ impl<const CAPACITY: usize> CallbackPool<CAPACITY> {
         true
     }
 
+    #[inline]
+    fn oldest_queued_epoch(&self) -> u64 {
+        if self.queue_len == 0 {
+            return u64::MAX;
+        }
+        let index = usize::from(self.queue[self.queue_head]);
+        self.slots[index].target_epoch
+    }
+
     fn enqueue_reserved(
         &mut self,
         index: usize,
@@ -313,19 +322,19 @@ impl<const CAPACITY: usize> CallbackPool<CAPACITY> {
         })
     }
 
-    fn finish_running(&mut self, index: usize) {
+    fn finish_running(&mut self, index: usize) -> bool {
         assert!(index < CAPACITY, "RCU: invalid running slot");
         if self.slots[index].state == CallbackState::Quarantined {
             // R180-12 FIX: a failed stack reclaim must pin its PID-indexed slot
             // forever.  Releasing it here would allow the same virtual stack
             // slot to be reused while an old PTE or physical block is still
             // live.  `stack_slots` deliberately remains charged.
-            return;
+            return false;
         }
         if self.slots[index].state == CallbackState::FlushPending {
             // C3: the flush batch owns the slot until its flush; it stays
             // occupied and charged until `release_flush_pending_stack`.
-            return;
+            return false;
         }
         assert_eq!(
             self.slots[index].state,
@@ -338,6 +347,7 @@ impl<const CAPACITY: usize> CallbackPool<CAPACITY> {
             assert!(self.stack_slots > 0, "RCU: stack slot count underflow");
             self.stack_slots -= 1;
         }
+        true
     }
 
     /// Permanently pin a dequeued kernel-stack callback slot after a reclaim
@@ -411,6 +421,11 @@ impl<const CAPACITY: usize> CallbackPool<CAPACITY> {
 /// R180-12 FIX: Static callback storage; no operation on this pool allocates.
 static CALLBACKS: Mutex<CallbackPool<RCU_CALLBACK_CAPACITY>> = Mutex::new(CallbackPool::new());
 
+/// Target epoch of the oldest queued callback (`u64::MAX` when queue is empty).
+/// Updated under `CALLBACKS` lock so `poll()` can skip `DRAIN_OWNER` and
+/// `CALLBACKS.lock()` on the syscall-return hot path when no callback is ready.
+static OLDEST_QUEUED_EPOCH: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Proof that one callback slot was admitted before a resource was allocated.
 ///
 /// This type is deliberately non-`Clone`. Dropping an unconsumed permit returns
@@ -423,13 +438,52 @@ pub struct RcuCallbackPermit {
     armed: bool,
 }
 
+/// Lock-free mirror of occupied kernel-stack callback slots (`0..RCU_STACK_CALLBACK_CAPACITY`),
+/// updated under `CALLBACKS.lock()` so `allocate_global_pid` can skip PIDs with
+/// pending/flush-pending/quarantined stack reclamation without retrying `allocate_kernel_stack`.
+const STACK_SLOT_BUSY_WORDS: usize = (RCU_STACK_CALLBACK_CAPACITY + 63) / 64;
+static STACK_SLOT_BUSY: [AtomicU64; STACK_SLOT_BUSY_WORDS] =
+    [const { AtomicU64::new(0) }; STACK_SLOT_BUSY_WORDS];
+
+#[inline]
+fn set_stack_slot_busy(slot_index: usize) {
+    if slot_index < RCU_STACK_CALLBACK_CAPACITY {
+        STACK_SLOT_BUSY[slot_index / 64].fetch_or(1u64 << (slot_index % 64), Ordering::Release);
+    }
+}
+
+#[inline]
+fn clear_stack_slot_busy(slot_index: usize) {
+    if slot_index < RCU_STACK_CALLBACK_CAPACITY {
+        STACK_SLOT_BUSY[slot_index / 64].fetch_and(!(1u64 << (slot_index % 64)), Ordering::Release);
+    }
+}
+
+/// Lock-free hint indicating whether `pid`'s dedicated kernel-stack RCU slot is
+/// currently occupied (`Reserved`, `Queued`, `Running`, `FlushPending`, or `Quarantined`).
+#[inline]
+pub(crate) fn is_stack_callback_pending(pid: usize) -> bool {
+    if pid == 0 || pid > RCU_STACK_CALLBACK_CAPACITY {
+        return false;
+    }
+    let slot_index = pid - 1;
+    (STACK_SLOT_BUSY[slot_index / 64].load(Ordering::Acquire) & (1u64 << (slot_index % 64))) != 0
+}
+
 impl Drop for RcuCallbackPermit {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         self.armed = false;
-        let released = CALLBACKS.lock().release_reserved(self.slot_index);
+        let released = {
+            let mut callbacks = CALLBACKS.lock();
+            let ok = callbacks.release_reserved(self.slot_index);
+            if ok && self.slot_index < RCU_STACK_CALLBACK_CAPACITY {
+                clear_stack_slot_busy(self.slot_index);
+            }
+            ok
+        };
         assert!(released, "RCU: armed permit did not own a Reserved slot");
     }
 }
@@ -466,6 +520,7 @@ pub(crate) fn try_reserve_stack_callback(pid: usize) -> Result<RcuCallbackPermit
     if !callbacks.reserve_exact(CallbackClass::KernelStack, slot_index) {
         return Err(RcuBackpressure::StackCallbackLimit);
     }
+    set_stack_slot_busy(slot_index);
     Ok(RcuCallbackPermit {
         slot_index,
         armed: true,
@@ -916,9 +971,15 @@ pub(crate) fn defer_running_stack_release(pid: usize) {
 /// The caller holds drain ownership, so this cannot run between a callback's
 /// `defer_running_stack_release` and the drainer's `finish_running`.
 pub(crate) fn release_flush_pending_stack(pid: usize) {
-    let released = CALLBACKS
-        .lock()
-        .release_flush_pending_stack(stack_slot_index(pid));
+    let slot_index = stack_slot_index(pid);
+    let released = {
+        let mut callbacks = CALLBACKS.lock();
+        let ok = callbacks.release_flush_pending_stack(slot_index);
+        if ok {
+            clear_stack_slot_busy(slot_index);
+        }
+        ok
+    };
     assert!(
         released,
         "RCU: kernel-stack slot was not awaiting its batched flush"
@@ -963,7 +1024,8 @@ fn call_rcu_class(
     let target = allocate_epoch_or_panic();
 
     callbacks.enqueue_reserved(permit.slot_index, target, callback, args);
-    CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (bounded statistics counter)
+    OLDEST_QUEUED_EPOCH.store(callbacks.oldest_queued_epoch(), Ordering::Release);
+    CALLBACK_COUNT.fetch_add(1, Ordering::AcqRel); // lint-fetch-add: allow (bounded statistics counter)
     permit.armed = false;
 }
 
@@ -1006,6 +1068,11 @@ pub fn poll() -> usize {
     // Using COMPLETED_EPOCH (not GLOBAL_EPOCH) prevents racing ahead
     // of an in-progress synchronize_rcu().
     let completed_epoch = COMPLETED_EPOCH.load(Ordering::Acquire);
+    let has_ready_callback = CALLBACK_COUNT.load(Ordering::Acquire) > 0
+        && completed_epoch >= OLDEST_QUEUED_EPOCH.load(Ordering::Acquire);
+    if !has_ready_callback && !crate::kstack_flush::needs_epilogue() {
+        return 0;
+    }
     let budget = callback_drain_budget();
     drain_callbacks(completed_epoch, budget)
 }
@@ -1141,13 +1208,26 @@ fn drain_callbacks_inner(done_epoch: u64, max_callbacks: usize) -> usize {
         // Queued -> Running under the pool lock, then execute outside it. A
         // callback may reserve/enqueue another callback reentrantly; that new
         // entry lands at the ring tail and targets a later epoch.
-        let Some(ready) = CALLBACKS.lock().pop_ready(done_epoch) else {
+        let ready = {
+            let mut callbacks = CALLBACKS.lock();
+            let popped = callbacks.pop_ready(done_epoch);
+            OLDEST_QUEUED_EPOCH.store(callbacks.oldest_queued_epoch(), Ordering::Release);
+            popped
+        };
+        let Some(ready) = ready else {
             break;
         };
 
         (ready.callback)(ready.args);
 
-        CALLBACKS.lock().finish_running(ready.slot_index);
+        {
+            let mut callbacks = CALLBACKS.lock();
+            if callbacks.finish_running(ready.slot_index)
+                && ready.slot_index < RCU_STACK_CALLBACK_CAPACITY
+            {
+                clear_stack_slot_busy(ready.slot_index);
+            }
+        }
         let previous = CALLBACK_COUNT.fetch_sub(1, Ordering::Relaxed);
         assert!(previous > 0, "RCU: callback count underflow");
         count += 1;
@@ -1408,6 +1488,31 @@ mod tests {
         assert_eq!(pool.slots[1].state, CallbackState::Reserved);
         assert_eq!(pool.slots[2].state, CallbackState::Queued);
         assert_eq!(general.slots[3].state, CallbackState::Running);
+    }
+
+    #[test]
+    fn stack_slot_busy_mirror_tracks_reserve_and_drop() {
+        // Out-of-range PIDs fail closed to false.
+        assert!(!is_stack_callback_pending(0));
+        assert!(!is_stack_callback_pending(RCU_STACK_CALLBACK_CAPACITY + 1));
+
+        // Use a dedicated high PID to remain isolated under parallel test execution.
+        let pid = RCU_STACK_CALLBACK_CAPACITY - 7;
+        assert!(!is_stack_callback_pending(pid));
+
+        let permit = try_reserve_stack_callback(pid).expect("reserve dedicated stack slot");
+        assert!(is_stack_callback_pending(pid));
+        assert!(
+            try_reserve_stack_callback(pid).is_err(),
+            "double reservation of occupied PID slot must fail"
+        );
+        assert!(is_stack_callback_pending(pid));
+
+        drop(permit);
+        assert!(
+            !is_stack_callback_pending(pid),
+            "dropping armed permit must clear busy mirror"
+        );
     }
 }
 

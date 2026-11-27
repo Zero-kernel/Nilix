@@ -12,7 +12,7 @@ use crate::fork::{cow_flag, cow_readonly_flag, PAGE_REF_COUNT};
 use crate::process::{
     cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
     current_has_cap_rights, current_net_ns_id, current_pid, get_process, terminate_self_and_halt,
-    try_get_process, wait_should_abort, FileDescriptor, ProcessId, ProcessState,
+    try_get_process, wait_should_abort, FileDescriptor, ProcessArc, ProcessId, ProcessState,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -2362,12 +2362,16 @@ static STAGE_PENDING_TLS_BASES_CALLBACK: spin::Once<StagePendingTlsBasesCallback
 pub fn register_stage_pending_tls_bases_callback(cb: StagePendingTlsBasesCallback) {
     STAGE_PENDING_TLS_BASES_CALLBACK.call_once(|| cb);
 }
-/// R172-04: stage the running task's FS/GS bases for the SYSRET-epilogue commit (no-op
-/// until arch registers the callback at boot).
+/// R172-04: stage and commit the running task's FS/GS bases (returns `true` if
+/// the arch callback ran and committed the live MSRs; `false` only before arch
+/// registers the callback).
 #[inline]
-pub(crate) fn stage_pending_tls_bases(fs_base: u64, gs_base: u64) {
+pub(crate) fn stage_pending_tls_bases(fs_base: u64, gs_base: u64) -> bool {
     if let Some(&cb) = STAGE_PENDING_TLS_BASES_CALLBACK.get() {
         cb(fs_base, gs_base);
+        true
+    } else {
+        false
     }
 }
 
@@ -2496,7 +2500,8 @@ where
 /// 管道创建回调类型
 ///
 /// 由 ipc 模块注册，返回 (read_fd, write_fd) 或错误
-pub type PipeCreateCallback = fn(flags: u32) -> Result<(i32, i32), SyscallError>;
+pub type PipeCreateCallback =
+    fn(flags: u32, entry_proc: Option<&ProcessArc>) -> Result<(i32, i32), SyscallError>;
 
 /// 文件描述符读取回调类型
 ///
@@ -2505,18 +2510,19 @@ pub type PipeCreateCallback = fn(flags: u32) -> Result<(i32, i32), SyscallError>
 /// bytes through `copyout` and advance/dequeue the source only after copyout
 /// succeeds. This closes sibling-unmap races that bounds preflight cannot pin.
 pub type FdReadCopyout = fn(*mut u8, &[u8]) -> Result<(), SyscallError>;
-pub type FdReadCallback = fn(i32, &mut [u8], *mut u8, FdReadCopyout) -> Result<usize, SyscallError>;
+pub type FdReadCallback =
+    fn(i32, &mut [u8], *mut u8, FdReadCopyout, Option<&ProcessArc>) -> Result<usize, SyscallError>;
 
 /// 文件描述符写入回调类型
 ///
 /// 由 ipc 模块注册，处理管道等文件描述符的写入
-/// 参数: (fd, buf) -> bytes_written 或错误
-pub type FdWriteCallback = fn(i32, &[u8]) -> Result<usize, SyscallError>;
+/// 参数: (fd, buf, entry_proc) -> bytes_written 或错误
+pub type FdWriteCallback = fn(i32, &[u8], Option<&ProcessArc>) -> Result<usize, SyscallError>;
 
 /// 文件描述符关闭回调类型
 ///
 /// 由 ipc 模块注册，处理文件描述符的关闭
-pub type FdCloseCallback = fn(i32) -> Result<(), SyscallError>;
+pub type FdCloseCallback = fn(i32, Option<&ProcessArc>) -> Result<(), SyscallError>;
 
 /// Futex 操作回调类型
 ///
@@ -2773,15 +2779,34 @@ pub struct VfsStat {
 const _: [(); 144] = [(); core::mem::size_of::<VfsStat>()];
 const _: [(); 8] = [(); core::mem::align_of::<VfsStat>()];
 
+/// Lock-free hot-path syscall callbacks (registered once at boot by `ipc::init`;
+/// read via single Acquire load on every pipe/read/write/close syscall).
+static PIPE_CREATE_CALLBACK: spin::Once<PipeCreateCallback> = spin::Once::new();
+static FD_READ_CALLBACK: spin::Once<FdReadCallback> = spin::Once::new();
+static FD_WRITE_CALLBACK: spin::Once<FdWriteCallback> = spin::Once::new();
+static FD_CLOSE_CALLBACK: spin::Once<FdCloseCallback> = spin::Once::new();
+
+#[inline]
+fn get_pipe_create_callback() -> Option<PipeCreateCallback> {
+    PIPE_CREATE_CALLBACK.get().copied()
+}
+
+#[inline]
+fn get_fd_read_callback() -> Option<FdReadCallback> {
+    FD_READ_CALLBACK.get().copied()
+}
+
+#[inline]
+fn get_fd_write_callback() -> Option<FdWriteCallback> {
+    FD_WRITE_CALLBACK.get().copied()
+}
+
+#[inline]
+fn get_fd_close_callback() -> Option<FdCloseCallback> {
+    FD_CLOSE_CALLBACK.get().copied()
+}
+
 lazy_static::lazy_static! {
-    /// 管道创建回调
-    static ref PIPE_CREATE_CALLBACK: spin::Mutex<Option<PipeCreateCallback>> = spin::Mutex::new(None);
-    /// 文件描述符读取回调
-    static ref FD_READ_CALLBACK: spin::Mutex<Option<FdReadCallback>> = spin::Mutex::new(None);
-    /// 文件描述符写入回调
-    static ref FD_WRITE_CALLBACK: spin::Mutex<Option<FdWriteCallback>> = spin::Mutex::new(None);
-    /// 文件描述符关闭回调
-    static ref FD_CLOSE_CALLBACK: spin::Mutex<Option<FdCloseCallback>> = spin::Mutex::new(None);
     /// Futex 操作回调
     static ref FUTEX_CALLBACK: spin::Mutex<Option<FutexCallback>> = spin::Mutex::new(None);
     /// VFS 打开文件回调
@@ -2823,22 +2848,22 @@ lazy_static::lazy_static! {
 
 /// 注册管道创建回调
 pub fn register_pipe_callback(cb: PipeCreateCallback) {
-    *PIPE_CREATE_CALLBACK.lock() = Some(cb);
+    PIPE_CREATE_CALLBACK.call_once(|| cb);
 }
 
 /// 注册文件描述符读取回调
 pub fn register_fd_read_callback(cb: FdReadCallback) {
-    *FD_READ_CALLBACK.lock() = Some(cb);
+    FD_READ_CALLBACK.call_once(|| cb);
 }
 
 /// 注册文件描述符写入回调
 pub fn register_fd_write_callback(cb: FdWriteCallback) {
-    *FD_WRITE_CALLBACK.lock() = Some(cb);
+    FD_WRITE_CALLBACK.call_once(|| cb);
 }
 
 /// 注册文件描述符关闭回调
 pub fn register_fd_close_callback(cb: FdCloseCallback) {
-    *FD_CLOSE_CALLBACK.lock() = Some(cb);
+    FD_CLOSE_CALLBACK.call_once(|| cb);
 }
 
 /// 注册 Futex 操作回调
@@ -4343,6 +4368,7 @@ pub fn syscall_dispatcher(
     let mut entry_tgid: ProcessId = 0;
     let mut entry_creds: Option<crate::process::CredentialIds> = None;
     let mut fast_ns_id: Option<Result<usize, ()>> = None;
+    let mut entry_proc: Option<ProcessArc> = None;
 
     // Issue #109 §4.1: Consolidate syscall_entry_safe_point + atomic-gated
     // seccomp/pledge evaluation + LSM (tgid, credentials) snapshot + read-only
@@ -4388,12 +4414,14 @@ pub fn syscall_dispatcher(
                 seccomp::SeccompVerdict::kill(0)
             }
             crate::process::SyscallEntryState::Ready {
+                proc_arc,
                 exec_handoff: handoff,
                 verdict,
                 tgid,
                 creds,
                 fast_ns_id: ns_id,
             } => {
+                entry_proc = Some(proc_arc);
                 exec_handoff = handoff;
                 entry_tgid = tgid;
                 entry_creds = creds;
@@ -4434,6 +4462,9 @@ pub fn syscall_dispatcher(
                 );
             }
 
+            // Release cached ProcessArc before abandoning the syscall stack so
+            // reaping can reclaim the PCB allocation and its admission slot.
+            drop(entry_proc);
             // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
             // interrupts and switches to boot CR3 before halting, preventing timer
             // IRQ UAF on the zombie's stack/CR3.
@@ -4462,6 +4493,8 @@ pub fn syscall_dispatcher(
                 );
             }
 
+            // Release cached ProcessArc before abandoning the syscall stack.
+            drop(entry_proc);
             // R117-1 FIX: Use centralized terminate_self_and_halt().
             crate::process::terminate_group_self_and_halt(pid, 128 + 31);
         }
@@ -4564,10 +4597,20 @@ pub fn syscall_dispatcher(
     }
 
     // GAP-5 exec step 2: the exec a non-leader handed to this leader replaces
-    // the call.
+    // the call. Release `entry_proc` first because `run_exec_handoff()` can
+    // terminate fatally without unwinding this frame.
     if exec_handoff {
+        drop(entry_proc);
         let result = run_exec_handoff();
-        return finish_syscall(syscall_num, &args, timestamp, &lsm_ctx, result, false);
+        return finish_syscall(syscall_num, &args, timestamp, &lsm_ctx, result, false, None);
+    }
+
+    // Release cached ProcessArc before any syscall whose handler may terminate
+    // fatally without unwinding (`rt_sigreturn`, `execve`, `exit`, `kill`,
+    // `tkill`, `exit_group`, `tgkill`, `spawn_image`) so the dying task's PCB
+    // strong count never stays pinned on the abandoned syscall stack.
+    if matches!(syscall_num, 15 | 59 | 60 | 62 | 200 | 231 | 234 | 517) {
+        entry_proc = None;
     }
 
     let result = match syscall_num {
@@ -4605,7 +4648,7 @@ pub fn syscall_dispatcher(
         // the charge (the FA-09 over-count / permanent-undeletability direction),
         // and an independent-MmState process that skips the fork charge would
         // strand the child's exit uncharge into a saturating under-count.
-        57 => sys_fork(),
+        57 => sys_fork(entry_proc.as_ref()),
         // M0-4: execve is now REAL path-based exec(pathname, argv, envp).
         // arg0 is a pathname pointer (NOT a raw ELF image) — the confused-deputy
         // is gone. Native raw-image spawn moved to sys_spawn_image (517).
@@ -4621,7 +4664,12 @@ pub fn syscall_dispatcher(
         // Ring-3 parent that ever reaped a real child (stress-v2 memory
         // profile, stage=cgroup_child_wait errno=14). rusage (arg3) is
         // accepted and ignored — Linux permits NULL.
-        61 => sys_wait4(arg0 as i64, arg1 as *mut i32, arg2 as i32),
+        61 => sys_wait4(
+            arg0 as i64,
+            arg1 as *mut i32,
+            arg2 as i32,
+            entry_proc.clone(),
+        ),
         39 => sys_getpid_fast(fast_ns_id),
         186 => sys_gettid_fast(fast_ns_id),
         110 => sys_getppid(),
@@ -4656,8 +4704,18 @@ pub fn syscall_dispatcher(
         308 => sys_setns(arg0 as i32, arg1 as i32),
 
         // 文件I/O
-        0 => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
-        1 => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
+        0 => sys_read(
+            arg0 as i32,
+            arg1 as *mut u8,
+            arg2 as usize,
+            entry_proc.as_ref(),
+        ),
+        1 => sys_write(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as usize,
+            entry_proc.as_ref(),
+        ),
         17 => sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i64),
         18 => sys_pwrite64(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3 as i64),
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
@@ -4668,7 +4726,7 @@ pub fn syscall_dispatcher(
             arg2 as *const OpenHow,
             arg3 as usize,
         ),
-        3 => sys_close(arg0 as i32),
+        3 => sys_close(arg0 as i32, entry_proc.as_ref()),
         4 => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
         5 => sys_fstat(arg0 as i32, arg1 as *mut VfsStat),
         6 => sys_lstat(arg0 as *const u8, arg1 as *mut VfsStat),
@@ -4690,7 +4748,7 @@ pub fn syscall_dispatcher(
         16 => sys_ioctl(arg0 as i32, arg1, arg2),
         19 => sys_readv(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
         20 => sys_writev(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
-        22 => sys_pipe(arg0 as *mut i32),
+        22 => sys_pipe(arg0 as *mut i32, entry_proc.as_ref()),
         32 => sys_dup(arg0 as i32),
         33 => sys_dup2(arg0 as i32, arg1 as i32),
         72 => sys_fcntl(arg0 as i32, arg1 as i32, arg2),
@@ -4701,7 +4759,7 @@ pub fn syscall_dispatcher(
         162 => sys_sync(),
         277 => sys_sync_file_range(arg0 as i32, arg1 as i64, arg2 as i64, arg3 as u32),
         217 => sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
-        293 => sys_pipe2(arg0 as *mut i32, arg1 as i32),
+        293 => sys_pipe2(arg0 as *mut i32, arg1 as i32, entry_proc.as_ref()),
 
         // 文件系统操作
         21 => sys_access(arg0 as *const u8, arg1 as i32),
@@ -4914,7 +4972,15 @@ pub fn syscall_dispatcher(
         _ => Err(SyscallError::ENOSYS),
     };
 
-    finish_syscall(syscall_num, &args, timestamp, &lsm_ctx, result, true)
+    finish_syscall(
+        syscall_num,
+        &args,
+        timestamp,
+        &lsm_ctx,
+        result,
+        true,
+        entry_proc,
+    )
 }
 
 /// The syscall return path shared by every dispatched call: audit, the LSM
@@ -4926,14 +4992,15 @@ fn finish_syscall(
     args: &[u64; 6],
     timestamp: u64,
     lsm_ctx: &lsm::SyscallCtx,
-    mut result: SyscallResult,
+    result: SyscallResult,
     dispatched: bool,
+    entry_proc: Option<ProcessArc>,
 ) -> i64 {
     if dispatched {
         audit_syscall_exit(syscall_num, args, timestamp, lsm_ctx, &result);
     }
     let voluntary_yield = dispatched && syscall_num == 24 && result.is_ok();
-    finish_syscall_tail(result, voluntary_yield)
+    finish_syscall_tail(result, voluntary_yield, entry_proc)
 }
 
 /// Audit record and LSM exit hook for a dispatched call.
@@ -4986,7 +5053,11 @@ fn audit_syscall_exit(
 }
 
 /// Return safe point, signal delivery and rescheduling for every syscall.
-fn finish_syscall_tail(mut result: SyscallResult, mut voluntary_yield: bool) -> i64 {
+fn finish_syscall_tail(
+    mut result: SyscallResult,
+    mut voluntary_yield: bool,
+    entry_proc: Option<ProcessArc>,
+) -> i64 {
     // Compute the syscall's return value (→ RAX). Captured here because signal
     // delivery saves it into the sigframe (so `rt_sigreturn` restores the
     // interrupted context's RAX — the EINTR / partial-op short-count contract: the
@@ -5008,9 +5079,10 @@ fn finish_syscall_tail(mut result: SyscallResult, mut voluntary_yield: bool) -> 
     // replaces the call's.
     //
     // Issue #109 §4.1: Consolidate syscall_return_safe_point + maybe_deliver_signal
-    // + poll_restore_sigmask_tail into ONE get_process + PCB lock on the common path.
+    // + poll_restore_sigmask_tail into ONE PCB lock, reusing `entry_proc` from
+    // syscall entry so normal syscalls never re-acquire `PROCESS_TABLE`.
     if let Some(pid) = current_pid() {
-        if let Some(proc_arc) = get_process(pid) {
+        if let Some(proc_arc) = entry_proc.or_else(|| get_process(pid)) {
             let phase1 = {
                 let mut proc = proc_arc.lock();
                 let frame_bound = proc.saved_frame_ptr != 0 && proc.saved_frame_owner == pid as u64;
@@ -5025,7 +5097,9 @@ fn finish_syscall_tail(mut result: SyscallResult, mut voluntary_yield: bool) -> 
                 }
             };
             match phase1 {
-                SignalTailStep::Done => {}
+                SignalTailStep::Done => {
+                    drop(proc_arc);
+                }
                 SignalTailStep::Exit(exit_code) => {
                     drop(proc_arc);
                     // R117-1 FIX: Use centralized terminate_self_and_halt().
@@ -5050,6 +5124,8 @@ fn finish_syscall_tail(mut result: SyscallResult, mut voluntary_yield: bool) -> 
                 other => finish_signal_tail_step(pid, ret_val, proc_arc, other),
             }
         }
+    } else {
+        drop(entry_proc);
     }
 
     // 在返回用户态前检查是否需要调度
@@ -5160,7 +5236,7 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
 /// POSIX specifies that fork() in a multi-threaded process only duplicates the
 /// calling thread, but shared resources (mutexes, file locks) may be in
 /// inconsistent states in the child.
-fn sys_fork() -> SyscallResult {
+fn sys_fork(entry_proc: Option<&ProcessArc>) -> SyscallResult {
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1070); // sys_fork entry
@@ -5172,7 +5248,10 @@ fn sys_fork() -> SyscallResult {
     #[cfg(debug_assertions)]
     {
         let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
-        let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+        let parent_arc = match entry_proc {
+            Some(arc) => arc.clone(),
+            None => get_process(parent_pid).ok_or(SyscallError::ESRCH)?,
+        };
         let sibling_count = {
             let parent = parent_arc.lock();
             if parent.pid == parent.tgid {
@@ -5191,8 +5270,12 @@ fn sys_fork() -> SyscallResult {
         }
     }
 
-    // 调用真正的 fork 实现（包含 COW 支持）
-    match crate::fork::sys_fork() {
+    // 调用真正的 fork 实现（包含 COW 支持），复用 syscall 入口已持有的父进程 Arc
+    let fork_res = match entry_proc {
+        Some(parent_arc) => crate::fork::sys_fork_with_parent(parent_arc.clone()),
+        None => crate::fork::sys_fork(),
+    };
+    match fork_res {
         Ok((_child_pid, parent_view_pid)) => {
             // R180-19: LSM authorization and namespace-local PID translation
             // were completed during fork PREPARE, before parent PTE commit.  The
@@ -8115,11 +8198,12 @@ fn exec_from_bytes(
         // unconditional switch-out save would read the STALE live MSRs back into the PCB,
         // resurrecting the pre-exec TLS. Writing all three (PCB above + pending + live MSR)
         // closes both. Runs in the exec'ing task's own syscall context (its own CPU).
-        stage_pending_tls_bases(0, 0);
-        unsafe {
-            use x86_64::registers::model_specific::Msr;
-            Msr::new(0xC000_0100u32).write(0); // IA32_FS_BASE
-            Msr::new(0xC000_0102u32).write(0); // IA32_KERNEL_GS_BASE (user GS via SWAPGS)
+        if !stage_pending_tls_bases(0, 0) {
+            unsafe {
+                use x86_64::registers::model_specific::Msr;
+                Msr::new(0xC000_0100u32).write(0); // IA32_FS_BASE
+                Msr::new(0xC000_0102u32).write(0); // IA32_KERNEL_GS_BASE (user GS via SWAPGS)
+            }
         }
 
         // OpenBSD Pledge 语义：exec 后应用 exec_promises
@@ -8855,7 +8939,12 @@ pub fn run_exec_disambiguation_self_test() {
 ///   (WIFEXITED true, WEXITSTATUS = code). Signal deaths surface as this
 ///   kernel's unified 128+sig exit code, i.e. as an "exited" status — the
 ///   single-exit-code model predates signaled-death wstatus encoding.
-fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
+fn sys_wait4(
+    pid_sel: i64,
+    status: *mut i32,
+    options: i32,
+    entry_proc: Option<ProcessArc>,
+) -> SyscallResult {
     if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
         return Err(SyscallError::EINVAL);
     }
@@ -8880,7 +8969,7 @@ fn sys_wait4(pid_sel: i64, status: *mut i32, options: i32) -> SyscallResult {
         copy_to_user(status as *mut u8, &wstatus.to_ne_bytes())
     };
 
-    match wait_reap_core(target, options & WNOHANG != 0, false, publish)? {
+    match wait_reap_core_with_parent(target, options & WNOHANG != 0, false, publish, entry_proc)? {
         Some(outcome) => Ok(outcome.view_pid),
         // WNOHANG with nothing reapable.
         None => Ok(0),
@@ -9415,23 +9504,114 @@ fn wait_reap_core<W>(
     target: WaitTarget,
     nohang: bool,
     nowait: bool,
+    publish: W,
+) -> Result<Option<WaitOutcome>, SyscallError>
+where
+    W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
+{
+    wait_reap_core_with_parent(target, nohang, nowait, publish, None)
+}
+
+fn wait_reap_core_with_parent<W>(
+    target: WaitTarget,
+    nohang: bool,
+    nowait: bool,
     mut publish: W,
+    entry_proc: Option<ProcessArc>,
 ) -> Result<Option<WaitOutcome>, SyscallError>
 where
     W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
 {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let parent = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let parent = entry_proc
+        .or_else(|| get_process(pid))
+        .ok_or(SyscallError::ESRCH)?;
     let mut resumed_from_block = false;
 
     // GAP-5 G8: a thread of a multi-threaded process waits for the children of
-    // every thread in its group.
-    let group = {
+    // every thread in its group. Also check for the O(1) direct already-zombie
+    // reap fast path (single-threaded root-namespace `waitpid(child_pid)`):
+    // avoids heap Vec snapshot, sibling PCB scans, and Ready->Blocked->Ready
+    // transitions when the requested child is already a reapable zombie.
+    enum FastWaitCheck {
+        MultiThread(Arc<crate::process::ThreadGroup>),
+        DirectCandidate(ProcessId, crate::pid_namespace::PidNamespaceArc),
+        AbortEintr,
+        SlowPath,
+    }
+    let fast_check = {
         let proc = parent.lock();
-        (proc.thread_group.members() > 1).then(|| Arc::clone(&proc.thread_group))
+        if proc.thread_group.members() > 1 {
+            FastWaitCheck::MultiThread(Arc::clone(&proc.thread_group))
+        } else if crate::signal::should_abort_pending_block(&proc) {
+            FastWaitCheck::AbortEintr
+        } else if let WaitTarget::Pid(want) = target {
+            let ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+                .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone());
+            if Arc::ptr_eq(&ns, &crate::pid_namespace::ROOT_PID_NAMESPACE)
+                && proc.children.contains(&want)
+            {
+                FastWaitCheck::DirectCandidate(want, ns)
+            } else {
+                FastWaitCheck::SlowPath
+            }
+        } else {
+            FastWaitCheck::SlowPath
+        }
     };
-    if let Some(group) = group {
-        return wait_reap_group(target, nohang, nowait, publish, pid, &parent, &group);
+    match fast_check {
+        FastWaitCheck::MultiThread(group) => {
+            return wait_reap_group(target, nohang, nowait, publish, pid, &parent, &group);
+        }
+        FastWaitCheck::AbortEintr => {
+            return Err(SyscallError::EINTR);
+        }
+        FastWaitCheck::DirectCandidate(want, parent_namespace) => {
+            let direct_zombie = get_process(want).and_then(|child_proc| {
+                let child = child_proc.lock();
+                if child.ppid == pid
+                    && child.wait_pid_in_namespace(&parent_namespace) == Some(want)
+                    && child.state == ProcessState::Zombie
+                    && child
+                        .teardown_done
+                        .load(core::sync::atomic::Ordering::Acquire)
+                    && !child.on_cpu.load(core::sync::atomic::Ordering::Acquire)
+                    && !child
+                        .switch_reap_pending
+                        .load(core::sync::atomic::Ordering::Acquire)
+                    && child.tgid == want
+                    && child.thread_group.members() == 1
+                {
+                    Some(WaitOutcome {
+                        global_pid: want,
+                        view_pid: want,
+                        exit_code: child.exit_code.unwrap_or(0),
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some(outcome) = direct_zombie {
+                if nowait || crate::process::claim_wait_reap(want) {
+                    if let Err(e) = publish(&outcome) {
+                        if !nowait {
+                            crate::process::release_wait_reap(want);
+                        }
+                        return Err(e);
+                    }
+                    if nowait {
+                        return Ok(Some(outcome));
+                    }
+                    {
+                        let mut proc = parent.lock();
+                        proc.children.retain(|&c| c != want);
+                    }
+                    cleanup_zombie(want);
+                    return Ok(Some(outcome));
+                }
+            }
+        }
+        FastWaitCheck::SlowPath => {}
     }
 
     loop {
@@ -10401,6 +10581,9 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
             return Err(SyscallError::ESRCH);
         }
     }
+    // Release `owning_ns` before signal delivery so a fatal self-signal does
+    // not pin the namespace Arc on the abandoned syscall stack.
+    drop(owning_ns);
 
     // 【安全修复 Z-9】POSIX 权限检查（防御深度）
     // send_signal 也会进行相同检查，这里提前拒绝以提供更清晰的错误
@@ -10424,8 +10607,10 @@ fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
         .ok_or(SyscallError::ESRCH)?
         .lock()
         .tgid;
-    let signal_target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
-    let has_dac_permission = crate::signal::user_signal_dac_allowed(&signal_target)?;
+    let has_dac_permission = {
+        let signal_target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
+        crate::signal::user_signal_dac_allowed(&signal_target)?
+    };
     let mut namespace_init_supervisor = false;
     if self_tgid != target_tgid {
         let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
@@ -13155,7 +13340,7 @@ pub fn run_rlimit_self_test() {
     .is_ok()); // lower
 }
 
-fn sys_pipe(fds: *mut i32) -> SyscallResult {
+fn sys_pipe(fds: *mut i32, entry_proc: Option<&ProcessArc>) -> SyscallResult {
     // 验证用户指针
     if fds.is_null() {
         return Err(SyscallError::EFAULT);
@@ -13165,15 +13350,11 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
     // already calls validate_user_ptr internally as its first step.
     verify_user_memory(fds as *const u8, core::mem::size_of::<[i32; 2]>(), true)?;
 
-    // 获取回调函数指针并立即释放锁
-    // 避免在持有锁时执行可能耗时的回调
-    let create_fn = {
-        let callback = PIPE_CREATE_CALLBACK.lock();
-        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
-    };
+    // 获取回调函数指针（无锁原子读取）
+    let create_fn = get_pipe_create_callback().ok_or(SyscallError::ENOSYS)?;
 
     // 调用管道创建回调
-    let (read_fd, write_fd) = create_fn(0)?;
+    let (read_fd, write_fd) = create_fn(0, entry_proc)?;
 
     // 将文件描述符写回用户空间
     let fd_array = [read_fd, write_fd];
@@ -13187,14 +13368,9 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
 
     // copy_to_user 失败时回滚：关闭已创建的文件描述符
     if let Err(e) = copy_to_user(fds as *mut u8, bytes) {
-        // 尝试关闭已分配的 fd（通过关闭回调）
-        let close_fn = {
-            let callback = FD_CLOSE_CALLBACK.lock();
-            callback.as_ref().copied()
-        };
-        if let Some(close) = close_fn {
-            let _ = close(read_fd);
-            let _ = close(write_fd);
+        if let Some(close) = get_fd_close_callback() {
+            let _ = close(read_fd, entry_proc);
+            let _ = close(write_fd, entry_proc);
         }
         return Err(e);
     }
@@ -13214,7 +13390,7 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
 /// # Returns
 ///
 /// 0 on success, errno on failure
-fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
+fn sys_pipe2(fds: *mut i32, flags: i32, entry_proc: Option<&ProcessArc>) -> SyscallResult {
     // Validate flags (only O_CLOEXEC and O_NONBLOCK are supported)
     const O_CLOEXEC: i32 = 0x80000;
     const O_NONBLOCK: i32 = 0x800;
@@ -13230,16 +13406,13 @@ fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
     }
     verify_user_memory(fds as *const u8, core::mem::size_of::<[i32; 2]>(), true)?;
 
-    // Get pipe creation callback
-    let create_fn = {
-        let callback = PIPE_CREATE_CALLBACK.lock();
-        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
-    };
+    // Get pipe creation callback (lock-free)
+    let create_fn = get_pipe_create_callback().ok_or(SyscallError::ENOSYS)?;
 
     // KSA-013: prepare NONBLOCK and both CLOEXEC slots before publication.
     // The callback reserves both numeric descriptors within soft NOFILE and
     // rolls back both ends if any preflight resource cannot be acquired.
-    let (read_fd, write_fd) = create_fn(flags as u32)?;
+    let (read_fd, write_fd) = create_fn(flags as u32, entry_proc)?;
 
     // Write fds to user space
     let fd_array = [read_fd, write_fd];
@@ -13253,13 +13426,9 @@ fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
 
     // copy_to_user failure → rollback: close allocated fds
     if let Err(e) = copy_to_user(fds as *mut u8, bytes) {
-        let close_fn = {
-            let callback = FD_CLOSE_CALLBACK.lock();
-            callback.as_ref().copied()
-        };
-        if let Some(close) = close_fn {
-            let _ = close(read_fd);
-            let _ = close(write_fd);
+        if let Some(close) = get_fd_close_callback() {
+            let _ = close(read_fd, entry_proc);
+            let _ = close(write_fd, entry_proc);
         }
         return Err(e);
     }
@@ -13533,8 +13702,22 @@ fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallRe
 /// descriptor (EBADF if absent), and later console I/O on that number fails
 /// with EBADF.
 fn lookup_console_file(fd: i32) -> Result<Option<crate::process::ConsoleFile>, SyscallError> {
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    lookup_console_file_with(fd, None)
+}
+
+fn lookup_console_file_with(
+    fd: i32,
+    entry_proc: Option<&ProcessArc>,
+) -> Result<Option<crate::process::ConsoleFile>, SyscallError> {
+    let owned_process;
+    let process = match entry_proc {
+        Some(proc_arc) => proc_arc,
+        None => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            owned_process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            &owned_process
+        }
+    };
     let proc = process.lock();
     let descriptor = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
     Ok(descriptor
@@ -13543,13 +13726,13 @@ fn lookup_console_file(fd: i32) -> Result<Option<crate::process::ConsoleFile>, S
         .copied())
 }
 
-fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
+fn sys_read(fd: i32, buf: *mut u8, count: usize, entry_proc: Option<&ProcessArc>) -> SyscallResult {
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1000); // sys_read entry
     }
 
-    let console = lookup_console_file(fd)?;
+    let console = lookup_console_file_with(fd, entry_proc)?;
 
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
@@ -13638,17 +13821,14 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         coverage::trace_pc(1003); // sys_read fd callback path
     }
 
-    // 获取回调函数指针并立即释放锁
-    let read_fn = {
-        let callback = FD_READ_CALLBACK.lock();
-        *callback.as_ref().ok_or(SyscallError::EBADF)?
-    };
+    // 获取回调函数指针（无锁原子读取）
+    let read_fn = get_fd_read_callback().ok_or(SyscallError::EBADF)?;
 
     // R180-10 FIX: ordinary files, pipes, and sockets retain this buffer across
     // their callback lifetime, which may block. Small transfers (<= 256 B) use
     // stack storage and consume zero heap bytes.
     let mut tmp = IoScratchBuffer::try_zeroed(count)?;
-    let bytes_read = read_fn(fd, tmp.as_mut_slice(), buf, copy_to_user)?;
+    let bytes_read = read_fn(fd, tmp.as_mut_slice(), buf, copy_to_user, entry_proc)?;
 
     // Z-4 安全修复：将回调返回值 clamp 到请求的大小
     // 防止恶意/错误回调返回超大值导致切片越界 panic
@@ -13669,13 +13849,18 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 ///
 /// 回调返回的 bytes_written 必须 clamp 到请求的 count，防止恶意/错误回调
 /// 返回超大值。
-fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
+fn sys_write(
+    fd: i32,
+    buf: *const u8,
+    count: usize,
+    entry_proc: Option<&ProcessArc>,
+) -> SyscallResult {
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1010); // sys_write entry
     }
 
-    let console = lookup_console_file(fd)?;
+    let console = lookup_console_file_with(fd, entry_proc)?;
 
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
@@ -13718,14 +13903,11 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         {
             coverage::trace_pc(1013); // sys_write fd callback path
         }
-        // 获取回调函数指针并立即释放锁
-        let write_fn = {
-            let callback = FD_WRITE_CALLBACK.lock();
-            *callback.as_ref().ok_or(SyscallError::EBADF)?
-        };
+        // 获取回调函数指针（无锁原子读取）
+        let write_fn = get_fd_write_callback().ok_or(SyscallError::EBADF)?;
 
         // 在锁外执行写入
-        let bytes_written = write_fn(fd, tmp.as_slice())?;
+        let bytes_written = write_fn(fd, tmp.as_slice(), entry_proc)?;
 
         // Z-4 安全修复：将回调返回值 clamp 到请求的大小
         Ok(bytes_written.min(count))
@@ -13843,7 +14025,7 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
         }
 
         // 验证并写入单个缓冲区
-        match sys_write(fd, entry.iov_base, entry.iov_len) {
+        match sys_write(fd, entry.iov_base, entry.iov_len, None) {
             Ok(written) => {
                 // R104-4 FIX: Use checked_add to prevent silent usize wrap-around
                 // when a malicious/buggy iov list accumulates > usize::MAX bytes.
@@ -13989,7 +14171,7 @@ fn sys_readv(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
             // `iov_base` is the destination here. `sys_read` validates it
             // writable (validate_user_ptr_mut) and performs the fault-tolerant
             // usercopy — we never form a Rust `&mut [u8]` from the raw pointer.
-            sys_read(fd, entry.iov_base as *mut u8, entry.iov_len)
+            sys_read(fd, entry.iov_base as *mut u8, entry.iov_len, None)
         }
         // Empty vector (iovcnt == 0) or all segments zero-length: read nothing.
         None => Ok(0),
@@ -14485,7 +14667,7 @@ fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
 }
 
 /// sys_close - 关闭文件描述符
-fn sys_close(fd: i32) -> SyscallResult {
+fn sys_close(fd: i32, entry_proc: Option<&ProcessArc>) -> SyscallResult {
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1030); // sys_close entry
@@ -14499,14 +14681,11 @@ fn sys_close(fd: i32) -> SyscallResult {
         coverage::trace_pc(1032); // sys_close callback path
     }
 
-    // 获取回调函数指针并立即释放锁
-    let close_fn = {
-        let callback = FD_CLOSE_CALLBACK.lock();
-        *callback.as_ref().ok_or(SyscallError::EBADF)?
-    };
+    // 获取回调函数指针（无锁原子读取）
+    let close_fn = get_fd_close_callback().ok_or(SyscallError::EBADF)?;
 
     // 在锁外执行关闭
-    close_fn(fd)?;
+    close_fn(fd, entry_proc)?;
     Ok(0)
 }
 
@@ -19930,16 +20109,13 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
                 proc.gs_base
             };
 
-            // 立即更新 MSR（当前进程正在运行）
-            unsafe {
-                let mut msr = Msr::new(MSR_FS_BASE);
-                msr.write(addr);
+            // R172-04 W3: commit live MSR + keep staged/committed coherent atomically.
+            if !stage_pending_tls_bases(addr, gs_base) {
+                unsafe {
+                    let mut msr = Msr::new(MSR_FS_BASE);
+                    msr.write(addr);
+                }
             }
-
-            // R172-04 W3: keep the SYSRET-epilogue staged pair coherent with the live
-            // MSR + PCB. Without this, a no-block return commits the STALE pending FS
-            // staged at switch-in (W1), clobbering the FS just set here.
-            stage_pending_tls_bases(addr, gs_base);
 
             Ok(0)
         }
@@ -19975,14 +20151,13 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
                 proc.fs_base
             };
 
-            // 立即更新 MSR
-            unsafe {
-                let mut msr = Msr::new(MSR_KERNEL_GS_BASE);
-                msr.write(addr);
+            // R172-04 W3: commit live MSR + keep staged/committed coherent atomically.
+            if !stage_pending_tls_bases(fs_base, addr) {
+                unsafe {
+                    let mut msr = Msr::new(MSR_KERNEL_GS_BASE);
+                    msr.write(addr);
+                }
             }
-
-            // R172-04 W3: keep the SYSRET-epilogue staged pair coherent (see SET_FS).
-            stage_pending_tls_bases(fs_base, addr);
 
             Ok(0)
         }

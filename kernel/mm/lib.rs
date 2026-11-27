@@ -81,6 +81,7 @@ pub use memory::{
 pub use oom_killer::{
     get_stats as get_oom_stats, on_allocation_failure as oom_allocation_failed,
     register_audit_callback as register_oom_audit_callback,
+    register_cache_reclaim_callback as register_oom_cache_reclaim_callback,
     register_callbacks as register_oom_callbacks, score_process as score_oom_process,
     OomProcessInfo, OomStats,
 };

@@ -37,12 +37,12 @@ pub mod sha256 {
 
     #[inline(always)]
     fn ch(x: u32, y: u32, z: u32) -> u32 {
-        (x & y) ^ (!x & z)
+        z ^ (x & (y ^ z))
     }
 
     #[inline(always)]
     fn maj(x: u32, y: u32, z: u32) -> u32 {
-        (x & y) ^ (x & z) ^ (y & z)
+        (x & y) | (z & (x | y))
     }
 
     #[inline(always)]
@@ -160,6 +160,174 @@ pub mod sha256 {
             };
             scrub_crypto_stack();
             digest
+        }
+
+        /// Fast fused HMAC-SHA256 from precomputed RFC 2104 `ipad`/`opad`
+        /// midstates (each representing 64 bytes already compressed).
+        ///
+        /// Compresses full 64-byte blocks directly from `data`, folds the
+        /// 32-byte inner digest into the single outer block, and performs ONE
+        /// scrub of all working buffers + ONE `scrub_crypto_stack()` before
+        /// returning (preserving R94-10 zeroization).
+        #[inline]
+        pub fn hmac_from_midstates(
+            ipad_state: &[u32; 8],
+            opad_state: &[u32; 8],
+            data: &[u8],
+        ) -> [u8; 32] {
+            #[repr(align(8))]
+            struct AlignedState([u32; 8]);
+            #[repr(align(8))]
+            struct AlignedSchedule([u32; 64]);
+            #[repr(align(8))]
+            struct AlignedBlock([u8; 64]);
+
+            let mut inner_state = AlignedState([0u32; 8]);
+            inner_state.0.copy_from_slice(ipad_state);
+            let mut w = AlignedSchedule([0u32; 64]);
+            let mut block_buf = AlignedBlock([0u8; 64]);
+            let block = &mut block_buf.0;
+
+            let mut input = data;
+            while input.len() >= 64 {
+                let (head, tail) = input.split_at(64);
+                let blk: &[u8; 64] = head.try_into().expect("64-byte SHA-256 block");
+                Self::load_block_words(blk, &mut w.0);
+                Self::compress_words(&mut inner_state.0, &mut w.0);
+                input = tail;
+            }
+
+            let rem = input.len();
+            block[..rem].copy_from_slice(input);
+            block[rem] = 0x80;
+            let inner_bits = (64u64).wrapping_add(data.len() as u64).wrapping_mul(8);
+            if rem >= 56 {
+                block[rem + 1..64].fill(0);
+                Self::load_block_words(block, &mut w.0);
+                Self::compress_words(&mut inner_state.0, &mut w.0);
+                block[..56].fill(0);
+            } else {
+                block[rem + 1..56].fill(0);
+            }
+            block[56..64].copy_from_slice(&inner_bits.to_be_bytes());
+            Self::load_block_words(block, &mut w.0);
+            Self::compress_words(&mut inner_state.0, &mut w.0);
+
+            let out = Self::finish_hmac_outer(opad_state, &mut inner_state.0, &mut w.0);
+
+            let block_u64 = block.as_mut_ptr().cast::<u64>();
+            for i in 0..8 {
+                unsafe { core::ptr::write_volatile(block_u64.add(i), 0) };
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            scrub_crypto_stack();
+            out
+        }
+
+        /// Fast fused HMAC-SHA256 over caller-padded 64-byte blocks.
+        ///
+        /// Scrubs all working state AND invokes [`scrub_crypto_stack`] before
+        /// returning so compressor spill frames directly below this frame are
+        /// always within `scrub_crypto_stack`'s exact coverage window in both
+        /// debug and release builds (R94-10).
+        ///
+        /// `padded_blocks` MUST be a non-empty multiple of 64 bytes already
+        /// terminated with `0x80`, zero padding, and the big-endian total bit
+        /// length `(64 + payload_len) * 8`.
+        #[inline]
+        pub fn hmac_from_midstates_padded(
+            ipad_state: &[u32; 8],
+            opad_state: &[u32; 8],
+            padded_blocks: &[u8],
+        ) -> [u8; 32] {
+            #[repr(align(8))]
+            struct AlignedState([u32; 8]);
+            #[repr(align(8))]
+            struct AlignedSchedule([u32; 64]);
+
+            debug_assert!(!padded_blocks.is_empty() && padded_blocks.len() % 64 == 0);
+            let mut inner_state = AlignedState([0u32; 8]);
+            inner_state.0.copy_from_slice(ipad_state);
+            let mut w = AlignedSchedule([0u32; 64]);
+
+            for chunk in padded_blocks.chunks_exact(64) {
+                let blk: &[u8; 64] = chunk.try_into().expect("64-byte SHA-256 block");
+                Self::load_block_words(blk, &mut w.0);
+                Self::compress_words(&mut inner_state.0, &mut w.0);
+            }
+
+            let out = Self::finish_hmac_outer(opad_state, &mut inner_state.0, &mut w.0);
+            scrub_crypto_stack();
+            out
+        }
+
+        /// Compute outer HMAC-SHA256 compression directly from `inner_state`
+        /// words and volatile-scrub `inner_state`, `outer_state`, and `w`.
+        #[inline(always)]
+        fn finish_hmac_outer(
+            opad_state: &[u32; 8],
+            inner_state: &mut [u32; 8],
+            w: &mut [u32; 64],
+        ) -> [u8; 32] {
+            #[repr(align(8))]
+            struct AlignedState([u32; 8]);
+
+            w[0] = inner_state[0];
+            w[1] = inner_state[1];
+            w[2] = inner_state[2];
+            w[3] = inner_state[3];
+            w[4] = inner_state[4];
+            w[5] = inner_state[5];
+            w[6] = inner_state[6];
+            w[7] = inner_state[7];
+            w[8] = 0x8000_0000;
+            w[9] = 0;
+            w[10] = 0;
+            w[11] = 0;
+            w[12] = 0;
+            w[13] = 0;
+            w[14] = 0;
+            w[15] = (64 + 32) * 8;
+
+            let mut outer_state = AlignedState([0u32; 8]);
+            outer_state.0.copy_from_slice(opad_state);
+            Self::compress_words(&mut outer_state.0, w);
+
+            let mut out = [0u8; 32];
+            for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&outer_state.0[i].to_be_bytes());
+            }
+
+            // R94-10: scrub every key-derived chaining state and message schedule
+            // using aligned 64-bit volatile stores where guaranteed.
+            let inner_ptr = inner_state.as_mut_ptr();
+            let w_ptr = w.as_mut_ptr();
+            if inner_ptr as usize % 8 == 0 {
+                let p = inner_ptr.cast::<u64>();
+                for i in 0..4 {
+                    unsafe { core::ptr::write_volatile(p.add(i), 0) };
+                }
+            } else {
+                for word in inner_state.iter_mut() {
+                    unsafe { core::ptr::write_volatile(word, 0) };
+                }
+            }
+            let outer_p = outer_state.0.as_mut_ptr().cast::<u64>();
+            for i in 0..4 {
+                unsafe { core::ptr::write_volatile(outer_p.add(i), 0) };
+            }
+            if w_ptr as usize % 8 == 0 {
+                let p = w_ptr.cast::<u64>();
+                for i in 0..32 {
+                    unsafe { core::ptr::write_volatile(p.add(i), 0) };
+                }
+            } else {
+                for word in w.iter_mut() {
+                    unsafe { core::ptr::write_volatile(word, 0) };
+                }
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            out
         }
 
         /// Fast single-block finalization from a block-aligned `state` for a
@@ -284,7 +452,18 @@ pub mod sha256 {
         /// compiler-spilled frame slots left below RSP.
         #[inline(never)]
         fn compress_state(state: &mut [u32; 8], block: &[u8; 64]) {
-            let mut w = [0u32; 16];
+            let mut w = [0u32; 64];
+            Self::load_block_words(block, &mut w);
+            Self::compress_words(state, &mut w);
+            // Scrub message schedule words so key-derived pad blocks do not linger.
+            for word in &mut w {
+                unsafe { core::ptr::write_volatile(word, 0) };
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+
+        #[inline(always)]
+        fn load_block_words(block: &[u8; 64], w: &mut [u32; 64]) {
             for i in 0..16 {
                 let off = i * 4;
                 w[i] = u32::from_be_bytes([
@@ -294,26 +473,34 @@ pub mod sha256 {
                     block[off + 3],
                 ]);
             }
+        }
+
+        #[inline(never)]
+        fn compress_words(state: &mut [u32; 8], w: &mut [u32; 64]) {
+            // Phase 1: expand W[16..64] and fold K[0..64] into W[0..64] in place
+            // before loading the 8 working state variables into registers. Keeping
+            // schedule expansion separate from the round loop eliminates all GPR
+            // spilling and dynamic `& 15` index computation in the hot round loop.
+            for i in 16..64 {
+                let w16 = w[i - 16];
+                w[i] = w16
+                    .wrapping_add(small_sigma0(w[i - 15]))
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(small_sigma1(w[i - 2]));
+                w[i - 16] = w16.wrapping_add(K[i - 16]);
+            }
+            for i in 48..64 {
+                w[i] = w[i].wrapping_add(K[i]);
+            }
 
             #[cfg(debug_assertions)]
             {
                 let mut v = *state;
-                for round in 0..64 {
-                    let word = if round < 16 {
-                        w[round]
-                    } else {
-                        let i = round & 15;
-                        w[i] = w[i]
-                            .wrapping_add(small_sigma0(w[(i + 1) & 15]))
-                            .wrapping_add(w[(i + 9) & 15])
-                            .wrapping_add(small_sigma1(w[(i + 14) & 15]));
-                        w[i]
-                    };
+                for &wk in w.iter() {
                     let t1 = v[7]
                         .wrapping_add(big_sigma1(v[4]))
                         .wrapping_add(ch(v[4], v[5], v[6]))
-                        .wrapping_add(K[round])
-                        .wrapping_add(word);
+                        .wrapping_add(wk);
                     let t2 = big_sigma0(v[0]).wrapping_add(maj(v[0], v[1], v[2]));
                     v[7] = v[6];
                     v[6] = v[5];
@@ -327,8 +514,7 @@ pub mod sha256 {
                 for i in 0..8 {
                     state[i] = state[i].wrapping_add(v[i]);
                 }
-                // Scrub working variables and schedule words so key-derived
-                // pad blocks and chaining states do not linger on the stack.
+                // Scrub working variables so key-derived chaining states do not linger.
                 for word in &mut v {
                     unsafe { core::ptr::write_volatile(word, 0) };
                 }
@@ -346,64 +532,29 @@ pub mod sha256 {
                 let mut h = state[7];
 
                 macro_rules! sha256_round {
-                    ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident, $k:expr, $w:expr) => {{
+                    ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:ident, $g:ident, $h:ident, $wk:expr) => {{
                         let t1 = $h
                             .wrapping_add(big_sigma1($e))
                             .wrapping_add(ch($e, $f, $g))
-                            .wrapping_add($k)
-                            .wrapping_add($w);
+                            .wrapping_add($wk);
                         let t2 = big_sigma0($a).wrapping_add(maj($a, $b, $c));
                         $d = $d.wrapping_add(t1);
                         $h = t1.wrapping_add(t2);
                     }};
                 }
 
-                macro_rules! expand_word {
-                    ($idx:expr) => {{
-                        let i = $idx & 15;
-                        let s0 = small_sigma0(w[(i + 1) & 15]);
-                        let s1 = small_sigma1(w[(i + 14) & 15]);
-                        w[i] = w[i]
-                            .wrapping_add(s0)
-                            .wrapping_add(w[(i + 9) & 15])
-                            .wrapping_add(s1);
-                        w[i]
-                    }};
-                }
-
-                // Rounds 0..16: consume initial message schedule words directly.
-                let mut base = 0usize;
-                while base < 16 {
-                    sha256_round!(a, b, c, d, e, f, g, h, K[base], w[base]);
-                    sha256_round!(h, a, b, c, d, e, f, g, K[base + 1], w[base + 1]);
-                    sha256_round!(g, h, a, b, c, d, e, f, K[base + 2], w[base + 2]);
-                    sha256_round!(f, g, h, a, b, c, d, e, K[base + 3], w[base + 3]);
-                    sha256_round!(e, f, g, h, a, b, c, d, K[base + 4], w[base + 4]);
-                    sha256_round!(d, e, f, g, h, a, b, c, K[base + 5], w[base + 5]);
-                    sha256_round!(c, d, e, f, g, h, a, b, K[base + 6], w[base + 6]);
-                    sha256_round!(b, c, d, e, f, g, h, a, K[base + 7], w[base + 7]);
-                    base += 8;
-                }
-
-                // Rounds 16..64: expand message schedule in place over the 16-word ring.
-                while base < 64 {
-                    let w0 = expand_word!(base);
-                    sha256_round!(a, b, c, d, e, f, g, h, K[base], w0);
-                    let w1 = expand_word!(base + 1);
-                    sha256_round!(h, a, b, c, d, e, f, g, K[base + 1], w1);
-                    let w2 = expand_word!(base + 2);
-                    sha256_round!(g, h, a, b, c, d, e, f, K[base + 2], w2);
-                    let w3 = expand_word!(base + 3);
-                    sha256_round!(f, g, h, a, b, c, d, e, K[base + 3], w3);
-                    let w4 = expand_word!(base + 4);
-                    sha256_round!(e, f, g, h, a, b, c, d, K[base + 4], w4);
-                    let w5 = expand_word!(base + 5);
-                    sha256_round!(d, e, f, g, h, a, b, c, K[base + 5], w5);
-                    let w6 = expand_word!(base + 6);
-                    sha256_round!(c, d, e, f, g, h, a, b, K[base + 6], w6);
-                    let w7 = expand_word!(base + 7);
-                    sha256_round!(b, c, d, e, f, g, h, a, K[base + 7], w7);
-                    base += 8;
+                // Compact 8-round loop reading pre-added `wk = W[r] + K[r]`
+                // sequentially: 8 state regs + 1 slice ptr + 4 scratch regs =
+                // zero GPR spills and ~1 KiB L1I footprint.
+                for chunk in w.chunks_exact(8) {
+                    sha256_round!(a, b, c, d, e, f, g, h, chunk[0]);
+                    sha256_round!(h, a, b, c, d, e, f, g, chunk[1]);
+                    sha256_round!(g, h, a, b, c, d, e, f, chunk[2]);
+                    sha256_round!(f, g, h, a, b, c, d, e, chunk[3]);
+                    sha256_round!(e, f, g, h, a, b, c, d, chunk[4]);
+                    sha256_round!(d, e, f, g, h, a, b, c, chunk[5]);
+                    sha256_round!(c, d, e, f, g, h, a, b, chunk[6]);
+                    sha256_round!(b, c, d, e, f, g, h, a, chunk[7]);
                 }
 
                 // Update state
@@ -416,12 +567,6 @@ pub mod sha256 {
                 state[6] = state[6].wrapping_add(g);
                 state[7] = state[7].wrapping_add(h);
             }
-
-            // Scrub rolling schedule words so key-derived pad blocks do not linger.
-            for word in &mut w {
-                unsafe { core::ptr::write_volatile(word, 0) };
-            }
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -432,12 +577,13 @@ pub mod sha256 {
     ///
     /// Sized strictly larger than `compress_state`'s frame (and its transitive
     /// `update`/`finalize_in_place` frames in `digest_from_midstate`):
-    /// - release: `compress_state` ~200 B, `update`/`finalize_in_place` ~128 B
-    ///   -> 512 B (64 u64 words) covers the full callee stack footprint;
+    /// - release: `compress_words` ~64 B, `compress_state` ~320 B,
+    ///   `update`/`finalize_in_place` ~128 B -> 512 B (64 u64 words) covers
+    ///   the full callee stack footprint;
     /// - debug: `update`/`finalize_in_place` ~424 B + `compress_state` ~1048 B
     ///   -> 2048 B (256 u64 words) covers the full nested debug call footprint.
     #[inline(never)]
-    fn scrub_crypto_stack() {
+    pub fn scrub_crypto_stack() {
         #[cfg(debug_assertions)]
         const SCRUB_WORDS: usize = 256;
         #[cfg(not(debug_assertions))]

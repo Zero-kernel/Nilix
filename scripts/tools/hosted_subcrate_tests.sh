@@ -135,7 +135,7 @@ run_standalone_rust_suite() {
     echo "OK: ${name} matched its ${expected_passed}-test fail-closed oracle."
 }
 
-run_suite audit 19 0 \
+run_suite audit 21 0 \
     --manifest-path kernel/audit/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --lib --locked
@@ -176,7 +176,7 @@ run_suite livepatch 3 0 \
     --manifest-path kernel/livepatch/Cargo.toml \
     --target x86_64-unknown-linux-gnu --lib --locked
 
-run_suite mm 80 0 \
+run_suite mm 85 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -203,13 +203,13 @@ run_suite seccomp 16 0 \
 # test that is invalid in a hosted process. Keep the security-relevant RF186
 # allocator lifecycle pair executable and count-pinned until that legacy test
 # receives an explicit host-harness conversion.
-run_suite cap-rf186 2 10 \
+run_suite cap-rf186 3 10 \
     --manifest-path kernel/cap/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
     --lib --locked -- rf186_23_
 
-run_suite cap-cloexec 1 11 \
+run_suite cap-cloexec 1 12 \
     --manifest-path kernel/cap/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -246,14 +246,14 @@ run_suite cgroup-access 1 0 \
 
 # Includes the C3 aligned TID store and concurrent word tests, the C3
 # work-stealing hint with its model, and P2 wake-affine / placement / voluntary-yield policy tests.
-run_suite kernel-core 208 0 \
+run_suite kernel-core 213 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
     --lib --locked
 
-# Includes SMP AP trampoline GDT/CR4/CR3 sanitizer invariants and syscall frame layout tests.
-run_suite arch 6 0 \
+# Includes SMP AP trampoline GDT/CR4/CR3 sanitizer invariants, x2APIC helpers, and syscall frame layout tests.
+run_suite arch 8 0 \
     --manifest-path kernel/arch/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -286,7 +286,7 @@ run_suite mitigation-status 3 13 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
 
-run_suite mitigation-mappings 5 208 \
+run_suite mitigation-mappings 5 213 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

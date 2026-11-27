@@ -1274,6 +1274,24 @@ pub extern "C" fn ap_rust_entry(
 
     let cpu_idx = cpu_index as usize;
 
+    // Synchronize this AP's hardware LAPIC mode (x2APIC vs xAPIC) with the BSP
+    // BEFORE reading `apic::lapic_id()` or loading an IDT whose handlers may
+    // call `cpu_local::current_cpu_id()`.
+    if !unsafe { apic::enable_x2apic_for_ap_if_active() } {
+        klog!(
+            Error,
+            "[SMP] SECURITY: CPU {} does not support BSP x2APIC mode - halting AP",
+            cpu_idx
+        );
+        let _ = AP_BOOT_STATE.compare_exchange(
+            AP_BOOT_STARTING,
+            AP_BOOT_REJECTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        halt_rejected_ap();
+    }
+
     // R67-3 FIX: Verify hardware LAPIC ID matches trampoline data
     // Prevents CPU spoofing via malformed MADT or misrouted SIPI
     let lapic_expected = lapic_id as u32;

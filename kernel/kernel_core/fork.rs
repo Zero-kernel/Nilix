@@ -3,7 +3,7 @@
 //! 实现完整的进程复制功能，包含写时复制(COW)机制
 
 use crate::process::{
-    create_process, current_pid, free_address_space, free_kernel_stack, get_process,
+    create_process_arc_for_fork, current_pid, free_address_space, free_kernel_stack, get_process,
     FileDescriptor, ProcessArc, ProcessId,
 };
 use alloc::sync::Arc;
@@ -13,7 +13,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU32, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::{with_as_pt_lock, with_kernel_pt_lock};
-use mm::{arc_charge_bytes, try_reserve_heap, vec_charge_bytes, AdmittedMap, HeapClass};
+use mm::{try_reserve_heap, vec_charge_bytes, AdmittedMap, HeapClass};
 use spin::Mutex;
 // G.1 Observability: Watchdog handle type for cleanup_partial_child
 use trace::watchdog::{unregister_watchdog, WatchdogHandle};
@@ -167,19 +167,21 @@ impl Drop for ForkChargeGuard {
 pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
     let current = current_pid().ok_or(ForkError::NoCurrentProcess)?;
     let parent_process = get_process(current).ok_or(ForkError::ProcessNotFound)?;
+    sys_fork_with_parent(parent_process)
+}
 
-    // F.2: Check cgroup pids.max limit BEFORE creating any resources
-    // This prevents fork bombs and ensures cgroup limits are enforced
-    {
+/// Fast path for `syscall_dispatcher` which already resolved `parent_process`
+/// at syscall entry, avoiding a second `PROCESS_TABLE` lock acquisition.
+pub(crate) fn sys_fork_with_parent(
+    parent_process: ProcessArc,
+) -> Result<(ProcessId, ProcessId), ForkError> {
+    // F.2: Check cgroup pids.max limit and capture parent metadata + namespaces in ONE lock
+    // acquisition before creating any resources, then release before create_process_arc_for_fork.
+    let (parent_root, parent_pid, parent_prio, child_name, parent_ns) = {
         let parent = parent_process.lock();
         if !crate::cgroup::check_fork_allowed(parent.cgroup_id) {
             return Err(ForkError::CgroupPidsLimitExceeded);
         }
-    }
-
-    // 捕获父进程信息后释放锁，避免 create_process 再次获取锁导致潜在问题
-    let (parent_root, parent_pid, parent_prio, child_name) = {
-        let parent = parent_process.lock();
         let root = if parent.memory_space == 0 {
             let (cr3, _) = Cr3::read();
             cr3.start_address().as_u64() as usize
@@ -191,31 +193,34 @@ pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
             parent.pid,
             parent.priority,
             crate::process::ProcessNameSnapshot::from_parts(&parent.name, "-child"),
+            (
+                parent.pid_ns_for_children.clone(),
+                parent.mount_ns_for_children.clone(),
+            ),
         )
     };
 
-    // 创建子进程（此时未持有父进程锁，避免死锁）
-    // Z-7: create_process 现在返回 Result，失败时正确传播错误
-    let child_pid = create_process(child_name, parent_pid, parent_prio)
-        .map_err(|_| ForkError::ProcessCreationFailed)?;
+    // 创建子进程（此时未持有父进程锁，避免死锁），复用父进程 Arc 与命名空间快照
+    let (child_pid, child_process) = create_process_arc_for_fork(
+        child_name,
+        parent_pid,
+        parent_prio,
+        &parent_process,
+        parent_ns,
+    )
+    .map_err(|_| ForkError::ProcessCreationFailed)?;
 
-    // R180-19 PREPARE: policy and PID-namespace visibility used to be checked
-    // by syscall.rs only after fork_inner had COW-committed the parent.  Build
-    // immutable contexts from the prospective child now and reject/clean up
-    // before any cgroup charge or page-table mutation.
-    let child_process = match get_process(child_pid) {
-        Some(process) => process,
-        None => {
-            parent_process
-                .lock()
-                .children
-                .retain(|&pid| pid != child_pid);
-            cleanup_partial_child(child_pid);
-            return Err(ForkError::ProcessCreationFailed);
-        }
-    };
-    let (parent_ctx, child_ctx, parent_view_pid, child_credentials) =
-        prepare_fork_identity_or_cleanup(&parent_process, child_pid)?;
+    // R180-19 PREPARE: policy, PID-namespace visibility, and scheduler placement
+    // inputs are snapshotted in ONE parent PCB lock before any cgroup charge or
+    // page-table mutation.
+    let (
+        parent_ctx,
+        child_ctx,
+        parent_view_pid,
+        child_credentials,
+        child_allowed_cpus,
+        child_cpuset_id,
+    ) = prepare_fork_identity_or_cleanup(&parent_process, child_pid)?;
     let Some(parent_view_pid) = parent_view_pid else {
         parent_process
             .lock()
@@ -233,14 +238,8 @@ pub fn sys_fork() -> Result<(ProcessId, ProcessId), ForkError> {
         return Err(ForkError::SecurityDenied);
     }
 
-    // Scheduler placement consumes affinity + cpuset before taking any queue
-    // lock. Snapshot them under the parent PCB, release it, then initialize the
-    // unpublished child. This preserves fork inheritance while keeping the
-    // canonical READY_QUEUE -> PCB order (never parent PCB -> READY_QUEUE).
-    let (child_allowed_cpus, child_cpuset_id) = {
-        let parent = parent_process.lock();
-        (parent.allowed_cpus, parent.cpuset_id)
-    };
+    // Initialize unpublished child placement fields before scheduler admission
+    // (preserving canonical READY_QUEUE -> PCB order).
     {
         let mut child = child_process.lock();
         child.allowed_cpus = child_allowed_cpus;
@@ -324,6 +323,8 @@ fn prepare_fork_identity_or_cleanup(
         lsm::ProcessCtx,
         Option<ProcessId>,
         crate::process::Credentials,
+        u64,
+        u32,
     ),
     ForkError,
 > {
@@ -363,7 +364,14 @@ fn prepare_fork_identity_or_cleanup(
             child_credentials.euid,
             child_credentials.egid,
         );
-        Ok((parent_ctx, child_ctx, visible_pid, child_credentials))
+        Ok((
+            parent_ctx,
+            child_ctx,
+            visible_pid,
+            child_credentials,
+            parent.allowed_cpus,
+            parent.cpuset_id,
+        ))
     })();
     if result.is_err() {
         parent_process
@@ -523,32 +531,26 @@ fn kernel_stack_resume_is_admissible(parent_memory_space: usize) -> bool {
     parent_memory_space == 0
 }
 
-/// Fork 的内部实现，便于错误处理和回滚
-fn fork_inner(
+/// Prepared child metadata returned by `fork_prepare_child_state` after its
+/// stack frame has unwound and before the recursive COW page-table clone runs.
+struct PreparedForkState {
+    shared_ranges: mm::AdmittedVec<(usize, usize)>,
+    child_fd_count: u64,
+    charge_guard: ForkChargeGuard,
+    child_cpuset_id: u32,
+}
+
+/// Phase 1 of `fork_inner`: copy context, FDs, capabilities, credentials, VFS,
+/// MmState, and reserve cgroup charges. Marked `#[inline(never)]` so its large
+/// debug stack frame (including the 4 KiB shared-capability histogram) unwinds
+/// completely before `copy_page_table_cow_with_shared` descends into page-table
+/// cloning and buddy allocation.
+#[inline(never)]
+fn fork_prepare_child_state(
     parent: &mut crate::process::Process,
     child_process: &ProcessArc,
-    parent_root: usize,
     child_credentials: crate::process::Credentials,
-) -> Result<(), ForkError> {
-    // R122-1 FIX: Reject fork() while any mmap/munmap operation is in-flight.
-    //
-    // The three-phase mmap/munmap protocol (R121-4) encodes transient state in
-    // the low 12 bits of each mmap_regions entry (PENDING_MAP / PENDING_UNMAP).
-    // Committed entries always store page-aligned lengths (low 12 bits = 0).
-    //
-    // If a sibling thread (CLONE_VM) is between Phase 1 (reserve with PENDING
-    // flag) and Phase 3 (commit by clearing flag), copying the entry into the
-    // child — even after stripping the flag — produces an inconsistent child
-    // address space: the region record says "mapped" but the page table may be
-    // partially populated (PENDING_MAP) or partially torn down (PENDING_UNMAP).
-    //
-    // Returning MmapTransientState (mapped to EAGAIN) lets userspace retry.
-    // This is fail-closed: any non-zero low bits block fork, covering future
-    // transient flags as well.
-    //
-    // D3-ARC-MM-SHARED: mmap_regions now lives inside MmState behind parent.mm.
-    // Lock ordering: Process (held) → MmState — never reverse.
-    let _mm_fork_reservation = ForkMmReservation::acquire(Arc::clone(&parent.mm))?;
+) -> Result<PreparedForkState, ForkError> {
     // ST-K2-P2: snapshot shared-anonymous ranges while the parent MmState is
     // already locked below. The admitted temporary vector lives through the
     // PT transaction and is dropped only after the child view is prepared.
@@ -564,8 +566,16 @@ fn fork_inner(
     // (`notify_parent_of_group_exit`) while the parent forks the next child.
     let mut child = child_process.lock();
 
-    // 复制 CPU 上下文（RAX 在下方置 0）
-    child.context = parent.context;
+    // 复制 CPU 上下文：若父进程从未使用 FPU 且为 Ring-3 fork，跳过 512 字节 `fx` 无效拷贝
+    // （`child.context.fx` 已在 `Process::init_with_allocations_in_place` 中初始化为干净默认状态）。
+    let ring3_user_frame = crate::syscall::with_current_syscall_frame(|frame| *frame);
+    if ring3_user_frame.is_some() {
+        if parent.fpu_used {
+            child.context.fx = parent.context.fx;
+        }
+    } else {
+        child.context = parent.context;
+    }
     // Lazy FPU: inherit parent's FPU usage flag
     // If parent used FPU, the state in context.fx is valid and child inherits it
     child.fpu_used = parent.fpu_used;
@@ -594,8 +604,6 @@ fn fork_inner(
     // dispatched via switch_context; with_current_syscall_frame returns
     // None outside an active syscall window, which is exactly the
     // entry-state discriminator D1-ARC-ENTRY-STATE prescribes).
-    let ring3_user_frame = crate::syscall::with_current_syscall_frame(|frame| *frame);
-
     if let Some(frame) = ring3_user_frame {
         // ST-K3 FIX (F1): validate BEFORE seeding the child. `frame.rsp` and
         // `frame.rcx` come straight from the SYSCALL entry stub with no
@@ -756,11 +764,8 @@ fn fork_inner(
     child.rlimits = parent.rlimits;
 
     // M0 item 5: inherit signal dispositions + blocked mask across fork (POSIX).
-    // `[SigAction; NSIG]` and `u64` are Copy. `saved_blocked`/`in_signal_handler`
-    // are handler scratch state and intentionally stay born-clean in the child
-    // (a fork inside a handler does NOT carry the parent's live frame state). The
-    // "any handler installed" fast-path hint is a monotonic global, so the child
-    // inheriting a parent's handler needs no per-task bookkeeping here.
+    // Copy unconditionally so SIG_IGN dispositions and custom sa_flags/sa_mask
+    // are preserved even before any custom signal handler is installed.
     child.sigactions.copy_from(&parent.sigactions);
     child.blocked = parent.blocked;
 
@@ -837,19 +842,10 @@ fn fork_inner(
 
     // R39-3 FIX: 继承父进程的凭证（fork 创建独立副本）
     //
-    // fork() 创建的子进程获得父进程凭证的克隆副本（独立 Arc）。
-    // 这意味着子进程后续的 setuid/setgid 不会影响父进程。
-    // 对于 CLONE_THREAD，sys_clone 中会处理共享凭证。
-    let credential_arc_reservation = try_reserve_heap(
-        HeapClass::CoreProcess,
-        arc_charge_bytes::<crate::process::SharedCredentials>()
-            .map_err(|_| ForkError::MemoryAllocationFailed)?,
-    )
-    .map_err(|_| ForkError::MemoryAllocationFailed)?;
-    let credentials = Arc::try_new(crate::process::SharedCredentials::new(child_credentials))
-        .map_err(|_| ForkError::MemoryAllocationFailed)?;
-    child.install_shared_credentials_for_clone(credentials);
-    drop(credential_arc_reservation);
+    // `child` is unpublished and owns a freshly admitted, unshared
+    // `Arc<SharedCredentials>` from `try_new_pcb`; overwrite it in place
+    // instead of allocating and dropping a second `Arc`.
+    child.install_credentials_for_fork(child_credentials);
     // GAP-5 slice 2: fork deep-copies root/cwd/umask into the child's own
     // (already admitted) handle; parent and child are never shared.
     child.fs.copy_from(&parent.fs);
@@ -1064,8 +1060,10 @@ fn fork_inner(
         child_mm
             .reserve_shared_fault_pt(None)
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        child.mm = Arc::try_new(crate::owner_lock::OwnerCpuMutex::new(child_mm))
-            .map_err(|_| ForkError::MemoryAllocationFailed)?;
+        // `child` is unpublished and owns a freshly admitted, unshared
+        // `Arc<OwnerCpuMutex<MmState>>` from `try_new_pcb`; populate it in place
+        // instead of allocating and dropping a second `Arc`.
+        *child.mm.lock() = child_mm;
         charge_bytes
     };
 
@@ -1134,6 +1132,32 @@ fn fork_inner(
     #[cfg(debug_assertions)]
     kprintln!("[FORKDIAG] FD3 charged");
 
+    Ok(PreparedForkState {
+        shared_ranges,
+        child_fd_count,
+        charge_guard,
+        child_cpuset_id,
+    })
+}
+
+/// Fork 的内部实现，便于错误处理和回滚
+fn fork_inner(
+    parent: &mut crate::process::Process,
+    child_process: &ProcessArc,
+    parent_root: usize,
+    child_credentials: crate::process::Credentials,
+) -> Result<(), ForkError> {
+    // R122-1 FIX: Reject fork() while any mmap/munmap operation is in-flight.
+    // D3-ARC-MM-SHARED: mmap_regions now lives inside MmState behind parent.mm.
+    // Lock ordering: Process (held) → MmState — never reverse.
+    let _mm_fork_reservation = ForkMmReservation::acquire(Arc::clone(&parent.mm))?;
+    let PreparedForkState {
+        shared_ranges,
+        child_fd_count,
+        mut charge_guard,
+        child_cpuset_id,
+    } = fork_prepare_child_state(parent, child_process, child_credentials)?;
+
     // R180-19 FIX: the parent-PTE COW transition is the COMMIT point.
     // Every heap allocation, namespace/capability/credential clone, cgroup
     // charge, and child metadata build above has already succeeded.  The
@@ -1144,8 +1168,9 @@ fn fork_inner(
     let child_root_frame = frame_alloc
         .allocate_frame()
         .ok_or(ForkError::MemoryAllocationFailed)?;
+    // Buddy order-0 Invariant S2 guarantees every allocated frame is zeroed.
     unsafe {
-        zero_table(child_root_frame);
+        debug_assert_table_zeroed(child_root_frame);
     }
     let child_memory_space = child_root_frame.start_address().as_u64() as usize;
     let child_user_memory_space = unsafe {
@@ -1387,9 +1412,12 @@ pub unsafe fn copy_page_table_cow_with_shared(
 
         // Issue #109 §1.1 (H4): snapshot shared kernel high-half (256..512) under KERNEL_PT_LOCK.
         with_kernel_pt_lock(|| {
-            for i in 256..512 {
-                child_pml4[i] = parent_pml4[i].clone();
-            }
+            const _: () = assert!(core::mem::size_of::<PageTableEntry>() == 8);
+            core::ptr::copy_nonoverlapping(
+                (&parent_pml4[256] as *const PageTableEntry).cast::<u64>(),
+                (&mut child_pml4[256] as *mut PageTableEntry).cast::<u64>(),
+                256,
+            );
         });
         // The recursive slot names its own root, as in
         // `create_fresh_address_space`; the copy above named the parent's root,
@@ -1402,40 +1430,31 @@ pub unsafe fn copy_page_table_cow_with_shared(
             );
         }
 
-        // Z-8 fix: 两阶段 COW
-        // 阶段 1: 规划 - 收集叶子修改计划和所需中间页表帧数量
+        // R180-19 PREPARE: single-pass child tree build without modifying the
+        // parent. Every private intermediate table frame is recorded in the
+        // inline-backed rollback ledger before descending; any allocation error
+        // clears child PML4[0..256] and returns all private frames cleanly.
         let mut plan = CowClonePlan::new();
-        plan_clone_level(parent_pml4, 4, 0, shared_ranges, &mut plan)?;
-        #[cfg(debug_assertions)]
-        kprintln!(
-            "[FORKDIAG] FD4 planned leaves={} tables={}",
-            plan.leaf_updates.len(),
-            plan.tables_needed
-        );
-
-        // 阶段 2: 预分配所有中间页表帧
-        // 若分配失败，此时父进程未被修改，直接返回错误即可
-        let mut table_frames = preallocate_table_frames(plan.tables_needed, &mut frame_alloc)?;
-
-        // R180-19 PREPARE: build the complete child tree without modifying the
-        // parent.  Keep the exact frame vector alive as a rollback ledger; a
-        // PhysFrame value is non-owning, so dropping the Vec after COMMIT is safe.
-        let mut leaf_cursor = 0usize;
-        let mut frame_iter = table_frames.iter().copied();
-        build_child_clone_level(
+        let mut table_frames = InlineTableFrames::new();
+        if let Err(error) = clone_child_level(
             parent_pml4,
             child_pml4,
-            &mut frame_iter,
-            &plan,
-            &mut leaf_cursor,
+            &mut frame_alloc,
+            &mut table_frames,
+            &mut plan,
             4,
             0,
             shared_ranges,
-        );
-        debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
-        debug_assert!(frame_iter.next().is_none());
+        ) {
+            rollback_prepared_child_clone(child_pml4, &mut table_frames, &mut frame_alloc);
+            return Err(error);
+        }
         #[cfg(debug_assertions)]
-        kprintln!("[FORKDIAG] FD5 child-built");
+        kprintln!(
+            "[FORKDIAG] FD5 child-built leaves={} tables={}",
+            plan.leaf_updates.len(),
+            table_frames.len()
+        );
 
         // R180-19 PREPARE: KPTI construction used to happen after parent PTEs
         // were committed.  Build it over the unpublished child tree now.  Any
@@ -1477,17 +1496,27 @@ pub unsafe fn copy_page_table_cow_with_shared(
         #[cfg(debug_assertions)]
         kprintln!("[FORKDIAG] FD8 committed");
 
-        // R23-1 fix: 父进程页表被改成只读+BIT_9，需要刷新 TLB 才能生效
-        // 使用 TLB shootdown 机制，为 SMP 支持做准备
-        // 当前单核模式下，只做本地 flush
-        mm::flush_current_as_all();
+        // R23-1 fix: invalidate parent TLB entries for leaves whose WRITABLE bit
+        // actually transitioned 1 -> 0. When 0 leaves lost WRITABLE (all writable
+        // pages were already COW-marked), no hardware permission narrowed; when
+        // 1..=COW_MAX_TARGETED_FLUSH_PAGES narrowed, invalidate only those pages
+        // instead of flushing the entire parent TLB.
+        if plan.write_protected_count == 0 {
+            // No parent hardware permission narrowed.
+        } else if plan.write_protected_count <= COW_MAX_TARGETED_FLUSH_PAGES {
+            for &va in &plan.write_protected_addrs[..plan.write_protected_count] {
+                mm::flush_current_as_page(va);
+            }
+        } else {
+            mm::flush_current_as_all();
+        }
 
         kprintln!(
             "COW page table copy: parent=0x{:x}, child=0x{:x}, leaves={}, tables={}",
             parent_page_table,
             child_page_table,
             plan.leaf_updates.len(),
-            plan.tables_needed
+            table_frames.len()
         );
 
         Ok(user_memory_space)
@@ -1609,14 +1638,19 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
     // `None` means PT_LOCK is contended, which is transient and retryable — it is
     // NOT a property of the faulting page and must never terminate the task.
     let outcome = try_with_current_manager(VirtAddr::new(0), |manager| -> CowFaultResult {
-        // R114-3 FIX: Read PTE flags UNDER PT_LOCK via translate_with_flags().
-        // This eliminates the TOCTOU window that existed when find_pte() was called
-        // outside the lock scope.
-        let Some((old_phys, flags)) = manager.translate_with_flags(virt) else {
-            // Nothing mapped here at all: this is an ordinary access violation,
-            // not a COW resolution failure.
-            return CowFaultResult::NotCow;
+        // R114-3 FIX: Resolve the present 4 KiB leaf ONCE under PT_LOCK.
+        // Eliminates both the pre-R114 TOCTOU window and the duplicate 4-level
+        // walk + duplicate local invlpg on unique-owner and copy-on-write paths.
+        let leaf = match manager.lookup_present_leaf_mut(page) {
+            Ok(leaf) => leaf,
+            Err(_) => {
+                // Nothing mapped here as a mutable 4 KiB user leaf: ordinary
+                // access violation, not a COW resolution failure.
+                return CowFaultResult::NotCow;
+            }
         };
+        let old_frame = leaf.frame();
+        let flags = leaf.flags();
 
         // R65-21 FIX: After acquiring the lock, re-check if the page is still COW.
         // Another thread may have resolved this COW fault while we were waiting for the lock.
@@ -1637,8 +1671,6 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
             }
         }
 
-        let old_frame = PhysFrame::containing_address(old_phys);
-
         // R180-19 defense in depth: a failed/denied fork (and the ordinary
         // "child exited first" case) can leave this process as the sole COW
         // owner.  Requiring a fresh frame in that state turns recoverable memory
@@ -1650,7 +1682,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
                 unique_flags.remove(cow_flag());
                 unique_flags.remove(cow_readonly_flag());
                 unique_flags.insert(PageTableFlags::WRITABLE);
-                if manager.update_flags(page, unique_flags).is_err() {
+                if leaf.replace(old_frame, old_frame, unique_flags).is_err() {
                     let restored = PAGE_REF_COUNT
                         .restore_unique_claim(old_frame.start_address().as_u64() as usize);
                     debug_assert!(restored, "failed to restore unique COW claim");
@@ -1661,7 +1693,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
                     // Metadata corruption: restore the read-only PTE and the
                     // tracking reference if possible.  Never leave a writable
                     // mapping paired with an ambiguous ownership count.
-                    let _ = manager.update_flags(page, flags);
+                    let _ = manager.replace_page(page, old_frame, old_frame, flags);
                     let restored = PAGE_REF_COUNT
                         .restore_unique_claim(old_frame.start_address().as_u64() as usize);
                     debug_assert!(restored, "failed to unwind unique COW finalization");
@@ -1684,13 +1716,26 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
             }
         }
 
-        // 分配新物理页
-        let Some(new_frame) = frame_alloc.allocate_frame() else {
-            // R186-10: a genuine COW page we cannot satisfy under memory
-            // pressure. Reported as OutOfMemory, NOT as "not a COW page" —
-            // the previous collapse made allocator exhaustion look identical
-            // to an ordinary protection violation in every diagnostic.
-            return CowFaultResult::Fatal(CowFaultFailure::OutOfMemory);
+        // 分配新物理页 (strictly non-blocking inside #PF so contended PCP/buddy/
+        // transient-cache locks surface as retryable `CowFaultResult::Busy` via
+        // `IRETQ` instead of fatal `OutOfMemory`).
+        let new_frame = match mm::buddy_allocator::try_alloc_order0_nonblocking() {
+            Ok(frame) => frame,
+            Err(mm::buddy_allocator::AllocError::Busy) => {
+                return CowFaultResult::Busy;
+            }
+            Err(
+                mm::buddy_allocator::AllocError::MetadataCorrupt
+                | mm::buddy_allocator::AllocError::AllocatorPoisoned,
+            ) => {
+                return CowFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
+            }
+            Err(_) => {
+                // R186-10: genuine COW exhaustion (buddy, PCP, and transient
+                // caches all empty without contention). Reported as OutOfMemory,
+                // NOT as "not a COW page".
+                return CowFaultResult::Fatal(CowFaultFailure::OutOfMemory);
+            }
         };
 
         // 复制页内容（使用高半区直映访问物理内存）
@@ -1711,10 +1756,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> CowFau
         // LEAD-G8-CHILDREN-SEGV-1: keep PRESENT set throughout the replacement.
         // A sibling's hardware page walk sees either complete mapping. Failure
         // leaves the old leaf untouched; no remap/rollback allocation is needed.
-        if manager
-            .replace_page(page, old_frame, new_frame, new_flags)
-            .is_err()
-        {
+        if leaf.replace(old_frame, new_frame, new_flags).is_err() {
             frame_alloc.deallocate_frame(new_frame);
             return CowFaultResult::Fatal(CowFaultFailure::MappingFailed);
         }
@@ -2540,12 +2582,17 @@ impl PhysicalPageRefCount {
     /// delta is recorded in its leaf; any failure rolls back the staged prefix
     /// before a parent PTE has been changed.
     fn stage_clone_refs(&self, plan: &mut CowClonePlan) -> Result<(), ForkError> {
-        debug_assert!(plan.leaf_updates.iter().all(|leaf| leaf.ref_delta == 0));
+        let leaves = plan.leaf_updates.as_mut_slice();
+        debug_assert!(leaves.iter().all(|leaf| leaf.ref_delta == 0));
 
-        for index in 0..plan.leaf_updates.len() {
-            let (phys_addr, flags) = {
-                let leaf = &plan.leaf_updates[index];
-                (leaf.phys_addr.as_u64() as usize, leaf.original_flags)
+        for index in 0..leaves.len() {
+            let (phys_addr, flags, shared) = {
+                let leaf = &leaves[index];
+                (
+                    leaf.phys_addr.as_u64() as usize,
+                    leaf.original_flags,
+                    leaf.shared,
+                )
             };
 
             // Supervisor identity-map leaves are copied unchanged. Only actual
@@ -2555,21 +2602,21 @@ impl PhysicalPageRefCount {
             }
 
             let Some(slot) = Self::slot(phys_addr) else {
-                self.rollback_clone_refs(&mut plan.leaf_updates[..index]);
+                self.rollback_clone_refs(&mut leaves[..index]);
                 return Err(ForkError::PageTableCopyFailed);
             };
-            let delta = match if plan.leaf_updates[index].shared {
+            let delta = match if shared {
                 Self::stage_shared_slot(slot)
             } else {
                 Self::stage_slot(slot, flags)
             } {
                 Ok(delta) => delta,
                 Err(error) => {
-                    self.rollback_clone_refs(&mut plan.leaf_updates[..index]);
+                    self.rollback_clone_refs(&mut leaves[..index]);
                     return Err(error);
                 }
             };
-            plan.leaf_updates[index].ref_delta = delta;
+            leaves[index].ref_delta = delta;
         }
 
         Ok(())
@@ -2657,6 +2704,7 @@ pub(crate) const fn cow_readonly_flag() -> PageTableFlags {
 /// 记录叶子节点需要应用的 COW 修改
 ///
 /// 存储父 PTE 指针、原始标志和物理地址，用于应用阶段
+#[derive(Clone, Copy)]
 struct LeafUpdate {
     /// 父进程页表项指针
     entry_ptr: *mut PageTableEntry,
@@ -2672,222 +2720,321 @@ struct LeafUpdate {
     shared: bool,
 }
 
+// Release builds have full NRVO and tiny stack frames, so 64 inline leaves
+// (~2 KiB) avoid heap allocation on typical processes. Unoptimized debug
+// builds duplicate value-returned structs across helper frames, so cap inline
+// capacity to 8 (~320 B) there to keep the fork call chain well under the
+// 32 KiB kernel stack budget.
+#[cfg(not(debug_assertions))]
+const COW_INLINE_LEAVES: usize = 64;
+#[cfg(debug_assertions)]
+const COW_INLINE_LEAVES: usize = 8;
+const COW_INLINE_TABLES: usize = 16;
+const COW_MAX_TARGETED_FLUSH_PAGES: usize = 8;
+
+/// Small-buffer-optimized leaf ledger: avoids global heap allocator lock
+/// acquisitions on typical processes (<= 96 leaves) while falling back cleanly
+/// to a fallible `Vec` for larger address spaces.
+enum InlineLeafUpdates {
+    Inline {
+        buf: [core::mem::MaybeUninit<LeafUpdate>; COW_INLINE_LEAVES],
+        len: usize,
+    },
+    Heap(Vec<LeafUpdate>),
+}
+
+impl InlineLeafUpdates {
+    fn new() -> Self {
+        Self::Inline {
+            buf: [const { core::mem::MaybeUninit::uninit() }; COW_INLINE_LEAVES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[LeafUpdate] {
+        match self {
+            Self::Inline { buf, len } => unsafe {
+                core::slice::from_raw_parts(buf.as_ptr().cast::<LeafUpdate>(), *len)
+            },
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [LeafUpdate] {
+        match self {
+            Self::Inline { buf, len } => unsafe {
+                core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<LeafUpdate>(), *len)
+            },
+            Self::Heap(v) => v.as_mut_slice(),
+        }
+    }
+
+    fn try_push(&mut self, item: LeafUpdate) -> Result<(), ForkError> {
+        match self {
+            Self::Inline { buf, len } => {
+                if *len < COW_INLINE_LEAVES {
+                    buf[*len].write(item);
+                    *len += 1;
+                    return Ok(());
+                }
+                let mut vec = Vec::new();
+                if vec.try_reserve(COW_INLINE_LEAVES * 2).is_err() {
+                    return Err(ForkError::MemoryAllocationFailed);
+                }
+                let existing =
+                    unsafe { core::slice::from_raw_parts(buf.as_ptr().cast::<LeafUpdate>(), *len) };
+                vec.extend_from_slice(existing);
+                vec.push(item);
+                *self = Self::Heap(vec);
+                Ok(())
+            }
+            Self::Heap(v) => {
+                if v.try_reserve(1).is_err() {
+                    return Err(ForkError::MemoryAllocationFailed);
+                }
+                v.push(item);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Small-buffer-optimized rollback ledger for private child intermediate table frames.
+enum InlineTableFrames {
+    Inline {
+        buf: [PhysFrame<Size4KiB>; COW_INLINE_TABLES],
+        len: usize,
+    },
+    Heap(Vec<PhysFrame<Size4KiB>>),
+}
+
+impl InlineTableFrames {
+    fn new() -> Self {
+        Self::Inline {
+            buf: [PhysFrame::containing_address(PhysAddr::new(0)); COW_INLINE_TABLES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    fn try_push(&mut self, frame: PhysFrame<Size4KiB>) -> Result<(), ForkError> {
+        match self {
+            Self::Inline { buf, len } => {
+                if *len < COW_INLINE_TABLES {
+                    buf[*len] = frame;
+                    *len += 1;
+                    return Ok(());
+                }
+                let mut vec = Vec::new();
+                if vec.try_reserve(COW_INLINE_TABLES * 2).is_err() {
+                    return Err(ForkError::MemoryAllocationFailed);
+                }
+                vec.extend_from_slice(&buf[..*len]);
+                vec.push(frame);
+                *self = Self::Heap(vec);
+                Ok(())
+            }
+            Self::Heap(v) => {
+                if v.try_reserve(1).is_err() {
+                    return Err(ForkError::MemoryAllocationFailed);
+                }
+                v.push(frame);
+                Ok(())
+            }
+        }
+    }
+
+    fn deallocate_all_rev(&mut self, frame_alloc: &mut FrameAllocator) {
+        match self {
+            Self::Inline { buf, len } => {
+                for frame in buf[..*len].iter().rev().copied() {
+                    frame_alloc.deallocate_frame(frame);
+                }
+                *len = 0;
+            }
+            Self::Heap(v) => {
+                for frame in v.drain(..).rev() {
+                    frame_alloc.deallocate_frame(frame);
+                }
+            }
+        }
+    }
+}
+
 /// 记录 COW 复制计划
 ///
-/// 包含所有叶子修改和需要的中间页表帧数量
+/// 包含所有叶子修改与需要失效 TLB 的写保护虚拟地址
 struct CowClonePlan {
     /// 叶子节点修改列表
-    leaf_updates: Vec<LeafUpdate>,
-    /// 需要的中间页表帧数量
-    tables_needed: usize,
+    leaf_updates: InlineLeafUpdates,
+    /// Virtual addresses of user leaves whose WRITABLE bit transitions 1 -> 0.
+    write_protected_addrs: [VirtAddr; COW_MAX_TARGETED_FLUSH_PAGES],
+    /// Total count of leaves whose WRITABLE bit transitions 1 -> 0.
+    write_protected_count: usize,
 }
 
 impl CowClonePlan {
     fn new() -> Self {
         CowClonePlan {
-            leaf_updates: Vec::new(),
-            tables_needed: 0,
+            leaf_updates: InlineLeafUpdates::new(),
+            write_protected_addrs: [VirtAddr::new(0); COW_MAX_TARGETED_FLUSH_PAGES],
+            write_protected_count: 0,
         }
     }
 
     // R163-36 FIX: Fallible push to prevent OOM panic during COW planning.
-    fn record_leaf(&mut self, entry: &mut PageTableEntry, shared: bool) -> Result<(), ForkError> {
-        if self.leaf_updates.try_reserve(1).is_err() {
-            return Err(ForkError::MemoryAllocationFailed);
-        }
-        self.leaf_updates.push(LeafUpdate {
+    fn record_leaf(
+        &mut self,
+        entry: &mut PageTableEntry,
+        virt_addr: usize,
+        shared: bool,
+    ) -> Result<LeafUpdate, ForkError> {
+        let original_flags = entry.flags();
+        let leaf = LeafUpdate {
             entry_ptr: entry as *mut PageTableEntry,
-            original_flags: entry.flags(),
+            original_flags,
             phys_addr: entry.addr(),
             ref_delta: 0,
             shared,
-        });
-        Ok(())
-    }
-}
-
-/// 第一阶段：规划 - 遍历收集叶子修改计划并统计需要的新页表帧数量
-///
-/// 此阶段不修改任何页表项，仅收集信息
-fn plan_clone_level(
-    parent: &mut PageTable,
-    level: u8,
-    virt_base: usize,
-    shared_ranges: &[(usize, usize)],
-    plan: &mut CowClonePlan,
-) -> Result<(), ForkError> {
-    // 只处理用户空间（PML4 的索引 0-255）
-    let idx_range = if level == 4 { 0..256 } else { 0..512 };
-
-    for idx in idx_range {
-        let entry = &mut parent[idx];
-        if entry.is_unused() || !entry.flags().contains(PageTableFlags::PRESENT) {
-            continue;
-        }
-
-        // RF180-20 FIX: supervisor-only intermediate entries in the identity
-        // map are shared borrow paths, not user-owned COW leaves. Do not plan
-        // private descendants for them; the apply phase preserves the shared
-        // pointer directly. User-accessible branches remain fully planned.
-        if level > 1 && !entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-            continue;
-        }
-
-        let shift = match level {
-            4 => 39,
-            3 => 30,
-            2 => 21,
-            1 => 12,
-            _ => return Err(ForkError::PageTableCopyFailed),
         };
-        let entry_base = virt_base | (idx << shift);
-        if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            // 叶子节点：记录到计划中
-            let leaf_len = if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                1usize << shift
-            } else {
-                1usize << 12
-            };
-            let leaf_end = entry_base
-                .checked_add(leaf_len)
-                .ok_or(ForkError::PageTableCopyFailed)?;
-            let shared = shared_ranges
-                .iter()
-                .any(|&(start, end)| entry_base < end && leaf_end > start);
-            plan.record_leaf(entry, shared)?;
-        } else {
-            // 中间节点：计数并递归
-            plan.tables_needed += 1;
-            let parent_next = unsafe { phys_to_virt_table(entry.addr()) };
-            plan_clone_level(parent_next, level - 1, entry_base, shared_ranges, plan)?;
-        }
-    }
-    Ok(())
-}
-
-/// 第二阶段：预分配所有需要的中间页表帧
-///
-/// 若分配失败，此时父进程未被修改，直接返回错误即可
-///
-/// # Z-8b fix: 部分分配失败时回收已分配的帧
-///
-/// 当分配第 N 个帧失败时，回收已分配的 0..N-1 个帧，
-/// 避免物理帧泄漏导致内存 DoS。
-fn preallocate_table_frames(
-    count: usize,
-    frame_alloc: &mut FrameAllocator,
-) -> Result<Vec<PhysFrame<Size4KiB>>, ForkError> {
-    // R163-5 FIX: Fallible allocation to prevent OOM panic during fork.
-    let mut frames = Vec::new();
-    if frames.try_reserve_exact(count).is_err() {
-        return Err(ForkError::MemoryAllocationFailed);
-    }
-    for _ in 0..count {
-        match frame_alloc.allocate_frame() {
-            Some(frame) => frames.push(frame),
-            None => {
-                // Z-8b fix: 回收已分配的帧，避免部分失败导致物理帧泄漏
-                for frame in frames.drain(..) {
-                    frame_alloc.deallocate_frame(frame);
-                }
-                return Err(ForkError::MemoryAllocationFailed);
+        self.leaf_updates.try_push(leaf)?;
+        if !shared
+            && original_flags.contains(PageTableFlags::USER_ACCESSIBLE)
+            && original_flags.contains(PageTableFlags::WRITABLE)
+        {
+            if self.write_protected_count < COW_MAX_TARGETED_FLUSH_PAGES {
+                self.write_protected_addrs[self.write_protected_count] =
+                    VirtAddr::new(virt_addr as u64);
             }
+            self.write_protected_count = self.write_protected_count.saturating_add(1);
         }
+        Ok(leaf)
     }
-    Ok(frames)
 }
 
-/// R180-19 PREPARE: build the unpublished child page-table tree.
-///
-/// This consumes only preallocated frames and never changes a parent entry.
-/// Keeping parent mutation out of this traversal is what permits KPTI and all
-/// other fallible setup to complete before the transaction's commit point.
-fn build_child_clone_level(
+/// R180-19 PREPARE: single-pass child page-table tree construction without
+/// touching any parent PTE. Uses 4x u64 zero-skipping and pre-zeroed order-0
+/// table frames (Buddy Invariant S2). On any allocation failure, callers roll
+/// back `child_pml4[0..256]` and every frame recorded in `table_frames`.
+fn clone_child_level(
     parent: &mut PageTable,
     child: &mut PageTable,
-    frames: &mut impl Iterator<Item = PhysFrame<Size4KiB>>,
-    plan: &CowClonePlan,
-    leaf_cursor: &mut usize,
+    frame_alloc: &mut FrameAllocator,
+    table_frames: &mut InlineTableFrames,
+    plan: &mut CowClonePlan,
     level: u8,
     virt_base: usize,
     shared_ranges: &[(usize, usize)],
-) {
-    // 只处理用户空间（PML4 的索引 0-255）
-    let idx_range = if level == 4 { 0..256 } else { 0..512 };
+) -> Result<(), ForkError> {
+    const _: () = assert!(core::mem::size_of::<PageTableEntry>() == 8);
+    const _: () = assert!(core::mem::size_of::<PageTable>() == 512 * 8);
+    let idx_limit = if level == 4 { 256usize } else { 512usize };
+    let shift = match level {
+        4 => 39,
+        3 => 30,
+        2 => 21,
+        1 => 12,
+        _ => return Err(ForkError::PageTableCopyFailed),
+    };
+    let raw_ptr = (parent as *const PageTable).cast::<u64>();
 
-    for idx in idx_range {
-        let entry = &mut parent[idx];
-        if entry.is_unused() || !entry.flags().contains(PageTableFlags::PRESENT) {
-            continue;
-        }
-
-        // RF180-20 FIX: preserve supervisor-only identity-map intermediates as
-        // shared pointers. Allocating private copies here would make teardown
-        // ambiguous and either corrupt the shared tree or leak the private one.
-        if level > 1 && !entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-            child[idx] = entry.clone();
-            continue;
-        }
-
-        let shift = match level {
-            4 => 39,
-            3 => 30,
-            2 => 21,
-            1 => 12,
-            _ => return,
+    let mut base_idx = 0usize;
+    while base_idx < idx_limit {
+        let (w0, w1, w2, w3) = unsafe {
+            (
+                *raw_ptr.add(base_idx),
+                *raw_ptr.add(base_idx + 1),
+                *raw_ptr.add(base_idx + 2),
+                *raw_ptr.add(base_idx + 3),
+            )
         };
-        let entry_base = virt_base | (idx << shift);
-        if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            // Leaf: prepare only the child's COW view.  The parent is committed
-            // later from the stable plan after KPTI and refcounts are ready.
-            let planned = plan
-                .leaf_updates
-                .get(*leaf_cursor)
-                .expect("COW prepare traversal must match its locked plan");
-            *leaf_cursor += 1;
-            debug_assert_eq!(
-                planned.entry_ptr, entry as *mut PageTableEntry,
-                "COW prepare plan pointer mismatch"
-            );
-            let leaf_len = if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                1usize << shift
-            } else {
-                1usize << 12
-            };
-            let leaf_end = entry_base.saturating_add(leaf_len);
-            debug_assert_eq!(
-                planned.shared,
-                shared_ranges
-                    .iter()
-                    .any(|&(start, end)| entry_base < end && leaf_end > start),
-                "shared-range plan drifted between COW passes"
-            );
-            build_child_leaf(&mut child[idx], planned);
-        } else {
-            // 中间节点：使用预分配帧
-            let frame = frames
-                .next()
-                .expect("COW apply must have one preallocated frame per planned table");
-            unsafe {
-                zero_table(frame);
+        if (w0 | w1 | w2 | w3) == 0 {
+            base_idx += 4;
+            continue;
+        }
+        for idx in base_idx..base_idx + 4 {
+            if unsafe { *raw_ptr.add(idx) } == 0 {
+                continue;
+            }
+            let entry = &mut parent[idx];
+            let entry_flags = entry.flags();
+            if entry.is_unused() || !entry_flags.contains(PageTableFlags::PRESENT) {
+                continue;
             }
 
-            child[idx].set_addr(frame.start_address(), entry.flags());
+            // RF180-20 FIX: preserve supervisor-only identity-map intermediates as
+            // shared pointers. Allocating private copies here would make teardown
+            // ambiguous and either corrupt the shared tree or leak the private one.
+            if level > 1 && !entry_flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                child[idx] = entry.clone();
+                continue;
+            }
 
-            let parent_next = unsafe { phys_to_virt_table(entry.addr()) };
-            let child_next = unsafe { phys_to_virt_table(frame.start_address()) };
-            build_child_clone_level(
-                parent_next,
-                child_next,
-                frames,
-                plan,
-                leaf_cursor,
-                level - 1,
-                entry_base,
-                shared_ranges,
-            );
+            let entry_base = virt_base | (idx << shift);
+            if level == 1 || entry_flags.contains(PageTableFlags::HUGE_PAGE) {
+                let leaf_len = if entry_flags.contains(PageTableFlags::HUGE_PAGE) {
+                    1usize << shift
+                } else {
+                    1usize << 12
+                };
+                let leaf_end = entry_base
+                    .checked_add(leaf_len)
+                    .ok_or(ForkError::PageTableCopyFailed)?;
+                let shared = !shared_ranges.is_empty()
+                    && shared_ranges
+                        .iter()
+                        .any(|&(start, end)| entry_base < end && leaf_end > start);
+                let planned = plan.record_leaf(entry, entry_base, shared)?;
+                build_child_leaf(&mut child[idx], &planned);
+            } else {
+                // Allocate pre-zeroed intermediate table frame (Buddy Invariant S2).
+                let frame = frame_alloc
+                    .allocate_frame()
+                    .ok_or(ForkError::MemoryAllocationFailed)?;
+                if let Err(err) = table_frames.try_push(frame) {
+                    frame_alloc.deallocate_frame(frame);
+                    return Err(err);
+                }
+                unsafe {
+                    debug_assert_table_zeroed(frame);
+                }
+
+                child[idx].set_addr(frame.start_address(), entry_flags);
+
+                let parent_next = unsafe { phys_to_virt_table(entry.addr()) };
+                let child_next = unsafe { phys_to_virt_table(frame.start_address()) };
+                clone_child_level(
+                    parent_next,
+                    child_next,
+                    frame_alloc,
+                    table_frames,
+                    plan,
+                    level - 1,
+                    entry_base,
+                    shared_ranges,
+                )?;
+            }
         }
+        base_idx += 4;
     }
+    Ok(())
 }
 
 #[inline]
@@ -2926,7 +3073,7 @@ fn build_child_leaf(child_entry: &mut PageTableEntry, planned: &LeafUpdate) {
 /// plan.  The caller has already staged exact refcounts and owns every child
 /// resource; this pass performs no allocation and has no failure branch.
 unsafe fn commit_parent_cow(plan: &CowClonePlan) {
-    for planned in plan.leaf_updates.iter() {
+    for planned in plan.leaf_updates.as_slice().iter() {
         if planned.shared {
             continue;
         }
@@ -2936,10 +3083,14 @@ unsafe fn commit_parent_cow(plan: &CowClonePlan) {
         {
             continue;
         }
+        let new_flags = cloned_leaf_flags(planned);
+        if new_flags == planned.original_flags {
+            continue;
+        }
         debug_assert!(!planned.entry_ptr.is_null());
         let parent_entry = &mut *planned.entry_ptr;
         debug_assert_eq!(parent_entry.addr(), planned.phys_addr);
-        parent_entry.set_addr(planned.phys_addr, cloned_leaf_flags(planned));
+        parent_entry.set_addr(planned.phys_addr, new_flags);
     }
 }
 
@@ -2948,15 +3099,13 @@ unsafe fn commit_parent_cow(plan: &CowClonePlan) {
 /// first prevents generic cleanup from following frames after they are returned.
 fn rollback_prepared_child_clone(
     child_pml4: &mut PageTable,
-    table_frames: &mut Vec<PhysFrame<Size4KiB>>,
+    table_frames: &mut InlineTableFrames,
     frame_alloc: &mut FrameAllocator,
 ) {
     for index in 0..256 {
         child_pml4[index].set_unused();
     }
-    for frame in table_frames.drain(..).rev() {
-        frame_alloc.deallocate_frame(frame);
-    }
+    table_frames.deallocate_all_rev(frame_alloc);
 }
 
 /// Combined leaf helper retained for the boot-time COW regression probes.
@@ -3153,9 +3302,6 @@ pub fn run_cow_refcount_self_test() {
     let production_slot = PhysicalPageRefCount::slot(base).expect("first managed slot");
     assert_eq!(production_slot.load(Ordering::Acquire), 0);
     let mut plan = CowClonePlan::new();
-    plan.leaf_updates
-        .try_reserve_exact(3)
-        .expect("three-leaf rollback plan");
     let invalid_phys = base
         .checked_add(pages * 4096)
         .expect("managed-window end fits usize");
@@ -3164,20 +3310,26 @@ pub fn run_cow_refcount_self_test() {
         (base, user_readonly | cow_readonly_flag()),
         (invalid_phys, user_writable),
     ] {
-        plan.leaf_updates.push(LeafUpdate {
-            entry_ptr: core::ptr::null_mut(),
-            original_flags: flags,
-            phys_addr: PhysAddr::new(phys as u64),
-            ref_delta: 0,
-            shared: false,
-        });
+        plan.leaf_updates
+            .try_push(LeafUpdate {
+                entry_ptr: core::ptr::null_mut(),
+                original_flags: flags,
+                phys_addr: PhysAddr::new(phys as u64),
+                ref_delta: 0,
+                shared: false,
+            })
+            .expect("three-leaf rollback plan");
     }
     let staged = x86_64::instructions::interrupts::without_interrupts(|| {
         PAGE_REF_COUNT.stage_clone_refs(&mut plan)
     });
     assert!(matches!(staged, Err(ForkError::PageTableCopyFailed)));
     assert_eq!(production_slot.load(Ordering::Acquire), 0);
-    assert!(plan.leaf_updates.iter().all(|leaf| leaf.ref_delta == 0));
+    assert!(plan
+        .leaf_updates
+        .as_slice()
+        .iter()
+        .all(|leaf| leaf.ref_delta == 0));
 
     let supervisor_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
     let mut supervisor_parent = PageTableEntry::new();
@@ -3504,6 +3656,25 @@ unsafe fn zero_table(frame: PhysFrame) {
     core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
 }
 
+/// Debug-only verification of Buddy Invariant S2 (every order-0 frame returned
+/// by `FrameAllocator::allocate_frame()` is already zeroed).
+#[inline]
+unsafe fn debug_assert_table_zeroed(frame: PhysFrame) {
+    #[cfg(debug_assertions)]
+    {
+        let ptr = mm::phys_to_virt(frame.start_address()).as_ptr::<u64>();
+        for i in 0..512 {
+            debug_assert_eq!(
+                *ptr.add(i),
+                0,
+                "Buddy Invariant S2 violated: non-zero order-0 page table frame"
+            );
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = frame;
+}
+
 /// RF178-15 FIX: private-frame rollback ledger for fresh address spaces.
 /// The constructor allocates at most root + PDPT + PD + PT (the `PML4[0]`
 /// skeleton); the copied higher-half entries are shared and never freed here.
@@ -3680,12 +3851,12 @@ pub fn create_kpti_user_pml4(
         return Err(ForkError::PageTableCopyFailed);
     }
 
-    // Allocate user PML4 root
+    // Allocate user PML4 root (pre-zeroed by Buddy Invariant S2)
     let user_pml4_frame = frame_alloc
         .allocate_frame()
         .ok_or(ForkError::MemoryAllocationFailed)?;
     unsafe {
-        zero_table(user_pml4_frame);
+        debug_assert_table_zeroed(user_pml4_frame);
     }
 
     // R118-5 FIX: Allocate a dedicated PDPT for the entry island (PML4[511]).
@@ -3708,7 +3879,7 @@ pub fn create_kpti_user_pml4(
         }
     };
     unsafe {
-        zero_table(entry_island_pdpt_frame);
+        debug_assert_table_zeroed(entry_island_pdpt_frame);
     }
 
     let kernel_pml4_frame: PhysFrame<Size4KiB> =
@@ -3729,11 +3900,32 @@ pub fn create_kpti_user_pml4(
         // ── Share user-half entries (PML4[0..255]) ──
         //
         // These are raw pointer copies — the user PML4 shares the same PDPT/PD/PT
-        // frames as the kernel PML4. A PML4 entry created later reaches this
-        // root through `mm::page_table`'s mirror (LEAD-KPTI-PML4-1), which runs
-        // after every page-table edit of the running address space.
-        for i in 0..USER_HALF_END {
-            user_pml4[i] = kernel_pml4[i].clone();
+        // frames as the kernel PML4. `user_pml4` is pre-zeroed, so skip 4 zero
+        // entries at a time.
+        const _: () = assert!(core::mem::size_of::<PageTableEntry>() == 8);
+        let src_ptr = (kernel_pml4 as *const PageTable).cast::<u64>();
+        let dst_ptr = (user_pml4 as *mut PageTable).cast::<u64>();
+        let mut base = 0usize;
+        while base < USER_HALF_END {
+            let w0 = *src_ptr.add(base);
+            let w1 = *src_ptr.add(base + 1);
+            let w2 = *src_ptr.add(base + 2);
+            let w3 = *src_ptr.add(base + 3);
+            if (w0 | w1 | w2 | w3) != 0 {
+                if w0 != 0 {
+                    *dst_ptr.add(base) = w0;
+                }
+                if w1 != 0 {
+                    *dst_ptr.add(base + 1) = w1;
+                }
+                if w2 != 0 {
+                    *dst_ptr.add(base + 2) = w2;
+                }
+                if w3 != 0 {
+                    *dst_ptr.add(base + 3) = w3;
+                }
+            }
+            base += 4;
         }
 
         // ── Ensure no recursive mapping ──
@@ -3900,4 +4092,97 @@ unsafe fn build_user_low_skeleton(
     pdpt[PDPT_IDX].set_frame(pd_frame, parent);
     new_pml4[0].set_frame(pdpt_frame, parent);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_leaf_updates_and_table_frames_spill_to_heap_cleanly() {
+        let mut leaves = InlineLeafUpdates::new();
+        let total_leaves = COW_INLINE_LEAVES + 12;
+        for i in 0..total_leaves {
+            let item = LeafUpdate {
+                entry_ptr: core::ptr::null_mut(),
+                original_flags: PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
+                phys_addr: PhysAddr::new(0x10_0000 + (i as u64) * 4096),
+                ref_delta: (i & 3) as u32,
+                shared: i % 5 == 0,
+            };
+            leaves.try_push(item).expect("push leaf update");
+        }
+        assert_eq!(leaves.len(), total_leaves);
+        assert!(matches!(leaves, InlineLeafUpdates::Heap(_)));
+        for (i, item) in leaves.as_slice().iter().enumerate() {
+            assert_eq!(item.phys_addr.as_u64(), 0x10_0000 + (i as u64) * 4096);
+            assert_eq!(item.ref_delta, (i & 3) as u32);
+            assert_eq!(item.shared, i % 5 == 0);
+        }
+
+        let mut frames = InlineTableFrames::new();
+        let total_frames = COW_INLINE_TABLES + 6;
+        for i in 0..total_frames {
+            let frame = PhysFrame::containing_address(PhysAddr::new(0x20_0000 + (i as u64) * 4096));
+            frames.try_push(frame).expect("push table frame");
+        }
+        assert_eq!(frames.len(), total_frames);
+        assert!(matches!(frames, InlineTableFrames::Heap(_)));
+    }
+
+    #[test]
+    fn cow_clone_plan_tracks_only_private_writable_user_transitions() {
+        let mut plan = CowClonePlan::new();
+        let mut entry = PageTableEntry::new();
+
+        // Read-only user leaf -> does not narrow WRITABLE.
+        entry.set_addr(
+            PhysAddr::new(0x1000),
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE,
+        );
+        plan.record_leaf(&mut entry, 0x40_0000, false).unwrap();
+        assert_eq!(plan.write_protected_count, 0);
+
+        // Already-CoW user leaf -> WRITABLE already 0.
+        entry.set_addr(
+            PhysAddr::new(0x2000),
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | cow_flag(),
+        );
+        plan.record_leaf(&mut entry, 0x40_1000, false).unwrap();
+        assert_eq!(plan.write_protected_count, 0);
+
+        // Shared writable user leaf -> stays writable, does not narrow.
+        entry.set_addr(
+            PhysAddr::new(0x3000),
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE,
+        );
+        plan.record_leaf(&mut entry, 0x40_2000, true).unwrap();
+        assert_eq!(plan.write_protected_count, 0);
+
+        // Supervisor writable leaf -> ignored.
+        entry.set_addr(
+            PhysAddr::new(0x4000),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+        plan.record_leaf(&mut entry, 0x40_3000, false).unwrap();
+        assert_eq!(plan.write_protected_count, 0);
+
+        // Private writable user leaves -> tracked up to COW_MAX_TARGETED_FLUSH_PAGES,
+        // count continues past the cap so caller switches to full AS flush.
+        entry.set_addr(
+            PhysAddr::new(0x5000),
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE,
+        );
+        for i in 0..(COW_MAX_TARGETED_FLUSH_PAGES + 3) {
+            let va = 0x50_0000 + i * 4096;
+            plan.record_leaf(&mut entry, va, false).unwrap();
+        }
+        assert_eq!(plan.write_protected_count, COW_MAX_TARGETED_FLUSH_PAGES + 3);
+        for i in 0..COW_MAX_TARGETED_FLUSH_PAGES {
+            assert_eq!(
+                plan.write_protected_addrs[i],
+                VirtAddr::new((0x50_0000 + i * 4096) as u64)
+            );
+        }
+    }
 }

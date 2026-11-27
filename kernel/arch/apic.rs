@@ -308,16 +308,128 @@ pub unsafe fn init_bsp_tick() {
 }
 
 // ============================================================================
-// LAPIC Operations
+// LAPIC Operations (xAPIC MMIO + x2APIC MSR)
 // ============================================================================
+
+/// IA32_APIC_BASE architectural MSR address.
+const IA32_APIC_BASE_MSR: u32 = 0x1B;
+/// IA32_APIC_BASE bit 10: x2APIC Mode Enable (EXTD).
+const APIC_BASE_EXTD_BIT: u64 = 1 << 10;
+/// IA32_APIC_BASE bit 11: APIC Global Enable (EN).
+const APIC_BASE_EN_BIT: u64 = 1 << 11;
+/// Base MSR address for x2APIC register space (Intel SDM Vol. 3A §10.12.1.2).
+pub const X2APIC_MSR_BASE: u32 = 0x800;
+/// Maximum xAPIC register offset mapped into the x2APIC MSR range (`0x800..=0x83F`).
+const X2APIC_MAX_OFFSET: u32 = 0x3F0;
+/// Maximum LAPIC ID representable by `cpu_local`'s 256-entry reverse map.
+const MAX_SUPPORTED_LAPIC_ID: u32 = 255;
+
+/// Convert a 16-byte-aligned xAPIC MMIO register offset into its x2APIC MSR
+/// address (`0x800 + (offset >> 4)`).
+#[inline]
+pub const fn x2apic_msr_for_offset(reg: u32) -> u32 {
+    debug_assert!((reg & 0xF) == 0 && reg <= X2APIC_MAX_OFFSET);
+    X2APIC_MSR_BASE + (reg >> 4)
+}
+
+/// Encode a 64-bit `IA32_X2APIC_ICR` (`MSR 0x830`) value from the 32-bit
+/// destination APIC ID (bits 63:32) and 32-bit ICR command word (bits 31:0).
+#[inline]
+pub const fn encode_x2apic_icr(dest_lapic_id: u32, icr_low: u32) -> u64 {
+    ((dest_lapic_id as u64) << 32) | (icr_low as u64)
+}
+
+/// Extract the hardware LAPIC ID from a raw ID register value in either x2APIC
+/// (full 32-bit MSR `0x802`) or legacy xAPIC (bits 31:24 of MMIO `0x020`) mode.
+#[inline]
+pub const fn decode_lapic_id(raw: u32, x2apic: bool) -> u32 {
+    if x2apic {
+        raw
+    } else {
+        (raw >> 24) & 0xFF
+    }
+}
+
+/// Return whether the current CPU advertises x2APIC support (`CPUID.01H:ECX[21]`).
+#[inline]
+pub fn x2apic_supported() -> bool {
+    // SAFETY: CPUID leaves 0 and 1 exist on every x86_64 processor.
+    unsafe {
+        core::arch::x86_64::__cpuid(0).eax >= 1
+            && (core::arch::x86_64::__cpuid(1).ecx & (1 << 21)) != 0
+    }
+}
+
+/// Return whether the platform Local APIC is currently operating in x2APIC mode.
+#[inline]
+pub fn x2apic_enabled() -> bool {
+    cpu_local::x2apic_active()
+}
+
+#[inline]
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") msr,
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack, preserves_flags)
+    );
+    ((high as u64) << 32) | (low as u64)
+}
+
+#[inline]
+unsafe fn wrmsr(msr: u32, value: u64) {
+    core::arch::asm!(
+        "wrmsr",
+        in("ecx") msr,
+        in("eax") value as u32,
+        in("edx") (value >> 32) as u32,
+        options(nomem, nostack, preserves_flags)
+    );
+}
+
+/// Write the 64-bit `IA32_X2APIC_ICR` MSR (`0x830`).
+///
+/// Intel SDM Vol. 3A §12.12.3: unlike uncacheable xAPIC MMIO writes, `WRMSR`
+/// to `IA32_X2APIC_ICR` is non-serializing with respect to prior WB memory
+/// stores. Execute `MFENCE; LFENCE` immediately before `WRMSR` (without
+/// `nomem`, acting as a full compiler memory barrier as well) so all
+/// mailbox/trampoline/need_resched stores are globally visible and serialized
+/// before the IPI reaches its target CPU.
+#[inline]
+unsafe fn x2apic_write_icr(dest_lapic_id: u32, icr_low: u32) {
+    let msr = x2apic_msr_for_offset(lapic::ICR_LOW);
+    let value = encode_x2apic_icr(dest_lapic_id, icr_low);
+    core::arch::asm!(
+        "mfence",
+        "lfence",
+        "wrmsr",
+        in("ecx") msr,
+        in("eax") value as u32,
+        in("edx") (value >> 32) as u32,
+        options(nostack, preserves_flags)
+    );
+}
 
 /// Read a LAPIC register
 ///
 /// # Safety
 ///
-/// The LAPIC must be mapped at the stored base address.
+/// The LAPIC must be mapped at the stored base address (xAPIC) or enabled in
+/// x2APIC mode (`reg` must be a valid readable x2APIC register).
 #[inline]
 pub unsafe fn lapic_read(reg: u32) -> u32 {
+    if cpu_local::x2apic_active() {
+        debug_assert!(
+            reg != lapic::DFR && reg != lapic::ICR_HIGH,
+            "x2APIC does not support reading offset {:#x}",
+            reg
+        );
+        return rdmsr(x2apic_msr_for_offset(reg)) as u32;
+    }
     // R169-L7 FIX: read through the single authoritative base in `cpu_local`.
     let base = cpu_local::lapic_mmio_base();
     let addr = (base + reg as u64) as *const u32;
@@ -328,9 +440,19 @@ pub unsafe fn lapic_read(reg: u32) -> u32 {
 ///
 /// # Safety
 ///
-/// The LAPIC must be mapped at the stored base address.
+/// The LAPIC must be mapped at the stored base address (xAPIC) or enabled in
+/// x2APIC mode (`reg` must be a valid writable 32-bit x2APIC register).
 #[inline]
 pub unsafe fn lapic_write(reg: u32, value: u32) {
+    if cpu_local::x2apic_active() {
+        debug_assert!(
+            reg != lapic::DFR && reg != lapic::LDR && reg != lapic::ICR_HIGH,
+            "x2APIC does not support writing offset {:#x}",
+            reg
+        );
+        wrmsr(x2apic_msr_for_offset(reg), value as u64);
+        return;
+    }
     // R169-L7 FIX: write through the single authoritative base in `cpu_local`.
     let base = cpu_local::lapic_mmio_base();
     let addr = (base + reg as u64) as *mut u32;
@@ -341,10 +463,12 @@ pub unsafe fn lapic_write(reg: u32, value: u32) {
 ///
 /// # Safety
 ///
-/// LAPIC must be initialized.
+/// LAPIC must be initialized (and in x2APIC mode on this CPU whenever
+/// `cpu_local::x2apic_active()` is true).
 #[inline]
 pub unsafe fn lapic_id() -> u32 {
-    (lapic_read(lapic::ID) >> 24) & 0xFF
+    let x2apic = cpu_local::x2apic_active();
+    decode_lapic_id(lapic_read(lapic::ID), x2apic)
 }
 
 /// Send End of Interrupt to LAPIC
@@ -357,7 +481,13 @@ pub unsafe fn lapic_id() -> u32 {
 /// Must be called in interrupt context after handling the interrupt.
 #[inline]
 pub unsafe fn lapic_eoi() {
-    lapic_write(lapic::EOI, 0);
+    if cpu_local::x2apic_active() {
+        wrmsr(x2apic_msr_for_offset(lapic::EOI), 0);
+    } else {
+        let base = cpu_local::lapic_mmio_base();
+        let addr = (base + lapic::EOI as u64) as *mut u32;
+        write_volatile(addr, 0);
+    }
 }
 
 // ============================================================================
@@ -671,21 +801,9 @@ pub unsafe fn lapic_timer_running() -> bool {
 
 /// Check if LAPIC is enabled in hardware
 pub fn lapic_hw_enabled() -> bool {
-    // Read IA32_APIC_BASE MSR (0x1B)
-    let low: u32;
-    let high: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdmsr",
-            in("ecx") 0x1Bu32,
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack)
-        );
-    }
-    let msr_value = ((high as u64) << 32) | (low as u64);
+    let msr_value = unsafe { rdmsr(IA32_APIC_BASE_MSR) };
     // Bit 11 is the APIC Global Enable flag
-    (msr_value & (1 << 11)) != 0
+    (msr_value & APIC_BASE_EN_BIT) != 0
 }
 
 /// Enable LAPIC in hardware via IA32_APIC_BASE MSR
@@ -694,83 +812,110 @@ pub fn lapic_hw_enabled() -> bool {
 ///
 /// This modifies CPU state and should only be called during early boot.
 pub unsafe fn lapic_hw_enable() {
-    let msr: u32 = 0x1B;
-    let mut low: u32;
-    let mut high: u32;
+    let msr_value = rdmsr(IA32_APIC_BASE_MSR);
+    if (msr_value & APIC_BASE_EN_BIT) == 0 {
+        wrmsr(IA32_APIC_BASE_MSR, msr_value | APIC_BASE_EN_BIT);
+    }
+}
 
-    // Read current value
-    core::arch::asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") low,
-        out("edx") high,
-        options(nomem, nostack)
-    );
+/// Transition the current CPU's Local APIC into x2APIC mode (`EN=1, EXTD=1`).
+///
+/// Intel SDM Vol. 3A Table 10-5 forbids transitioning directly from disabled
+/// `(EN=0, EXTD=0)` to x2APIC `(EN=1, EXTD=1)` in one write; enable `EN` first
+/// if clear, then set `EXTD`.
+///
+/// # Safety
+///
+/// Caller must have verified `x2apic_supported()` on this CPU.
+unsafe fn enable_x2apic_hw() {
+    let mut msr_value = rdmsr(IA32_APIC_BASE_MSR);
+    if (msr_value & APIC_BASE_EN_BIT) == 0 {
+        msr_value |= APIC_BASE_EN_BIT;
+        wrmsr(IA32_APIC_BASE_MSR, msr_value);
+    }
+    if (msr_value & APIC_BASE_EXTD_BIT) == 0 {
+        msr_value |= APIC_BASE_EXTD_BIT;
+        wrmsr(IA32_APIC_BASE_MSR, msr_value);
+    }
+}
 
-    // Set bit 11 (Global Enable) and preserve base address
-    low |= 1 << 11;
-
-    // Write back
-    core::arch::asm!(
-        "wrmsr",
-        in("ecx") msr,
-        in("eax") low,
-        in("edx") high,
-        options(nomem, nostack)
-    );
+/// Synchronize a newly booted AP's Local APIC hardware mode with the BSP's
+/// published x2APIC state BEFORE the AP invokes `apic::lapic_id()` or loads
+/// an IDT that might consult `cpu_local::current_cpu_id()`.
+///
+/// Returns `true` if this AP's LAPIC matches the platform mode, or `false` if
+/// the BSP enabled x2APIC but this AP does not support it (caller must reject
+/// and halt the AP).
+///
+/// # Safety
+///
+/// Must run on an AP during early `ap_rust_entry` with interrupts disabled.
+pub unsafe fn enable_x2apic_for_ap_if_active() -> bool {
+    if !cpu_local::x2apic_active() {
+        return true;
+    }
+    if !x2apic_supported() {
+        return false;
+    }
+    enable_x2apic_hw();
+    let msr_value = rdmsr(IA32_APIC_BASE_MSR);
+    (msr_value & (APIC_BASE_EN_BIT | APIC_BASE_EXTD_BIT)) == (APIC_BASE_EN_BIT | APIC_BASE_EXTD_BIT)
 }
 
 /// R169-L7 FIX: detect the LAPIC operating mode and MMIO base from
 /// `IA32_APIC_BASE` and publish them to `cpu_local` — the single runtime
 /// authority that `current_cpu_id()` and `lapic_read`/`lapic_write` share.
 ///
-/// This is the *only* publisher of that state, so the base/mode can never be out
-/// of sync with the hardware. It is boot-time only and fails closed on any
-/// configuration this kernel does not support (x2APIC mode, or a firmware
-/// relocated LAPIC base), rather than silently performing invalid MMIO or
-/// aliasing per-CPU data. Idempotent: re-reading the MSR yields the same values.
-///
-/// Called as early as possible in BSP boot (before the IDT is installed, so the
-/// guard covers the first exception that could touch per-CPU state) and again at
-/// each LAPIC init; the idempotence makes the repeated calls harmless.
+/// In xAPIC mode (`EXTD=0`), fails closed if firmware relocated the LAPIC MMIO
+/// base away from `LAPIC_MMIO_DEFAULT_BASE`. In x2APIC mode (`EXTD=1`), all
+/// LAPIC accesses use MSRs `0x800..=0x83F` and the MMIO aperture is unused.
 ///
 /// # Safety
 ///
-/// Reads an MSR; must run at CPL0 during early boot.
+/// Reads an MSR; must run at CPL0 during early boot on BSP.
 pub unsafe fn publish_lapic_state() {
-    // IA32_APIC_BASE (MSR 0x1B): bit 10 = x2APIC enable (EXTD), bits 12+ = base.
-    let low: u32;
-    let high: u32;
-    core::arch::asm!(
-        "rdmsr",
-        in("ecx") 0x1Bu32,
-        out("eax") low,
-        out("edx") high,
-        options(nomem, nostack)
-    );
-    let msr_value = ((high as u64) << 32) | (low as u64);
-    let x2apic = (msr_value & (1 << 10)) != 0;
+    let msr_value = rdmsr(IA32_APIC_BASE_MSR);
+    let x2apic = (msr_value & APIC_BASE_EXTD_BIT) != 0;
     let base = msr_value & 0xFFFF_F000;
 
-    cpu_local::set_x2apic_active(x2apic);
+    if !x2apic {
+        // Only the architected base is supported in xAPIC mode: the identity-map
+        // hardening carve-out preserves exactly LAPIC_MMIO_DEFAULT_BASE. A
+        // firmware-relocated base would make MMIO reads target an unmapped page.
+        assert!(
+            base == cpu_local::LAPIC_MMIO_DEFAULT_BASE as u64,
+            "publish_lapic_state: relocated LAPIC base {:#x} is unsupported",
+            base
+        );
+    }
 
-    // arch::apic is xAPIC-MMIO only: the LAPIC register window is invalid in
-    // x2APIC mode and the 256-entry cpu_local reverse map cannot represent
-    // >8-bit x2APIC IDs. Refuse to proceed rather than corrupt per-CPU state.
-    assert!(
-        !x2apic,
-        "publish_lapic_state: x2APIC mode is unsupported (arch::apic is xAPIC-MMIO only)"
+    cpu_local::set_x2apic_active(x2apic);
+    // Memory initialization publishes a high-half alias for xAPIC mode.
+}
+
+/// Validate that an AP's `IA32_APIC_BASE` operating mode (and MMIO base in
+/// xAPIC mode) agrees with the global state published by the BSP.
+///
+/// # Safety
+///
+/// Must run on an AP at CPL0 during `init_lapic_for_ap`.
+unsafe fn validate_ap_lapic_state() {
+    let msr_value = rdmsr(IA32_APIC_BASE_MSR);
+    let ap_x2apic = (msr_value & APIC_BASE_EXTD_BIT) != 0;
+    let expected_x2apic = cpu_local::x2apic_active();
+    assert_eq!(
+        ap_x2apic, expected_x2apic,
+        "validate_ap_lapic_state: AP x2APIC mode ({}) disagrees with BSP ({})",
+        ap_x2apic, expected_x2apic
     );
-    // Only the architected base is supported: the identity-map hardening carve-out
-    // preserves exactly LAPIC_MMIO_DEFAULT_BASE. A firmware-relocated base would
-    // make these MMIO reads target an unmapped/aliased page, so fail closed.
-    assert!(
-        base == cpu_local::LAPIC_MMIO_DEFAULT_BASE as u64,
-        "publish_lapic_state: relocated LAPIC base {:#x} is unsupported",
-        base
-    );
-    // Memory initialization publishes a high-half alias. AP initialization
-    // revalidates the physical aperture without reverting that shared address.
+    if !ap_x2apic {
+        let base = msr_value & 0xFFFF_F000;
+        assert!(
+            base == cpu_local::LAPIC_MMIO_DEFAULT_BASE as u64,
+            "validate_ap_lapic_state: relocated LAPIC base {:#x} is unsupported",
+            base
+        );
+    }
 }
 
 /// Install the LAPIC alias inherited by all process kernel address spaces.
@@ -819,8 +964,22 @@ pub unsafe fn init_lapic() {
         lapic_hw_enable();
     }
 
-    // Store BSP LAPIC ID
+    // Prefer x2APIC mode when CPUID.01H:ECX[21] is supported: eliminates
+    // KVM xAPIC MMIO VM-exits on every IPI, EOI, and timer-tick ID check.
+    if !cpu_local::x2apic_active() && x2apic_supported() {
+        enable_x2apic_hw();
+        publish_lapic_state();
+    }
+    let x2apic = cpu_local::x2apic_active();
+
+    // Store BSP LAPIC ID (fail closed if ID exceeds 8-bit reverse-map capacity)
     let id = lapic_id();
+    assert!(
+        id <= MAX_SUPPORTED_LAPIC_ID,
+        "init_lapic: BSP LAPIC ID {} exceeds supported reverse-map capacity ({})",
+        id,
+        MAX_SUPPORTED_LAPIC_ID
+    );
     BSP_LAPIC_ID.store(id, Ordering::Relaxed);
 
     // Clear any existing errors
@@ -830,15 +989,18 @@ pub unsafe fn init_lapic() {
     // Set Task Priority to accept all interrupts
     lapic_write(lapic::TPR, 0);
 
-    // Set Destination Format Register to flat model
-    lapic_write(lapic::DFR, 0xFFFF_FFFF);
+    if !x2apic {
+        // DFR is reserved and LDR is read-only in x2APIC mode (writing raises #GP).
+        // Set Destination Format Register to flat model (xAPIC only).
+        lapic_write(lapic::DFR, 0xFFFF_FFFF);
 
-    // Set a per-CPU logical destination bit in flat mode.  Reusing literal 1
-    // on every CPU aliases all logical destinations and can deliver a
-    // broadcast IPI to the wrong scheduler.  LAPIC flat mode has eight bits;
-    // systems with larger IDs use physical-destination IPIs in this kernel.
-    let logical_bit = 1u32 << (id & 7);
-    lapic_write(lapic::LDR, logical_bit << 24);
+        // Set a per-CPU logical destination bit in flat mode.  Reusing literal 1
+        // on every CPU aliases all logical destinations and can deliver a
+        // broadcast IPI to the wrong scheduler.  LAPIC flat mode has eight bits;
+        // systems with larger IDs use physical-destination IPIs in this kernel.
+        let logical_bit = 1u32 << (id & 7);
+        lapic_write(lapic::LDR, logical_bit << 24);
+    }
 
     // Configure LVT entries: keep local sources masked, but allow legacy PIC via LINT0 (ExtINT)
     // LINT0 connects to the 8259 PIC's INTR output on the BSP; masking it blocks all PIC IRQs.
@@ -875,17 +1037,15 @@ pub unsafe fn init_lapic() {
 /// - Must be called from AP context (not BSP)
 /// - LAPIC MMIO region must be accessible
 pub unsafe fn init_lapic_for_ap() {
-    // R169-L7 FIX: re-validate the LAPIC base + mode from this AP's IA32_APIC_BASE
-    // before its per-CPU slot is touched in cpu_local::init_ap. The x2APIC flag and
-    // base are global and already published by the BSP (and again early in BSP
-    // boot), so this is a redundant per-AP confirmation; it runs before init_ap's
-    // current_cpu_id() slot access, so an unsupported AP fails closed there.
-    publish_lapic_state();
+    // R169-L7 FIX: re-validate that this AP's IA32_APIC_BASE operating mode
+    // (and MMIO base in xAPIC mode) agrees with the BSP before cpu_local::init_ap.
+    validate_ap_lapic_state();
 
     // Enable LAPIC in hardware if not already
     if !lapic_hw_enabled() {
         lapic_hw_enable();
     }
+    let x2apic = cpu_local::x2apic_active();
 
     // Clear any existing errors
     lapic_write(lapic::ESR, 0);
@@ -894,13 +1054,16 @@ pub unsafe fn init_lapic_for_ap() {
     // Set Task Priority to accept all interrupts
     lapic_write(lapic::TPR, 0);
 
-    // Set Destination Format Register to flat model
-    lapic_write(lapic::DFR, 0xFFFF_FFFF);
+    if !x2apic {
+        // DFR is reserved and LDR is read-only in x2APIC mode (writing raises #GP).
+        // Set Destination Format Register to flat model (xAPIC only).
+        lapic_write(lapic::DFR, 0xFFFF_FFFF);
 
-    // Match the BSP's flat-mode logical assignment, but derive it from this
-    // AP's own LAPIC ID so logical destinations remain distinct.
-    let logical_bit = 1u32 << (lapic_id() & 7);
-    lapic_write(lapic::LDR, logical_bit << 24);
+        // Match the BSP's flat-mode logical assignment, but derive it from this
+        // AP's own LAPIC ID so logical destinations remain distinct.
+        let logical_bit = 1u32 << (lapic_id() & 7);
+        lapic_write(lapic::LDR, logical_bit << 24);
+    }
 
     // Mask all LVT entries - APs should NOT have ExtINT on LINT0
     // Only the BSP is connected to the 8259 PIC
@@ -977,6 +1140,19 @@ unsafe fn wait_icr_idle() {
 ///
 /// LAPIC must be initialized. The vector must be valid for the delivery mode.
 pub unsafe fn send_ipi_raw(dest_lapic_id: u32, vector: u8, delivery_mode: u32) {
+    let icr_low = (vector as u32)
+        | delivery_mode
+        | icr_dest::NO_SHORTHAND
+        | icr_flags::LEVEL_ASSERT
+        | icr_flags::TRIGGER_EDGE;
+
+    if cpu_local::x2apic_active() {
+        // Intel SDM Vol. 3A §10.12.9: x2APIC ICR is a single 64-bit MSR write
+        // with no Delivery Status polling (bit 12 is reserved in x2APIC).
+        x2apic_write_icr(dest_lapic_id, icr_low);
+        return;
+    }
+
     wait_icr_idle();
 
     // Write destination to ICR high (bits 56-63 of physical APIC ID)
@@ -984,11 +1160,6 @@ pub unsafe fn send_ipi_raw(dest_lapic_id: u32, vector: u8, delivery_mode: u32) {
 
     // Write vector, delivery mode, and edge trigger to ICR low
     // This triggers the IPI
-    let icr_low = (vector as u32)
-        | delivery_mode
-        | icr_dest::NO_SHORTHAND
-        | icr_flags::LEVEL_ASSERT
-        | icr_flags::TRIGGER_EDGE;
     lapic_write(lapic::ICR_LOW, icr_low);
 }
 
@@ -1000,6 +1171,16 @@ pub unsafe fn send_ipi_raw(dest_lapic_id: u32, vector: u8, delivery_mode: u32) {
 ///
 /// Only valid during AP startup sequence.
 pub unsafe fn send_init_ipi(dest_lapic_id: u32) {
+    if cpu_local::x2apic_active() {
+        // Intel SDM Vol. 3A §10.12.9 Table 10-7: x2APIC uses a single
+        // edge-triggered INIT Assert write; INIT Level De-assert is invalid.
+        x2apic_write_icr(
+            dest_lapic_id,
+            icr_delivery::INIT | icr_flags::LEVEL_ASSERT | icr_flags::TRIGGER_EDGE,
+        );
+        return;
+    }
+
     wait_icr_idle();
 
     lapic_write(lapic::ICR_HIGH, dest_lapic_id << 24);
@@ -1033,13 +1214,16 @@ pub unsafe fn send_init_ipi(dest_lapic_id: u32) {
 ///
 /// Only valid during AP startup sequence after INIT IPI.
 pub unsafe fn send_sipi(dest_lapic_id: u32, start_page: u8) {
+    let icr_low = (start_page as u32) | icr_delivery::STARTUP | icr_flags::TRIGGER_EDGE;
+    if cpu_local::x2apic_active() {
+        x2apic_write_icr(dest_lapic_id, icr_low);
+        return;
+    }
+
     wait_icr_idle();
 
     lapic_write(lapic::ICR_HIGH, dest_lapic_id << 24);
-    lapic_write(
-        lapic::ICR_LOW,
-        (start_page as u32) | icr_delivery::STARTUP | icr_flags::TRIGGER_EDGE,
-    );
+    lapic_write(lapic::ICR_LOW, icr_low);
 }
 
 /// Broadcast an IPI to all CPUs except self
@@ -1048,16 +1232,19 @@ pub unsafe fn send_sipi(dest_lapic_id: u32, start_page: u8) {
 ///
 /// LAPIC must be initialized.
 pub unsafe fn broadcast_ipi_all_except_self(vector: u8) {
+    let icr_low = (vector as u32)
+        | icr_delivery::FIXED
+        | icr_dest::ALL_EXCLUDING_SELF
+        | icr_flags::TRIGGER_EDGE;
+    if cpu_local::x2apic_active() {
+        x2apic_write_icr(0, icr_low);
+        return;
+    }
+
     wait_icr_idle();
 
     lapic_write(lapic::ICR_HIGH, 0);
-    lapic_write(
-        lapic::ICR_LOW,
-        (vector as u32)
-            | icr_delivery::FIXED
-            | icr_dest::ALL_EXCLUDING_SELF
-            | icr_flags::TRIGGER_EDGE,
-    );
+    lapic_write(lapic::ICR_LOW, icr_low);
 }
 
 // ============================================================================
@@ -1247,7 +1434,12 @@ pub fn print_status() {
 
     if lapic_init {
         let bsp_id = bsp_lapic_id();
-        klog_always!("  LAPIC: enabled (BSP ID: {})", bsp_id);
+        let mode = if cpu_local::x2apic_active() {
+            "x2APIC"
+        } else {
+            "xAPIC"
+        };
+        klog_always!("  LAPIC: enabled (BSP ID: {}, mode: {})", bsp_id, mode);
     } else {
         klog_always!("  LAPIC: not initialized");
     }
@@ -1256,5 +1448,44 @@ pub fn print_status() {
         klog_always!("  I/O APIC: enabled");
     } else {
         klog_always!("  I/O APIC: not initialized (using 8259 PIC)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x2apic_msr_mapping_and_icr_encoding() {
+        assert_eq!(x2apic_msr_for_offset(lapic::ID), 0x802);
+        assert_eq!(x2apic_msr_for_offset(lapic::VERSION), 0x803);
+        assert_eq!(x2apic_msr_for_offset(lapic::TPR), 0x808);
+        assert_eq!(x2apic_msr_for_offset(lapic::EOI), 0x80B);
+        assert_eq!(x2apic_msr_for_offset(lapic::SIVR), 0x80F);
+        assert_eq!(x2apic_msr_for_offset(lapic::ICR_LOW), 0x830);
+        assert_eq!(x2apic_msr_for_offset(lapic::LVT_TIMER), 0x832);
+        assert_eq!(x2apic_msr_for_offset(lapic::TIMER_INIT), 0x838);
+        assert_eq!(x2apic_msr_for_offset(lapic::TIMER_CURRENT), 0x839);
+        assert_eq!(x2apic_msr_for_offset(lapic::TIMER_DIVIDE), 0x83E);
+
+        let icr = encode_x2apic_icr(0x0000_000F, 0x0000_40FE);
+        assert_eq!(icr, 0x0000_000F_0000_40FE);
+        assert_eq!(
+            encode_x2apic_icr(0x1234_5678, 0x89AB_CDEF),
+            0x1234_5678_89AB_CDEF
+        );
+    }
+
+    #[test]
+    fn decode_lapic_id_distinguishes_xapic_and_x2apic() {
+        // Legacy xAPIC stores the 8-bit ID in bits 31:24.
+        assert_eq!(decode_lapic_id(0x0F00_0000, false), 15);
+        assert_eq!(decode_lapic_id(0xFF12_3456, false), 0xFF);
+        assert_eq!(decode_lapic_id(0x0000_000F, false), 0);
+
+        // Native x2APIC returns the full 32-bit MSR 0x802 value directly.
+        assert_eq!(decode_lapic_id(15, true), 15);
+        assert_eq!(decode_lapic_id(0x0F00_0000, true), 0x0F00_0000);
+        assert_eq!(decode_lapic_id(0xFFFF_FFFF, true), 0xFFFF_FFFF);
     }
 }

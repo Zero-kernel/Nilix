@@ -885,8 +885,76 @@ fn finish_pending_prev() -> bool {
 pub static READY_QUEUE: CpuLocal<Mutex<ReadyQueues>> =
     CpuLocal::new(|| Mutex::new(ReadyQueues::new()));
 
-lazy_static! {
-    pub static ref SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats::new());
+/// Cache-line isolated per-CPU scheduler counters so high-frequency `fork()`,
+/// `remove_process()`, context switches, and timer ticks never contend on a
+/// global spinlock or bounce a shared cache line across cores.
+#[repr(align(64))]
+struct PerCpuSchedStats {
+    total_switches: AtomicU64,
+    total_ticks: AtomicU64,
+    processes_created: AtomicU64,
+    processes_terminated: AtomicU64,
+}
+
+impl PerCpuSchedStats {
+    const fn new() -> Self {
+        Self {
+            total_switches: AtomicU64::new(0),
+            total_ticks: AtomicU64::new(0),
+            processes_created: AtomicU64::new(0),
+            processes_terminated: AtomicU64::new(0),
+        }
+    }
+}
+
+static PER_CPU_SCHED_STATS: [PerCpuSchedStats; cpu_local::max_cpus()] =
+    [const { PerCpuSchedStats::new() }; cpu_local::max_cpus()];
+
+#[inline]
+fn record_sched_stat_switch(cpu_id: usize) {
+    if let Some(slot) = PER_CPU_SCHED_STATS.get(cpu_id) {
+        slot.total_switches.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn record_sched_stat_tick(cpu_id: usize) {
+    if let Some(slot) = PER_CPU_SCHED_STATS.get(cpu_id) {
+        slot.total_ticks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn record_sched_stat_created() {
+    if let Some(slot) = PER_CPU_SCHED_STATS.get(cpu_local::current_cpu_id()) {
+        slot.processes_created.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn record_sched_stat_terminated() {
+    if let Some(slot) = PER_CPU_SCHED_STATS.get(cpu_local::current_cpu_id()) {
+        slot.processes_terminated.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn snapshot_sched_stats() -> SchedulerStats {
+    let mut snap = SchedulerStats::new();
+    for slot in &PER_CPU_SCHED_STATS {
+        snap.total_switches = snap
+            .total_switches
+            .saturating_add(slot.total_switches.load(Ordering::Relaxed));
+        snap.total_ticks = snap
+            .total_ticks
+            .saturating_add(slot.total_ticks.load(Ordering::Relaxed));
+        snap.processes_created = snap
+            .processes_created
+            .saturating_add(slot.processes_created.load(Ordering::Relaxed));
+        snap.processes_terminated = snap
+            .processes_terminated
+            .saturating_add(slot.processes_terminated.load(Ordering::Relaxed));
+    }
+    snap
 }
 
 /// Load balancing tick counter (only driven on CPU0 to reduce contention)
@@ -906,6 +974,10 @@ impl TickDebt {
 }
 static TICK_DEBT: [TickDebt; cpu_local::max_cpus()] =
     [const { TickDebt::new() }; cpu_local::max_cpus()];
+/// Lock-free mirror of whether `TICK_DEBT[cpu]` holds pending tick debt,
+/// allowing `reschedule_now` to skip `cli`/`sti` on the 99% non-reschedule path.
+static TICK_DEBT_PENDING: [AtomicBool; cpu_local::max_cpus()] =
+    [const { AtomicBool::new(false) }; cpu_local::max_cpus()];
 
 /// Generation paired with the scheduler's per-CPU current PID. A fixed array
 /// avoids lazy allocation on the timer IRQ's first touch.
@@ -1052,11 +1124,13 @@ fn defer_current_tick(pid: Pid) {
         current_cpu().set_need_resched();
         return;
     }
-    let slot = unsafe { &mut *TICK_DEBT[current_cpu_id()].0.get() };
+    let cpu_id = current_cpu_id();
+    let slot = unsafe { &mut *TICK_DEBT[cpu_id].0.get() };
     if slot.0 == 0 || (slot.0 == pid && slot.1 == generation) {
         slot.0 = pid;
         slot.1 = generation;
         slot.2 = slot.2.saturating_add(1);
+        TICK_DEBT_PENDING[cpu_id].store(true, Ordering::Release);
     } else {
         // A switch with debt outstanding is handled by the process-context
         // drain before the next scheduling decision. Preserve the older debt.
@@ -1066,10 +1140,12 @@ fn defer_current_tick(pid: Pid) {
 
 #[inline]
 fn take_current_tick_debt(pid: Pid, generation: u64) -> u64 {
-    let slot = unsafe { &mut *TICK_DEBT[current_cpu_id()].0.get() };
+    let cpu_id = current_cpu_id();
+    let slot = unsafe { &mut *TICK_DEBT[cpu_id].0.get() };
     if slot.0 == pid && slot.1 == generation {
         let ticks = slot.2;
         *slot = (0, 0, 0);
+        TICK_DEBT_PENDING[cpu_id].store(false, Ordering::Release);
         ticks
     } else {
         0
@@ -1081,9 +1157,11 @@ fn take_current_tick_debt(pid: Pid, generation: u64) -> u64 {
 /// A false return means the identity is still live but contended. The caller
 /// must not switch and overwrite the single per-CPU debt slot in that case.
 fn drain_tick_debt_before_switch() -> bool {
-    let slot = unsafe { &mut *TICK_DEBT[current_cpu_id()].0.get() };
+    let cpu_id = current_cpu_id();
+    let slot = unsafe { &mut *TICK_DEBT[cpu_id].0.get() };
     let (pid, generation, ticks) = *slot;
     if pid == 0 || ticks == 0 {
+        TICK_DEBT_PENDING[cpu_id].store(false, Ordering::Release);
         return true;
     }
     let pcb = match process::try_get_process(pid) {
@@ -1093,6 +1171,7 @@ fn drain_tick_debt_before_switch() -> bool {
         }
         Some(None) => {
             *slot = (0, 0, 0);
+            TICK_DEBT_PENDING[cpu_id].store(false, Ordering::Release);
             return true;
         }
         Some(Some(pcb)) => pcb,
@@ -1105,11 +1184,13 @@ fn drain_tick_debt_before_switch() -> bool {
         || matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
     {
         *slot = (0, 0, 0);
+        TICK_DEBT_PENDING[cpu_id].store(false, Ordering::Release);
         return true;
     }
     // Consume only after identity and lifecycle validation. Nothing below may
     // re-resolve the PID or resurrect a teardown state.
     *slot = (0, 0, 0);
+    TICK_DEBT_PENDING[cpu_id].store(false, Ordering::Release);
     let ns = TICK_NS.saturating_mul(ticks);
     proc.cpu_time = proc.cpu_time.saturating_add(ticks);
     cgroup::account_cpu_time(proc.cgroup_id, ns);
@@ -2946,10 +3027,7 @@ impl Scheduler {
         };
         Self::mark_queue_mutated(token.cpu_id);
 
-        {
-            let mut stats = SCHEDULER_STATS.lock();
-            stats.processes_created = stats.processes_created.saturating_add(1);
-        }
+        record_sched_stat_created();
         let _ = allowed_cpus;
         Self::arm_ready_cpu(token.cpu_id);
     }
@@ -3000,10 +3078,7 @@ impl Scheduler {
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
     pub fn remove_process(pid: Pid, generation: u64) {
         Self::remove_identity_from_all_queues(pid, generation);
-        interrupts::without_interrupts(|| {
-            let mut stats = SCHEDULER_STATS.lock();
-            stats.processes_terminated += 1;
-        });
+        record_sched_stat_terminated();
     }
 
     /// RF178-36 identity-bound resume state machine.
@@ -3235,12 +3310,8 @@ impl Scheduler {
                 }
             }
 
-            // 最后更新 SCHEDULER_STATS
-            {
-                if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
-                    stats.total_ticks = stats.total_ticks.saturating_add(1);
-                }
-            }
+            // 最后更新调度器统计（无锁 per-CPU 计数器）
+            record_sched_stat_tick(cpu_id);
 
             // M4-1 (PART B): keep the cheap, IRQ-safe load-balance CADENCE on the tick; the
             // ALLOCATING work (balance_queues Vec + migrate_one_ready BTreeMap inserts) now
@@ -3395,9 +3466,7 @@ impl Scheduler {
                         if !selection.complete_cycle || candidate_deferred {
                             current_cpu().set_need_resched();
                         }
-                        if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
-                            stats.total_switches = stats.total_switches.saturating_add(1);
-                        }
+                        record_sched_stat_switch(local_cpu);
                         return Some(PreparedSwitch {
                             old_pid,
                             old_generation,
@@ -3460,9 +3529,7 @@ impl Scheduler {
                                 {
                                     current_cpu().set_need_resched();
                                 }
-                                if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
-                                    stats.total_switches = stats.total_switches.saturating_add(1);
-                                }
+                                record_sched_stat_switch(local_cpu);
                                 return Some(PreparedSwitch {
                                     old_pid,
                                     old_generation,
@@ -3607,9 +3674,7 @@ impl Scheduler {
         mm::heap_admission::set_current_owner(Some(next_heap_owner));
         process::set_current_pid(Some(next_pid));
         process::note_context_switch(local_cpu);
-        if let Some(mut stats) = SCHEDULER_STATS.try_lock() {
-            stats.total_switches = stats.total_switches.saturating_add(1);
-        }
+        record_sched_stat_switch(local_cpu);
 
         Some(PreparedSwitch {
             old_pid: old_pid.unwrap_or(0),
@@ -3646,6 +3711,9 @@ impl Scheduler {
         }
 
         process::activate_memory_space(prepared.next_space, Some(prepared.next_user_space));
+        // KSA SMP TLS: stage_pending_tls_bases atomically updates both staged
+        // pending_* and live IA32_FS_BASE/IA32_KERNEL_GS_BASE MSRs (skipping
+        // redundant wrmsr writes when the incoming task's bases already match).
         stage_pending_tls_bases(prepared.next_fs_base, prepared.next_gs_base);
         stage_prev_on_cpu(prepared.old_pid as u64, prepared.old_generation);
         let switch_hook = SECURITY_SWITCH_HOOK
@@ -3653,18 +3721,6 @@ impl Scheduler {
             .copied()
             .expect("scheduler security switch hook not registered");
         switch_hook(prepared.old_space != prepared.next_space);
-
-        // KSA SMP TLS: saved kernel contexts include timer-return continuations,
-        // which reach IRET without the SYSRET TLS commit. Restore live task TLS
-        // for every incoming context, also before a kernel continuation can
-        // reblock and have its live pair sampled by the next switch-out.
-        // Outgoing TLS was captured in prepare_switch; IF remains clear here.
-        // IA32_GS_BASE still names this CPU's kernel metadata and is untouched.
-        unsafe {
-            use x86_64::registers::model_specific::Msr;
-            Msr::new(0xC000_0100).write(prepared.next_fs_base);
-            Msr::new(0xC000_0102).write(prepared.next_gs_base);
-        }
 
         let next_is_user = (prepared.next_cs & 0x3) == 0x3;
         if next_is_user {
@@ -3720,7 +3776,7 @@ impl Scheduler {
 
     /// 打印调度统计信息
     pub fn print_stats() {
-        SCHEDULER_STATS.lock().print();
+        snapshot_sched_stats().print();
     }
 
     /// 在安全上下文中执行完整上下文切换（含 CR3）
@@ -3800,6 +3856,18 @@ impl Scheduler {
                 let current_pid = Self::get_current();
                 let _ = Self::try_steal_to_local_queue(current_pid);
             }
+        }
+
+        // Fast path: when no reschedule is forced or pending and this CPU has
+        // neither deferred tick debt nor a staged outgoing task, avoid disabling
+        // interrupts (`cli`/`sti`) and the unconditional SeqCst `swap` in
+        // `clear_need_resched()` on the dominant syscall-return path.
+        if !force
+            && !current_cpu().need_resched.load(Ordering::Acquire)
+            && !TICK_DEBT_PENDING[current_cpu_id()].load(Ordering::Acquire)
+            && PENDING_PREV_ON_CPU.with(|s| s.pid.load(Ordering::Acquire) == 0)
+        {
+            return;
         }
 
         interrupts::without_interrupts(|| {

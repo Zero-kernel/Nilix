@@ -1130,6 +1130,9 @@ extern "C" fn divide_error_handler(stack_frame: &mut InterruptStackFrameValue) {
 /// fires, those addresses would leak if not cleared.
 extern "C" fn debug_handler(stack_frame: &mut InterruptStackFrameValue) {
     clac_if_smap();
+    // Re-arm per-CPU DR scrubbing so the next syscall entry or context switch
+    // clears DR0..DR3, DR6, DR7 even if `#DB` fired in kernel mode or via TF.
+    crate::syscall::mark_debug_regs_dirty();
 
     // R174-A3 FIX: Clear debug registers if returning to user mode (CS.RPL == 3)
     // This prevents KASLR bypass via hardware breakpoint address leakage.

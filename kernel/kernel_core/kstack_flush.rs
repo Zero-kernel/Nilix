@@ -100,8 +100,10 @@ struct Batch<const K: usize> {
 /// documentation.
 pub struct KstackFlushQueue<const K: usize> {
     batch: Mutex<Batch<K>>,
-    /// The batch's length, for the drain epilogue's lock-free empty check.
+    /// The batch's length, for lock-free empty/capacity checks.
     pending: AtomicUsize,
+    /// Tick of the oldest waiting stack; published before `pending` transitions 0 -> 1.
+    oldest_tick: AtomicU64,
     max_age_ticks: u64,
     batches: AtomicU64,
     stacks: AtomicU64,
@@ -119,6 +121,7 @@ impl<const K: usize> KstackFlushQueue<K> {
                 oldest_tick: 0,
             }),
             pending: AtomicUsize::new(0),
+            oldest_tick: AtomicU64::new(0),
             max_age_ticks,
             batches: AtomicU64::new(0),
             stacks: AtomicU64::new(0),
@@ -126,6 +129,20 @@ impl<const K: usize> KstackFlushQueue<K> {
             by_age: AtomicU64::new(0),
             quarantined: AtomicU64::new(0),
         }
+    }
+
+    /// Lock-free check whether `drain_epilogue` has a full or age-expired batch
+    /// to complete at tick `now`. False positives are harmless (the locked check
+    /// re-validates); false negatives are prevented by Release/Acquire ordering
+    /// on `oldest_tick` -> `pending`.
+    #[inline]
+    pub fn needs_epilogue(&self, now: u64) -> bool {
+        let count = self.pending.load(Ordering::Acquire);
+        if count == 0 {
+            return false;
+        }
+        count >= K
+            || now.saturating_sub(self.oldest_tick.load(Ordering::Acquire)) >= self.max_age_ticks
     }
 
     /// Add a stack whose leaves were cleared at tick `now`. A full batch is
@@ -196,10 +213,13 @@ impl<const K: usize> KstackFlushQueue<K> {
         );
         if batch.len == 0 {
             batch.oldest_tick = now;
+            // Publish `oldest_tick` BEFORE `pending` becomes non-zero so lock-free
+            // `needs_epilogue()` readers always observe a valid timestamp.
+            self.oldest_tick.store(now, Ordering::Release);
         }
         batch.stacks[batch.len] = stack;
         batch.len += 1;
-        self.pending.store(batch.len, Ordering::Relaxed);
+        self.pending.store(batch.len, Ordering::Release);
     }
 
     /// Empty the batch into a caller-provided stack buffer, so that it
@@ -209,7 +229,7 @@ impl<const K: usize> KstackFlushQueue<K> {
         out.stacks[..len].copy_from_slice(&batch.stacks[..len]);
         out.len = len;
         batch.len = 0;
-        self.pending.store(0, Ordering::Relaxed);
+        self.pending.store(0, Ordering::Release);
     }
 
     fn complete<B: KstackFlushBackend>(
@@ -273,6 +293,196 @@ impl<const K: usize> TakenBatch<K> {
 static KSTACK_FLUSH: KstackFlushQueue<KSTACK_FLUSH_BATCH_CAPACITY> =
     KstackFlushQueue::new(KSTACK_FLUSH_BATCH_MAX_AGE_TICKS);
 
+/// Bounded cache of post-TLB-shootdown, pre-zeroed order-3 kernel-stack blocks.
+///
+/// Reclaimed kernel stacks are scrubbed to all zeros off the `fork()` critical
+/// path (immediately after `flush_all_address_spaces()` completes) and parked
+/// here so steady-state `allocate_kernel_stack()` pops an already-zeroed
+/// 32 KiB block without acquiring `BUDDY_ALLOCATOR` or zeroing 32 KiB on the
+/// parent thread. Sized to match `KSTACK_FLUSH_BATCH_CAPACITY` (128 stacks =
+/// 4 MiB) so a full completed flush batch can be retained without spilling 75%
+/// of its frames back to Buddy. Drained back to Buddy on `complete_now()` or
+/// OOM pressure.
+const KSTACK_FRAME_CACHE_CAP: usize = KSTACK_FLUSH_BATCH_CAPACITY;
+
+struct KstackFrameCache {
+    frames: [u64; KSTACK_FRAME_CACHE_CAP],
+    len: usize,
+}
+
+impl KstackFrameCache {
+    const fn new() -> Self {
+        Self {
+            frames: [0; KSTACK_FRAME_CACHE_CAP],
+            len: 0,
+        }
+    }
+
+    /// Try to insert a scrubbed order-3 block base physical address.
+    /// Returns `false` if the cache is full or already contains `phys`.
+    fn try_push(&mut self, phys: u64) -> bool {
+        if self.len >= KSTACK_FRAME_CACHE_CAP {
+            return false;
+        }
+        if self.frames[..self.len].contains(&phys) {
+            return false;
+        }
+        self.frames[self.len] = phys;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        let phys = self.frames[self.len];
+        self.frames[self.len] = 0;
+        Some(phys)
+    }
+
+    fn drain_into(&mut self, out: &mut [u64; KSTACK_FRAME_CACHE_CAP]) -> usize {
+        let n = self.len;
+        out[..n].copy_from_slice(&self.frames[..n]);
+        self.frames[..n].fill(0);
+        self.len = 0;
+        n
+    }
+}
+
+static KSTACK_FRAME_CACHE: Mutex<KstackFrameCache> = Mutex::new(KstackFrameCache::new());
+static KSTACK_FRAME_CACHE_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Number of blocks detached from `KSTACK_FRAME_CACHE` by `drain_kstack_frame_cache()`
+/// that are currently in flight awaiting return to the buddy allocator.
+static KSTACK_FRAME_CACHE_DRAINING: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of pre-zeroed order-3 kernel-stack blocks currently cached or in flight.
+#[inline]
+pub(crate) fn cached_frame_count() -> usize {
+    KSTACK_FRAME_CACHE_LEN
+        .load(Ordering::Acquire)
+        .saturating_add(KSTACK_FRAME_CACHE_DRAINING.load(Ordering::Acquire))
+}
+
+/// Pop one post-shootdown, pre-zeroed order-3 kernel-stack physical block, if cached.
+pub(crate) fn try_pop_zeroed_kstack_frame(
+) -> Option<x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>> {
+    if KSTACK_FRAME_CACHE_LEN.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let phys = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut cache = KSTACK_FRAME_CACHE.lock();
+        let phys = cache.pop();
+        KSTACK_FRAME_CACHE_LEN.store(cache.len, Ordering::Release);
+        phys
+    })?;
+    x86_64::structures::paging::PhysFrame::from_start_address(x86_64::PhysAddr::new(phys)).ok()
+}
+
+/// Return all cached pre-zeroed kernel-stack blocks back to the buddy allocator.
+pub(crate) fn drain_kstack_frame_cache() -> usize {
+    if KSTACK_FRAME_CACHE_LEN.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let mut drained = [0u64; KSTACK_FRAME_CACHE_CAP];
+    let count = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut cache = KSTACK_FRAME_CACHE.lock();
+        let n = cache.drain_into(&mut drained);
+        if n > 0 {
+            // Publish in-flight blocks BEFORE clearing `KSTACK_FRAME_CACHE_LEN` so
+            // concurrent reclaim/OOM observers never see an empty cache while blocks
+            // are still en route to Buddy.
+            // lint-fetch-add: allow (bounded in-flight drain count <= KSTACK_FRAME_CACHE_CAP)
+            KSTACK_FRAME_CACHE_DRAINING.fetch_add(n, Ordering::SeqCst);
+        }
+        KSTACK_FRAME_CACHE_LEN.store(0, Ordering::Release);
+        n
+    });
+    free_drained_kstack_frames(&drained[..count])
+}
+
+/// Non-blocking cache-only reclaim hook registered with `mm::oom_killer`.
+///
+/// Uses `try_lock()` on BOTH `KSTACK_FRAME_CACHE` and Buddy
+/// (`try_free_physical_pages_nonblocking`), so it can be invoked safely from
+/// general frame-allocation exhaustion and fault paths (`#PF` CoW, shared-anon
+/// fault, demand stack growth) with IRQs disabled and zero spinning. Any block
+/// rejected with `FreeError::Busy` remains owned by `KSTACK_FRAME_CACHE` and
+/// sets `busy = true` even if earlier blocks were freed (preventing partial
+/// reclaim from masking contention). In-flight `drain_kstack_frame_cache()`
+/// blocks likewise keep `busy = true` until returned to Buddy.
+pub(crate) fn reclaim_cached_kstack_pages() -> mm::oom_killer::CacheReclaimResult {
+    if KSTACK_FRAME_CACHE_LEN.load(Ordering::Acquire) == 0 {
+        return if KSTACK_FRAME_CACHE_DRAINING.load(Ordering::Acquire) > 0 {
+            mm::oom_killer::CacheReclaimResult::BUSY
+        } else {
+            mm::oom_killer::CacheReclaimResult::EMPTY
+        };
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let Some(mut cache) = KSTACK_FRAME_CACHE.try_lock() else {
+            return mm::oom_killer::CacheReclaimResult::BUSY;
+        };
+        let mut freed_blocks = 0usize;
+        let mut saw_busy = false;
+        while cache.len > 0 {
+            let phys = cache.frames[cache.len - 1];
+            let Ok(frame) = x86_64::structures::paging::PhysFrame::from_start_address(
+                x86_64::PhysAddr::new(phys),
+            ) else {
+                let _ = cache.pop();
+                continue;
+            };
+            match mm::buddy_allocator::try_free_physical_pages_nonblocking(
+                frame,
+                crate::process::KSTACK_PAGES,
+            ) {
+                Ok(()) => {
+                    let _ = cache.pop();
+                    freed_blocks += 1;
+                }
+                Err(mm::buddy_allocator::FreeError::Busy) => {
+                    // Retain block ownership in `cache` and propagate contention.
+                    saw_busy = true;
+                    break;
+                }
+                Err(_) => {
+                    // Reject invalid/unfreeable entry without looping forever.
+                    let _ = cache.pop();
+                }
+            }
+        }
+        KSTACK_FRAME_CACHE_LEN.store(cache.len, Ordering::Release);
+        mm::oom_killer::CacheReclaimResult {
+            reclaimed_pages: freed_blocks * crate::process::KSTACK_PAGES,
+            busy: saw_busy || KSTACK_FRAME_CACHE_DRAINING.load(Ordering::Acquire) > 0,
+        }
+    })
+}
+
+fn free_drained_kstack_frames(drained: &[u64]) -> usize {
+    if drained.is_empty() {
+        return 0;
+    }
+    let mut alloc = mm::memory::FrameAllocator::new();
+    let mut freed = 0usize;
+    for &phys in drained {
+        if let Ok(frame) =
+            x86_64::structures::paging::PhysFrame::from_start_address(x86_64::PhysAddr::new(phys))
+        {
+            if alloc
+                .try_deallocate_contiguous_frames(frame, crate::process::KSTACK_PAGES)
+                .is_ok()
+            {
+                freed += 1;
+            }
+        }
+        KSTACK_FRAME_CACHE_DRAINING.fetch_sub(1, Ordering::AcqRel);
+    }
+    freed
+}
+
 struct KernelBackend;
 
 impl KstackFlushBackend for KernelBackend {
@@ -289,6 +499,33 @@ impl KstackFlushBackend for KernelBackend {
         else {
             return false;
         };
+
+        // Fast path (bare-metal): when the pre-zeroed kstack cache has room,
+        // scrub the 32 KiB physical block right here (after shootdown, off the
+        // `fork()` critical path) and park it for immediate reuse.
+        #[cfg(target_os = "none")]
+        if KSTACK_FRAME_CACHE_LEN.load(Ordering::Acquire) < KSTACK_FRAME_CACHE_CAP {
+            let stack_bytes = crate::process::KSTACK_PAGES * 4096;
+            let direct_virt = mm::page_table::phys_to_virt(frame.start_address());
+            // SAFETY: `flush_all_address_spaces()` has already completed for this
+            // unmapped order-3 stack block, so no CPU holds any live reference to
+            // its physical pages; direct physical map covers all RAM.
+            unsafe {
+                core::ptr::write_bytes(direct_virt.as_mut_ptr::<u8>(), 0, stack_bytes);
+            }
+            let cached = x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut cache = KSTACK_FRAME_CACHE.lock();
+                let pushed = cache.try_push(stack.phys);
+                if pushed {
+                    KSTACK_FRAME_CACHE_LEN.store(cache.len, Ordering::Release);
+                }
+                pushed
+            });
+            if cached {
+                return true;
+            }
+        }
+
         mm::memory::FrameAllocator::new()
             .try_deallocate_contiguous_frames(frame, crate::process::KSTACK_PAGES)
             .is_ok()
@@ -329,6 +566,12 @@ pub(crate) fn drain_epilogue() {
     KSTACK_FLUSH.drain_epilogue(crate::time::get_ticks(), &mut KernelBackend);
 }
 
+/// Lock-free check whether `drain_epilogue()` needs RCU drain ownership right now.
+#[inline]
+pub(crate) fn needs_epilogue() -> bool {
+    KSTACK_FLUSH.needs_epilogue(crate::time::get_ticks())
+}
+
 /// Complete the batch now, for a caller that needs the waiting stacks' frames
 /// or PIDs back.
 ///
@@ -339,6 +582,7 @@ pub(crate) fn drain_epilogue() {
 /// have not run yet are not waited for.
 pub fn complete_now() {
     crate::rcu::with_drain_ownership(|| KSTACK_FLUSH.complete_now(&mut KernelBackend));
+    drain_kstack_frame_cache();
 }
 
 /// Completion counters and the number of stacks waiting; every field is read
@@ -347,11 +591,15 @@ pub fn stats() -> KstackFlushStats {
     KSTACK_FLUSH.stats()
 }
 
-/// Pages of reclaimed kernel stacks that wait for their flush and so are not
-/// back in the buddy allocator yet (the ST-K2-P2 exact memory baseline).
+/// Pages of reclaimed kernel stacks that wait for their flush or sit in the
+/// pre-zeroed kstack reuse cache and so are not back in the buddy allocator yet
+/// (the ST-K2-P2 exact memory baseline).
 #[cfg(feature = "syscall_test")]
 pub fn pending_pages() -> u64 {
-    (KSTACK_FLUSH.stats().pending * crate::process::KSTACK_PAGES) as u64
+    ((KSTACK_FLUSH.stats().pending
+        + KSTACK_FRAME_CACHE_LEN.load(Ordering::Acquire)
+        + KSTACK_FRAME_CACHE_DRAINING.load(Ordering::Acquire))
+        * crate::process::KSTACK_PAGES) as u64
 }
 
 #[cfg(test)]
@@ -609,5 +857,55 @@ mod tests {
         assert_eq!(queue.stats().batches, 1);
         assert_eq!(queue.stats().by_count, 1);
         assert_eq!(queue.stats().pending, 0);
+    }
+
+    #[test]
+    fn kstack_flush_needs_epilogue_tracks_empty_count_and_age() {
+        let queue = KstackFlushQueue::<3>::new(10);
+        let mut model = Model::default();
+        assert!(!queue.needs_epilogue(0));
+        assert!(!queue.needs_epilogue(u64::MAX));
+
+        queue.defer(stack(1), 100, &mut model);
+        assert!(!queue.needs_epilogue(100));
+        assert!(!queue.needs_epilogue(109));
+        assert!(queue.needs_epilogue(110));
+
+        // Reaching capacity triggers needs_epilogue regardless of age.
+        queue.defer(stack(2), 100, &mut model);
+        assert!(!queue.needs_epilogue(100));
+        queue.defer(stack(3), 100, &mut model);
+        assert!(queue.needs_epilogue(100));
+
+        queue.drain_epilogue(100, &mut model);
+        assert_eq!(model.take(), completion(1..=3));
+        assert!(!queue.needs_epilogue(1000));
+    }
+
+    #[test]
+    fn kstack_frame_cache_push_dedup_capacity_pop_and_drain() {
+        assert_eq!(KSTACK_FRAME_CACHE_CAP, KSTACK_FLUSH_BATCH_CAPACITY);
+        let mut cache = KstackFrameCache::new();
+        assert_eq!(cache.pop(), None);
+
+        // Push up to capacity; duplicates and overflow must be rejected.
+        for i in 0..KSTACK_FRAME_CACHE_CAP {
+            let phys = 0x100_0000 + (i as u64) * 0x8000;
+            assert!(cache.try_push(phys), "slot {i}");
+        }
+        assert!(!cache.try_push(0x100_0000), "duplicate must be rejected");
+        assert!(!cache.try_push(0x900_0000), "full cache must reject");
+
+        // LIFO pop returns the newest pushed block.
+        let last_phys = 0x100_0000 + ((KSTACK_FRAME_CACHE_CAP - 1) as u64) * 0x8000;
+        assert_eq!(cache.pop(), Some(last_phys));
+        assert!(cache.try_push(0x900_0000));
+
+        let mut drained = [0u64; KSTACK_FRAME_CACHE_CAP];
+        let n = cache.drain_into(&mut drained);
+        assert_eq!(n, KSTACK_FRAME_CACHE_CAP);
+        assert_eq!(drained[0], 0x100_0000);
+        assert_eq!(drained[n - 1], 0x900_0000);
+        assert_eq!(cache.pop(), None);
     }
 }

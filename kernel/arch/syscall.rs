@@ -42,6 +42,9 @@ const IA32_SFMASK: u32 = 0xC000_0084;
 /// IA32_EFER MSR 地址
 const IA32_EFER: u32 = 0xC000_0080;
 
+/// IA32_FS_BASE MSR 地址 (用户态 FS 基址 / TLS)
+const IA32_FS_BASE: u32 = 0xC000_0100;
+
 /// IA32_GS_BASE MSR 地址 (用户态 GS 基址)
 ///
 /// Used with SWAPGS instruction to swap between user and kernel GS base.
@@ -300,6 +303,14 @@ pub struct SyscallPerCpu {
     /// Eliminates both the CPU-ID lookup and the `PER_CPU_DATA.cpus[cpu_id]` index in
     /// `cpu_local::current_cpu()`.
     pub per_cpu_data_ptr: u64,
+    /// Non-zero when hardware debug registers (`DR0..DR3`, `DR6`, `DR7`) may hold
+    /// non-zero state and must be scrubbed on the next syscall entry or context
+    /// switch. Initialized to 1 (fail-closed), cleared once per CPU at bring-up
+    /// after scrubbing all DRs, and re-armed on every `#DB` exception. Ring-3
+    /// cannot execute `mov dr*` (`#GP`), so a 0 value proves hardware DRs remain
+    /// zero without triggering KVM `EXIT_REASON_DR_ACCESS` VM-exits on every
+    /// syscall and context switch.
+    pub dr_dirty: u64,
 }
 
 impl SyscallPerCpu {
@@ -317,6 +328,7 @@ impl SyscallPerCpu {
             pending_gs_base: 0,
             encoded_cpu_id: 0,
             per_cpu_data_ptr: 0,
+            dr_dirty: 1,
         }
     }
 }
@@ -384,6 +396,8 @@ pub const PERCPU_PENDING_GS_BASE_OFFSET: usize = 72;
 pub const PERCPU_ENCODED_CPU_ID_OFFSET: usize = 80;
 /// Issue #109 §2.1: Offset of per_cpu_data_ptr (`&'static PerCpuData`) in SyscallPerCpu.
 pub const PERCPU_PER_CPU_DATA_PTR_OFFSET: usize = 88;
+/// Offset of `dr_dirty` in SyscallPerCpu (1 = scrub DR0..DR3/DR6/DR7 on next entry/switch).
+pub const PERCPU_DR_DIRTY_OFFSET: usize = 96;
 
 // R103-3 FIX: Compile-time assertions that the offsets match the struct layout.
 // If SyscallPerCpu is reordered, these will produce a build error.
@@ -439,6 +453,14 @@ const _: () = {
     assert!(
         core::mem::offset_of!(SyscallPerCpu, per_cpu_data_ptr) == PERCPU_PER_CPU_DATA_PTR_OFFSET,
         "PERCPU_PER_CPU_DATA_PTR_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, dr_dirty) == PERCPU_DR_DIRTY_OFFSET,
+        "PERCPU_DR_DIRTY_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::size_of::<SyscallPerCpu>() == 128,
+        "SyscallPerCpu must remain two 64-byte cache lines"
     );
     assert!(
         PERCPU_PER_CPU_DATA_PTR_OFFSET == cpu_local::GS_PER_CPU_DATA_PTR_OFFSET,
@@ -873,24 +895,47 @@ fn set_frame_binding_inner(frame_ptr: u64, owner_pid: u64) {
     }
 }
 
-/// R172-04 FIX: stage the FS/GS bases the currently-running task must have on the MSRs
-/// at its next ring-3 return. The SYSRET fast-path epilogue commits these via two
-/// `wrmsr` (and the enter_usermode/switch_to_user IRETQ paths write the MSRs directly).
-/// Single-writer per CPU (scheduler switch-in W1 runs with IRQs off; arch_prctl W3 /
-/// exec W4 run in the task's own syscall context on this CPU). Exposed BOTH as a pub fn
-/// (the `sched` crate calls it directly for W1) AND registered as a `kernel_core`
-/// callback (W3/W4, since `kernel_core` cannot depend on `arch`).
+/// Mark this CPU's hardware debug registers (`DR0..DR3`, `DR6`, `DR7`) dirty so
+/// the next syscall entry or context switch scrubs them to zero.
+///
+/// Called from the `#DB` exception handler (the only hardware event by which
+/// Ring-3 execution can cause `DR6` to become non-zero) and any future code that
+/// programs hardware breakpoints.
+#[inline]
+pub fn mark_debug_regs_dirty() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cpu_id = cpu_local::current_cpu_id();
+        if cpu_id < SYSCALL_MAX_CPUS {
+            // SAFETY: single-writer per CPU with interrupts disabled.
+            unsafe {
+                SYSCALL_PERCPU[cpu_id].dr_dirty = 1;
+            }
+        }
+    });
+}
+
+/// R172-04 FIX: stage and unconditionally commit the FS/GS bases the
+/// currently-running task must have on the MSRs.
+///
+/// Unconditional `wrmsr` is required even with `CR4.FSGSBASE=0`: Ring-3 can
+/// execute `mov fs, sel` / `mov gs, sel` to reload a segment descriptor base
+/// (zeroing the hardware base without trapping), so a software cache of the
+/// last-written MSR value would silently disagree with hardware.
 pub fn stage_pending_tls_bases(fs_base: u64, gs_base: u64) {
-    let cpu_id = cpu_local::current_cpu_id();
-    if cpu_id >= SYSCALL_MAX_CPUS {
-        return;
-    }
-    // SAFETY: per-CPU slot, single-writer on this CPU; the epilogue reads it with IRQs
-    // off / kernel GS active.
-    unsafe {
-        SYSCALL_PERCPU[cpu_id].pending_fs_base = fs_base;
-        SYSCALL_PERCPU[cpu_id].pending_gs_base = gs_base;
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cpu_id = cpu_local::current_cpu_id();
+        if cpu_id >= SYSCALL_MAX_CPUS {
+            return;
+        }
+        // SAFETY: per-CPU slot, single-writer on this CPU with IRQs disabled.
+        unsafe {
+            let slot = &mut SYSCALL_PERCPU[cpu_id];
+            slot.pending_fs_base = fs_base;
+            slot.pending_gs_base = gs_base;
+            wrmsr(IA32_FS_BASE, fs_base);
+            wrmsr(IA32_KERNEL_GS_BASE, gs_base);
+        }
+    });
 }
 
 /// M0 item 5: MUTABLE access to the current syscall frame, for signal-handler
@@ -985,12 +1030,28 @@ pub unsafe fn init_syscall_percpu(cpu_id: usize) {
         .get_cpu(cpu_id)
         .map_or(0, |per_cpu| per_cpu as *const cpu_local::PerCpuData as u64);
 
+    // Scrub hardware debug registers once per CPU at bring-up and clear `dr_dirty`.
+    // Ring-3 cannot execute `mov dr*` (#GP); `#DB` re-arms `dr_dirty = 1`.
+    asm!(
+        "xor eax, eax",
+        "mov dr0, rax",
+        "mov dr1, rax",
+        "mov dr2, rax",
+        "mov dr3, rax",
+        "mov dr6, rax",
+        "mov dr7, rax",
+        out("rax") _,
+        options(nostack, nomem),
+    );
+    SYSCALL_PERCPU[cpu_id].dr_dirty = 0;
+
     // Program kernel GS base to point to this CPU's SyscallPerCpu
     // After SWAPGS, GS:0 will point to SYSCALL_PERCPU[cpu_id]
     let percpu_addr = &SYSCALL_PERCPU[cpu_id] as *const SyscallPerCpu as u64;
     wrmsr(IA32_KERNEL_GS_BASE, percpu_addr);
 
-    // User GS base starts at 0 (user can set it via arch_prctl)
+    // User FS/GS base start at 0 (matching committed_fs_base/committed_gs_base = 0)
+    wrmsr(IA32_FS_BASE, 0);
     wrmsr(IA32_GS_BASE, 0);
 
     // R100-2 FIX (double-fault regression): 立即执行 SWAPGS，使内核从启动
@@ -1042,6 +1103,37 @@ pub fn publish_gs_percpu_identity(cpu_id: usize) {
 // C ABI 辅助函数
 // ============================================================================
 
+/// Scrub hardware debug registers (`DR0..DR3`, `DR6`, `DR7`) when `dr_dirty` is
+/// set on this CPU. Runs from `syscall_get_kernel_rsp0` while interrupts remain
+/// disabled (`IF=0`), keeping `syscall_entry_stub`'s static branch set exact
+/// for the KPTI/SWAPGS mitigation proof while avoiding 6 KVM `MOV DR` VM-exits
+/// on clean syscalls.
+#[inline]
+unsafe fn scrub_debug_regs_if_dirty() {
+    let dirty: u64;
+    asm!(
+        "mov {dirty}, qword ptr gs:[{off}]",
+        dirty = out(reg) dirty,
+        off = const PERCPU_DR_DIRTY_OFFSET,
+        options(nostack, readonly, preserves_flags),
+    );
+    if dirty != 0 {
+        asm!(
+            "xor eax, eax",
+            "mov dr0, rax",
+            "mov dr1, rax",
+            "mov dr2, rax",
+            "mov dr3, rax",
+            "mov dr6, rax",
+            "mov dr7, rax",
+            "mov qword ptr gs:[{off}], rax",
+            off = const PERCPU_DR_DIRTY_OFFSET,
+            out("rax") _,
+            options(nostack),
+        );
+    }
+}
+
 /// 获取内核栈顶（TSS RSP0）
 ///
 /// # Safety
@@ -1049,6 +1141,10 @@ pub fn publish_gs_percpu_identity(cpu_id: usize) {
 /// 仅由 syscall_entry_stub 汇编代码调用
 #[no_mangle]
 extern "C" fn syscall_get_kernel_rsp0() -> u64 {
+    // SAFETY: called from `syscall_entry_stub` with kernel GS active and IF=0.
+    unsafe {
+        scrub_debug_regs_if_dirty();
+    }
     gdt::get_kernel_stack().as_u64()
 }
 
@@ -1203,11 +1299,6 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov [rsp + {off_r14}], r14",               // callee-saved
         "mov [rsp + {off_r15}], r15",               // callee-saved
 
-        // 清除用户设置的调试寄存器，防止硬件断点打进内核
-        "xor rax, rax",
-        "mov dr7, rax",
-        "mov dr6, rax",
-
         // ========================================
         // 阶段 4: 切换到内核栈
         // ========================================
@@ -1311,8 +1402,8 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         //   * only RAX (the syscall return value, NOT reloaded) must survive, so it is
         //     parked in the kpti_tmp scratch across the two wrmsr (kpti_tmp is reused by
         //     the CR3 switch strictly later — no overlap).
-        // For a non-blocking syscall the staged pair already equals the running task's
-        // FS/GS (set at switch-in W1 / arch_prctl W3), so the commit is idempotent.
+        // R172-04: unconditionally commit staged FS/GS bases before returning
+        // to Ring-3 (cannot cache MSR state across Ring-3 `mov fs/gs, sel`).
         "mov qword ptr gs:[{percpu_kpti_tmp}], rax",
         "mov rax, qword ptr gs:[{percpu_pending_fs_base}]",
         "mov rdx, rax",

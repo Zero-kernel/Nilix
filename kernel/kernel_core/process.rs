@@ -1131,21 +1131,26 @@ pub fn allocate_kernel_stack(
     let mut rollback_table_count = 0usize;
     let mut rollback_quarantine = false;
 
+    let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
     let mapped_result = unsafe {
         page_table::with_kernel_manager(VirtAddr::new(0), |mgr| {
-            // 检查整个 slot（守护页 + 栈页）是否已被映射
+            // 检查整个 slot（守护页 + 栈页）是否已被映射（单次按 PT 批量检查）
             let total_pages = KSTACK_PAGES + KSTACK_GUARD_PAGES;
-            for i in 0..total_pages {
-                let addr = guard_base + (i as u64 * PAGE_SIZE);
-                if !mgr.page_slot_is_unused(Page::containing_address(addr)) {
-                    return Err(KernelStackError::AlreadyMapped);
-                }
+            if !mgr.page_range_slots_unused(Page::containing_address(guard_base), total_pages) {
+                return Err(KernelStackError::AlreadyMapped);
             }
 
-            // 分配连续物理帧
-            let phys_start_frame = frame_alloc
-                .allocate_contiguous_frames(KSTACK_PAGES)
-                .ok_or(KernelStackError::AllocationFailed)?;
+            // 优先从 post-shootdown 预清零的 order-3 栈帧缓存弹出（免去 Buddy 锁与热路径 32 KiB 清零），
+            // 未命中再向 Buddy 分配连续物理帧。
+            let (phys_start_frame, already_zeroed) =
+                if let Some(cached) = crate::kstack_flush::try_pop_zeroed_kstack_frame() {
+                    (cached, true)
+                } else {
+                    let fresh = frame_alloc
+                        .allocate_contiguous_frames(KSTACK_PAGES)
+                        .ok_or(KernelStackError::AllocationFailed)?;
+                    (fresh, false)
+                };
             let phys_start = phys_start_frame.start_address();
 
             // R128-1 FIX: 内核栈页标志：可写、不可执行。
@@ -1157,116 +1162,134 @@ pub fn allocate_kernel_stack(
             let flags =
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
 
-            // 映射栈页（守护页不映射，自动触发页错误）
-            let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
-            // Map with a fixed rollback ledger. `map_range()` uses a heap Vec
-            // after physical allocation; a kernel stack has exactly KSTACK_PAGES
-            // pages, so keep this post-admission path allocation-free.
-            let mut mapped_pages = 0usize;
+            // 映射栈页（守护页不映射，自动触发页错误）。
+            // Map with a fixed rollback ledger and single-PT batched writes
+            // (no per-page invlpg on fresh unused -> present PTEs).
             let mut pt_recorder = KernelStackPtRecorder::new(&mut frame_alloc);
-            for index in 0..KSTACK_PAGES {
-                let page = Page::containing_address(stack_base + (index as u64 * PAGE_SIZE));
-                let frame = PhysFrame::containing_address(phys_start + (index as u64 * PAGE_SIZE));
-                if mgr.map_page(page, frame, flags, &mut pt_recorder).is_err() {
-                    // Freeze the table-frame provenance record before any
-                    // rollback mutation. No allocation occurs below this point.
-                    let (tracked_tables, tracked_len) = pt_recorder.into_record();
+            if let Err((mapped_pages, _)) = mgr.map_contiguous_kernel_pages_no_flush(
+                Page::containing_address(stack_base),
+                phys_start_frame,
+                KSTACK_PAGES,
+                flags,
+                &mut pt_recorder,
+            ) {
+                // Freeze the table-frame provenance record before any
+                // rollback mutation. No allocation occurs below this point.
+                let (tracked_tables, tracked_len) = pt_recorder.into_record();
 
-                    // First prove every installed leaf still maps the exact
-                    // order-3 (KSTACK_PAGES) block allocated by this transaction. If proof
-                    // fails, mutate nothing and quarantine both the mapping and
-                    // PID-indexed RCU permit.
-                    let mut leaves_valid = true;
-                    for rollback in 0..mapped_pages {
+                // First prove every installed leaf still maps the exact
+                // order-3 (KSTACK_PAGES) block allocated by this transaction. If proof
+                // fails, mutate nothing and quarantine both the mapping and
+                // PID-indexed RCU permit.
+                let mut leaves_valid = true;
+                for rollback in 0..mapped_pages {
+                    let rollback_page =
+                        Page::containing_address(stack_base + (rollback as u64 * PAGE_SIZE));
+                    let expected =
+                        PhysFrame::containing_address(phys_start + (rollback as u64 * PAGE_SIZE));
+                    if mgr.translate_page_4k(rollback_page) != Some(expected) {
+                        leaves_valid = false;
+                        break;
+                    }
+                }
+
+                let mut cleared = 0usize;
+                let mut matched = 0usize;
+                if leaves_valid {
+                    for rollback in (0..mapped_pages).rev() {
                         let rollback_page =
                             Page::containing_address(stack_base + (rollback as u64 * PAGE_SIZE));
                         let expected = PhysFrame::containing_address(
                             phys_start + (rollback as u64 * PAGE_SIZE),
                         );
-                        if mgr.translate_page_4k(rollback_page) != Some(expected) {
-                            leaves_valid = false;
-                            break;
-                        }
-                    }
-
-                    let mut cleared = 0usize;
-                    let mut matched = 0usize;
-                    if leaves_valid {
-                        for rollback in (0..mapped_pages).rev() {
-                            let rollback_page = Page::containing_address(
-                                stack_base + (rollback as u64 * PAGE_SIZE),
-                            );
-                            let expected = PhysFrame::containing_address(
-                                phys_start + (rollback as u64 * PAGE_SIZE),
-                            );
-                            match mgr.unmap_page(rollback_page) {
-                                Ok(actual) => {
-                                    cleared += 1;
-                                    if actual == expected {
-                                        matched += 1;
-                                    } else {
-                                        leaves_valid = false;
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
+                        match mgr.unmap_page(rollback_page) {
+                            Ok(actual) => {
+                                cleared += 1;
+                                if actual == expected {
+                                    matched += 1;
+                                } else {
                                     leaves_valid = false;
                                     break;
                                 }
                             }
+                            Err(_) => {
+                                leaves_valid = false;
+                                break;
+                            }
                         }
                     }
+                }
 
-                    // These high-half tables are shared by many distinct CR3
-                    // roots. A current-CR3 range shootdown is insufficient.
-                    if cleared != 0 {
-                        mm::flush_all_address_spaces();
-                    }
+                // These high-half tables are shared by many distinct CR3
+                // roots. A current-CR3 range shootdown is insufficient.
+                if cleared != 0 {
+                    mm::flush_all_address_spaces();
+                }
 
-                    if leaves_valid && matched == mapped_pages {
-                        let report = mgr.rollback_tracked_leaf_tables(
-                            stack_base,
-                            stack_size,
-                            &tracked_tables,
-                            tracked_len,
-                            &mut rollback_table_frames,
-                            false,
-                        );
-                        if report.all_accounted {
-                            rollback_table_count = report.reclaimed_count;
-                            rollback_data_frame = Some(phys_start_frame);
-                        } else {
-                            // R180-12 FIX: an incomplete hierarchy report can
-                            // mean that a recorder-owned table still contains an
-                            // unexpected leaf.  Even though the requested stack
-                            // leaves were removed, that leaf may alias the same
-                            // buddy block.  Quarantine the detached table frames
-                            // and data block together; freeing either would turn
-                            // an accounting anomaly into mapped-frame reuse.
-                            rollback_table_count = 0;
-                            rollback_quarantine = true;
-                        }
+                if leaves_valid && matched == mapped_pages {
+                    let report = mgr.rollback_tracked_leaf_tables(
+                        stack_base,
+                        stack_size,
+                        &tracked_tables,
+                        tracked_len,
+                        &mut rollback_table_frames,
+                        false,
+                    );
+                    if report.all_accounted {
+                        rollback_table_count = report.reclaimed_count;
+                        rollback_data_frame = Some(phys_start_frame);
                     } else {
+                        // R180-12 FIX: an incomplete hierarchy report can
+                        // mean that a recorder-owned table still contains an
+                        // unexpected leaf.  Even though the requested stack
+                        // leaves were removed, that leaf may alias the same
+                        // buddy block.  Quarantine the detached table frames
+                        // and data block together; freeing either would turn
+                        // an accounting anomaly into mapped-frame reuse.
+                        rollback_table_count = 0;
                         rollback_quarantine = true;
                     }
-                    return Err(KernelStackError::MapFailed);
+                } else {
+                    rollback_quarantine = true;
                 }
-                mapped_pages += 1;
+                return Err(KernelStackError::MapFailed);
             }
-
-            // 清零栈区域
-            core::ptr::write_bytes(stack_base.as_mut_ptr::<u8>(), 0, stack_size);
 
             // ST-K2-P2(c): the tables built here outlive this stack.
             #[cfg(feature = "syscall_test")]
             crate::fork::shared_fault_test::note_kernel_stack_tables(pt_recorder.len);
 
-            Ok((stack_base, stack_top, phys_start_frame))
+            Ok((stack_base, stack_top, phys_start_frame, already_zeroed))
         })
     };
 
     match mapped_result {
-        Ok(mapped) => Ok((mapped.0, mapped.1, mapped.2, reclaim_permit)),
+        Ok((stack_base, stack_top, phys_start_frame, already_zeroed)) => {
+            if !already_zeroed {
+                // Zero the newly mapped 32 KiB kernel stack OUTSIDE `KERNEL_PT_LOCK`
+                // (with interrupts enabled). This PID is still unpublished under
+                // `NEXT_PID_HINT` and all KSTACK_PAGES leaves are already installed,
+                // so no concurrent reader/unmapper can observe this slot while zeroing.
+                unsafe {
+                    core::ptr::write_bytes(stack_base.as_mut_ptr::<u8>(), 0, stack_size);
+                }
+            } else {
+                #[cfg(debug_assertions)]
+                {
+                    let words = unsafe {
+                        core::slice::from_raw_parts(
+                            stack_base.as_ptr::<u64>(),
+                            stack_size / core::mem::size_of::<u64>(),
+                        )
+                    };
+                    debug_assert!(
+                        words.iter().all(|&w| w == 0),
+                        "pre-zeroed kstack cache returned non-zero bytes"
+                    );
+                }
+            }
+            Ok((stack_base, stack_top, phys_start_frame, reclaim_permit))
+        }
         Err(error) => {
             let mut release_failed = false;
             for frame in rollback_table_frames
@@ -3625,6 +3648,19 @@ impl Process {
         name: ProcessNameSnapshot,
         priority: Priority,
     ) -> Result<ProcessArc, ProcessCreateError> {
+        Self::try_new_pcb_inner(pid, ppid, name, priority, true)
+    }
+
+    /// Internal constructor allowing child-creation paths (`ppid != 0`, whose
+    /// `cap_table` is immediately replaced by `fork` or `clone`) to avoid
+    /// allocating and immediately dropping 64-slot capability vectors.
+    fn try_new_pcb_inner(
+        pid: ProcessId,
+        ppid: ProcessId,
+        name: ProcessNameSnapshot,
+        priority: Priority,
+        prealloc_cap_slots: bool,
+    ) -> Result<ProcessArc, ProcessCreateError> {
         let process_arc_bytes = arc_charge_bytes::<OwnerCpuMutex<Process>>()
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let mut fixed_total = 0usize;
@@ -3670,11 +3706,21 @@ impl Process {
             .map_err(|_| ProcessCreateError::OutOfMemory)?;
         owned_name.push_str(name.as_str());
 
-        let mm = Arc::try_new(OwnerCpuMutex::new(MmState::new(
-            security::randomized_mmap_base(DEFAULT_MMAP_BASE),
-        )))
-        .map_err(|_| ProcessCreateError::OutOfMemory)?;
-        let cap_table = CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?;
+        // Fork/clone children (`!prealloc_cap_slots`, `ppid != 0`) unconditionally
+        // overwrite `child.mm` from the parent before publication; skip the
+        // `GLOBAL_RNG` / ChaCha20 call for a discarded placeholder `next_mmap_addr`.
+        let initial_mmap_base = if prealloc_cap_slots {
+            security::randomized_mmap_base(DEFAULT_MMAP_BASE)
+        } else {
+            DEFAULT_MMAP_BASE
+        };
+        let mm = Arc::try_new(OwnerCpuMutex::new(MmState::new(initial_mmap_base)))
+            .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        let cap_table = if prealloc_cap_slots {
+            CapTable::try_new_arc().map_err(|_| ProcessCreateError::OutOfMemory)?
+        } else {
+            CapTable::try_new_empty_arc().map_err(|_| ProcessCreateError::OutOfMemory)?
+        };
         let thread_group = Arc::try_new(
             ThreadGroup::try_new_for_uid(if ppid == 0 {
                 0
@@ -4762,6 +4808,24 @@ impl Process {
         self.credentials = credentials;
     }
 
+    /// Install a freshly cloned `Credentials` value in place on a provisioning
+    /// `fork()` child whose `SharedCredentials` wrapper is exclusively owned,
+    /// avoiding a redundant `Arc<SharedCredentials>` allocation and drop.
+    #[inline]
+    pub(crate) fn install_credentials_for_fork(&mut self, credentials: Credentials) {
+        assert_eq!(
+            self.state,
+            ProcessState::Provisioning,
+            "fork credentials may only be installed on a provisioning child"
+        );
+        assert_eq!(
+            Arc::strong_count(&self.credentials),
+            1,
+            "fork child must exclusively own its SharedCredentials wrapper"
+        );
+        self.credentials.replace_unpublished(credentials);
+    }
+
     /// Read-only capability-table observability for boot diagnostics.
     #[inline]
     pub fn capability_count(&self) -> usize {
@@ -5261,24 +5325,27 @@ fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup
 lazy_static::lazy_static! {
     pub static ref PROCESS_TABLE: OwnerCpuMutex<AdmittedVec<Option<ProcessArc>>> =
         OwnerCpuMutex::new(AdmittedVec::new(HeapClass::CoreProcess));
-    static ref SCHEDULER_CLEANUP: Mutex<Option<SchedulerCleanupCallback>> = Mutex::new(None);
-    static ref IPC_CLEANUP: Mutex<Option<IpcCleanupCallback>> = Mutex::new(None);
-    static ref ROBUST_FUTEX_CLEANUP: Mutex<Option<RobustFutexCleanupCallback>> = Mutex::new(None);
-    /// R180-19: scheduler admission is registered as one atomic callback set so
-    /// a permit can never be born without matching commit/cancel operations.
-    static ref SCHEDULER_ADMISSION: Mutex<Option<SchedulerAdmissionCallbacks>> = Mutex::new(None);
-    /// Futex 唤醒回调（用于 clear_child_tid）
-    static ref FUTEX_WAKE: Mutex<Option<FutexWakeCallback>> = Mutex::new(None);
-    /// GAP-5 futex parity (review F7): exec's futex key-space drop.
-    static ref FUTEX_EXEC: Mutex<Option<FutexExecCallback>> = Mutex::new(None);
-    /// E.5 Cpuset: Task joined callback (for fork/clone)
-    static ref CPUSET_TASK_JOINED: Mutex<Option<CpusetTaskJoinedCallback>> = Mutex::new(None);
-    /// E.5 Cpuset: Task left callback (for process exit)
-    static ref CPUSET_TASK_LEFT: Mutex<Option<CpusetTaskLeftCallback>> = Mutex::new(None);
     /// H.3 KPTI: Per-CPU CR3 update callback (bridges kernel_core → arch)
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
-static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
+    static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
+
+/// Lock-free boot-time-once subsystem callbacks (eliminates global spinlock
+/// traffic across all CPUs during fork, exit, and zombie reap).
+static SCHEDULER_CLEANUP: spin::Once<SchedulerCleanupCallback> = spin::Once::new();
+static IPC_CLEANUP: spin::Once<IpcCleanupCallback> = spin::Once::new();
+static ROBUST_FUTEX_CLEANUP: spin::Once<RobustFutexCleanupCallback> = spin::Once::new();
+/// R180-19: scheduler admission is registered as one atomic callback set so
+/// a permit can never be born without matching commit/cancel operations.
+static SCHEDULER_ADMISSION: spin::Once<SchedulerAdmissionCallbacks> = spin::Once::new();
+/// Futex 唤醒回调（用于 clear_child_tid）
+static FUTEX_WAKE: spin::Once<FutexWakeCallback> = spin::Once::new();
+/// GAP-5 futex parity (review F7): exec's futex key-space drop.
+static FUTEX_EXEC: spin::Once<FutexExecCallback> = spin::Once::new();
+/// E.5 Cpuset: Task joined callback (for fork/clone)
+static CPUSET_TASK_JOINED: spin::Once<CpusetTaskJoinedCallback> = spin::Once::new();
+/// E.5 Cpuset: Task left callback (for process exit)
+static CPUSET_TASK_LEFT: spin::Once<CpusetTaskLeftCallback> = spin::Once::new();
 
 /// Issue #109 §4.2: lock-free cached physical address of the boot PML4 root.
 ///
@@ -5819,6 +5886,7 @@ fn allocate_global_pid(
     let is_free = |pid: ProcessId| {
         table.get(pid).map(|slot| slot.is_none()).unwrap_or(true)
             && !reaping_pid_is_set(&reaping, pid)
+            && !crate::rcu::is_stack_callback_pending(pid)
     };
     let pid = pick_global_pid(start, window, pid_max, extend, is_free)
         .ok_or(ProcessCreateError::PidExhausted)?;
@@ -6048,10 +6116,63 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
     ppid: ProcessId,
     priority: Priority,
 ) -> Result<ProcessId, ProcessCreateError> {
+    create_process_arc(name, ppid, priority).map(|(pid, _)| pid)
+}
+
+/// Internal counterpart to [`create_process`] that also returns the published
+/// `ProcessArc` so `sys_fork` avoids an extra `PROCESS_TABLE` lookup.
+pub(crate) fn create_process_arc<N: IntoProcessNameSnapshot>(
+    name: N,
+    ppid: ProcessId,
+    priority: Priority,
+) -> Result<(ProcessId, ProcessArc), ProcessCreateError> {
+    create_process_arc_inner(name, ppid, priority, None, None)
+}
+
+/// Fast path for `sys_fork_with_parent` which already holds `parent_process`
+/// and snapshotted `(pid_ns_for_children, mount_ns_for_children)`, avoiding two
+/// redundant `PROCESS_TABLE` + parent PCB lock acquisitions.
+pub(crate) fn create_process_arc_for_fork<N: IntoProcessNameSnapshot>(
+    name: N,
+    ppid: ProcessId,
+    priority: Priority,
+    parent_process: &ProcessArc,
+    parent_ns: (
+        crate::pid_namespace::PidNamespaceArc,
+        Arc<crate::mount_namespace::MountNamespace>,
+    ),
+) -> Result<(ProcessId, ProcessArc), ProcessCreateError> {
+    create_process_arc_inner(name, ppid, priority, Some(parent_process), Some(parent_ns))
+}
+
+fn create_process_arc_inner<N: IntoProcessNameSnapshot>(
+    name: N,
+    ppid: ProcessId,
+    priority: Priority,
+    parent_process: Option<&ProcessArc>,
+    parent_ns: Option<(
+        crate::pid_namespace::PidNamespaceArc,
+        Arc<crate::mount_namespace::MountNamespace>,
+    )>,
+) -> Result<(ProcessId, ProcessArc), ProcessCreateError> {
     let name = name.into_process_name_snapshot();
     // R158-4 FIX: Reserve parent child slot BEFORE allocating any resources.
     // If reservation fails, return ENOMEM with no cleanup needed.
-    reserve_child_slot(ppid)?;
+    if let Some(parent_arc) = parent_process {
+        let mut parent = parent_arc.lock();
+        let needed_capacity = parent.children.len() + parent.children_reserved + 1;
+        let current_capacity = parent.children.capacity();
+        if current_capacity < needed_capacity {
+            let additional = needed_capacity - current_capacity;
+            parent
+                .children
+                .try_reserve(additional)
+                .map_err(|_| ProcessCreateError::OutOfMemory)?;
+        }
+        parent.children_reserved += 1;
+    } else {
+        reserve_child_slot(ppid)?;
+    }
     let mut slot_guard = ChildSlotGuard::new(ppid);
 
     // R106-11 (P0-4): Allocate PID via recycling scan.
@@ -6102,7 +6223,8 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
             }
             Err(KernelStackError::AllocationFailed)
                 if !flushed_pending_stacks
-                    && crate::kstack_flush::stats().pending > 0
+                    && (crate::kstack_flush::stats().pending > 0
+                        || crate::kstack_flush::cached_frame_count() > 0)
                     && x86_64::instructions::interrupts::are_enabled() =>
             {
                 // Under memory pressure, reclaim frames held in the batched
@@ -6125,7 +6247,7 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
         }
     };
 
-    let process = match Process::try_new_pcb(pid, ppid, name, priority) {
+    let process = match Process::try_new_pcb_inner(pid, ppid, name, priority, ppid == 0) {
         Ok(process) => process,
         Err(error) => {
             free_kernel_stack(pid, stack_base, stack_phys, stack_rcu);
@@ -6140,98 +6262,81 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
         }
     }
 
-    // 设置已分配的内核栈
-    {
-        let mut proc = process.lock();
-        proc.kernel_stack = stack_base;
-        proc.kernel_stack_top = stack_top;
-        proc.kernel_stack_phys = Some(stack_phys);
-        proc.kernel_stack_rcu = Some(stack_rcu);
-    }
-
-    // R101-1 FIX: Kernel-internal processes (ppid == 0) need explicit root credentials.
-    //
-    // Process::new() now defaults to nobody (uid=65534). Kernel threads and init
-    // processes must be explicitly promoted to root. User-spawned processes will
-    // inherit credentials from the parent via fork()/clone().
-    if ppid == 0 {
-        let mut proc = process.lock();
-        proc.credentials.replace_unpublished(Credentials {
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
-            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        });
-    }
-
-    // F.1 PID Namespace: Assign namespace chain for the new process
-    //
-    // For kernel-created processes (ppid == 0), use root namespace.
-    // For forked/cloned processes, the caller (fork.rs/sys_clone) will handle
-    // namespace inheritance from the parent.
-    let pid_publication_sources = {
-        let target_ns = if ppid == 0 {
-            // Kernel thread: use root namespace
-            crate::pid_namespace::ROOT_PID_NAMESPACE.clone()
+    // F.1 PID Namespace & Mount Namespace: inherit from caller snapshot when provided
+    // (`fork` fast path) or in ONE PROCESS_TABLE + parent PCB lock acquisition.
+    let (target_ns, target_mnt_ns) = if let Some(ns) = parent_ns {
+        ns
+    } else if ppid == 0 {
+        (
+            crate::pid_namespace::ROOT_PID_NAMESPACE.clone(),
+            crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
+        )
+    } else {
+        let table = PROCESS_TABLE.lock();
+        if let Some(Some(parent)) = table.get(ppid) {
+            let p = parent.lock();
+            (
+                p.pid_ns_for_children.clone(),
+                p.mount_ns_for_children.clone(),
+            )
         } else {
-            // Child process: inherit from parent's pid_ns_for_children
-            // Note: For now, default to root. Fork/clone will override this.
-            let table = PROCESS_TABLE.lock();
-            if let Some(Some(parent)) = table.get(ppid) {
-                parent.lock().pid_ns_for_children.clone()
-            } else {
-                crate::pid_namespace::ROOT_PID_NAMESPACE.clone()
-            }
-        };
+            (
+                crate::pid_namespace::ROOT_PID_NAMESPACE.clone(),
+                crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
+            )
+        }
+    };
 
-        // Assign PID chain from root namespace down to target
+    // Assign PID chain and populate kernel stack + namespaces + root creds in ONE PCB lock.
+    let pid_publication_sources =
         match crate::pid_namespace::assign_pid_chain(target_ns.clone(), pid) {
             Ok(chain) => {
                 let Some(publication_sources) =
                     crate::pid_namespace::PidPublicationSources::from_chain(&chain)
                 else {
                     let mut proc = process.lock();
+                    proc.kernel_stack = stack_base;
+                    proc.kernel_stack_top = stack_top;
+                    proc.kernel_stack_phys = Some(stack_phys);
+                    proc.kernel_stack_rcu = Some(stack_rcu);
                     proc.pid_ns_chain = chain;
                     drop(proc);
                     cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
                     return Err(ProcessCreateError::NamespaceError);
                 };
                 let mut proc = process.lock();
+                proc.kernel_stack = stack_base;
+                proc.kernel_stack_top = stack_top;
+                proc.kernel_stack_phys = Some(stack_phys);
+                proc.kernel_stack_rcu = Some(stack_rcu);
+                if ppid == 0 {
+                    proc.credentials.replace_unpublished(Credentials {
+                        uid: 0,
+                        gid: 0,
+                        euid: 0,
+                        egid: 0,
+                        supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
+                    });
+                }
                 proc.pid_ns_chain = chain;
                 proc.pid_ns_for_children = target_ns;
+                proc.mount_ns = target_mnt_ns.clone();
+                proc.mount_ns_for_children = target_mnt_ns;
                 publication_sources
             }
             Err(e) => {
-                // Namespace chain assignment failed, clean up
-                // R104-2 FIX: Gate diagnostic println behind debug_assertions.
                 kprintln!("Error: Failed to assign PID namespace chain: {:?}", e);
-                let _ = e; // suppress unused warning in release
+                let _ = e;
+                let mut proc = process.lock();
+                proc.kernel_stack = stack_base;
+                proc.kernel_stack_top = stack_top;
+                proc.kernel_stack_phys = Some(stack_phys);
+                proc.kernel_stack_rcu = Some(stack_rcu);
+                drop(proc);
                 cleanup_unpublished_process_resources(&process, pid, stack_base, stack_phys);
-                // R106-11: PID reclaim is automatic — the slot is still None,
-                // so the next allocate_global_pid() scan will find it.
                 return Err(ProcessCreateError::NamespaceError);
             }
-        }
-    };
-
-    // Mount namespace: inherit from parent's mount_ns_for_children (or root for kernel threads)
-    {
-        let target_mnt_ns = if ppid == 0 {
-            crate::mount_namespace::ROOT_MNT_NAMESPACE.clone()
-        } else {
-            let table = PROCESS_TABLE.lock();
-            if let Some(Some(parent)) = table.get(ppid) {
-                parent.lock().mount_ns_for_children.clone()
-            } else {
-                crate::mount_namespace::ROOT_MNT_NAMESPACE.clone()
-            }
         };
-
-        let mut proc = process.lock();
-        proc.mount_ns = target_mnt_ns.clone();
-        proc.mount_ns_for_children = target_mnt_ns;
-    }
 
     // RF180-16: namespace mapping and PCB publication are one lifecycle
     // transaction. Lock order is namespace sources (root->leaf) ->
@@ -6281,8 +6386,9 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
         }
     }
 
-    // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-    {
+    // R104-2 FIX: Gate diagnostic println behind debug_assertions and avoid
+    // locking the published PCB when Info logging is disabled.
+    if klog::enabled(klog::Level::Info) {
         let proc = process.lock();
         klog!(
             Info,
@@ -6293,7 +6399,7 @@ pub fn create_process<N: IntoProcessNameSnapshot>(
         );
     }
 
-    Ok(pid)
+    Ok((pid, process))
 }
 
 /// F.1 PID Namespace: Create a process in a specific namespace.
@@ -6357,7 +6463,8 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
             }
             Err(KernelStackError::AllocationFailed)
                 if !flushed_pending_stacks
-                    && crate::kstack_flush::stats().pending > 0
+                    && (crate::kstack_flush::stats().pending > 0
+                        || crate::kstack_flush::cached_frame_count() > 0)
                     && x86_64::instructions::interrupts::are_enabled() =>
             {
                 flushed_pending_stacks = true;
@@ -6377,7 +6484,7 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
         }
     };
 
-    let process = match Process::try_new_pcb(pid, ppid, name, priority) {
+    let process = match Process::try_new_pcb_inner(pid, ppid, name, priority, ppid == 0) {
         Ok(process) => process,
         Err(error) => {
             free_kernel_stack(pid, stack_base, stack_phys, stack_rcu);
@@ -8070,14 +8177,16 @@ pub(crate) fn syscall_safe_point_locked(proc: &mut Process, frame_bound: bool) -
 /// `PROCESS_TABLE` + `PCB` lock instead of 4 separate lock acquisitions
 /// (`syscall_entry_safe_point` + `evaluate_seccomp` + `current_credentials` +
 /// `current_tgid`, plus read-only `getpid`/`gettid`).
-#[derive(Debug, Clone, Copy)]
 pub enum SyscallEntryState {
     /// No process-table entry found for `pid` (fail closed like `evaluate_seccomp`).
     MissingProcess,
     /// A posted fatal exit was consumed; caller must terminate with this code.
     Exit(i32),
-    /// Entry checks completed; caller proceeds with seccomp verdict + LSM ctx.
+    /// Entry checks completed; caller proceeds with seccomp verdict + LSM ctx
+    /// and reuses `proc_arc` across syscall dispatch and return tail without
+    /// re-acquiring the global `PROCESS_TABLE` lock.
     Ready {
+        proc_arc: ProcessArc,
         exec_handoff: bool,
         verdict: SeccompVerdict,
         tgid: ProcessId,
@@ -8086,6 +8195,30 @@ pub enum SyscallEntryState {
         /// `Some(Ok(id))` or `Some(Err(()))` (EFAULT on missing ns translation).
         fast_ns_id: Option<Result<usize, ()>>,
     },
+}
+
+impl core::fmt::Debug for SyscallEntryState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingProcess => f.write_str("MissingProcess"),
+            Self::Exit(code) => f.debug_tuple("Exit").field(code).finish(),
+            Self::Ready {
+                proc_arc: _,
+                exec_handoff,
+                verdict,
+                tgid,
+                creds,
+                fast_ns_id,
+            } => f
+                .debug_struct("Ready")
+                .field("exec_handoff", exec_handoff)
+                .field("verdict", verdict)
+                .field("tgid", tgid)
+                .field("creds", creds)
+                .field("fast_ns_id", fast_ns_id)
+                .finish(),
+        }
+    }
 }
 
 /// Consolidated syscall-entry path: consumes any posted fatal exit, snapshots
@@ -8153,22 +8286,20 @@ pub fn syscall_entry_prepare(
             }
             _ => None,
         };
-        (
-            SyscallEntryState::Ready {
-                exec_handoff,
-                verdict,
-                tgid,
-                creds,
-                fast_ns_id,
-            },
-            retarget,
-        )
+        ((exec_handoff, verdict, tgid, creds, fast_ns_id), retarget)
     };
-    drop(proc_arc);
     if let Some(group) = retarget {
         retarget_shared_signals(pid, &group);
     }
-    state
+    let (exec_handoff, verdict, tgid, creds, fast_ns_id) = state;
+    SyscallEntryState::Ready {
+        proc_arc,
+        exec_handoff,
+        verdict,
+        tgid,
+        creds,
+        fast_ns_id,
+    }
 }
 
 /// Syscall-entry safe point: consume a posted fatal exit, snapshot the live
@@ -10475,12 +10606,12 @@ pub fn try_get_process(pid: ProcessId) -> Option<Option<ProcessArc>> {
 
 /// 注册调度器的清理回调，用于在 PCB 删除时同步调度器状态
 pub fn register_cleanup_notifier(callback: SchedulerCleanupCallback) {
-    *SCHEDULER_CLEANUP.lock() = Some(callback);
+    let _ = SCHEDULER_CLEANUP.call_once(|| callback);
 }
 
 /// 注册IPC清理回调，用于在进程退出时清理其端点
 pub fn register_ipc_cleanup(callback: IpcCleanupCallback) {
-    *IPC_CLEANUP.lock() = Some(callback);
+    let _ = IPC_CLEANUP.call_once(|| callback);
 }
 
 /// Register the exit-time robust-futex list walker supplied by the IPC crate.
@@ -10488,7 +10619,7 @@ pub fn register_ipc_cleanup(callback: IpcCleanupCallback) {
 /// robust list must be walked while the dying task's address space is still
 /// mapped (before `cleanup_zombie()` can free it).
 pub fn register_robust_futex_cleanup(callback: RobustFutexCleanupCallback) {
-    *ROBUST_FUTEX_CLEANUP.lock() = Some(callback);
+    let _ = ROBUST_FUTEX_CLEANUP.call_once(|| callback);
 }
 
 /// Register the scheduler's prepare/commit/cancel admission transaction.
@@ -10497,7 +10628,7 @@ pub fn register_scheduler_admission(
     commit: SchedulerCommitCallback,
     cancel: SchedulerCancelCallback,
 ) {
-    *SCHEDULER_ADMISSION.lock() = Some(SchedulerAdmissionCallbacks {
+    let _ = SCHEDULER_ADMISSION.call_once(|| SchedulerAdmissionCallbacks {
         reserve,
         commit,
         cancel,
@@ -10506,12 +10637,12 @@ pub fn register_scheduler_admission(
 
 /// 注册 futex 唤醒回调，用于线程退出时唤醒等待者
 pub fn register_futex_wake(callback: FutexWakeCallback) {
-    *FUTEX_WAKE.lock() = Some(callback);
+    let _ = FUTEX_WAKE.call_once(|| callback);
 }
 
 /// Register the futex key-space drop that exec runs (GAP-5 review F7).
 pub fn register_futex_exec(callback: FutexExecCallback) {
-    *FUTEX_EXEC.lock() = Some(callback);
+    let _ = FUTEX_EXEC.call_once(|| callback);
 }
 
 /// GAP-5 futex parity (review F7): the `mm` object, and so its futex key
@@ -10519,8 +10650,7 @@ pub fn register_futex_exec(callback: FutexExecCallback) {
 /// state included, must not meet the new image's waiters. Call with no PCB or
 /// futex lock held.
 pub(crate) fn notify_futex_exec(space: usize) {
-    let callback = *FUTEX_EXEC.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = FUTEX_EXEC.get().copied() {
         let _ = cb(space);
     }
 }
@@ -10530,8 +10660,7 @@ pub(crate) fn notify_futex_exec(space: usize) {
 /// RF178-33 / P1-B: generation is load-bearing. Call only with the reaped
 /// task's identity captured under the PCB lock before the slot was cleared.
 fn notify_scheduler_process_removed(pid: ProcessId, generation: u64) {
-    let callback = *SCHEDULER_CLEANUP.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = SCHEDULER_CLEANUP.get().copied() {
         cb(pid, generation);
     }
 }
@@ -10546,8 +10675,7 @@ fn notify_ipc_process_cleanup(
     ipc_ns_id: cap::NamespaceId,
     generation: u64,
 ) {
-    let callback = *IPC_CLEANUP.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = IPC_CLEANUP.get().copied() {
         cb(pid, tgid, ipc_ns_id, generation);
     }
 }
@@ -10562,8 +10690,7 @@ fn notify_robust_futex_cleanup(
     generation: u64,
     owner_tid: ProcessId,
 ) {
-    let callback = *ROBUST_FUTEX_CLEANUP.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = ROBUST_FUTEX_CLEANUP.get().copied() {
         cb(pid, tgid, generation, owner_tid);
     }
 }
@@ -10573,7 +10700,10 @@ fn notify_robust_futex_cleanup(
 pub fn prepare_scheduler_add_process(
     process: ProcessArc,
 ) -> Result<SchedulerAddPermit, SchedulerAddError> {
-    let callbacks = (*SCHEDULER_ADMISSION.lock()).ok_or(SchedulerAddError::Unavailable)?;
+    let callbacks = SCHEDULER_ADMISSION
+        .get()
+        .copied()
+        .ok_or(SchedulerAddError::Unavailable)?;
     prepare_scheduler_add_process_with(process, callbacks)
 }
 
@@ -10598,7 +10728,10 @@ pub(crate) fn prepare_clone_scheduler_add_process(
     process: ProcessArc,
     credentials: Arc<SharedCredentials>,
 ) -> Result<SchedulerAddPermit, SchedulerAddError> {
-    let callbacks = (*SCHEDULER_ADMISSION.lock()).ok_or(SchedulerAddError::Unavailable)?;
+    let callbacks = SCHEDULER_ADMISSION
+        .get()
+        .copied()
+        .ok_or(SchedulerAddError::Unavailable)?;
     prepare_clone_scheduler_add_process_with(process, credentials, callbacks)
 }
 
@@ -11615,8 +11748,7 @@ pub(crate) fn store_user_tid_word(addr: usize, tid: u32) -> Result<(), ()> {
 ///
 /// 由线程退出时调用，用于 clear_child_tid 机制
 fn notify_futex_wake(tgid: ProcessId, uaddr: usize, max_wake: usize) -> usize {
-    let callback = *FUTEX_WAKE.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = FUTEX_WAKE.get().copied() {
         cb(tgid, uaddr, max_wake)
     } else {
         0
@@ -11627,22 +11759,21 @@ fn notify_futex_wake(tgid: ProcessId, uaddr: usize, max_wake: usize) -> usize {
 ///
 /// Called by sched::cpuset during initialization to register its task_joined function.
 pub fn register_cpuset_task_joined(callback: CpusetTaskJoinedCallback) {
-    *CPUSET_TASK_JOINED.lock() = Some(callback);
+    let _ = CPUSET_TASK_JOINED.call_once(|| callback);
 }
 
 /// E.5 Cpuset: Register callback for task leaving a cpuset
 ///
 /// Called by sched::cpuset during initialization to register its task_left function.
 pub fn register_cpuset_task_left(callback: CpusetTaskLeftCallback) {
-    *CPUSET_TASK_LEFT.lock() = Some(callback);
+    let _ = CPUSET_TASK_LEFT.call_once(|| callback);
 }
 
 /// E.5 Cpuset: Notify that a task joined a cpuset
 ///
 /// Called when a new process is created via fork/clone.
 pub fn notify_cpuset_task_joined(cpuset_id: u32) {
-    let callback = *CPUSET_TASK_JOINED.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = CPUSET_TASK_JOINED.get().copied() {
         cb(cpuset_id);
     }
 }
@@ -11651,8 +11782,7 @@ pub fn notify_cpuset_task_joined(cpuset_id: u32) {
 ///
 /// Called when a process exits.
 pub fn notify_cpuset_task_left(cpuset_id: u32) {
-    let callback = *CPUSET_TASK_LEFT.lock();
-    if let Some(cb) = callback {
+    if let Some(cb) = CPUSET_TASK_LEFT.get().copied() {
         cb(cpuset_id);
     }
 }
@@ -14295,57 +14425,28 @@ fn reclaim_kernel_stack(args: [usize; 2]) {
         .unwrap_or_else(|_| panic!("RCU: invalid PID in kernel-stack callback"));
 
     // Prevalidate every leaf against the immutable original buddy-block
-    // identity before mutating any PTE. A mismatch is quarantined in place.
+    // identity before mutating any PTE, then clear all KSTACK_PAGES leaves in
+    // one batched PT walk without redundant per-page invlpg (C3 defers the
+    // broadcast TLB shootdown to the flush batch). A mismatch is quarantined.
     let reclaim_ready = unsafe {
         page_table::with_kernel_manager(VirtAddr::new(0), |mgr| {
-            for index in 0..KSTACK_PAGES {
-                let page = Page::containing_address(stack_base + (index as u64 * PAGE_SIZE));
-                let expected = PhysFrame::containing_address(
-                    expected_phys.start_address() + (index as u64 * PAGE_SIZE),
-                );
-                if mgr.translate_page_4k(page) != Some(expected) {
-                    return false;
+            match mgr.verify_and_unmap_contiguous_4k_no_flush(
+                Page::containing_address(stack_base),
+                expected_phys,
+                KSTACK_PAGES,
+            ) {
+                page_table::ContiguousUnmapOutcome::Verified => true,
+                page_table::ContiguousUnmapOutcome::PrecheckFailed => false,
+                page_table::ContiguousUnmapOutcome::PartialMismatch { cleared, .. } => {
+                    // Kernel-stack mappings are shared through many distinct CR3 roots.
+                    // A partial failure quarantines the stack below, so its cleared
+                    // leaves are broadcast here.
+                    if cleared != 0 {
+                        mm::flush_all_address_spaces();
+                    }
+                    false
                 }
             }
-
-            let mut cleared = 0usize;
-            let mut matched = 0usize;
-            let mut exact = true;
-            for index in (0..KSTACK_PAGES).rev() {
-                let page = Page::containing_address(stack_base + (index as u64 * PAGE_SIZE));
-                let expected = PhysFrame::containing_address(
-                    expected_phys.start_address() + (index as u64 * PAGE_SIZE),
-                );
-                match mgr.unmap_page(page) {
-                    Ok(actual) => {
-                        // `unmap_page` has already cleared the PTE on every Ok,
-                        // even if the returned physical identity is wrong.  TLB
-                        // invalidation therefore follows mutation accounting,
-                        // while physical reuse additionally requires identity.
-                        cleared += 1;
-                        if actual == expected {
-                            matched += 1;
-                        } else {
-                            exact = false;
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        exact = false;
-                        break;
-                    }
-                }
-            }
-
-            // Kernel-stack mappings are shared through many distinct CR3 roots.
-            // A partial failure quarantines the stack below, so its cleared
-            // leaves are broadcast here. C3 (#90): a fully verified stack
-            // leaves its broadcast to the flush batch.
-            let verified = exact && matched == KSTACK_PAGES;
-            if cleared != 0 && !verified {
-                mm::flush_all_address_spaces();
-            }
-            verified
         })
     };
 
@@ -14461,89 +14562,110 @@ unsafe fn free_page_table_level(
     level: u8,
     frame_alloc: &mut FrameAllocator,
 ) {
-    // PML4 只处理用户空间条目 (0-255)，其他层级处理全部 512 条目
-    let idx_range = if level == 4 { 0..256 } else { 0..512 };
+    // PML4 只处理用户空间条目 (0-255)，其他层级处理全部 512 条目。
+    // Fast sparse scan: skip 4 zero 64-bit PTEs at a time.
+    const _: () = assert!(
+        core::mem::size_of::<x86_64::structures::paging::page_table::PageTableEntry>() == 8
+    );
+    const _: () = assert!(core::mem::size_of::<PageTable>() == 512 * 8);
+    let idx_limit = if level == 4 { 256usize } else { 512usize };
+    let raw_ptr = (table as *const PageTable).cast::<u64>();
 
-    for idx in idx_range {
-        let entry = &mut table[idx];
-        if entry.is_unused() {
+    let mut base_idx = 0usize;
+    while base_idx < idx_limit {
+        let w0 = *raw_ptr.add(base_idx);
+        let w1 = *raw_ptr.add(base_idx + 1);
+        let w2 = *raw_ptr.add(base_idx + 2);
+        let w3 = *raw_ptr.add(base_idx + 3);
+        if (w0 | w1 | w2 | w3) == 0 {
+            base_idx += 4;
             continue;
         }
-
-        let flags = entry.flags();
-        let entry_phys = entry.addr();
-
-        // RF178-31: the low identity map is supervisor-only and shared. COW
-        // clones copy those leaves but never own their physical frames; only
-        // the private intermediate page-table frames are reclaimed below.
-        let is_leaf = level == 1 || flags.contains(PageTableFlags::HUGE_PAGE);
-        if is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
-            entry.set_unused();
-            continue;
-        }
-
-        // RF180-20 FIX: supervisor-only intermediate entries in the user-half
-        // are shared kernel tables (until D0-ISO-1 Approach A, the identity map
-        // `deep_copy_identity_for_user` copied in; user address spaces now have
-        // none). Such an entry is never walked or returned to the buddy
-        // allocator during private user-AS teardown.
-        // User-owned ELF page-table branches retain USER_ACCESSIBLE at every
-        // intermediate level and continue through the recursive cleanup below.
-        if !is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
-            entry.set_unused();
-            continue;
-        }
-
-        // R123-1 defense-in-depth: Reclaim leaf frames referenced by non-present
-        // PTEs. A buggy PROT_NONE mmap path could install non-present leaf entries
-        // that still encode a physical frame address. Older code skipped all
-        // non-PRESENT entries, leaking those frames permanently. At level 1 (PT),
-        // if the PTE is non-present but encodes a non-zero physical address, free
-        // the frame. At higher levels, skip non-present entries (intermediate page
-        // table structures are always present when valid).
-        if level == 1 && !flags.contains(PageTableFlags::PRESENT) {
-            if entry_phys.as_u64() != 0 {
-                free_leaf_frame(entry_phys, frame_alloc);
-                entry.set_unused();
+        for idx in base_idx..base_idx + 4 {
+            if *raw_ptr.add(idx) == 0 {
+                continue;
             }
-            continue;
-        }
+            let entry = &mut table[idx];
+            if entry.is_unused() {
+                continue;
+            }
 
-        if !flags.contains(PageTableFlags::PRESENT) {
-            continue;
-        }
+            let flags = entry.flags();
+            let entry_phys = entry.addr();
 
-        // 检查是否是大页 (2MB 或 1GB)
-        //
-        // R192 FIX (LEAD-TEARDOWN-HUGE-1), superseding R49-2: no path maps a
-        // user huge page (every user mapping is 4 KiB, and fork refuses a USER
-        // huge leaf), so one here is an anomaly, such as a supervisor identity
-        // leaf that gained USER through `map_to`'s parent-flag OR before the
-        // R192-2 guard. Its frames are not this address space's: freeing the
-        // base frame (R49-2) could hand a live kernel or MMIO frame to the
-        // allocator. Drop the entry and leak the frame, failing safe.
-        // Bit 7 of a PT entry is PAT, not a page size: only levels 2-3 map huge.
-        if level > 1 && flags.contains(PageTableFlags::HUGE_PAGE) {
-            klog_force!(
-                "[MM] teardown: dropped an unexpected USER huge leaf (level {}); frame not freed",
-                level
-            );
-            entry.set_unused();
-            continue;
-        }
+            // RF178-31: the low identity map is supervisor-only and shared. COW
+            // clones copy those leaves but never own their physical frames; only
+            // the private intermediate page-table frames are reclaimed below.
+            let is_leaf = level == 1 || flags.contains(PageTableFlags::HUGE_PAGE);
+            if is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                entry.set_unused();
+                continue;
+            }
 
-        if level == 1 {
-            // PT 层级的叶子节点：释放 4KB 物理帧
-            free_leaf_frame(entry_phys, frame_alloc);
-        } else {
-            // 中间节点：递归处理子页表
-            let next_table = phys_to_virt_table(entry_phys);
-            free_page_table_level(next_table, level - 1, frame_alloc);
+            // RF180-20 FIX: supervisor-only intermediate entries in the user-half
+            // are shared kernel tables (until D0-ISO-1 Approach A, the identity map
+            // `deep_copy_identity_for_user` copied in; user address spaces now have
+            // none). Such an entry is never walked or returned to the buddy
+            // allocator during private user-AS teardown.
+            // User-owned ELF page-table branches retain USER_ACCESSIBLE at every
+            // intermediate level and continue through the recursive cleanup below.
+            if !is_leaf && !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                entry.set_unused();
+                continue;
+            }
 
-            // 释放子页表帧本身
-            let next_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(entry_phys);
-            frame_alloc.deallocate_frame(next_frame);
+            // R123-1 defense-in-depth: Reclaim leaf frames referenced by non-present
+            // PTEs. A buggy PROT_NONE mmap path could install non-present leaf entries
+            // that still encode a physical frame address. Older code skipped all
+            // non-PRESENT entries, leaking those frames permanently. At level 1 (PT),
+            // if the PTE is non-present but encodes a non-zero physical address, free
+            // the frame. At higher levels, skip non-present entries (intermediate page
+            // table structures are always present when valid).
+            if level == 1 && !flags.contains(PageTableFlags::PRESENT) {
+                if entry_phys.as_u64() != 0 {
+                    free_leaf_frame(entry_phys, frame_alloc);
+                    entry.set_unused();
+                }
+                continue;
+            }
+
+            if !flags.contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+
+            // 检查是否是大页 (2MB 或 1GB)
+            //
+            // R192 FIX (LEAD-TEARDOWN-HUGE-1), superseding R49-2: no path maps a
+            // user huge page (every user mapping is 4 KiB, and fork refuses a USER
+            // huge leaf), so one here is an anomaly, such as a supervisor identity
+            // leaf that gained USER through `map_to`'s parent-flag OR before the
+            // R192-2 guard. Its frames are not this address space's: freeing the
+            // base frame (R49-2) could hand a live kernel or MMIO frame to the
+            // allocator. Drop the entry and leak the frame, failing safe.
+            // Bit 7 of a PT entry is PAT, not a page size: only levels 2-3 map huge.
+            if level > 1 && flags.contains(PageTableFlags::HUGE_PAGE) {
+                klog_force!(
+                    "[MM] teardown: dropped an unexpected USER huge leaf (level {}); frame not freed",
+                    level
+                );
+                entry.set_unused();
+                continue;
+            }
+
+            if level == 1 {
+                // PT 层级的叶子节点：释放 4KB 物理帧
+                free_leaf_frame(entry_phys, frame_alloc);
+            } else {
+                // 中间节点：递归处理子页表
+                let next_table = phys_to_virt_table(entry_phys);
+                free_page_table_level(next_table, level - 1, frame_alloc);
+
+                // 释放子页表帧本身
+                let next_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(entry_phys);
+                frame_alloc.deallocate_frame(next_frame);
+            }
         }
+        base_idx += 4;
     }
 }
 
@@ -15442,6 +15564,7 @@ pub fn oom_timestamp() -> u64 {
 /// 在内核初始化时调用，将进程管理函数注册到 OOM killer
 pub fn register_oom_callbacks() {
     mm::register_oom_callbacks(oom_snapshot, oom_kill, oom_timestamp);
+    mm::register_oom_cache_reclaim_callback(crate::kstack_flush::reclaim_cached_kstack_pages);
     klog!(Info, "  OOM killer callbacks registered");
 }
 

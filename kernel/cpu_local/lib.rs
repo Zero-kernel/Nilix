@@ -130,11 +130,10 @@ static LAPIC_MMIO_BASE: AtomicU64 = AtomicU64::new(LAPIC_MMIO_DEFAULT_BASE as u6
 
 /// True once the platform is operating the local APIC in x2APIC mode.
 ///
-/// R169-L7 FIX: in x2APIC mode the APIC ID is delivered via an MSR, can exceed
-/// 8 bits (overflowing the 256-entry `LAPIC_ID_REVERSE_MAP`), and the xAPIC MMIO
-/// ID register is invalid. `current_cpu_id()` fails closed when this is set rather
-/// than read a bogus ID and alias another CPU's per-CPU slot. Published by
-/// `arch::apic` at LAPIC init; the current kernel never enables x2APIC.
+/// Published by `arch::apic` at LAPIC init. When set, hardware LAPIC ID reads
+/// use MSR `0x802` (`IA32_X2APIC_APICID`, full 32-bit ID) instead of the xAPIC
+/// MMIO window (`base + 0x20`). IDs `>= LAPIC_ID_REVERSE_MAP_SIZE` (256)
+/// still fail closed in `lapic_cpu_lookup()` and `register_cpu_id()`.
 static X2APIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Read the authoritative LAPIC MMIO base (see [`LAPIC_MMIO_BASE`]).
@@ -502,7 +501,7 @@ pub fn publish_identity(cpu_id: usize) {
     let by_value = identity_value_registered_cpu(value);
     let by_lapic = match lapic_cpu_lookup() {
         CurrentCpuLookup::Registered(lapic_cpu) => Some(lapic_cpu),
-        CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+        CurrentCpuLookup::Unregistered(_) => None,
     };
     assert!(
         by_value.is_some() && by_value == by_lapic,
@@ -589,7 +588,7 @@ pub fn publish_gs_identity(cpu_id: usize) {
     let by_value = identity_value_registered_cpu(gs_val);
     let by_lapic = match lapic_cpu_lookup() {
         CurrentCpuLookup::Registered(lapic_cpu) => Some(lapic_cpu),
-        CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+        CurrentCpuLookup::Unregistered(_) => None,
     };
     assert!(
         by_value.is_some() && by_value == by_lapic,
@@ -674,7 +673,7 @@ pub fn check_identity_tick() {}
 pub fn lapic_registered_cpu_id() -> Option<usize> {
     match lapic_cpu_lookup() {
         CurrentCpuLookup::Registered(cpu_id) => Some(cpu_id),
-        CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+        CurrentCpuLookup::Unregistered(_) => None,
     }
 }
 
@@ -1234,7 +1233,7 @@ pub fn try_current_registered_cpu_id() -> Option<usize> {
     {
         match current_cpu_lookup() {
             CurrentCpuLookup::Registered(cpu_id) => Some(cpu_id),
-            CurrentCpuLookup::X2ApicActive | CurrentCpuLookup::Unregistered(_) => None,
+            CurrentCpuLookup::Unregistered(_) => None,
         }
     }
 }
@@ -1254,7 +1253,6 @@ fn current_cpu_id_impl() -> usize {
 #[cfg(not(feature = "host_harness"))]
 enum CurrentCpuLookup {
     Registered(usize),
-    X2ApicActive,
     Unregistered(u32),
 }
 
@@ -1264,6 +1262,7 @@ enum CurrentCpuLookup {
 /// A reverse entry alone is not a registration proof: firmware or a buggy
 /// re-registration could otherwise leave a stale entry that aliases KCOV (and
 /// other per-CPU state) to an unrelated online CPU.
+#[cfg_attr(all(feature = "host_harness", not(test)), allow(dead_code))]
 #[inline]
 fn registered_cpu_mapping_matches(cpu_id: usize, lapic_id: u32) -> bool {
     cpu_id < MAX_CPUS && LAPIC_ID_MAP[cpu_id].load(Ordering::Acquire) == lapic_id
@@ -1273,16 +1272,6 @@ fn registered_cpu_mapping_matches(cpu_id: usize, lapic_id: u32) -> bool {
 #[cfg(not(feature = "host_harness"))]
 #[inline]
 fn current_cpu_lookup() -> CurrentCpuLookup {
-    // R169-L7 FIX: in x2APIC mode the APIC ID comes from an MSR, can exceed 8 bits
-    // (overflowing the 256-entry reverse map), and the xAPIC MMIO ID register read
-    // below is invalid. Reading it would alias another CPU's per-CPU slot, so fail
-    // closed. `arch::apic` publishes this flag at LAPIC init (it is xAPIC-MMIO
-    // only); the kernel never enables x2APIC, so on supported hardware this branch
-    // is never taken.
-    if X2APIC_ACTIVE.load(Ordering::Acquire) {
-        return CurrentCpuLookup::X2ApicActive;
-    }
-
     // Issue #109 §2.1: single-instruction Ring-0 GS-base fast path once every
     // online CPU has published and LAPIC-verified its GS per-CPU record.
     // Falls through to LAPIC on an invalid/zero encoding (fail-closed).
@@ -1312,6 +1301,24 @@ fn current_cpu_lookup() -> CurrentCpuLookup {
 #[cfg(not(feature = "host_harness"))]
 #[inline]
 fn read_lapic_id_register() -> u32 {
+    if X2APIC_ACTIVE.load(Ordering::Acquire) {
+        // x2APIC mode: IA32_X2APIC_APICID (MSR 0x802) returns the full 32-bit
+        // APIC ID directly in EAX (no shift). Avoids xAPIC MMIO completely and
+        // is hardware-accelerated by KVM APICv.
+        let low: u32;
+        let _high: u32;
+        unsafe {
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") 0x802u32,
+                out("eax") low,
+                out("edx") _high,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        return low;
+    }
+
     // R169-L7 FIX: read the LAPIC ID register (offset 0x20, bits 31:24) through the
     // single authoritative MMIO base shared with `arch::apic::lapic_read`, not a
     // hard-coded `0xFEE0_0020` literal. After memory initialization this is a
@@ -1327,13 +1334,10 @@ fn read_lapic_id_register() -> u32 {
 #[cfg(not(feature = "host_harness"))]
 #[inline]
 fn lapic_cpu_lookup() -> CurrentCpuLookup {
-    if X2APIC_ACTIVE.load(Ordering::Acquire) {
-        return CurrentCpuLookup::X2ApicActive;
-    }
-
     let apic_id = read_lapic_id_register();
 
-    // R67-8 FIX: O(1) reverse lookup instead of linear search
+    // R67-8 FIX: O(1) reverse lookup instead of linear search.
+    // Bounds check ensures any >8-bit x2APIC ID fails closed as Unregistered.
     let cpu_idx = if (apic_id as usize) < LAPIC_ID_REVERSE_MAP_SIZE {
         LAPIC_ID_REVERSE_MAP[apic_id as usize].load(Ordering::Acquire)
     } else {
@@ -1356,9 +1360,6 @@ fn lapic_cpu_lookup() -> CurrentCpuLookup {
 fn current_cpu_id_impl() -> usize {
     match current_cpu_lookup() {
         CurrentCpuLookup::Registered(cpu_id) => cpu_id,
-        CurrentCpuLookup::X2ApicActive => {
-            panic!("current_cpu_id: x2APIC mode is unsupported (would alias per-CPU data)");
-        }
         CurrentCpuLookup::Unregistered(apic_id) => {
             // R151-6 FIX: After SMP init, an unregistered LAPIC ID is a critical bug
             // that would silently alias CPU 0's per-CPU data. Panic immediately.
