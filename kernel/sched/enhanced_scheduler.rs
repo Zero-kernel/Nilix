@@ -888,6 +888,17 @@ fn finish_pending_prev() -> bool {
     true
 }
 
+/// Post-switch tail invoked by `switch_to_user` after switching `RSP` onto the
+/// incoming user task's private kernel stack (with IF=0 and kernel CR3/GS still
+/// active). Immediately releases the outgoing task's `on_cpu` gate and wakes
+/// any blocked parent/reaper instead of stalling until the new child's first
+/// syscall or timer tick.
+extern "C" fn finish_pending_prev_after_user_switch() {
+    if !finish_pending_prev() {
+        current_cpu().set_need_resched();
+    }
+}
+
 /// R69-1 FIX: Per-CPU ready queues - each CPU has its own priority-bucketed queue.
 ///
 /// Using CpuLocal splits the lock across CPUs, reducing cross-CPU contention and
@@ -3734,9 +3745,19 @@ impl Scheduler {
 
         let next_is_user = (prepared.next_cs & 0x3) == 0x3;
         if next_is_user {
+            let tail = if prepared.next_kstack_top != 0 {
+                Some(finish_pending_prev_after_user_switch as extern "C" fn())
+            } else {
+                None
+            };
             unsafe {
                 process::publish_current_kcov_token(prepared.next_kcov_token);
-                switch_to_user(prepared.old_ctx_ptr, prepared.next_ctx_ptr);
+                switch_to_user(
+                    prepared.old_ctx_ptr,
+                    prepared.next_ctx_ptr,
+                    prepared.next_kstack_top,
+                    tail,
+                );
             }
         } else {
             unsafe {

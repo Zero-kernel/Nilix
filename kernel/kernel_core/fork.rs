@@ -2960,7 +2960,7 @@ struct LeafUpdate {
 // capacity to 8 (~320 B) there to keep the fork call chain well under the
 // 32 KiB kernel stack budget.
 #[cfg(not(debug_assertions))]
-const COW_INLINE_LEAVES: usize = 64;
+const COW_INLINE_LEAVES: usize = 192;
 #[cfg(debug_assertions)]
 const COW_INLINE_LEAVES: usize = 8;
 const COW_INLINE_TABLES: usize = 16;
@@ -4106,6 +4106,121 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
     Ok((new_pml4_frame, phys_addr))
 }
 
+/// Shared read-only KPTI entry-island PDPT frame for all real user address
+/// spaces derived from the boot kernel's immutable `PML4[511]` PDPT.
+///
+/// Every user process's KPTI entry island maps the exact same supervisor-only
+/// top 6 GiB (`PDPT[506..=511]`) while keeping `PDPT[0..506]` absent. Sharing
+/// one dedicated PDPT frame (strictly distinct from the kernel's `PML4[511]`
+/// PDPT) eliminates 1 physical frame allocation, 4 KiB scrub-on-free zeroing,
+/// and 1 frame deallocation on every `fork()` and `exec()`, while synthetic
+/// test roots with non-boot `PML4[511]` PDPTs still build and free private
+/// island frames.
+static SHARED_KPTI_ISLAND_SRC_PDPT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static SHARED_KPTI_ISLAND_PDPT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Snapshot of the 6 `PDPT[506..=511]` words (masked of `USER | ACCESSED | DIRTY`)
+/// copied into `SHARED_KPTI_ISLAND_PDPT`, verified on every reuse so any
+/// hypothetical post-boot change falls back cleanly to a private island PDPT.
+static SHARED_KPTI_ISLAND_WORDS: [core::sync::atomic::AtomicU64; 6] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+static SHARED_KPTI_ISLAND_LOCK: Mutex<()> = Mutex::new(());
+
+/// Mask out hardware Accessed/Dirty (bits 5..6) and USER_ACCESSIBLE (bit 2)
+/// when comparing `PDPT[506..=511]` entries against the cached shared island.
+const KPTI_PDPT_COMPARE_MASK: u64 = !((1u64 << 2) | (1u64 << 5) | (1u64 << 6));
+
+#[inline]
+fn kpti_island_word_matches(live_word: u64, cached_masked_word: u64) -> bool {
+    (live_word & KPTI_PDPT_COMPARE_MASK) == cached_masked_word
+}
+
+#[inline]
+fn shared_kpti_island_entries_match(kernel_pdpt: &PageTable) -> bool {
+    const _: () = assert!(512 - KPTI_ISLAND_FIRST_PDPT == 6);
+    let raw = (kernel_pdpt as *const PageTable).cast::<u64>();
+    for offset in 0..6 {
+        let live = unsafe { *raw.add(KPTI_ISLAND_FIRST_PDPT + offset) };
+        if !kpti_island_word_matches(
+            live,
+            SHARED_KPTI_ISLAND_WORDS[offset].load(Ordering::Relaxed),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn try_get_shared_kpti_island_pdpt(
+    src_pdpt_phys: u64,
+    kernel_pdpt: &PageTable,
+) -> Result<Option<PhysFrame<Size4KiB>>, ForkError> {
+    if src_pdpt_phys == 0 {
+        return Ok(None);
+    }
+    if SHARED_KPTI_ISLAND_SRC_PDPT.load(Ordering::Acquire) == src_pdpt_phys {
+        let cached = SHARED_KPTI_ISLAND_PDPT.load(Ordering::Relaxed);
+        if cached != 0 && shared_kpti_island_entries_match(kernel_pdpt) {
+            return Ok(Some(PhysFrame::containing_address(PhysAddr::new(cached))));
+        }
+        return Ok(None);
+    }
+
+    // Only share for the live boot kernel's immutable `PML4[511]` PDPT so
+    // synthetic probe roots retain private allocation/rollback accounting.
+    let boot_cr3 = crate::process::boot_cr3_phys();
+    if boot_cr3 == 0 {
+        return Ok(None);
+    }
+    let boot_pdpt_phys = unsafe {
+        let boot_pml4 = phys_to_virt_table(PhysAddr::new(boot_cr3));
+        if !kernel_stack_pdpt_entry_ready(&boot_pml4[511]) {
+            return Ok(None);
+        }
+        boot_pml4[511].addr().as_u64()
+    };
+    if src_pdpt_phys != boot_pdpt_phys {
+        return Ok(None);
+    }
+
+    let _guard = SHARED_KPTI_ISLAND_LOCK.lock();
+    if SHARED_KPTI_ISLAND_SRC_PDPT.load(Ordering::Acquire) == src_pdpt_phys {
+        let cached = SHARED_KPTI_ISLAND_PDPT.load(Ordering::Relaxed);
+        if cached != 0 && shared_kpti_island_entries_match(kernel_pdpt) {
+            return Ok(Some(PhysFrame::containing_address(PhysAddr::new(cached))));
+        }
+        return Ok(None);
+    }
+
+    let mut frame = [PhysFrame::containing_address(PhysAddr::new(0)); 1];
+    if mm::buddy_allocator::alloc_physical_pages_batch(&mut frame) < 1 {
+        return Err(ForkError::MemoryAllocationFailed);
+    }
+    let island_frame = frame[0];
+    unsafe {
+        debug_assert_table_zeroed(island_frame);
+        let island_pdpt = phys_to_virt_table(island_frame.start_address());
+        let raw_src = (kernel_pdpt as *const PageTable).cast::<u64>();
+        for offset in 0..6 {
+            let i = KPTI_ISLAND_FIRST_PDPT + offset;
+            island_pdpt[i] = kernel_pdpt[i].clone();
+            if !island_pdpt[i].is_unused() {
+                let addr = island_pdpt[i].addr();
+                let mut flags = island_pdpt[i].flags();
+                flags.remove(PageTableFlags::USER_ACCESSIBLE);
+                island_pdpt[i].set_addr(addr, flags);
+            }
+            SHARED_KPTI_ISLAND_WORDS[offset]
+                .store(*raw_src.add(i) & KPTI_PDPT_COMPARE_MASK, Ordering::Relaxed);
+        }
+    }
+    let island_phys = island_frame.start_address().as_u64();
+    SHARED_KPTI_ISLAND_PDPT.store(island_phys, Ordering::Release);
+    SHARED_KPTI_ISLAND_SRC_PDPT.store(src_pdpt_phys, Ordering::Release);
+    Ok(Some(island_frame))
+}
+
 /// H.3 KPTI: Create a user-mode PML4 root for KPTI dual page tables.
 ///
 /// The user PML4 provides the address space visible under the user CR3:
@@ -4134,7 +4249,8 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
 ///
 /// The user PML4 root frame is privately owned. User-half entries are shared
 /// pointers into the kernel PML4's sub-tables and MUST NOT be recursively freed.
-/// Call `free_kpti_user_pml4()` to release the private root and entry PDPT.
+/// Call `free_kpti_user_pml4()` to release the private root and any private
+/// entry-island PDPT.
 ///
 /// # Arguments
 ///
@@ -4152,37 +4268,6 @@ pub fn create_kpti_user_pml4(
         return Err(ForkError::PageTableCopyFailed);
     }
 
-    // Allocate both the user PML4 root and the R118-5 dedicated entry-island
-    // PDPT frame (PML4[511]) in a single batched PCP/buddy call (pre-zeroed by
-    // Buddy Invariant S2).
-    //
-    // Instead of copying the kernel's full PML4[511] (which maps 512 GiB),
-    // we create a fresh PDPT and copy only its top 6 GiB
-    // (PDPT[KPTI_ISLAND_FIRST_PDPT..=511], 506..=511).
-    // This limits speculative Meltdown-style exposure from 512 GiB to 6 GiB,
-    // covering only the regions actually needed by the trampoline:
-    //   - Per-process kernel stacks (TSS.RSP0)
-    //   - Kernel text/data (.text at 0xffffffff80100000)
-    //   - Per-CPU syscall metadata (SyscallPerCpu)
-    //   - IDT/GDT/TSS and scratch stacks
-    let mut kpti_frames = [PhysFrame::containing_address(PhysAddr::new(0)); 2];
-    let got = mm::buddy_allocator::alloc_physical_pages_batch(&mut kpti_frames);
-    if got < 2 {
-        if got > 0 {
-            mm::buddy_allocator::free_physical_pages_batch(&kpti_frames[..got]);
-        }
-        return Err(ForkError::MemoryAllocationFailed);
-    }
-    let user_pml4_frame = kpti_frames[0];
-    let entry_island_pdpt_frame = kpti_frames[1];
-    unsafe {
-        debug_assert_table_zeroed(user_pml4_frame);
-        debug_assert_table_zeroed(entry_island_pdpt_frame);
-    }
-
-    let kernel_pml4_frame: PhysFrame<Size4KiB> =
-        PhysFrame::containing_address(PhysAddr::new(kernel_pml4_phys as u64));
-
     /// User-half boundary: PML4 indices 0..255
     const USER_HALF_END: usize = 256;
     /// Recursive page table slot — must be empty in user PML4
@@ -4190,7 +4275,59 @@ pub fn create_kpti_user_pml4(
     /// Entry island slot — contains kernel text/entry stubs/IDT/GDT/TSS
     const ENTRY_ISLAND_INDEX: usize = 511;
 
-    let mut stacks_reachable = false;
+    let kernel_pml4_frame: PhysFrame<Size4KiB> =
+        PhysFrame::containing_address(PhysAddr::new(kernel_pml4_phys as u64));
+
+    // LEAD-KSTACK-WINDOW-1: validate `PML4[511]` and its kernel-stack PDPT
+    // entries UP FRONT before allocating any frames, so malformed roots fail
+    // closed with zero allocator churn.
+    let (island_flags, src_pdpt_phys, kernel_pdpt_ref) = unsafe {
+        let kernel_pml4 = phys_to_virt_table(kernel_pml4_frame.start_address());
+        if !kernel_stack_pdpt_entry_ready(&kernel_pml4[ENTRY_ISLAND_INDEX]) {
+            return Err(ForkError::PageTableCopyFailed);
+        }
+        let mut flags = kernel_pml4[ENTRY_ISLAND_INDEX].flags();
+        flags.remove(PageTableFlags::USER_ACCESSIBLE);
+        let pdpt_addr = kernel_pml4[ENTRY_ISLAND_INDEX].addr();
+        let kernel_pdpt = phys_to_virt_table(pdpt_addr);
+        let stacks_reachable = (KPTI_ISLAND_FIRST_PDPT..=KSTACK_LAST_PDPT)
+            .all(|i| kernel_stack_pdpt_entry_ready(&kernel_pdpt[i]));
+        if !stacks_reachable {
+            return Err(ForkError::PageTableCopyFailed);
+        }
+        (flags, pdpt_addr.as_u64(), kernel_pdpt)
+    };
+
+    // Fast path: reuse the shared immutable entry-island PDPT for real boot
+    // kernel roots (allocating only 1 frame instead of 2). Synthetic probe
+    // roots fall back to a private 2-frame allocation.
+    let shared_island = try_get_shared_kpti_island_pdpt(src_pdpt_phys, kernel_pdpt_ref)?;
+    let (user_pml4_frame, entry_island_pdpt_frame, populate_private_island) =
+        if let Some(shared_frame) = shared_island {
+            let mut one = [PhysFrame::containing_address(PhysAddr::new(0)); 1];
+            if mm::buddy_allocator::alloc_physical_pages_batch(&mut one) < 1 {
+                return Err(ForkError::MemoryAllocationFailed);
+            }
+            unsafe {
+                debug_assert_table_zeroed(one[0]);
+            }
+            (one[0], shared_frame, false)
+        } else {
+            let mut kpti_frames = [PhysFrame::containing_address(PhysAddr::new(0)); 2];
+            let got = mm::buddy_allocator::alloc_physical_pages_batch(&mut kpti_frames);
+            if got < 2 {
+                if got > 0 {
+                    mm::buddy_allocator::free_physical_pages_batch(&kpti_frames[..got]);
+                }
+                return Err(ForkError::MemoryAllocationFailed);
+            }
+            unsafe {
+                debug_assert_table_zeroed(kpti_frames[0]);
+                debug_assert_table_zeroed(kpti_frames[1]);
+            }
+            (kpti_frames[0], kpti_frames[1], true)
+        };
+
     unsafe {
         let kernel_pml4 = phys_to_virt_table(kernel_pml4_frame.start_address());
         let user_pml4 = phys_to_virt_table(user_pml4_frame.start_address());
@@ -4230,43 +4367,11 @@ pub fn create_kpti_user_pml4(
         user_pml4[RECURSIVE_INDEX].set_unused();
 
         // ── Map entry island (PML4[511]) ──
-        //
-        // R118-5 FIX: Instead of copying the kernel's PML4[511] verbatim (512 GiB),
-        // point to a dedicated PDPT that only maps the top 6 GiB
-        // (PDPT[KPTI_ISLAND_FIRST_PDPT..=511]).
-        //
-        // R121-2 NOTE: these PDPT entries are currently required:
-        //   - PDPT[506..=507]: Per-process kernel stacks (LEAD-KSTACK-WINDOW-1:
-        //                KSTACK_BASE = 0xffff_fffe_8000_0000; their page
-        //                directories exist from boot, so later stacks appear in
-        //                every island). TSS.RSP0 points here; must be mapped
-        //                during Ring 3→0 transitions.
-        //   - PDPT[508]: Empty since LEAD-KSTACK-WINDOW-1 (copied with the rest).
-        //   - PDPT[509]: stack_guard guarded RSP0/IST stacks mapped during boot.
-        //   - PDPT[510]: Kernel .text/.rodata/.data/.bss + statics (GDT, TSS,
-        //                SYSCALL_PERCPU, scratch stacks).
-        //   - PDPT[511]: Heap allocations (IDT via lazy_static, etc.)
-        //
-        // A tighter island (R121-2 final) requires relocating kernel stacks
-        // into PDPT[510..=511] or using a dedicated entry stack in the island,
-        // plus moving IDT/GDT/TSS into dedicated linker sections at known
-        // page-aligned addresses — deferred to dedicated KPTI hardening cycle.
-        //
-        // All entries are supervisor-only (USER_ACCESSIBLE removed at both PML4
-        // and PDPT levels) to prevent normal Ring 3 access and limit Meltdown-style
-        // speculative exposure to 6 GiB instead of 512 GiB.
-        if kernel_stack_pdpt_entry_ready(&kernel_pml4[ENTRY_ISLAND_INDEX]) {
-            let mut island_flags = kernel_pml4[ENTRY_ISLAND_INDEX].flags();
-            island_flags.remove(PageTableFlags::USER_ACCESSIBLE);
-            user_pml4[ENTRY_ISLAND_INDEX].set_frame(entry_island_pdpt_frame, island_flags);
-
-            let kernel_pdpt = phys_to_virt_table(kernel_pml4[ENTRY_ISLAND_INDEX].addr());
+        user_pml4[ENTRY_ISLAND_INDEX].set_frame(entry_island_pdpt_frame, island_flags);
+        if populate_private_island {
             let island_pdpt = phys_to_virt_table(entry_island_pdpt_frame.start_address());
-
-            // Copy only PDPT[KPTI_ISLAND_FIRST_PDPT..=511] (top 6 GiB) from the
-            // kernel's PDPT. The entries below remain absent in the user PDPT.
             for i in KPTI_ISLAND_FIRST_PDPT..512 {
-                island_pdpt[i] = kernel_pdpt[i].clone();
+                island_pdpt[i] = kernel_pdpt_ref[i].clone();
                 if !island_pdpt[i].is_unused() {
                     let addr = island_pdpt[i].addr();
                     let mut flags = island_pdpt[i].flags();
@@ -4274,18 +4379,7 @@ pub fn create_kpti_user_pml4(
                     island_pdpt[i].set_addr(addr, flags);
                 }
             }
-            stacks_reachable = (KPTI_ISLAND_FIRST_PDPT..=KSTACK_LAST_PDPT)
-                .all(|i| kernel_stack_pdpt_entry_ready(&kernel_pdpt[i]));
         }
-    }
-    // LEAD-KSTACK-WINDOW-1: every kernel stack must be reachable from this
-    // root (an interrupt from ring 3 pushes its frame on TSS.RSP0 before the
-    // CR3 switch), which holds only while the boot-time page directories are
-    // in the copied entries. Fail closed rather than build a root whose first
-    // interrupt would double-fault.
-    if !stacks_reachable {
-        mm::buddy_allocator::free_physical_pages_batch(&[entry_island_pdpt_frame, user_pml4_frame]);
-        return Err(ForkError::PageTableCopyFailed);
     }
 
     let phys_addr = user_pml4_frame.start_address().as_u64() as usize;
@@ -4334,16 +4428,20 @@ pub fn free_kpti_user_pml4(user_memory_space: usize) {
     let mut frames = [PhysFrame::containing_address(PhysAddr::new(0)); 2];
     let mut count = 0usize;
 
-    // R118-5 FIX: Free the privately-owned entry-island PDPT frame (PML4[511])
-    // and user PML4 root in a single batched PCP/buddy release.
+    // R118-5 FIX: Free any privately-owned entry-island PDPT frame (PML4[511])
+    // and user PML4 root in a single batched PCP/buddy release; never free the
+    // permanent boot-shared entry-island PDPT.
+    let shared_island_phys = SHARED_KPTI_ISLAND_PDPT.load(Ordering::Acquire);
     unsafe {
         const ENTRY_ISLAND_INDEX: usize = 511;
         let user_pml4 = phys_to_virt_table(root_frame.start_address());
         if !user_pml4[ENTRY_ISLAND_INDEX].is_unused() {
             let pdpt_phys = user_pml4[ENTRY_ISLAND_INDEX].addr();
             user_pml4[ENTRY_ISLAND_INDEX].set_unused();
-            frames[count] = PhysFrame::containing_address(pdpt_phys);
-            count += 1;
+            if shared_island_phys == 0 || pdpt_phys.as_u64() != shared_island_phys {
+                frames[count] = PhysFrame::containing_address(pdpt_phys);
+                count += 1;
+            }
         }
     }
 
@@ -4572,5 +4670,42 @@ mod tests {
         assert!(pool.alloc_with_fallback(alloc_fn, oom_fallback).is_none());
         assert_eq!(refill_calls.get(), 4);
         assert_eq!(oom_fallback_calls.get(), 2);
+    }
+
+    #[test]
+    fn kpti_island_word_match_ignores_uad_and_catches_structural_drift() {
+        let base = 0x0000_0001_2345_0000u64
+            | PageTableFlags::PRESENT.bits()
+            | PageTableFlags::WRITABLE.bits()
+            | PageTableFlags::NO_EXECUTE.bits();
+        let cached = base & KPTI_PDPT_COMPARE_MASK;
+
+        // Hardware Accessed/Dirty updates and stripped USER_ACCESSIBLE bit match.
+        assert!(kpti_island_word_matches(base, cached));
+        assert!(kpti_island_word_matches(
+            base | PageTableFlags::ACCESSED.bits()
+                | PageTableFlags::DIRTY.bits()
+                | PageTableFlags::USER_ACCESSIBLE.bits(),
+            cached
+        ));
+
+        // Any physical frame change or structural flag change must force private fallback.
+        assert!(!kpti_island_word_matches(base + 0x1000, cached));
+        assert!(!kpti_island_word_matches(
+            base & !PageTableFlags::PRESENT.bits(),
+            cached
+        ));
+        assert!(!kpti_island_word_matches(
+            base & !PageTableFlags::WRITABLE.bits(),
+            cached
+        ));
+        assert!(!kpti_island_word_matches(
+            base | PageTableFlags::HUGE_PAGE.bits(),
+            cached
+        ));
+        assert!(!kpti_island_word_matches(
+            base & !PageTableFlags::NO_EXECUTE.bits(),
+            cached
+        ));
     }
 }
