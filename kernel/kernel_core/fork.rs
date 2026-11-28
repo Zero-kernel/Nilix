@@ -770,6 +770,9 @@ fn fork_prepare_child_state(
     child.blocked = parent.blocked;
     // N2.6a: POSIX/Linux fork(2) inherits the parent's alternate signal stack.
     child.sigaltstack = parent.sigaltstack;
+    // N2.5: POSIX/Linux fork(2) inherits process group, session, and
+    // controlling terminal; child starts with has_execed = false.
+    child.thread_group.inherit_job_control(&parent.thread_group);
 
     // 克隆能力表（尊重 CLOFORK 标志）
     //

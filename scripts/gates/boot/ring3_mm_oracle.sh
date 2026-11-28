@@ -151,6 +151,7 @@ FPU IRQ isolation: concurrent SSE XMM0-XMM7 state stays bit-exact across timer p
 N2.8 loopback UDP/TCP echo, getsockname/getpeername, and RST/SO_ERROR
 N2.8 setsockopt/getsockopt round-trip, bounds, and negative checks
 N2.8 sendmsg/recvmsg scatter-gather, MSG_TRUNC, EOPNOTSUPP control, and multi-iovec readv
+N2.5 pgid/sid, controlling terminal ioctls, kill(-pgid), wait4/waitid stop & continue
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.

@@ -669,6 +669,12 @@ pub fn syscall_dispatcher(
             Sc::Getpid => sys_getpid_fast(fast_ns_id),
             Sc::Gettid => sys_gettid_fast(fast_ns_id),
             Sc::Getppid => sys_getppid(),
+            // N2.5: Process groups & sessions.
+            Sc::Setpgid => sys_setpgid(arg0 as i32, arg1 as i32),
+            Sc::Getpgrp => sys_getpgrp(),
+            Sc::Setsid => sys_setsid(),
+            Sc::Getpgid => sys_getpgid(arg0 as i32),
+            Sc::Getsid => sys_getsid(arg0 as i32),
             Sc::Getuid => sys_getuid(),
             Sc::Geteuid => sys_geteuid(),
             Sc::Getgid => sys_getgid(),
@@ -678,7 +684,7 @@ pub fn syscall_dispatcher(
             Sc::GetRobustList => {
                 sys_get_robust_list(arg0 as i32, arg1 as *mut u64, arg2 as *mut u64)
             }
-            Sc::Kill => sys_kill(arg0 as ProcessId, arg1 as i32),
+            Sc::Kill => sys_kill(arg0 as i32, arg1 as i32),
             // GAP-5 slice 4 G7: thread-directed signals.
             Sc::Tkill => sys_tkill(arg0 as i32, arg1 as i32),
             Sc::Tgkill => sys_tgkill(arg0 as i32, arg1 as i32, arg2 as i32),

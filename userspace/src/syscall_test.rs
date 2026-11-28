@@ -381,6 +381,8 @@ pub extern "C" fn _start() -> ! {
     test_n2_8_loopback_udp_tcp_echo(&mut results);
     test_n2_8_sockopts_and_negative(&mut results);
     test_n2_8_sendmsg_recvmsg_and_readv(&mut results);
+    // N2.5: Process groups, sessions, controlling terminal ioctls, kill(-pgid), wait4/waitid job control.
+    test_n2_5_job_control_sessions_and_wait(&mut results);
 
     // Print summary
     println("");
@@ -2503,11 +2505,11 @@ fn test_waitid(results: &mut TestResult) {
     //    needs a child. Each is a claim in §4 of the design.
     let mut info = SigInfo::poisoned();
     let bad = [
-        (P_PGID, 1, WEXITED, "P_PGID"),
+        (P_PGID, (-1_i32) as u64, WEXITED, "P_PGID with negative id"),
         (P_PID, 0, WEXITED, "P_PID with id 0"),
         (7, 1, WEXITED, "unknown idtype"),
-        (P_ALL, 0, 0, "missing WEXITED"),
-        (P_ALL, 0, WEXITED | WUNTRACED, "WUNTRACED"),
+        (P_ALL, 0, 0, "missing event flag"),
+        (P_ALL, 0, WNOHANG, "WNOHANG without event flag"),
         (P_ALL, 0, WEXITED | (1 << 20), "unknown option bit"),
     ];
     for (idtype, id, opts, what) in bad {
@@ -12658,5 +12660,309 @@ fn test_n2_8_sendmsg_recvmsg_and_readv(results: &mut TestResult) {
 
     results.pass(
         "N2.8 sendmsg/recvmsg scatter-gather, MSG_TRUNC, EOPNOTSUPP control, and multi-iovec readv",
+    );
+}
+
+// ===========================================================================
+// N2.5: Process Groups, Sessions, Controlling Terminal & Job Control Wait
+// ===========================================================================
+
+const N25_SYS_IOCTL: u64 = 16;
+const N25_SYS_PIPE: u64 = 22;
+const N25_SYS_WAIT4: u64 = 61;
+const N25_SYS_KILL: u64 = 62;
+const N25_SYS_SETPGID: u64 = 109;
+const N25_SYS_GETPGRP: u64 = 111;
+const N25_SYS_SETSID: u64 = 112;
+const N25_SYS_GETPGID: u64 = 121;
+const N25_SYS_GETSID: u64 = 124;
+
+const N25_TIOCSCTTY: u64 = 0x540E;
+const N25_TIOCGPGRP: u64 = 0x540F;
+const N25_TIOCSPGRP: u64 = 0x5410;
+const N25_TIOCNOTTY: u64 = 0x5422;
+const N25_TIOCGSID: u64 = 0x5429;
+
+const N25_SIGCONT: u64 = 18;
+const N25_SIGSTOP: u64 = 19;
+const N25_WCONTINUED: u64 = 8;
+const N25_CLD_CONTINUED: i32 = 6;
+const N25_EPERM: i32 = 1;
+const N25_EINTR: i32 = 4;
+const N25_ENOTTY: i32 = 25;
+
+fn test_n2_5_job_control_sessions_and_wait(results: &mut TestResult) {
+    print("Testing N2.5 pgid/sid, ctty ioctls, kill(-pgid), wait4/waitid stop & continue... ");
+
+    let my_pid = unsafe { sys_getpid() };
+    let pgrp = unsafe { syscall0(N25_SYS_GETPGRP) };
+    let pgid0 = unsafe { syscall1(N25_SYS_GETPGID, 0) };
+    let sid0 = unsafe { syscall1(N25_SYS_GETSID, 0) };
+    let setsid_leader = unsafe { syscall0(N25_SYS_SETSID) };
+    if pgrp != my_pid
+        || pgid0 != my_pid
+        || sid0 != my_pid
+        || !is_error(setsid_leader)
+        || errno(setsid_leader) != N25_EPERM
+    {
+        results.fail("n2_5: initial pgid/sid or leader setsid EPERM check failed");
+        return;
+    }
+
+    let mut fg_pgid: i32 = 0;
+    let mut tty_sid: i32 = 0;
+    let r_gpgrp = unsafe {
+        syscall3(
+            N25_SYS_IOCTL,
+            0,
+            N25_TIOCGPGRP,
+            &mut fg_pgid as *mut i32 as u64,
+        )
+    };
+    let r_gsid = unsafe {
+        syscall3(
+            N25_SYS_IOCTL,
+            0,
+            N25_TIOCGSID,
+            &mut tty_sid as *mut i32 as u64,
+        )
+    };
+    if is_error(r_gpgrp) || is_error(r_gsid) || fg_pgid != my_pid as i32 || tty_sid != my_pid as i32
+    {
+        results.fail("n2_5: initial TIOCGPGRP/TIOCGSID check failed");
+        return;
+    }
+
+    // Leg 1: fork child, move it into its own process group, switch fg_pgid,
+    // stop via kill(-pgid, SIGSTOP), observe WUNTRACED via wait4(-pgid),
+    // continue via kill(-pgid, SIGCONT), observe WCONTINUED via waitid(P_PGID),
+    // and reap exit via waitid(P_PGID, WEXITED).
+    let mut c2p = [0i32; 2];
+    let mut p2c = [0i32; 2];
+    if is_error(unsafe { syscall1(N25_SYS_PIPE, c2p.as_mut_ptr() as u64) })
+        || is_error(unsafe { syscall1(N25_SYS_PIPE, p2c.as_mut_ptr() as u64) })
+    {
+        results.fail("n2_5: pipe creation failed");
+        return;
+    }
+
+    let child1 = unsafe { sys_fork() };
+    if is_error(child1) {
+        results.fail("n2_5: fork child1 failed");
+        return;
+    }
+    if child1 == 0 {
+        unsafe {
+            sys_close(c2p[0] as u64);
+            sys_close(p2c[1] as u64);
+        }
+        let r_sp = unsafe { syscall2(N25_SYS_SETPGID, 0, 0) };
+        if is_error(r_sp) {
+            unsafe { userspace::syscall::sys_exit(101) };
+        }
+        let ready = [b'R'];
+        let _ = unsafe { syscall3(SYS_WRITE, c2p[1] as u64, ready.as_ptr() as u64, 1) };
+        unsafe { sys_close(c2p[1] as u64) };
+        let mut go = [0u8; 1];
+        loop {
+            let n = unsafe { syscall3(SYS_READ, p2c[0] as u64, go.as_mut_ptr() as u64, 1) };
+            if is_error(n) && errno(n) == N25_EINTR {
+                continue;
+            }
+            break;
+        }
+        unsafe {
+            sys_close(p2c[0] as u64);
+            userspace::syscall::sys_exit(37);
+        }
+    }
+
+    unsafe {
+        sys_close(c2p[1] as u64);
+        sys_close(p2c[0] as u64);
+    }
+    let mut ready_byte = [0u8; 1];
+    let r_ready = unsafe { syscall3(SYS_READ, c2p[0] as u64, ready_byte.as_mut_ptr() as u64, 1) };
+    unsafe { sys_close(c2p[0] as u64) };
+    if is_error(r_ready) || r_ready != 1 || ready_byte[0] != b'R' {
+        let _ = unsafe { syscall2(N25_SYS_KILL, child1, 9) };
+        unsafe { sys_close(p2c[1] as u64) };
+        reap_quietly(child1);
+        results.fail("n2_5: child1 ready handshake failed");
+        return;
+    }
+
+    let c1_pgid = unsafe { syscall1(N25_SYS_GETPGID, child1) };
+    let c1_sid = unsafe { syscall1(N25_SYS_GETSID, child1) };
+    let new_fg = child1 as i32;
+    let orig_fg = my_pid as i32;
+    let r_set_fg = unsafe {
+        syscall3(
+            N25_SYS_IOCTL,
+            0,
+            N25_TIOCSPGRP,
+            &new_fg as *const i32 as u64,
+        )
+    };
+    let mut observed_fg: i32 = 0;
+    let r_get_fg = unsafe {
+        syscall3(
+            N25_SYS_IOCTL,
+            0,
+            N25_TIOCGPGRP,
+            &mut observed_fg as *mut i32 as u64,
+        )
+    };
+    let r_restore_fg = unsafe {
+        syscall3(
+            N25_SYS_IOCTL,
+            0,
+            N25_TIOCSPGRP,
+            &orig_fg as *const i32 as u64,
+        )
+    };
+    if c1_pgid != child1
+        || c1_sid != my_pid
+        || is_error(r_set_fg)
+        || is_error(r_get_fg)
+        || observed_fg != new_fg
+        || is_error(r_restore_fg)
+    {
+        unsafe { sys_close(p2c[1] as u64) };
+        reap_quietly(child1);
+        results.fail("n2_5: getpgid/getsid or TIOCSPGRP/TIOCGPGRP switch failed");
+        return;
+    }
+
+    let neg_c1 = (-(child1 as i64)) as u64;
+    let r_stop = unsafe { syscall2(N25_SYS_KILL, neg_c1, N25_SIGSTOP) };
+    let mut wstatus: i32 = 0;
+    let r_wait_stop = unsafe {
+        syscall4(
+            N25_SYS_WAIT4,
+            neg_c1,
+            &mut wstatus as *mut i32 as u64,
+            WUNTRACED,
+            0,
+        )
+    };
+    let expected_stop_status = ((N25_SIGSTOP as i32) << 8) | 0x7f;
+
+    let r_cont = unsafe { syscall2(N25_SYS_KILL, neg_c1, N25_SIGCONT) };
+    let mut cont_info = SigInfo::poisoned();
+    let r_wait_cont = waitid(P_PGID, child1, &mut cont_info, N25_WCONTINUED);
+
+    let go_byte = [b'G'];
+    let _ = unsafe { syscall3(SYS_WRITE, p2c[1] as u64, go_byte.as_ptr() as u64, 1) };
+    unsafe { sys_close(p2c[1] as u64) };
+
+    let mut exit_info = SigInfo::poisoned();
+    let r_wait_exit = waitid(P_PGID, child1, &mut exit_info, WEXITED);
+
+    if is_error(r_stop)
+        || r_wait_stop != child1
+        || wstatus != expected_stop_status
+        || is_error(r_cont)
+        || is_error(r_wait_cont)
+        || cont_info.signo() != SIGCHLD
+        || cont_info.code() != N25_CLD_CONTINUED
+        || cont_info.pid() as u64 != child1
+        || cont_info.status() != N25_SIGCONT as i32
+        || is_error(r_wait_exit)
+        || exit_info.signo() != SIGCHLD
+        || exit_info.code() != CLD_EXITED
+        || exit_info.pid() as u64 != child1
+        || exit_info.status() != 37
+    {
+        results
+            .fail("n2_5: kill(-pgid)/wait4(WUNTRACED)/waitid(P_PGID, WCONTINUED|WEXITED) failed");
+        return;
+    }
+
+    // Leg 2: setsid() detaches from inherited ctty, TIOCSCTTY(0) fails EPERM
+    // while another session owns it, TIOCSCTTY(1) steals, TIOCNOTTY detaches.
+    let child2 = unsafe { sys_fork() };
+    if is_error(child2) {
+        results.fail("n2_5: fork child2 failed");
+        return;
+    }
+    if child2 == 0 {
+        let c2_pid = unsafe { sys_getpid() };
+        let ns = unsafe { syscall0(N25_SYS_SETSID) };
+        if ns != c2_pid {
+            unsafe { userspace::syscall::sys_exit(11) };
+        }
+        if unsafe { syscall0(N25_SYS_GETPGRP) } != c2_pid
+            || unsafe { syscall1(N25_SYS_GETSID, 0) } != c2_pid
+        {
+            unsafe { userspace::syscall::sys_exit(12) };
+        }
+        let mut s: i32 = 0;
+        let r_gsid_no_ctty =
+            unsafe { syscall3(N25_SYS_IOCTL, 0, N25_TIOCGSID, &mut s as *mut i32 as u64) };
+        if !is_error(r_gsid_no_ctty) || errno(r_gsid_no_ctty) != N25_ENOTTY {
+            unsafe { userspace::syscall::sys_exit(13) };
+        }
+        let r_sctty_nosteal = unsafe { syscall3(N25_SYS_IOCTL, 0, N25_TIOCSCTTY, 0) };
+        if !is_error(r_sctty_nosteal) || errno(r_sctty_nosteal) != N25_EPERM {
+            unsafe { userspace::syscall::sys_exit(14) };
+        }
+        let r_sctty_steal = unsafe { syscall3(N25_SYS_IOCTL, 0, N25_TIOCSCTTY, 1) };
+        if is_error(r_sctty_steal) {
+            unsafe { userspace::syscall::sys_exit(15) };
+        }
+        let mut s2: i32 = 0;
+        let mut fg2: i32 = 0;
+        let r_gsid2 =
+            unsafe { syscall3(N25_SYS_IOCTL, 0, N25_TIOCGSID, &mut s2 as *mut i32 as u64) };
+        let r_gpgrp2 =
+            unsafe { syscall3(N25_SYS_IOCTL, 0, N25_TIOCGPGRP, &mut fg2 as *mut i32 as u64) };
+        if is_error(r_gsid2) || is_error(r_gpgrp2) || s2 != c2_pid as i32 || fg2 != c2_pid as i32 {
+            unsafe { userspace::syscall::sys_exit(16) };
+        }
+        let r_notty = unsafe { syscall3(N25_SYS_IOCTL, 0, N25_TIOCNOTTY, 0) };
+        if is_error(r_notty) {
+            unsafe { userspace::syscall::sys_exit(17) };
+        }
+        // Session leader releasing its ctty sends SIGHUP to its foreground PGID
+        // (which includes child2 itself), so child2 should not reach exit(18).
+        unsafe { userspace::syscall::sys_exit(18) };
+    }
+
+    let mut c2_status: i32 = -1;
+    let r_c2 = unsafe {
+        syscall4(
+            N25_SYS_WAIT4,
+            child2,
+            &mut c2_status as *mut i32 as u64,
+            0,
+            0,
+        )
+    };
+    // Re-attach PID 1 to the console ctty after child2 released it with TIOCNOTTY.
+    let r_reattach = unsafe { syscall3(N25_SYS_IOCTL, 0, N25_TIOCSCTTY, 0) };
+    let mut restored_sid: i32 = 0;
+    let r_check_sid = unsafe {
+        syscall3(
+            N25_SYS_IOCTL,
+            0,
+            N25_TIOCGSID,
+            &mut restored_sid as *mut i32 as u64,
+        )
+    };
+    // 128 + SIGHUP(1) = 129 encoded in wait4 status as (129 << 8).
+    const EXPECTED_SIGHUP_STATUS: i32 = 129 << 8;
+    if r_c2 != child2
+        || c2_status != EXPECTED_SIGHUP_STATUS
+        || is_error(r_reattach)
+        || is_error(r_check_sid)
+        || restored_sid != my_pid as i32
+    {
+        results.fail("n2_5: setsid/TIOCSCTTY/TIOCNOTTY child2 leg failed");
+        return;
+    }
+
+    results.pass(
+        "N2.5 pgid/sid, controlling terminal ioctls, kill(-pgid), wait4/waitid stop & continue",
     );
 }

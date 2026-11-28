@@ -1200,6 +1200,8 @@ pub(super) fn exec_from_bytes(
         proc.poll_restore_blocked = None;
         // N2.6a: POSIX/Linux execve(2) disables any established alternate signal stack.
         proc.sigaltstack = crate::signal::SigAltStack::disabled();
+        // N2.5: Mark process as having executed a new image (POSIX setpgid EACCES rule).
+        proc.thread_group.mark_execed();
         let exec_tgid = proc.tgid;
         // Robust-list registration is address-space-local. Clear the old
         // image's pointer before publishing the replacement so exit cleanup
