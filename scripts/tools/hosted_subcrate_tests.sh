@@ -176,7 +176,7 @@ run_suite livepatch 3 0 \
     --manifest-path kernel/livepatch/Cargo.toml \
     --target x86_64-unknown-linux-gnu --lib --locked
 
-run_suite mm 98 0 \
+run_suite mm 100 0 \
     --manifest-path kernel/mm/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -231,7 +231,7 @@ run_suite ipc-robust-futex 31 17 \
     --features mm/host_harness \
     --lib --locked -- robust_ futex_parity_ futex_pi_ pipe_close_
 
-run_suite vfs 105 0 \
+run_suite vfs 106 0 \
     --manifest-path kernel/vfs/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
