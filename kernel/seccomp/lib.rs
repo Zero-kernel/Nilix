@@ -66,8 +66,12 @@ use spin::RwLock;
 // Audit integration for violation logging
 use audit::{emit_seccomp_violation, AuditSeccompAction, AuditSubject};
 
+pub mod syscall_table;
 pub mod types;
 
+pub use syscall_table::{
+    DispatchStatus, DispatchedSyscall, PledgePolicy, SyscallSpec, SYSCALL_TABLE,
+};
 pub use types::{
     FastAllowSet, PledgePromises, PledgeState, SeccompAction, SeccompError, SeccompFilter,
     SeccompFlags, SeccompInsn, SeccompState, SeccompVerdict, MAX_INSNS,
@@ -121,62 +125,41 @@ pub fn register_current_hooks(evaluator: SeccompEvaluator, enabled_check: Seccom
 }
 
 // ============================================================================
-// Strict Mode Syscall Whitelist
+// Strict Mode Syscall Whitelist (generated from syscall_table::SYSCALL_TABLE)
 // ============================================================================
 
-/// Syscalls allowed in SECCOMP_MODE_STRICT.
-///
-/// This mirrors Linux's strict mode whitelist (see seccomp(2)):
-/// read, write, exit, exit_group, and rt_sigreturn.
-///
-/// R144-3 FIX: Added rt_sigreturn(15). Without it, a process in strict mode
-/// that receives a signal cannot return from its signal handler — the sigreturn
-/// syscall is denied by seccomp, causing forced termination instead of graceful
-/// signal handling.
-const STRICT_ALLOWED: &[u64] = &[
-    0,   // read
-    1,   // write
-    15,  // rt_sigreturn — R144-3 FIX
-    60,  // exit
-    231, // exit_group
-];
+/// Syscalls allowed in SECCOMP_MODE_STRICT, derived at compile time from
+/// `syscall_table::SYSCALL_TABLE` (`strict_allowed == true`).
+const STRICT_ALLOWED: &[u64] = &syscall_table::STRICT_ALLOWED;
 
-const STRICT_PROGRAM: [SeccompInsn; 12] = [
-    SeccompInsn::LdSyscallNr,
-    SeccompInsn::JmpEq(0, 0, 1),
-    SeccompInsn::Ret(SeccompAction::Allow),
-    SeccompInsn::JmpEq(1, 0, 1),
-    SeccompInsn::Ret(SeccompAction::Allow),
-    SeccompInsn::JmpEq(15, 0, 1),
-    SeccompInsn::Ret(SeccompAction::Allow),
-    SeccompInsn::JmpEq(60, 0, 1),
-    SeccompInsn::Ret(SeccompAction::Allow),
-    SeccompInsn::JmpEq(231, 0, 1),
-    SeccompInsn::Ret(SeccompAction::Allow),
-    SeccompInsn::Ret(SeccompAction::Kill),
-];
+const WORST_CASE_STRICT_INSNS: usize = 2 + 2 * syscall_table::STRICT_ALLOWED_COUNT;
 
-/// R169-12: Conservative worst-case instruction count for a generated pledge
-/// filter — `1` (LdSyscallNr) + `2` per allowed syscall + `1` (Ret Kill). The
-/// deduped union of every promise's syscall list is 53 today (49 + the 4 M0-6
-/// poll/select STDIO additions); we bound it at
-/// 64 distinct syscalls for headroom. The const-assert below makes any future
-/// promise/syscall expansion that would overrun `MAX_TRUSTED_INSNS` a BUILD
-/// error rather than a silent runtime fail-closed (deny-all). If you add
-/// promises, update `MAX_PLEDGE_SYSCALLS` to the new deduped maximum.
+const fn build_strict_program() -> [SeccompInsn; WORST_CASE_STRICT_INSNS] {
+    let mut prog = [SeccompInsn::Ret(SeccompAction::Kill); WORST_CASE_STRICT_INSNS];
+    prog[0] = SeccompInsn::LdSyscallNr;
+    let mut i = 0usize;
+    while i < syscall_table::STRICT_ALLOWED_COUNT {
+        prog[1 + 2 * i] = SeccompInsn::JmpEq(syscall_table::STRICT_ALLOWED[i], 0, 1);
+        prog[2 + 2 * i] = SeccompInsn::Ret(SeccompAction::Allow);
+        i += 1;
+    }
+    prog[WORST_CASE_STRICT_INSNS - 1] = SeccompInsn::Ret(SeccompAction::Kill);
+    prog
+}
+
+const STRICT_PROGRAM: [SeccompInsn; WORST_CASE_STRICT_INSNS] = build_strict_program();
+
+/// R169-12 / N2.0b: Conservative worst-case instruction count for a generated
+/// pledge filter — `1` (LdSyscallNr) + `2` per allowed syscall + `1` (Ret Kill).
+/// `PLEDGE_UNION_COUNT` is derived at compile time from `SYSCALL_TABLE` and
+/// bounded by `MAX_PLEDGE_SYSCALLS` so any table expansion that would overrun
+/// `MAX_TRUSTED_INSNS` is a build error.
 const MAX_PLEDGE_SYSCALLS: usize = 64;
+const _: () = assert!(syscall_table::PLEDGE_UNION_COUNT <= MAX_PLEDGE_SYSCALLS);
 const WORST_CASE_PLEDGE_INSNS: usize = 2 + 2 * MAX_PLEDGE_SYSCALLS;
 const _: () = assert!(WORST_CASE_PLEDGE_INSNS <= types::MAX_TRUSTED_INSNS);
 
-/// R170-I1: parallel bound for the OTHER trusted generator — `strict_filter`
-/// emits exactly 1 (LdSyscallNr) + 2 per allowed syscall (JmpEq + Ret Allow)
-/// + 1 (Ret Kill) = `2 + 2 * STRICT_ALLOWED.len()` instructions. This makes a
-/// future `STRICT_ALLOWED` expansion that would overrun `MAX_TRUSTED_INSNS` a
-/// BUILD error instead of a silent runtime flip of strict mode to deny-all
-/// (the fail-closed fallback below would otherwise mask it). Keep this assert
-/// ADJACENT to the pledge assert above so both trusted generators are visibly
-/// bounded together.
-const WORST_CASE_STRICT_INSNS: usize = 2 + 2 * STRICT_ALLOWED.len();
+/// R170-I1: parallel bound for the strict-mode trusted generator.
 const _: () = assert!(WORST_CASE_STRICT_INSNS <= types::MAX_TRUSTED_INSNS);
 const _: () = assert!(STRICT_PROGRAM.len() == WORST_CASE_STRICT_INSNS);
 
@@ -219,140 +202,19 @@ pub fn strict_filter() -> SeccompFilter {
 // Pledge Filter Generation
 // ============================================================================
 
-/// Generate a seccomp filter from pledge promises.
+/// N2.0b: the deduped, sorted set of syscall numbers a pledge promise set allows,
+/// generated directly from `syscall_table::SYSCALL_TABLE`.
 ///
-/// This compiles the promise set into a BPF-like filter that can be
-/// evaluated by the same code path as user-provided filters.
-/// M0-6: the deduped, sorted set of syscall numbers a pledge promise set allows.
-///
-/// SINGLE SOURCE OF TRUTH for the BPF whitelist: `pledge_to_filter` compiles
-/// exactly this list, so the divergence-prevention parity self-test
-/// (`pledge_full_syscall_union`) is provably equal to what the filter whitelists
-/// — there is no third hand-maintained list to drift (R150-3).
+/// `SYSCALL_TABLE` is strictly sorted with unique syscall numbers, so collecting
+/// matching rows produces the canonical sorted, deduplicated BPF allowlist with
+/// zero duplication against `promise_allows_syscall()` or `syscall_dispatcher()`.
 pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
-    use types::*;
     let mut allowed_syscalls: Vec<u64> = Vec::new();
-
-    // R149-I3 FIX: Use centralized syscall number constants from types.rs.
-    // Always allow exit
-    allowed_syscalls.push(SYS_EXIT);
-    allowed_syscalls.push(SYS_EXIT_GROUP);
-
-    // Add syscalls for each promise
-    if promises.contains(PledgePromises::STDIO) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_READ,
-            SYS_WRITE,
-            SYS_CLOSE,
-            SYS_FSTAT,
-            SYS_LSEEK,
-            SYS_GETPID,
-            SYS_GETUID,
-            SYS_GETGID,
-            SYS_GETEUID,
-            SYS_GETEGID,
-            SYS_GETPPID,
-            SYS_SCHED_YIELD,
-            // M0-6 poll/select: I/O multiplexing over already-held fds is a
-            // core stdio capability (OpenBSD pledge("stdio") grants
-            // poll/select/ppoll/pselect identically). Added in lockstep with
-            // promise_allows_syscall (types.rs) per R150-3.
-            SYS_POLL,
-            SYS_SELECT,
-            SYS_PSELECT6,
-            SYS_PPOLL,
-            // ST-K4: durability over already-held descriptors. In lockstep with
-            // promise_allows_syscall (types.rs) per R150-3.
-            SYS_FSYNC,
-            SYS_FDATASYNC,
-            SYS_SYNC,
-            SYS_SYNC_FILE_RANGE,
-        ]);
+    for spec in syscall_table::SYSCALL_TABLE {
+        if spec.pledge.allows_nr(promises) {
+            allowed_syscalls.push(spec.nr);
+        }
     }
-
-    if promises.contains(PledgePromises::RPATH) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_OPEN,
-            SYS_OPENAT, // R150-3 FIX: match promise_allows_syscall() open/openat gating
-            SYS_STAT,
-            SYS_LSTAT,
-            SYS_READLINK,
-            SYS_GETDENTS64,
-        ]);
-    }
-
-    if promises.contains(PledgePromises::WPATH) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_OPEN,
-            SYS_OPENAT, // R150-3 FIX: match promise_allows_syscall() open/openat gating
-            SYS_RENAME,
-            SYS_UNLINK,
-            SYS_SYMLINK,
-        ]);
-    }
-
-    if promises.contains(PledgePromises::CPATH) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_OPEN,   // R150-3 FIX: CPATH is a valid path capability for open (creation)
-            SYS_OPENAT, // R150-3 FIX: match promise_allows_syscall() has_path gate
-            SYS_MKDIR, SYS_RMDIR, SYS_LINK,
-        ]);
-    }
-
-    // R150-3 FIX: TMPPATH is a valid path capability for open/openat with
-    // creation flags (O_CREAT, O_TRUNC). The semantic evaluator gates this
-    // on argument inspection; the BPF path must at least whitelist the syscalls.
-    if promises.contains(PledgePromises::TMPPATH) {
-        allowed_syscalls.extend_from_slice(&[SYS_OPEN, SYS_OPENAT]);
-    }
-
-    if promises.contains(PledgePromises::VM) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_MMAP,
-            SYS_MPROTECT,
-            SYS_MUNMAP,
-            SYS_BRK,
-            SYS_MREMAP,
-        ]);
-    }
-
-    if promises.contains(PledgePromises::PROC) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_CLONE, SYS_FORK, SYS_VFORK, SYS_WAIT4, SYS_KILL, SYS_WAITID,
-        ]);
-    }
-
-    if promises.contains(PledgePromises::EXEC) {
-        allowed_syscalls.push(SYS_EXECVE);
-    }
-
-    if promises.contains(PledgePromises::THREAD) {
-        allowed_syscalls.extend_from_slice(&[SYS_CLONE, SYS_FUTEX, SYS_SET_TID_ADDRESS]);
-    }
-
-    if promises.contains(PledgePromises::TIME) {
-        allowed_syscalls.extend_from_slice(&[SYS_CLOCK_GETTIME, SYS_GETRANDOM]);
-    }
-
-    if promises.contains(PledgePromises::SENDSIG) {
-        allowed_syscalls.push(SYS_KILL);
-    }
-
-    if promises.contains(PledgePromises::FATTR) {
-        allowed_syscalls.extend_from_slice(&[SYS_CHMOD, SYS_CHOWN, SYS_FCHMOD, SYS_FCHOWN]);
-    }
-
-    if promises.contains(PledgePromises::RLIMIT) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_GETRLIMIT,
-            SYS_SETRLIMIT,
-            SYS_PRLIMIT64, // M0-6: modern get/setrlimit route through prlimit64
-        ]);
-    }
-
-    // Deduplicate -> the canonical sorted+deduped allow set.
-    allowed_syscalls.sort();
-    allowed_syscalls.dedup();
     allowed_syscalls
 }
 

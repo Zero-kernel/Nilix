@@ -602,385 +602,405 @@ pub fn syscall_dispatcher(
     // fatally without unwinding (`rt_sigreturn`, `execve`, `exit`, `kill`,
     // `tkill`, `exit_group`, `tgkill`, `spawn_image`) so the dying task's PCB
     // strong count never stays pinned on the abandoned syscall stack.
-    if matches!(syscall_num, 15 | 59 | 60 | 62 | 200 | 231 | 234 | 517) {
+    if seccomp::syscall_table::drops_entry_proc(syscall_num) {
         entry_proc = None;
     }
 
-    let result = match syscall_num {
-        // 进程管理
-        56 => sys_clone(
-            arg0,
-            arg1 as *mut u8,
-            arg2 as *mut i32,
-            arg3 as *mut i32,
-            arg4,
-        ),
-        60 => sys_exit(arg0 as i32),
-        231 => sys_exit_group(arg0 as i32),
-        // M2-1 SLICE-2 INVARIANT (vfork / syscall 58 scope boundary):
-        // There is intentionally NO `58 =>` arm here. vfork is in the default
-        // seccomp allowlist (`pledge_syscall_list` / `promise_allows_syscall`
-        // under PledgePromises::PROC) but has no dispatch, so syscall 58 falls
-        // through to the `_ => Err(ENOSYS)` default arm below. It is listed as
-        // `UndispatchedKind::NoArm` in INTENTIONAL_UNDISPATCHED, and the hosted
-        // R190-11 parity test fails if an arm appears. vfork is therefore ENOSYS and
-        // CHARGE-NEUTRAL today: it creates no process and no address space, so
-        // it can never pin/charge cgroup memory and cannot strand a mem_pinned
-        // residual (no path exists). If a FUTURE slice wires vfork to real Linux
-        // semantics (child borrows the parent's MmState until exec/exit), the
-        // handler MUST route memory accounting through exactly ONE of:
-        //   (a) fork_inner / sys_fork  -> independent MmState, so the aggregated
-        //       fork charge at fork.rs:240 (try_charge_memory(parent_cgroup_id,
-        //       fork_charge_bytes)) applies and telescopes via the child's exit
-        //       uncharge; OR
-        //   (b) the CLONE_VM shared-MmState path (see line ~3151:
-        //       `if flags & CLONE_VM != 0 { (parent_space, true) }`) which shares
-        //       the parent AS and performs NO independent fork charge.
-        // A vfork handler MUST NOT introduce a THIRD, uncharged AS-creating path:
-        // a shared-MmState process that independently fork-charges would double
-        // the charge (the FA-09 over-count / permanent-undeletability direction),
-        // and an independent-MmState process that skips the fork charge would
-        // strand the child's exit uncharge into a saturating under-count.
-        57 => sys_fork(entry_proc.as_ref()),
-        // M0-4: execve is now REAL path-based exec(pathname, argv, envp).
-        // arg0 is a pathname pointer (NOT a raw ELF image) — the confused-deputy
-        // is gone. Native raw-image spawn moved to sys_spawn_image (517).
-        59 => sys_execve(
-            arg0 as *const u8,        // pathname
-            arg1 as *const *const u8, // argv
-            arg2 as *const *const u8, // envp
-        ),
-        // ST-K3 FIX (wait4 ABI): Linux wait4(pid, wstatus, options, rusage) —
-        // the pid SELECTOR is arg0 and the status pointer is arg1. The old
-        // dispatch passed arg0 (the PID) as the status pointer, so musl's
-        // waitpid(pid, &status, 0) hit copy_to_user(pid) = EFAULT on the first
-        // Ring-3 parent that ever reaped a real child (stress-v2 memory
-        // profile, stage=cgroup_child_wait errno=14). rusage (arg3) is
-        // accepted and ignored — Linux permits NULL.
-        61 => sys_wait4(
-            arg0 as i64,
-            arg1 as *mut i32,
-            arg2 as i32,
-            entry_proc.clone(),
-        ),
-        39 => sys_getpid_fast(fast_ns_id),
-        186 => sys_gettid_fast(fast_ns_id),
-        110 => sys_getppid(),
-        102 => sys_getuid(),
-        107 => sys_geteuid(),
-        104 => sys_getgid(),
-        108 => sys_getegid(),
-        218 => sys_set_tid_address(arg0 as *mut i32),
-        273 => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
-        274 => sys_get_robust_list(arg0 as i32, arg1 as *mut u64, arg2 as *mut u64),
-        62 => sys_kill(arg0 as ProcessId, arg1 as i32),
-        // GAP-5 slice 4 G7: thread-directed signals.
-        200 => sys_tkill(arg0 as i32, arg1 as i32),
-        234 => sys_tgkill(arg0 as i32, arg1 as i32, arg2 as i32),
-        // M0 item 5: signal-handler delivery (sub-slice 1a).
-        13 => sys_rt_sigaction(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as *mut u8,
-            arg3 as usize,
-        ),
-        14 => sys_rt_sigprocmask(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as *mut u8,
-            arg3 as usize,
-        ),
-        15 => sys_rt_sigreturn(),
-        // F.1: Namespace unshare
-        272 => sys_unshare(arg0 as u64),
-        // F.1: setns for mount namespace
-        308 => sys_setns(arg0 as i32, arg1 as i32),
+    use seccomp::syscall_table::DispatchedSyscall as Sc;
+    let result = match Sc::from_nr(syscall_num) {
+        Some(sc) => match sc {
+            // 进程管理
+            Sc::Clone => sys_clone(
+                arg0,
+                arg1 as *mut u8,
+                arg2 as *mut i32,
+                arg3 as *mut i32,
+                arg4,
+            ),
+            Sc::Exit => sys_exit(arg0 as i32),
+            Sc::ExitGroup => sys_exit_group(arg0 as i32),
+            // M2-1 SLICE-2 INVARIANT (vfork / syscall 58 scope boundary):
+            // There is intentionally NO `58 =>` arm here. vfork is in the default
+            // seccomp allowlist (`pledge_syscall_list` / `promise_allows_syscall`
+            // under PledgePromises::PROC) but has no dispatch, so syscall 58 falls
+            // through to the `_ => Err(ENOSYS)` default arm below. It is listed as
+            // `UndispatchedKind::NoArm` in INTENTIONAL_UNDISPATCHED, and the hosted
+            // R190-11 parity test fails if an arm appears. vfork is therefore ENOSYS and
+            // CHARGE-NEUTRAL today: it creates no process and no address space, so
+            // it can never pin/charge cgroup memory and cannot strand a mem_pinned
+            // residual (no path exists). If a FUTURE slice wires vfork to real Linux
+            // semantics (child borrows the parent's MmState until exec/exit), the
+            // handler MUST route memory accounting through exactly ONE of:
+            //   (a) fork_inner / sys_fork  -> independent MmState, so the aggregated
+            //       fork charge at fork.rs:240 (try_charge_memory(parent_cgroup_id,
+            //       fork_charge_bytes)) applies and telescopes via the child's exit
+            //       uncharge; OR
+            //   (b) the CLONE_VM shared-MmState path (see line ~3151:
+            //       `if flags & CLONE_VM != 0 { (parent_space, true) }`) which shares
+            //       the parent AS and performs NO independent fork charge.
+            // A vfork handler MUST NOT introduce a THIRD, uncharged AS-creating path:
+            // a shared-MmState process that independently fork-charges would double
+            // the charge (the FA-09 over-count / permanent-undeletability direction),
+            // and an independent-MmState process that skips the fork charge would
+            // strand the child's exit uncharge into a saturating under-count.
+            Sc::Fork => sys_fork(entry_proc.as_ref()),
+            // M0-4: execve is now REAL path-based exec(pathname, argv, envp).
+            // arg0 is a pathname pointer (NOT a raw ELF image) — the confused-deputy
+            // is gone. Native raw-image spawn moved to sys_spawn_image (517).
+            Sc::Execve => sys_execve(
+                arg0 as *const u8,        // pathname
+                arg1 as *const *const u8, // argv
+                arg2 as *const *const u8, // envp
+            ),
+            // ST-K3 FIX (wait4 ABI): Linux wait4(pid, wstatus, options, rusage) —
+            // the pid SELECTOR is arg0 and the status pointer is arg1. The old
+            // dispatch passed arg0 (the PID) as the status pointer, so musl's
+            // waitpid(pid, &status, 0) hit copy_to_user(pid) = EFAULT on the first
+            // Ring-3 parent that ever reaped a real child (stress-v2 memory
+            // profile, stage=cgroup_child_wait errno=14). rusage (arg3) is
+            // accepted and ignored — Linux permits NULL.
+            Sc::Wait4 => sys_wait4(
+                arg0 as i64,
+                arg1 as *mut i32,
+                arg2 as i32,
+                entry_proc.clone(),
+            ),
+            Sc::Getpid => sys_getpid_fast(fast_ns_id),
+            Sc::Gettid => sys_gettid_fast(fast_ns_id),
+            Sc::Getppid => sys_getppid(),
+            Sc::Getuid => sys_getuid(),
+            Sc::Geteuid => sys_geteuid(),
+            Sc::Getgid => sys_getgid(),
+            Sc::Getegid => sys_getegid(),
+            Sc::SetTidAddress => sys_set_tid_address(arg0 as *mut i32),
+            Sc::SetRobustList => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
+            Sc::GetRobustList => {
+                sys_get_robust_list(arg0 as i32, arg1 as *mut u64, arg2 as *mut u64)
+            }
+            Sc::Kill => sys_kill(arg0 as ProcessId, arg1 as i32),
+            // GAP-5 slice 4 G7: thread-directed signals.
+            Sc::Tkill => sys_tkill(arg0 as i32, arg1 as i32),
+            Sc::Tgkill => sys_tgkill(arg0 as i32, arg1 as i32, arg2 as i32),
+            // M0 item 5: signal-handler delivery (sub-slice 1a).
+            Sc::RtSigaction => sys_rt_sigaction(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as *mut u8,
+                arg3 as usize,
+            ),
+            Sc::RtSigprocmask => sys_rt_sigprocmask(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as *mut u8,
+                arg3 as usize,
+            ),
+            Sc::RtSigreturn => sys_rt_sigreturn(),
+            // F.1: Namespace unshare
+            Sc::Unshare => sys_unshare(arg0 as u64),
+            // F.1: setns for mount namespace
+            Sc::Setns => sys_setns(arg0 as i32, arg1 as i32),
 
-        // 文件I/O
-        0 => sys_read(
-            arg0 as i32,
-            arg1 as *mut u8,
-            arg2 as usize,
-            entry_proc.as_ref(),
-        ),
-        1 => sys_write(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as usize,
-            entry_proc.as_ref(),
-        ),
-        17 => sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i64),
-        18 => sys_pwrite64(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3 as i64),
-        2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
-        257 => sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
-        437 => sys_openat2(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as *const OpenHow,
-            arg3 as usize,
-        ),
-        3 => sys_close(arg0 as i32, entry_proc.as_ref()),
-        4 => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
-        5 => sys_fstat(arg0 as i32, arg1 as *mut VfsStat),
-        6 => sys_lstat(arg0 as *const u8, arg1 as *mut VfsStat),
-        262 => sys_fstatat(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as *mut VfsStat,
-            arg3 as i32,
-        ),
-        // M0-6: statx - modern extended stat interface
-        332 => sys_statx(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as i32,
-            arg3 as u32,
-            arg4 as *mut u8,
-        ),
-        8 => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
-        16 => sys_ioctl(arg0 as i32, arg1, arg2),
-        19 => sys_readv(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
-        20 => sys_writev(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
-        22 => sys_pipe(arg0 as *mut i32, entry_proc.as_ref()),
-        32 => sys_dup(arg0 as i32),
-        33 => sys_dup2(arg0 as i32, arg1 as i32),
-        72 => sys_fcntl(arg0 as i32, arg1 as i32, arg2),
-        292 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as i32),
-        77 => sys_ftruncate(arg0 as i32, arg1 as i64),
-        74 => sys_fsync(arg0 as i32),
-        75 => sys_fdatasync(arg0 as i32),
-        162 => sys_sync(),
-        277 => sys_sync_file_range(arg0 as i32, arg1 as i64, arg2 as i64, arg3 as u32),
-        217 => sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
-        293 => sys_pipe2(arg0 as *mut i32, arg1 as i32, entry_proc.as_ref()),
+            // 文件I/O
+            Sc::Read => sys_read(
+                arg0 as i32,
+                arg1 as *mut u8,
+                arg2 as usize,
+                entry_proc.as_ref(),
+            ),
+            Sc::Write => sys_write(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as usize,
+                entry_proc.as_ref(),
+            ),
+            Sc::Pread64 => sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i64),
+            Sc::Pwrite64 => {
+                sys_pwrite64(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3 as i64)
+            }
+            Sc::Open => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
+            Sc::Openat => sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
+            Sc::Openat2 => sys_openat2(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as *const OpenHow,
+                arg3 as usize,
+            ),
+            Sc::Close => sys_close(arg0 as i32, entry_proc.as_ref()),
+            Sc::Stat => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
+            Sc::Fstat => sys_fstat(arg0 as i32, arg1 as *mut VfsStat),
+            Sc::Lstat => sys_lstat(arg0 as *const u8, arg1 as *mut VfsStat),
+            Sc::Fstatat => sys_fstatat(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as *mut VfsStat,
+                arg3 as i32,
+            ),
+            // M0-6: statx - modern extended stat interface
+            Sc::Statx => sys_statx(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as i32,
+                arg3 as u32,
+                arg4 as *mut u8,
+            ),
+            Sc::Lseek => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
+            Sc::Ioctl => sys_ioctl(arg0 as i32, arg1, arg2),
+            Sc::Readv => sys_readv(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
+            Sc::Writev => sys_writev(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
+            Sc::Pipe => sys_pipe(arg0 as *mut i32, entry_proc.as_ref()),
+            Sc::Dup => sys_dup(arg0 as i32),
+            Sc::Dup2 => sys_dup2(arg0 as i32, arg1 as i32),
+            Sc::Fcntl => sys_fcntl(arg0 as i32, arg1 as i32, arg2),
+            Sc::Dup3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as i32),
+            Sc::Ftruncate => sys_ftruncate(arg0 as i32, arg1 as i64),
+            Sc::Fsync => sys_fsync(arg0 as i32),
+            Sc::Fdatasync => sys_fdatasync(arg0 as i32),
+            Sc::Sync => sys_sync(),
+            Sc::SyncFileRange => {
+                sys_sync_file_range(arg0 as i32, arg1 as i64, arg2 as i64, arg3 as u32)
+            }
+            Sc::Getdents64 => sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
+            Sc::Pipe2 => sys_pipe2(arg0 as *mut i32, arg1 as i32, entry_proc.as_ref()),
 
-        // 文件系统操作
-        21 => sys_access(arg0 as *const u8, arg1 as i32),
-        79 => sys_getcwd(arg0 as *mut u8, arg1 as usize),
-        80 => sys_chdir(arg0 as *const u8),
-        83 => sys_mkdir(arg0 as *const u8, arg1 as u32),
-        84 => sys_rmdir(arg0 as *const u8),
-        86 => sys_link(arg0 as *const u8, arg1 as *const u8),
-        87 => sys_unlink(arg0 as *const u8),
-        // M0-6 slice 3: symlink/readlink - DEFERRED per plan
-        // Blocked on ramfs lacking Symlink NodeKind + /proc/self contradictory inode
-        88 => sys_symlink(arg0 as *const u8, arg1 as *const u8),
-        89 => sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
-        // M0-6 slice 2: rename family. 82 is pledge-promised (WPATH); 264/316 dispatch as
-        // plain unpledged arms (no seccomp constant -> default-denied for a pledged process).
-        82 => sys_rename(arg0 as *const u8, arg1 as *const u8),
-        264 => sys_renameat(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as i32,
-            arg3 as *const u8,
-        ),
-        316 => sys_renameat2(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as i32,
-            arg3 as *const u8,
-            arg4 as u32,
-        ),
-        90 => sys_chmod(arg0 as *const u8, arg1 as u32),
-        91 => sys_fchmod(arg0 as i32, arg1 as u32),
-        95 => sys_umask(arg0 as u32),
-        155 => sys_pivot_root(arg0 as *const u8, arg1 as *const u8),
-        161 => sys_chroot(arg0 as *const u8),
+            // 文件系统操作
+            Sc::Access => sys_access(arg0 as *const u8, arg1 as i32),
+            Sc::Getcwd => sys_getcwd(arg0 as *mut u8, arg1 as usize),
+            Sc::Chdir => sys_chdir(arg0 as *const u8),
+            Sc::Mkdir => sys_mkdir(arg0 as *const u8, arg1 as u32),
+            Sc::Rmdir => sys_rmdir(arg0 as *const u8),
+            Sc::Link => sys_link(arg0 as *const u8, arg1 as *const u8),
+            Sc::Unlink => sys_unlink(arg0 as *const u8),
+            // M0-6 slice 3: symlink/readlink - DEFERRED per plan
+            // Blocked on ramfs lacking Symlink NodeKind + /proc/self contradictory inode
+            Sc::Symlink => sys_symlink(arg0 as *const u8, arg1 as *const u8),
+            Sc::Readlink => sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
+            // M0-6 slice 2: rename family. 82 is pledge-promised (WPATH); 264/316 dispatch as
+            // plain unpledged arms (no seccomp constant -> default-denied for a pledged process).
+            Sc::Rename => sys_rename(arg0 as *const u8, arg1 as *const u8),
+            Sc::Renameat => sys_renameat(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as i32,
+                arg3 as *const u8,
+            ),
+            Sc::Renameat2 => sys_renameat2(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as i32,
+                arg3 as *const u8,
+                arg4 as u32,
+            ),
+            Sc::Chmod => sys_chmod(arg0 as *const u8, arg1 as u32),
+            Sc::Fchmod => sys_fchmod(arg0 as i32, arg1 as u32),
+            Sc::Umask => sys_umask(arg0 as u32),
+            Sc::PivotRoot => sys_pivot_root(arg0 as *const u8, arg1 as *const u8),
+            Sc::Chroot => sys_chroot(arg0 as *const u8),
 
-        // M0-6: POSIX resource limits (closes the RLIMIT allowed-but-ENOSYS seam).
-        // prlimit64 arg order: (pid, resource, NEW=arg2, OLD=arg3) — keep new=arg2/old=arg3.
-        97 => sys_getrlimit(arg0 as u32, arg1 as *mut u8),
-        160 => sys_setrlimit(arg0 as u32, arg1 as *const u8),
-        302 => sys_prlimit64(
-            arg0 as ProcessId,
-            arg1 as u32,
-            arg2 as *const u8,
-            arg3 as *mut u8,
-        ),
+            // M0-6: POSIX resource limits (closes the RLIMIT allowed-but-ENOSYS seam).
+            // prlimit64 arg order: (pid, resource, NEW=arg2, OLD=arg3) — keep new=arg2/old=arg3.
+            Sc::Getrlimit => sys_getrlimit(arg0 as u32, arg1 as *mut u8),
+            Sc::Setrlimit => sys_setrlimit(arg0 as u32, arg1 as *const u8),
+            Sc::Prlimit64 => sys_prlimit64(
+                arg0 as ProcessId,
+                arg1 as u32,
+                arg2 as *const u8,
+                arg3 as *mut u8,
+            ),
 
-        // 内存管理
-        12 => sys_brk(arg0 as usize),
-        9 => sys_mmap(
-            arg0 as usize,
-            arg1 as usize,
-            arg2 as i32,
-            arg3 as i32,
-            arg4 as i32,
-            arg5 as i64,
-        ),
-        10 => sys_mprotect(arg0 as usize, arg1 as usize, arg2 as i32),
-        11 => sys_munmap(arg0 as usize, arg1 as usize),
+            // 内存管理
+            Sc::Brk => sys_brk(arg0 as usize),
+            Sc::Mmap => sys_mmap(
+                arg0 as usize,
+                arg1 as usize,
+                arg2 as i32,
+                arg3 as i32,
+                arg4 as i32,
+                arg5 as i64,
+            ),
+            Sc::Mprotect => sys_mprotect(arg0 as usize, arg1 as usize, arg2 as i32),
+            Sc::Munmap => sys_munmap(arg0 as usize, arg1 as usize),
 
-        // 架构相关
-        158 => sys_arch_prctl(arg0 as i32, arg1 as u64),
+            // 架构相关
+            Sc::ArchPrctl => sys_arch_prctl(arg0 as i32, arg1 as u64),
 
-        // Futex
-        // R39-6 FIX: 传递第4个参数用于超时
-        202 => sys_futex(
-            arg0 as usize,
-            arg1 as i32,
-            arg2 as u32,
-            arg3 as usize,
-            arg4 as usize,
-            arg5 as u32,
-        ),
+            // Futex
+            // R39-6 FIX: 传递第4个参数用于超时
+            Sc::Futex => sys_futex(
+                arg0 as usize,
+                arg1 as i32,
+                arg2 as u32,
+                arg3 as usize,
+                arg4 as usize,
+                arg5 as u32,
+            ),
 
-        // 安全/沙箱 (Seccomp/Prctl)
-        157 => sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
-        317 => sys_seccomp(arg0 as u32, arg1 as u32, arg2),
+            // 安全/沙箱 (Seccomp/Prctl)
+            Sc::Prctl => sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
+            Sc::Seccomp => sys_seccomp(arg0 as u32, arg1 as u32, arg2),
 
-        // 时间相关
-        35 => sys_nanosleep(arg0 as *const TimeSpec, arg1 as *mut TimeSpec),
-        96 => sys_gettimeofday(arg0 as *mut TimeVal, arg1 as usize),
-        228 => sys_clock_gettime(arg0 as i32, arg1 as *mut TimeSpec),
+            // 时间相关
+            Sc::Nanosleep => sys_nanosleep(arg0 as *const TimeSpec, arg1 as *mut TimeSpec),
+            Sc::Gettimeofday => sys_gettimeofday(arg0 as *mut TimeVal, arg1 as usize),
+            Sc::ClockGettime => sys_clock_gettime(arg0 as i32, arg1 as *mut TimeSpec),
 
-        // 系统信息
-        63 => sys_uname(arg0 as *mut UtsName),
+            // 系统信息
+            Sc::Uname => sys_uname(arg0 as *mut UtsName),
 
-        // 其他
-        24 => sys_yield(),
-        318 => sys_getrandom(arg0 as *mut u8, arg1 as usize, arg2 as u32),
+            // 其他
+            Sc::SchedYield => sys_yield(),
+            Sc::Getrandom => sys_getrandom(arg0 as *mut u8, arg1 as usize, arg2 as u32),
 
-        // CPU Affinity (E.5 SMP Scheduler - syscalls 203/204)
-        203 => sys_sched_setaffinity(arg0 as i32, arg1 as usize, arg2 as *const u8),
-        204 => sys_sched_getaffinity(arg0 as i32, arg1 as usize, arg2 as *mut u8),
+            // CPU Affinity (E.5 SMP Scheduler - syscalls 203/204)
+            Sc::SchedSetaffinity => {
+                sys_sched_setaffinity(arg0 as i32, arg1 as usize, arg2 as *const u8)
+            }
+            Sc::SchedGetaffinity => {
+                sys_sched_getaffinity(arg0 as i32, arg1 as usize, arg2 as *mut u8)
+            }
 
-        // 套接字 (Socket syscalls - Linux x86_64 ABI)
-        41 => sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
-        42 => sys_connect(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
-        43 => sys_accept(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
-        288 => sys_accept4(
-            arg0 as i32,
-            arg1 as *mut SockAddrIn,
-            arg2 as *mut u32,
-            arg3 as i32,
-        ),
-        44 => sys_sendto(
-            arg0 as i32,
-            arg1 as *const u8,
-            arg2 as usize,
-            arg3 as i32,
-            arg4 as *const SockAddrIn,
-            arg5 as u32,
-        ),
-        45 => sys_recvfrom(
-            arg0 as i32,
-            arg1 as *mut u8,
-            arg2 as usize,
-            arg3 as i32,
-            arg4 as *mut SockAddrIn,
-            arg5 as *mut u32,
-        ),
-        46 => sys_sendmsg(arg0 as i32, arg1 as *const MsgHdr, arg2 as i32),
-        47 => sys_recvmsg(arg0 as i32, arg1 as *mut MsgHdr, arg2 as i32),
-        48 => sys_shutdown(arg0 as i32, arg1 as i32),
-        49 => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
-        50 => sys_listen(arg0 as i32, arg1 as i32),
-        51 => sys_getsockname(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
-        52 => sys_getpeername(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
-        54 => sys_setsockopt(
-            arg0 as i32,
-            arg1 as i32,
-            arg2 as i32,
-            arg3 as *const u8,
-            arg4 as u32,
-        ),
-        55 => sys_getsockopt(
-            arg0 as i32,
-            arg1 as i32,
-            arg2 as i32,
-            arg3 as *mut u8,
-            arg4 as *mut u32,
-        ),
+            // 套接字 (Socket syscalls - Linux x86_64 ABI)
+            Sc::Socket => sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
+            Sc::Connect => sys_connect(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
+            Sc::Accept => sys_accept(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
+            Sc::Accept4 => sys_accept4(
+                arg0 as i32,
+                arg1 as *mut SockAddrIn,
+                arg2 as *mut u32,
+                arg3 as i32,
+            ),
+            Sc::Sendto => sys_sendto(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as usize,
+                arg3 as i32,
+                arg4 as *const SockAddrIn,
+                arg5 as u32,
+            ),
+            Sc::Recvfrom => sys_recvfrom(
+                arg0 as i32,
+                arg1 as *mut u8,
+                arg2 as usize,
+                arg3 as i32,
+                arg4 as *mut SockAddrIn,
+                arg5 as *mut u32,
+            ),
+            Sc::Sendmsg => sys_sendmsg(arg0 as i32, arg1 as *const MsgHdr, arg2 as i32),
+            Sc::Recvmsg => sys_recvmsg(arg0 as i32, arg1 as *mut MsgHdr, arg2 as i32),
+            Sc::Shutdown => sys_shutdown(arg0 as i32, arg1 as i32),
+            Sc::Bind => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
+            Sc::Listen => sys_listen(arg0 as i32, arg1 as i32),
+            Sc::Getsockname => {
+                sys_getsockname(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32)
+            }
+            Sc::Getpeername => {
+                sys_getpeername(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32)
+            }
+            Sc::Setsockopt => sys_setsockopt(
+                arg0 as i32,
+                arg1 as i32,
+                arg2 as i32,
+                arg3 as *const u8,
+                arg4 as u32,
+            ),
+            Sc::Getsockopt => sys_getsockopt(
+                arg0 as i32,
+                arg1 as i32,
+                arg2 as i32,
+                arg3 as *mut u8,
+                arg4 as *mut u32,
+            ),
 
-        // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504, 513, 516)
-        500 => sys_cgroup_create(arg0 as u64, arg1 as u32),
-        501 => sys_cgroup_destroy(arg0 as u64),
-        502 => sys_cgroup_attach(arg0 as u64),
-        503 => sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2),
-        // 504 is the FROZEN v1 stats ABI (2-arg, writes the 104-byte v1 prefix, returns 0).
-        504 => sys_cgroup_get_stats(arg0 as u64, arg1 as *mut CgroupStatsBuf),
-        513 => sys_cgroup_delegate(arg0 as u64, arg1 as u64),
-        // J.2: v2 stats with statx-style size negotiation (writes min(buf_len, sizeof)).
-        516 => sys_cgroup_get_stats2(arg0 as u64, arg1 as *mut CgroupStatsBuf, arg2 as usize),
+            // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504, 513, 516)
+            Sc::CgroupCreate => sys_cgroup_create(arg0 as u64, arg1 as u32),
+            Sc::CgroupDestroy => sys_cgroup_destroy(arg0 as u64),
+            Sc::CgroupAttach => sys_cgroup_attach(arg0 as u64),
+            Sc::CgroupSetLimit => sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2),
+            // 504 is the FROZEN v1 stats ABI (2-arg, writes the 104-byte v1 prefix, returns 0).
+            Sc::CgroupGetStats => sys_cgroup_get_stats(arg0 as u64, arg1 as *mut CgroupStatsBuf),
+            Sc::CgroupDelegate => sys_cgroup_delegate(arg0 as u64, arg1 as u64),
+            // J.2: v2 stats with statx-style size negotiation (writes min(buf_len, sizeof)).
+            Sc::CgroupGetStats2 => {
+                sys_cgroup_get_stats2(arg0 as u64, arg1 as *mut CgroupStatsBuf, arg2 as usize)
+            }
 
-        // M0-4: Zero-OS-private (517) raw in-memory-image spawn — the pre-M0-4
-        // execve(image, image_len, argv, envp) behavior, relocated off 59 so that
-        // execve(59) can be real path-based. arg0 is ALWAYS an image pointer here.
-        517 => sys_spawn_image(
-            arg0 as *const u8,
-            arg1 as usize,
-            arg2 as *const *const u8,
-            arg3 as *const *const u8,
-        ),
+            // M0-4: Zero-OS-private (517) raw in-memory-image spawn — the pre-M0-4
+            // execve(image, image_len, argv, envp) behavior, relocated off 59 so that
+            // execve(59) can be real path-based. arg0 is ALWAYS an image pointer here.
+            Sc::SpawnImage => sys_spawn_image(
+                arg0 as *const u8,
+                arg1 as usize,
+                arg2 as *const *const u8,
+                arg3 as *const *const u8,
+            ),
 
-        // D3 NETNS-DATAPLANE-CONFIG: Move network device between namespaces
-        518 => sys_move_net_device(arg0 as u32, arg1 as i32),
+            // D3 NETNS-DATAPLANE-CONFIG: Move network device between namespaces
+            Sc::MoveNetDevice => sys_move_net_device(arg0 as u32, arg1 as i32),
 
-        // G.3 Compliance syscalls (Zero-OS specific, 505-508)
-        505 => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
-        506 => sys_fips_enable(),
-        507 => sys_compliance_query_algo(arg0 as u32),
-        508 => sys_audit_export(arg0 as *mut u8, arg1 as usize, arg2 as u64, arg3 as usize),
+            // G.3 Compliance syscalls (Zero-OS specific, 505-508)
+            Sc::ComplianceStatus => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
+            Sc::FipsEnable => sys_fips_enable(),
+            Sc::ComplianceQuery => sys_compliance_query_algo(arg0 as u32),
+            Sc::AuditExport => {
+                sys_audit_export(arg0 as *mut u8, arg1 as usize, arg2 as u64, arg3 as usize)
+            }
 
-        // G.2 Live Patching syscalls (Zero-OS specific, 509-512, 514-515)
-        509 => sys_kpatch_load(arg0 as usize, arg1 as usize),
-        510 => sys_kpatch_enable(arg0 as u64),
-        511 => sys_kpatch_disable(arg0 as u64),
-        // R104-5 FIX: Wire kpatch_unload to complete the livepatch syscall family
-        512 => sys_kpatch_unload(arg0 as u64),
-        // P1-4: Batch enable/disable with topological dependency ordering
-        514 => sys_kpatch_enable_all(),
-        515 => sys_kpatch_disable_all(),
+            // G.2 Live Patching syscalls (Zero-OS specific, 509-512, 514-515)
+            Sc::KpatchLoad => sys_kpatch_load(arg0 as usize, arg1 as usize),
+            Sc::KpatchEnable => sys_kpatch_enable(arg0 as u64),
+            Sc::KpatchDisable => sys_kpatch_disable(arg0 as u64),
+            // R104-5 FIX: Wire kpatch_unload to complete the livepatch syscall family
+            Sc::KpatchUnload => sys_kpatch_unload(arg0 as u64),
+            // P1-4: Batch enable/disable with topological dependency ordering
+            Sc::KpatchEnableAll => sys_kpatch_enable_all(),
+            Sc::KpatchDisableAll => sys_kpatch_disable_all(),
 
-        // KCOV (Kernel Code Coverage) syscalls (Zero-OS specific, 520-524)
-        // Used for coverage-guided fuzzing infrastructure
-        520 => sys_kcov_init(arg0 as usize),
-        521 => sys_kcov_enable(),
-        522 => sys_kcov_disable(),
-        523 => sys_kcov_dump(arg0 as usize, arg1 as usize),
-        524 => sys_kcov_reset(),
+            // KCOV (Kernel Code Coverage) syscalls (Zero-OS specific, 520-524)
+            // Used for coverage-guided fuzzing infrastructure
+            Sc::KcovInit => sys_kcov_init(arg0 as usize),
+            Sc::KcovEnable => sys_kcov_enable(),
+            Sc::KcovDisable => sys_kcov_disable(),
+            Sc::KcovDump => sys_kcov_dump(arg0 as usize, arg1 as usize),
+            Sc::KcovReset => sys_kcov_reset(),
 
-        // M0-6 poll/select: I/O multiplexing (poll/select/pselect6/ppoll).
-        // ppoll/pselect6 timeout args are *mut: raw-Linux writes remaining time
-        // back (glibc hides this in a local; man ppoll/pselect6 NOTES).
-        7 => sys_poll(arg0, arg1, arg2),
-        23 => sys_select(
-            arg0 as i32,
-            arg1 as *mut u8,
-            arg2 as *mut u8,
-            arg3 as *mut u8,
-            arg4 as *mut u8,
-        ),
-        270 => sys_pselect6(
-            arg0 as i32,
-            arg1 as *mut u8,
-            arg2 as *mut u8,
-            arg3 as *mut u8,
-            arg4 as *mut u8,
-            arg5,
-        ),
-        271 => sys_ppoll(arg0, arg1, arg2 as *mut u8, arg3, arg4),
+            // M0-6 poll/select: I/O multiplexing (poll/select/pselect6/ppoll).
+            // ppoll/pselect6 timeout args are *mut: raw-Linux writes remaining time
+            // back (glibc hides this in a local; man ppoll/pselect6 NOTES).
+            Sc::Poll => sys_poll(arg0, arg1, arg2),
+            Sc::Select => sys_select(
+                arg0 as i32,
+                arg1 as *mut u8,
+                arg2 as *mut u8,
+                arg3 as *mut u8,
+                arg4 as *mut u8,
+            ),
+            Sc::Pselect6 => sys_pselect6(
+                arg0 as i32,
+                arg1 as *mut u8,
+                arg2 as *mut u8,
+                arg3 as *mut u8,
+                arg4 as *mut u8,
+                arg5,
+            ),
+            Sc::Ppoll => sys_ppoll(arg0, arg1, arg2 as *mut u8, arg3, arg4),
 
-        // Memory management
-        25 => sys_mremap(
-            arg0 as u64,
-            arg1 as usize,
-            arg2 as usize,
-            arg3 as i32,
-            arg4 as u64,
-        ),
+            // Memory management
+            Sc::Mremap => sys_mremap(
+                arg0 as u64,
+                arg1 as usize,
+                arg2 as usize,
+                arg3 as i32,
+                arg4 as u64,
+            ),
 
-        // File ownership (dispatch-or-stub per plan)
-        92 => sys_chown(arg0 as *const u8, arg1 as u32, arg2 as u32),
-        93 => sys_fchown(arg0 as i32, arg1 as u32, arg2 as u32),
-        94 => sys_lchown(arg0 as *const u8, arg1 as u32, arg2 as u32),
+            // File ownership (dispatch-or-stub per plan)
+            Sc::Chown => sys_chown(arg0 as *const u8, arg1 as u32, arg2 as u32),
+            Sc::Fchown => sys_fchown(arg0 as i32, arg1 as u32, arg2 as u32),
+            Sc::Lchown => sys_lchown(arg0 as *const u8, arg1 as u32, arg2 as u32),
 
-        // Process wait
-        247 => sys_waitid(arg0 as i32, arg1 as i32, arg2 as *mut u8, arg3 as i32),
-
-        _ => Err(SyscallError::ENOSYS),
+            // Process wait
+            Sc::Waitid => sys_waitid(arg0 as i32, arg1 as i32, arg2 as *mut u8, arg3 as i32),
+        },
+        None => Err(SyscallError::ENOSYS),
     };
 
     finish_syscall(
@@ -1158,96 +1178,33 @@ fn finish_syscall_tail(
 }
 
 // ============================================================================
-// M0-6: seccomp pledge <-> dispatch DIVERGENCE-PREVENTION (the class fix)
+// M0-6 / N2.0b: seccomp pledge <-> dispatch DIVERGENCE-PREVENTION
+//
+// Dispatch, pledge BPF lists, pledge semantic evaluation, and strict-mode
+// filtering all flow from the single table `seccomp::syscall_table::SYSCALL_TABLE`.
 // ============================================================================
 
-/// Pledge-promised syscalls that HAVE a functional dispatcher arm (a handler
-/// that is not a fixed ENOSYS stub; deliberate non-ENOSYS errnos such as
-/// chmod's EOPNOTSUPP or link's EPERM count as dispatched). With
-/// INTENTIONAL_UNDISPATCHED this must PARTITION the pledge union, so a
-/// newly-promised-but-undispatched syscall (allowed-but-ENOSYS) fails the
-/// parity self-test at `make test`.
-///
-/// R190-11 FIX: this list and INTENTIONAL_UNDISPATCHED were hand-verified and
-/// had drifted. mremap, link, symlink and readlink were dispatched while still
-/// listed as undispatched. The hosted `r190_11_dispatch_parity_tests` now parse
-/// the real `syscall_dispatcher` match and fail on any disagreement.
-const DISPATCHED_PROMISED: &[u64] = &[
-    0, 1, 2, 3, 4, 5, 6, 8, // read write open close stat fstat lstat lseek
-    7, 23, 270, 271, // poll select pselect6 ppoll (M0-6 poll/select STDIO wiring)
-    9, 10, 11, 12, 25, // mmap mprotect munmap brk mremap (VM promise)
-    24, 39, // sched_yield getpid
-    56, 57, 59, 60, 61, 62,  // clone fork execve exit wait4 kill
-    247, // waitid (ST-K3, dispatched 2026-09-25)
-    74, 75, 162, 277, // fsync fdatasync sync sync_file_range (ST-K4)
-    82, 83, 84, 87, // rename mkdir rmdir unlink  (82 = M0-6 slice 2)
-    86, 88, 89, // link (fixed EPERM, R173-09) symlink readlink
-    90, 91, // chmod fchmod (fixed EOPNOTSUPP, R72)
-    97, 160, 302, // getrlimit setrlimit prlimit64  (M0-6 NEW)
-    102, 104, 107, 108, 110, // getuid getgid geteuid getegid getppid
-    202, 217, 218, // futex getdents64 set_tid_address
-    228, 231, 257, 318, // clock_gettime exit_group openat getrandom
-];
-
-/// How an intentionally undispatched pledge syscall reaches ENOSYS.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UndispatchedKind {
-    /// No dispatcher arm: the number falls to the `_ => ENOSYS` default.
-    NoArm,
-    /// A dispatcher arm whose handler is a fixed ENOSYS stub.
-    EnosysStub,
-}
-
-/// Pledge-promised syscalls deliberately NOT dispatched (ENOSYS), each with a
-/// reason. Bounded by MAX_EXEMPT, which every future M0-6 slice MUST lower — so
-/// this list can never permanently hide divergence.
-const INTENTIONAL_UNDISPATCHED: &[(u64, UndispatchedKind, &str)] = &[
-    (
-        58,
-        UndispatchedKind::NoArm,
-        "vfork: deliberate ENOSYS-by-invariant (sys_clone documents the fallback)",
-    ),
-    (
-        92,
-        UndispatchedKind::EnosysStub,
-        "chown: FATTR, ENOSYS stub arm (M0-6 later slice)",
-    ),
-    (
-        93,
-        UndispatchedKind::EnosysStub,
-        "fchown: FATTR (post-const-fix), ENOSYS stub arm (M0-6 later slice)",
-    ),
-];
+/// Upper bound on intentionally undispatched pledge-promised syscalls.
+/// Every future slice wiring an exemption MUST lower this ceiling.
 const MAX_EXEMPT: usize = 3;
+const _: () = assert!(seccomp::syscall_table::PLEDGE_EXEMPTION_COUNT <= MAX_EXEMPT);
 
-/// R172-P6-F3: syscall numbers that are PRIVATE / native dispatch arms (reachable by direct
-/// syscall number) but MUST NEVER appear in the pledge union — there is no seccomp constant
-/// for them and they are not pledge-grantable. The parity test fences ALL of them (not just
-/// 517): a future engineer who grants e.g. WPATH and naively adds renameat(264)/renameat2(316)
-/// to the pledge union would otherwise hit the MISLEADING "must be dispatched XOR exempt"
-/// failure (they are dispatched but NOT in DISPATCHED_PROMISED), which invites "fixing" it by
-/// adding them to DISPATCHED_PROMISED — a fail-open seccomp escape (a private arm reachable
-/// from a pledged sandbox). To LEGITIMATELY pledge one: remove it here, add it IDENTICALLY to
-/// pledge_to_filter (seccomp/lib.rs) AND promise_allows_syscall (seccomp/types.rs) per R150-3,
-/// AND add it to DISPATCHED_PROMISED — never silence the XOR assert by editing
-/// DISPATCHED_PROMISED alone. Members: 517 spawn_image (Zero-OS-private native), 264 renameat
-/// / 316 renameat2 (siblings of pledged 82 rename), 437 openat2 (sibling of pledged 257
-/// openat), 262 newfstatat (sibling of pledged 4/5/6 stat-family).
-const PRIVATE_NEVER_PLEDGED: &[u64] = &[262, 264, 316, 437, 517];
-
-fn rlimit_is_exempt(nr: u64) -> bool {
-    INTENTIONAL_UNDISPATCHED.iter().any(|&(n, _, _)| n == nr)
-}
-
-/// M0-6: the divergence-prevention parity self-test. Asserts the pledge allowlist
-/// is PARTITIONED into dispatched XOR intentionally-exempt, fences the FastAllowSet
-/// boundary, and confirms 517 is private. A future promise that grants an
-/// un-dispatched syscall (allowed-but-ENOSYS) then fails `make test`.
+/// M0-6 / N2.0b: the divergence-prevention parity self-test. Asserts the single
+/// syscall table's pledge allowlist is partitioned into dispatched XOR
+/// intentionally-exempt, fences the FastAllowSet boundary, and confirms every
+/// `PrivateNeverPledged` entry is excluded from the pledge union.
 pub fn run_pledge_dispatch_parity_self_test() {
+    use seccomp::syscall_table::{DispatchStatus, SYSCALL_TABLE};
+
+    let exemption_count = SYSCALL_TABLE
+        .iter()
+        .filter(|spec| spec.is_pledge_exemption())
+        .count();
     assert!(
-        INTENTIONAL_UNDISPATCHED.len() <= MAX_EXEMPT,
+        exemption_count <= MAX_EXEMPT,
         "M0-6: exemption set exceeded MAX_EXEMPT (a slice must LOWER it)"
     );
+
     let union = seccomp::pledge_full_syscall_union();
     for &nr in &union {
         assert!(
@@ -1255,48 +1212,67 @@ pub fn run_pledge_dispatch_parity_self_test() {
             "M0-6: pledge union member {} >= 512 (FastAllowSet boundary)",
             nr
         );
-        let disp = DISPATCHED_PROMISED.contains(&nr);
-        let ex = rlimit_is_exempt(nr);
+        let spec = seccomp::syscall_table::lookup(nr).unwrap_or_else(|| {
+            panic!(
+                "N2.0b: pledge union member {} missing from SYSCALL_TABLE",
+                nr
+            )
+        });
+        let disp = spec.is_dispatched_promised();
+        let ex = spec.is_pledge_exemption();
         assert!(
             disp ^ ex,
             "M0-6 allowed-but-ENOSYS: pledge syscall {} must be dispatched XOR exempt (disp={}, exempt={})",
-            nr, disp, ex
+            nr,
+            disp,
+            ex
         );
     }
-    for &nr in DISPATCHED_PROMISED {
-        assert!(
-            union.contains(&nr),
-            "M0-6: DISPATCHED_PROMISED {} is not pledge-promised (stale)",
-            nr
-        );
-    }
-    for &(nr, _, _) in INTENTIONAL_UNDISPATCHED {
-        assert!(
-            union.contains(&nr),
-            "M0-6: exemption {} is not pledge-promised (stale)",
-            nr
-        );
-    }
-    // R172-P6-F3: fence EVERY private/native arm out of the pledge union (the both-directions
-    // form), not just 517 — so the misleading-XOR fail-open trap is closed for the whole
-    // class (rename/openat/stat siblings), not just one number.
-    for &nr in PRIVATE_NEVER_PLEDGED {
-        assert!(
-            !union.contains(&nr),
-            "R172-P6-F3 fail-open seccomp escape: private/native syscall {} must NEVER be pledge-able",
-            nr
-        );
-    }
-    // Disjointness seal (the second direction): a private arm must NOT also be in
-    // DISPATCHED_PROMISED. If a misled engineer adds e.g. 264 to DISPATCHED_PROMISED to
-    // silence the XOR assert, THIS fires instead with a clear contradiction message,
-    // converting the misleading invitation into an explicit stop sign.
-    for &nr in PRIVATE_NEVER_PLEDGED {
-        assert!(
-            !DISPATCHED_PROMISED.contains(&nr),
-            "R172-P6-F3 contradiction: {} is in BOTH PRIVATE_NEVER_PLEDGED and DISPATCHED_PROMISED",
-            nr
-        );
+
+    for spec in SYSCALL_TABLE {
+        if spec.is_dispatched_promised() {
+            assert!(
+                union.contains(&spec.nr),
+                "N2.0b: dispatched promised syscall {} ({}) missing from pledge union",
+                spec.nr,
+                spec.name
+            );
+            assert!(
+                seccomp::syscall_table::DispatchedSyscall::from_nr(spec.nr).is_some(),
+                "N2.0b: dispatched promised syscall {} ({}) missing from DispatchedSyscall",
+                spec.nr,
+                spec.name
+            );
+        }
+        if spec.is_pledge_exemption() {
+            assert!(
+                union.contains(&spec.nr),
+                "N2.0b: exemption {} ({}) missing from pledge union",
+                spec.nr,
+                spec.name
+            );
+            assert!(
+                !spec.exemption_reason.is_empty(),
+                "N2.0b: exemption {} ({}) must document its rationale",
+                spec.nr,
+                spec.name
+            );
+        }
+        // R172-P6-F3: fence EVERY private/native arm out of the pledge union.
+        if spec.is_private_never_pledged() {
+            assert!(
+                !union.contains(&spec.nr),
+                "R172-P6-F3 fail-open seccomp escape: private/native syscall {} ({}) must NEVER be pledge-able",
+                spec.nr,
+                spec.name
+            );
+            assert!(
+                matches!(spec.dispatch, DispatchStatus::Dispatched),
+                "R172-P6-F3: private syscall {} ({}) must remain dispatched",
+                spec.nr,
+                spec.name
+            );
+        }
     }
 }
 
@@ -1338,41 +1314,65 @@ pub fn run_pledge_semantic_parity_self_test() {
     }
 }
 
-/// R190-11 FIX: bind the hand-written pledge partition to the real dispatch
-/// table. The boot parity self-test only compared lists with each other, so
-/// it stayed green while six of seven "undispatched" entries had live arms.
+/// R190-11 / N2.0b: bind `seccomp::syscall_table::SYSCALL_TABLE` to the real
+/// exhaustive `DispatchedSyscall` match in `syscall_dispatcher`, fixed-errno
+/// stub probes, and the LSM hook census fences.
 #[cfg(test)]
 mod r190_11_dispatch_parity_tests {
     use super::*;
     use alloc::string::String;
     use alloc::vec::Vec;
+    use seccomp::syscall_table::{DispatchStatus, DispatchedSyscall, SYSCALL_TABLE};
 
-    /// `(number, handler)` for every `N => handler(...)` arm of the
-    /// `syscall_dispatcher` match, parsed from this file. Any other arm form
-    /// in the match (or-patterns, named constants, guards, blocks) fails the
-    /// parse, so a new arm cannot hide from the checks below.
+    /// `(number, handler)` for every `Sc::<Variant> => handler(...)` arm of the
+    /// exhaustive `syscall_dispatcher` match, parsed from `mod.rs` and resolved
+    /// through `DispatchedSyscall::from_variant_name`. Any unexpected arm form
+    /// (wildcard, or-pattern, guard, block) fails the parse.
     fn dispatcher_arms() -> Vec<(u64, String)> {
         let source = include_str!("mod.rs");
+        let start_marker = "        Some(sc) => match sc {";
+        let end_marker = "        None => Err(SyscallError::ENOSYS),";
         let start = source
-            .find("    let result = match syscall_num {")
-            .expect("syscall_dispatcher match not found");
-        let body = &source[start + "    let result = match syscall_num {".len()..];
+            .find(start_marker)
+            .expect("syscall_dispatcher exhaustive match not found");
+        let body = &source[start + start_marker.len()..];
         let end = body
-            .find("        _ => Err(SyscallError::ENOSYS),")
-            .expect("syscall_dispatcher default arm not found");
+            .find(end_marker)
+            .expect("syscall_dispatcher None arm not found");
         let mut arms = Vec::new();
-        for line in body[..end].lines() {
-            let line = line.trim_start();
+        let mut lines = body[..end].lines().peekable();
+        while let Some(raw_line) = lines.next() {
+            let line = raw_line.trim();
             if line.starts_with("//") || !line.contains("=>") {
                 continue;
             }
-            let (number, rest) = line
+            let (pattern, rest) = line
                 .split_once(" => ")
                 .unwrap_or_else(|| panic!("unparsable dispatcher arm: {line}"));
-            let number = number
-                .parse::<u64>()
-                .unwrap_or_else(|_| panic!("dispatcher arm must be one integer literal: {line}"));
-            let handler = rest
+            let variant_name = pattern
+                .strip_prefix("Sc::")
+                .unwrap_or_else(|| panic!("dispatcher arm must be one Sc::<Variant>: {line}"));
+            let variant = DispatchedSyscall::from_variant_name(variant_name)
+                .unwrap_or_else(|| panic!("unknown DispatchedSyscall variant: {variant_name}"));
+            // rustfmt wraps single-call arms >100 cols as `Sc::Foo => {\n sys_foo(...)\n }`.
+            let call_expr = if rest == "{" {
+                let inner = lines
+                    .next()
+                    .unwrap_or_else(|| panic!("unclosed block arm: {line}"))
+                    .trim();
+                let close = lines
+                    .next()
+                    .unwrap_or_else(|| panic!("missing closing brace for single-call arm: {line}"))
+                    .trim();
+                assert!(
+                    close == "}" || close == "},",
+                    "dispatcher arm block must contain only one sys_ call: {line} -> {inner} / {close}"
+                );
+                inner
+            } else {
+                rest
+            };
+            let handler = call_expr
                 .split(|c: char| c == '(' || c.is_whitespace())
                 .next()
                 .unwrap_or_default();
@@ -1380,7 +1380,7 @@ mod r190_11_dispatch_parity_tests {
                 handler.starts_with("sys_"),
                 "dispatcher arm must call a sys_ handler: {line}"
             );
-            arms.push((number, String::from(handler)));
+            arms.push((variant.as_u64(), String::from(handler)));
         }
         arms
     }
@@ -1470,35 +1470,45 @@ mod r190_11_dispatch_parity_tests {
             );
         }
 
-        for &nr in DISPATCHED_PROMISED {
-            let handler = handler_of(nr)
-                .unwrap_or_else(|| panic!("DISPATCHED_PROMISED {} has no dispatcher arm", nr));
-            if let Some((result, pinned)) = probe_fixed_errno_stub(handler) {
-                assert_eq!(result, Err(pinned), "{} stub errno drifted", handler);
-                assert_ne!(
-                    pinned,
-                    SyscallError::ENOSYS,
-                    "DISPATCHED_PROMISED {} is an ENOSYS stub ({})",
-                    nr,
-                    handler
-                );
-            }
-        }
-        for &(nr, kind, _) in INTENTIONAL_UNDISPATCHED {
-            match (kind, handler_of(nr)) {
-                (UndispatchedKind::NoArm, None) => {}
-                (UndispatchedKind::NoArm, Some(handler)) => {
+        // N2.0b: every SYSCALL_TABLE row must match its real dispatcher arm and
+        // stub behavior.
+        for spec in SYSCALL_TABLE {
+            match (spec.dispatch, handler_of(spec.nr)) {
+                (DispatchStatus::Dispatched, Some(handler)) => {
+                    if let Some((result, pinned)) = probe_fixed_errno_stub(handler) {
+                        assert_eq!(result, Err(pinned), "{} stub errno drifted", handler);
+                        assert_ne!(
+                            pinned,
+                            SyscallError::ENOSYS,
+                            "SYSCALL_TABLE {} ({}) marked Dispatched but is an ENOSYS stub ({})",
+                            spec.nr,
+                            spec.name,
+                            handler
+                        );
+                    }
+                }
+                (DispatchStatus::Dispatched, None) => {
                     panic!(
-                        "exemption {} claims no arm but dispatches to {}",
-                        nr, handler
-                    )
+                        "SYSCALL_TABLE {} ({}) marked Dispatched but has no dispatcher arm",
+                        spec.nr, spec.name
+                    );
                 }
-                (UndispatchedKind::EnosysStub, None) => {
-                    panic!("exemption {} claims a stub arm but has none", nr)
+                (DispatchStatus::IntentionalNoArm, None) => {}
+                (DispatchStatus::IntentionalNoArm, Some(handler)) => {
+                    panic!(
+                        "SYSCALL_TABLE {} ({}) marked IntentionalNoArm but dispatches to {}",
+                        spec.nr, spec.name, handler
+                    );
                 }
-                (UndispatchedKind::EnosysStub, Some(handler)) => {
+                (DispatchStatus::IntentionalEnosysStub, None) => {
+                    panic!(
+                        "SYSCALL_TABLE {} ({}) marked IntentionalEnosysStub but has no arm",
+                        spec.nr, spec.name
+                    );
+                }
+                (DispatchStatus::IntentionalEnosysStub, Some(handler)) => {
                     let (result, _) = probe_fixed_errno_stub(handler).unwrap_or_else(|| {
-                        panic!("exemption {}: no stub probe for {}", nr, handler)
+                        panic!("exemption {}: no stub probe for {}", spec.nr, handler)
                     });
                     assert_eq!(
                         result,
@@ -1508,13 +1518,6 @@ mod r190_11_dispatch_parity_tests {
                     );
                 }
             }
-        }
-        for &nr in PRIVATE_NEVER_PLEDGED {
-            assert!(
-                handler_of(nr).is_some(),
-                "private syscall {} lost its arm",
-                nr
-            );
         }
 
         // R190-1: a syscall that would expose a feature-absent LSM hook family
@@ -1603,7 +1606,7 @@ mod r190_11_dispatch_parity_tests {
             }
         }
 
-        // The boot self-test itself must also hold on the corrected lists.
+        // The boot self-test itself must also hold on the single table.
         run_pledge_dispatch_parity_self_test();
     }
 }

@@ -169,108 +169,10 @@ fn try_new_filter_arc(value: SeccompFilter) -> Result<SeccompFilterArc, ()> {
 }
 
 // ============================================================================
-// R149-I3 FIX: Centralized Linux x86_64 syscall number definitions.
-//
-// Single source of truth for all pledge/seccomp syscall filtering.
-// Both pledge_to_filter() (lib.rs) and promise_allows_syscall() (below)
-// MUST use these constants instead of local definitions or raw literals.
+// N2.0b: Syscall number constants are sourced from `crate::syscall_table`.
 // ============================================================================
-
-// Process lifecycle
-pub(crate) const SYS_EXIT: u64 = 60;
-pub(crate) const SYS_EXIT_GROUP: u64 = 231;
-pub(crate) const SYS_FORK: u64 = 57;
-pub(crate) const SYS_VFORK: u64 = 58;
-pub(crate) const SYS_CLONE: u64 = 56;
-pub(crate) const SYS_EXECVE: u64 = 59;
-/// M0-4: Zero-OS-private (non-Linux) raw in-memory-image spawn. INTENTIONALLY
-/// NOT in any pledge/seccomp allowlist until M0 item 6 (seccomp↔dispatch
-/// reconcile); seccomp is opt-in so a non-pledged process is unaffected. If it is
-/// ever allowlisted it MUST be added to BOTH `pledge_to_filter` (lib.rs) AND
-/// `promise_allows_syscall` (below) identically (R150-3). The 512-bit FastAllowSet
-/// cannot represent 517, so it is always interpreted/default — never fast-allowed.
-pub(crate) const SYS_SPAWN_IMAGE: u64 = 517;
-pub(crate) const SYS_WAIT4: u64 = 61;
-pub(crate) const SYS_WAITID: u64 = 247;
-pub(crate) const SYS_KILL: u64 = 62;
-
-// File I/O
-pub(crate) const SYS_READ: u64 = 0;
-pub(crate) const SYS_WRITE: u64 = 1;
-pub(crate) const SYS_OPEN: u64 = 2;
-pub(crate) const SYS_CLOSE: u64 = 3;
-pub(crate) const SYS_STAT: u64 = 4;
-pub(crate) const SYS_FSTAT: u64 = 5;
-pub(crate) const SYS_LSTAT: u64 = 6;
-pub(crate) const SYS_LSEEK: u64 = 8;
-pub(crate) const SYS_FSYNC: u64 = 74;
-pub(crate) const SYS_FDATASYNC: u64 = 75;
-pub(crate) const SYS_SYNC: u64 = 162;
-pub(crate) const SYS_SYNC_FILE_RANGE: u64 = 277;
-
-// Memory management
-pub(crate) const SYS_MMAP: u64 = 9;
-pub(crate) const SYS_MPROTECT: u64 = 10;
-pub(crate) const SYS_MUNMAP: u64 = 11;
-pub(crate) const SYS_BRK: u64 = 12;
-pub(crate) const SYS_MREMAP: u64 = 25;
-
-// Process info
-pub(crate) const SYS_GETPID: u64 = 39;
-pub(crate) const SYS_GETUID: u64 = 102;
-pub(crate) const SYS_GETGID: u64 = 104;
-pub(crate) const SYS_GETEUID: u64 = 107;
-pub(crate) const SYS_GETEGID: u64 = 108;
-pub(crate) const SYS_GETPPID: u64 = 110;
-pub(crate) const SYS_SCHED_YIELD: u64 = 24;
-
-// Directory / link operations
-pub(crate) const SYS_RENAME: u64 = 82;
-pub(crate) const SYS_MKDIR: u64 = 83;
-pub(crate) const SYS_RMDIR: u64 = 84;
-pub(crate) const SYS_LINK: u64 = 86;
-pub(crate) const SYS_UNLINK: u64 = 87;
-pub(crate) const SYS_SYMLINK: u64 = 88;
-pub(crate) const SYS_READLINK: u64 = 89;
-
-// File attributes
-// M0-6 FIX (fail-unsafe): the Linux x86-64 numbers are chmod=90, fchmod=91,
-// chown=92, fchown=93, lchown=94. SYS_FCHMOD/SYS_FCHOWN were 93/94 (wrong), so a
-// FATTR-pledged process calling the REAL fchmod(91) — dispatched at syscall.rs
-// `91 => sys_fchmod` — was DENIED (91 in neither pledge gate), and 93/94 were
-// allowed-but-ENOSYS phantoms. Corrected to 91/93.
-pub(crate) const SYS_CHMOD: u64 = 90;
-pub(crate) const SYS_FCHMOD: u64 = 91;
-pub(crate) const SYS_CHOWN: u64 = 92;
-pub(crate) const SYS_FCHOWN: u64 = 93;
-pub(crate) const SYS_LCHOWN: u64 = 94;
-
-// Resource limits
-pub(crate) const SYS_GETRLIMIT: u64 = 97;
-pub(crate) const SYS_SETRLIMIT: u64 = 160;
-// M0-6: prlimit64 — the modern interface musl/glibc route get/setrlimit through.
-pub(crate) const SYS_PRLIMIT64: u64 = 302;
-
-// Threading
-pub(crate) const SYS_FUTEX: u64 = 202;
-pub(crate) const SYS_SET_TID_ADDRESS: u64 = 218;
-
-// Directories
-pub(crate) const SYS_GETDENTS64: u64 = 217;
-
-// *at() syscalls
-pub(crate) const SYS_OPENAT: u64 = 257;
-pub(crate) const SYS_STATX: u64 = 332;
-
-// Time / entropy
-pub(crate) const SYS_CLOCK_GETTIME: u64 = 228;
-pub(crate) const SYS_GETRANDOM: u64 = 318;
-
-// I/O multiplexing (M0-6 SLICE 5+)
-pub(crate) const SYS_SELECT: u64 = 23;
-pub(crate) const SYS_PSELECT6: u64 = 270;
-pub(crate) const SYS_PPOLL: u64 = 271;
-pub(crate) const SYS_POLL: u64 = 7;
+#[allow(unused_imports)]
+pub(crate) use crate::syscall_table::*;
 
 // ============================================================================
 // Seccomp Actions
@@ -1278,13 +1180,36 @@ fn compute_filter_id(prog: &[SeccompInsn]) -> u64 {
     hash
 }
 
-/// Check if a pledge promise set allows a syscall.
+/// Check if a pledge promise set allows a syscall (N2.0b: driven directly from
+/// `crate::syscall_table::SYSCALL_TABLE`).
 ///
-/// This is a simplified mapping; real implementation would be more comprehensive.
+/// Membership is resolved from the same single table that generates
+/// `pledge_syscall_list()` / `pledge_to_filter()`, eliminating R150-3 BPF vs.
+/// semantic divergence by construction. Entries marked `PledgePolicy::Guarded`
+/// additionally enforce argument-sensitive checks (`open`/`openat` flags,
+/// `mmap`/`mprotect` `PROT_EXEC`, `clone` flags).
 fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64; 6]) -> bool {
-    // R149-I3 FIX: Syscall numbers now defined in module-level constants above.
-    // Removed local duplicates to prevent drift.
+    use crate::syscall_table::PledgePolicy;
 
+    let Some(spec) = crate::syscall_table::lookup(syscall_nr) else {
+        return false;
+    };
+
+    match spec.pledge {
+        PledgePolicy::Always => true,
+        PledgePolicy::Promises(bits) => promises.intersects(bits),
+        PledgePolicy::Guarded(bits) => {
+            if !promises.intersects(bits) {
+                return false;
+            }
+            check_guarded_syscall_args(promises, syscall_nr, args)
+        }
+        PledgePolicy::Unpledged | PledgePolicy::PrivateNeverPledged => false,
+    }
+}
+
+/// Argument-sensitive semantic checks for `PledgePolicy::Guarded` syscalls.
+fn check_guarded_syscall_args(promises: PledgePromises, syscall_nr: u64, args: &[u64; 6]) -> bool {
     // File open flag bits (must match VFS)
     const O_ACCMODE: u64 = 0x3;
     const O_WRONLY: u64 = 0x1;
@@ -1296,273 +1221,71 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     // Memory protection flags
     const PROT_EXEC: i32 = 0x4;
 
-    // R145-7 FIX: Always allow exit(60) and exit_group(231).  The libc
-    // exit() path calls exit_group; omitting it would kill pledged processes
-    // on normal termination.
-    if syscall_nr == SYS_EXIT || syscall_nr == SYS_EXIT_GROUP {
-        return true;
-    }
+    // Clone flags
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const CLONE_NEWUTS: u64 = 0x0400_0000;
+    const CLONE_NEWIPC: u64 = 0x0800_0000;
+    const CLONE_NEWUSER: u64 = 0x1000_0000;
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const NS_DISALLOWED: u64 =
+        CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+    const THREAD_REQUIRED: u64 = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND;
 
-    // Handle path syscalls with flag-aware checks
-    if matches!(syscall_nr, SYS_OPEN | SYS_OPENAT) {
-        let flags = if syscall_nr == SYS_OPEN {
-            args[1]
-        } else {
-            args[2]
-        };
-        let accmode = flags & O_ACCMODE;
-        let wants_write = accmode == O_WRONLY || accmode == O_RDWR;
-        let wants_create = (flags & (O_CREAT | O_TRUNC)) != 0;
-        let wants_append = (flags & O_APPEND) != 0;
+    match syscall_nr {
+        SYS_OPEN | SYS_OPENAT => {
+            let flags = if syscall_nr == SYS_OPEN {
+                args[1]
+            } else {
+                args[2]
+            };
+            let accmode = flags & O_ACCMODE;
+            let wants_write = accmode == O_WRONLY || accmode == O_RDWR;
+            let wants_create = (flags & (O_CREAT | O_TRUNC)) != 0;
+            let wants_append = (flags & O_APPEND) != 0;
 
-        // Require at least one path capability
-        let has_path = promises.intersects(
-            PledgePromises::RPATH
-                | PledgePromises::WPATH
-                | PledgePromises::CPATH
-                | PledgePromises::TMPPATH,
-        );
-        if !has_path {
-            return false;
-        }
-
-        // Writing (including append/truncate) requires WPATH/CPATH/TMPPATH
-        if (wants_write || wants_append)
-            && !(promises.contains(PledgePromises::WPATH)
-                || promises.contains(PledgePromises::CPATH)
-                || promises.contains(PledgePromises::TMPPATH))
-        {
-            return false;
-        }
-
-        // Creation/truncate requires CPATH or TMPPATH
-        if wants_create
-            && !(promises.contains(PledgePromises::CPATH)
-                || promises.contains(PledgePromises::TMPPATH))
-        {
-            return false;
-        }
-
-        // Read-only open is permitted with RPATH
-        if !wants_write && !wants_create {
-            return promises.contains(PledgePromises::RPATH)
-                || promises.contains(PledgePromises::WPATH)
-                || promises.contains(PledgePromises::CPATH)
-                || promises.contains(PledgePromises::TMPPATH);
-        }
-
-        return true;
-    }
-
-    // Memory management with PROT_EXEC gating
-    if matches!(syscall_nr, SYS_MMAP | SYS_MPROTECT) {
-        if !promises.contains(PledgePromises::VM) {
-            return false;
-        }
-        let prot = args[2] as i32;
-        if (prot & PROT_EXEC) != 0 && !promises.contains(PledgePromises::PROT_EXEC) {
-            return false;
-        }
-        return true;
-    }
-
-    // Check each promise category
-    // R150-3 FIX: Synchronized with pledge_to_filter() to eliminate divergence.
-    // The BPF generator (pledge_to_filter) provides a first-pass syscall whitelist;
-    // this semantic evaluator adds argument-sensitive gating that BPF cannot express.
-    // Both paths must agree on which syscall numbers are allowed per promise.
-
-    if promises.contains(PledgePromises::STDIO) {
-        if matches!(
-            syscall_nr,
-            SYS_READ
-                | SYS_WRITE
-                | SYS_CLOSE
-                | SYS_FSTAT
-                | SYS_LSEEK
-                | SYS_GETPID
-                | SYS_GETUID      // R150-3 FIX
-                | SYS_GETGID      // R150-3 FIX
-                | SYS_GETEUID     // R150-3 FIX
-                | SYS_GETEGID     // R150-3 FIX
-                | SYS_GETPPID     // R150-3 FIX
-                | SYS_SCHED_YIELD // R150-3 FIX
-                | SYS_POLL        // M0-6 poll/select: lockstep with pledge_syscall_list (R150-3)
-                | SYS_SELECT      // M0-6 poll/select
-                | SYS_PSELECT6    // M0-6 poll/select (sigmask leg only masks the CALLER's own signals)
-                | SYS_PPOLL // M0-6 poll/select
-                | SYS_FSYNC // ST-K4: lockstep with pledge_syscall_list
-                | SYS_FDATASYNC
-                | SYS_SYNC
-                | SYS_SYNC_FILE_RANGE
-        ) {
-            return true;
-        }
-    }
-
-    if promises.contains(PledgePromises::RPATH) {
-        // R150-3 FIX: Added lstat, readlink, getdents64 to match pledge_to_filter().
-        if matches!(
-            syscall_nr,
-            SYS_STAT | SYS_LSTAT | SYS_READLINK | SYS_GETDENTS64
-        ) {
-            return true;
-        }
-    }
-
-    if promises.contains(PledgePromises::WPATH) {
-        // R150-3 FIX: Added rename, unlink, symlink to match pledge_to_filter().
-        if matches!(syscall_nr, SYS_RENAME | SYS_UNLINK | SYS_SYMLINK) {
-            return true;
-        }
-    }
-
-    // R150-3 FIX: CPATH was missing entirely from promise_allows_syscall().
-    if promises.contains(PledgePromises::CPATH) {
-        if matches!(syscall_nr, SYS_MKDIR | SYS_RMDIR | SYS_LINK) {
-            return true;
-        }
-    }
-
-    if promises.contains(PledgePromises::VM) {
-        // R150-3 FIX: Added mremap to match pledge_to_filter().
-        if matches!(syscall_nr, SYS_MUNMAP | SYS_BRK | SYS_MREMAP) {
-            return true;
-        }
-    }
-
-    if promises.contains(PledgePromises::PROC) {
-        // R150-3 FIX: Added vfork, waitid to match pledge_to_filter().
-        if matches!(
-            syscall_nr,
-            SYS_FORK | SYS_VFORK | SYS_WAIT4 | SYS_WAITID | SYS_KILL
-        ) {
-            return true;
-        }
-        // R147-2 FIX: PROC allows clone() but rejects namespace-creating flags.
-        // A pledged "proc" process must not create new namespaces (privilege escalation).
-        //
-        // R151-2 FIX: Also reject CLONE_VM under PROC. CLONE_VM creates an
-        // address-space-sharing sibling, which is a thread-like semantic that
-        // should require the THREAD promise. Without this, a process pledged
-        // with only "proc" could call clone(CLONE_VM) to share its address
-        // space with a child, bypassing the THREAD promise boundary.
-        //
-        // Exception: if the THREAD promise is also present and the flags
-        // satisfy the THREAD-required pattern (CLONE_THREAD|CLONE_VM|
-        // CLONE_SIGHAND all set), the clone is allowed under THREAD semantics.
-        // This preserves correct behavior for "proc|thread" combined pledges.
-        if syscall_nr == SYS_CLONE {
-            let clone_flags = args[0];
-            const CLONE_VM: u64 = 0x0000_0100;
-            const CLONE_SIGHAND: u64 = 0x0000_0800;
-            const CLONE_THREAD: u64 = 0x0001_0000;
-            const CLONE_NEWNS: u64 = 0x0002_0000;
-            const CLONE_NEWUTS: u64 = 0x0400_0000;
-            const CLONE_NEWIPC: u64 = 0x0800_0000;
-            const CLONE_NEWUSER: u64 = 0x1000_0000;
-            const CLONE_NEWPID: u64 = 0x2000_0000;
-            const CLONE_NEWNET: u64 = 0x4000_0000;
-            let ns_disallowed = CLONE_NEWNS
-                | CLONE_NEWUTS
-                | CLONE_NEWIPC
-                | CLONE_NEWUSER
-                | CLONE_NEWPID
-                | CLONE_NEWNET;
-
-            // Always reject namespace-creating flags under PROC.
-            if (clone_flags & ns_disallowed) != 0 {
+            // Writing (including append/truncate) requires WPATH/CPATH/TMPPATH
+            if (wants_write || wants_append)
+                && !promises.intersects(
+                    PledgePromises::WPATH | PledgePromises::CPATH | PledgePromises::TMPPATH,
+                )
+            {
                 return false;
             }
 
-            // R151-2 FIX: If CLONE_VM is requested, only allow when THREAD
-            // promise is also present and all thread-required flags are set.
-            if (clone_flags & CLONE_VM) != 0 {
-                let thread_required = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND;
-                return promises.contains(PledgePromises::THREAD)
-                    && (clone_flags & thread_required) == thread_required;
+            // Creation/truncate requires CPATH or TMPPATH
+            if wants_create && !promises.intersects(PledgePromises::CPATH | PledgePromises::TMPPATH)
+            {
+                return false;
             }
 
-            // Fork-like clone (no CLONE_VM, no namespace flags): allowed.
-            return true;
+            true
         }
-    }
-
-    if promises.contains(PledgePromises::EXEC) {
-        if syscall_nr == SYS_EXECVE {
-            return true;
+        SYS_MMAP | SYS_MPROTECT => {
+            let prot = args[2] as i32;
+            (prot & PROT_EXEC) == 0 || promises.contains(PledgePromises::PROT_EXEC)
         }
-    }
-
-    if promises.contains(PledgePromises::THREAD) {
-        // R150-3 FIX: Added set_tid_address to match pledge_to_filter().
-        if matches!(syscall_nr, SYS_FUTEX | SYS_SET_TID_ADDRESS) {
-            return true;
-        }
-        // R147-2 FIX: THREAD only allows thread-style clone (shared VM + sighand).
-        // Allowing arbitrary clone flags would let a pledged "thread" process
-        // create full child processes or namespaces.
-        if syscall_nr == SYS_CLONE {
+        SYS_CLONE => {
             let clone_flags = args[0];
-            const CLONE_VM: u64 = 0x0000_0100;
-            const CLONE_SIGHAND: u64 = 0x0000_0800;
-            const CLONE_THREAD: u64 = 0x0001_0000;
-            // R154-11 FIX: Explicitly reject CLONE_NEW* namespace flags.
-            // The THREAD promise should only create threads within the
-            // existing namespace context. Without this check, a pledged
-            // "thread"-only process could smuggle namespace-creating flags
-            // alongside the required thread flags.
-            const CLONE_NEWNS: u64 = 0x0002_0000;
-            const CLONE_NEWUTS: u64 = 0x0400_0000;
-            const CLONE_NEWIPC: u64 = 0x0800_0000;
-            const CLONE_NEWUSER: u64 = 0x1000_0000;
-            const CLONE_NEWPID: u64 = 0x2000_0000;
-            const CLONE_NEWNET: u64 = 0x4000_0000;
-            const NS_DISALLOWED: u64 = CLONE_NEWNS
-                | CLONE_NEWUTS
-                | CLONE_NEWIPC
-                | CLONE_NEWUSER
-                | CLONE_NEWPID
-                | CLONE_NEWNET;
+            // R147-2 / R154-11: Always reject namespace-creating flags under PROC/THREAD.
             if (clone_flags & NS_DISALLOWED) != 0 {
                 return false;
             }
-            let required = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND;
-            return (clone_flags & required) == required;
+            // R151-2: CLONE_VM requires THREAD plus full thread-sharing flags.
+            if (clone_flags & CLONE_VM) != 0 {
+                return promises.contains(PledgePromises::THREAD)
+                    && (clone_flags & THREAD_REQUIRED) == THREAD_REQUIRED;
+            }
+            // Fork-like clone (no CLONE_VM, no namespace flags) requires PROC.
+            promises.contains(PledgePromises::PROC)
         }
+        // Fail closed if a new Guarded entry is added to SYSCALL_TABLE without
+        // wiring its semantic argument check here.
+        _ => false,
     }
-
-    // R147-3 FIX: TIME promise must include clock_gettime (228) in addition
-    // to getrandom, matching pledge_to_filter() BPF path to avoid divergence.
-    if promises.contains(PledgePromises::TIME) {
-        if matches!(syscall_nr, SYS_CLOCK_GETTIME | SYS_GETRANDOM) {
-            return true;
-        }
-    }
-
-    // R150-3 FIX: SENDSIG allows kill independently of PROC.
-    if promises.contains(PledgePromises::SENDSIG) {
-        if syscall_nr == SYS_KILL {
-            return true;
-        }
-    }
-
-    // R150-3 FIX: FATTR was missing entirely from promise_allows_syscall().
-    if promises.contains(PledgePromises::FATTR) {
-        if matches!(syscall_nr, SYS_CHMOD | SYS_CHOWN | SYS_FCHMOD | SYS_FCHOWN) {
-            return true;
-        }
-    }
-
-    // R150-3 FIX: RLIMIT was missing entirely from promise_allows_syscall().
-    // M0-6: prlimit64 added in lockstep with pledge_to_filter (R150-3).
-    if promises.contains(PledgePromises::RLIMIT) {
-        if matches!(syscall_nr, SYS_GETRLIMIT | SYS_SETRLIMIT | SYS_PRLIMIT64) {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// M0-6: public probe of the semantic pledge gate for the divergence-prevention
@@ -1571,6 +1294,16 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
 /// at args=0; the headline parity check is over the arg-insensitive BPF union.
 pub fn promise_allows_syscall_probe(promises: PledgePromises, syscall_nr: u64) -> bool {
     promise_allows_syscall(promises, syscall_nr, &[0u64; 6])
+}
+
+/// Hosted test helper exposing argument-aware pledge evaluation.
+#[cfg(test)]
+pub(crate) fn promise_allows_syscall_with_args(
+    promises: PledgePromises,
+    syscall_nr: u64,
+    args: &[u64; 6],
+) -> bool {
+    promise_allows_syscall(promises, syscall_nr, args)
 }
 
 #[cfg(test)]
