@@ -64,7 +64,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # Kernel Rust sources parsed by Leg A (relative to repo root). Read utf-8 with \r
 # stripped -- the repo's rustfmt uses Windows (CRLF) newlines.
 SOURCES = {
-    "syscall": "kernel/kernel_core/syscall.rs",
+    "syscall_abi": "kernel/kernel_core/syscall/abi.rs",
+    "syscall_helpers": "kernel/kernel_core/syscall/helpers.rs",
+    "syscall_fs": "kernel/kernel_core/syscall/fs.rs",
+    "syscall_signal": "kernel/kernel_core/syscall/signal.rs",
     "poll": "kernel/kernel_core/poll.rs",
     "process": "kernel/kernel_core/process.rs",
     "signal": "kernel/kernel_core/signal.rs",
@@ -136,7 +139,7 @@ class StructLayout:
 # `#[repr(C)]` or `#[repr(C, align(N))]` (align optional). Other repr forms are
 # rejected by absence (the struct won't be found with the required repr).
 _REPR_RE = re.compile(r"#\[repr\(C(?:\s*,\s*align\((\d+)\))?\)\]")
-_FIELD_RE = re.compile(r"^(?:pub(?:\(crate\))?\s+)?(\w+)\s*:\s*(.+?)\s*,?$")
+_FIELD_RE = re.compile(r"^(?:pub(?:\((?:crate|super)\))?\s+)?(\w+)\s*:\s*(.+?)\s*,?$")
 
 
 def parse_repr_c_struct(text, name):
@@ -149,7 +152,7 @@ def parse_repr_c_struct(text, name):
     # boundary (the newline before `pub struct ..`), not mid-line on a `pub `
     # fragment that would abort the backward attribute scan.
     struct_re = re.compile(
-        r"(?:pub(?:\(crate\))?\s+)?struct\s+" + re.escape(name) + r"\b\s*\{", re.M)
+        r"(?:pub(?:\((?:crate|super)\))?\s+)?struct\s+" + re.escape(name) + r"\b\s*\{", re.M)
     matches = list(struct_re.finditer(text))
     if not matches:
         raise SourceDriftError(f"struct {name!r} not found")
@@ -229,7 +232,7 @@ def parse_repr_c_struct(text, name):
 # ---------------------------------------------------------------------------
 
 _CONST_DECL_RE_TMPL = (
-    r"(?:pub\s+)?const\s+{name}\s*:\s*(?:u64|u32|usize|i64|i32|u16)\s*=\s*(.+?);"
+    r"(?:pub(?:\((?:crate|super)\))?\s+)?const\s+{name}\s*:\s*(?:u64|u32|usize|i64|i32|u16)\s*=\s*(.+?);"
 )
 _ARITH_CHARSET_RE = re.compile(r"^[\w\s+\-*/()]+$")
 _OFFSETOF_RE = re.compile(r"core::mem::offset_of!\(\s*(\w+)\s*,\s*(\w+)\s*\)")
@@ -322,13 +325,13 @@ ZEROOS_DIVERGENT = "ZEROOS_DIVERGENT"           # deliberately differs from Linu
 #                                        c_type/c_include for Leg C when LINUX_UAPI)
 STRUCT_REFS = {
     "TimeSpec": dict(
-        src="syscall", layer=LINUX_UAPI, cite="uapi/linux/time.h struct timespec",
+        src="syscall_abi", layer=LINUX_UAPI, cite="uapi/linux/time.h struct timespec",
         fields=[("tv_sec", 0, 8), ("tv_nsec", 8, 8)], size=16,
         c_type="struct timespec", c_include="time.h",
         c_fields=[("tv_sec", 0), ("tv_nsec", 8)],
     ),
     "TimeVal": dict(
-        src="syscall", layer=LINUX_UAPI, cite="uapi/linux/time.h struct timeval",
+        src="syscall_abi", layer=LINUX_UAPI, cite="uapi/linux/time.h struct timeval",
         fields=[("tv_sec", 0, 8), ("tv_usec", 8, 8)], size=16,
         c_type="struct timeval", c_include="sys/time.h",
         c_fields=[("tv_sec", 0), ("tv_usec", 8)],
@@ -346,20 +349,20 @@ STRUCT_REFS = {
         c_fields=[("rlim_cur", 0), ("rlim_max", 8)],
     ),
     "Iovec": dict(
-        src="syscall", layer=LINUX_UAPI, cite="uapi/linux/uio.h struct iovec",
+        src="syscall_fs", layer=LINUX_UAPI, cite="uapi/linux/uio.h struct iovec",
         fields=[("iov_base", 0, 8), ("iov_len", 8, 8)], size=16,
         c_type="struct iovec", c_include="sys/uio.h",
         c_fields=[("iov_base", 0), ("iov_len", 8)],
     ),
     "SockAddrIn": dict(
-        src="syscall", layer=LINUX_UAPI, cite="uapi/linux/in.h struct sockaddr_in",
+        src="syscall_abi", layer=LINUX_UAPI, cite="uapi/linux/in.h struct sockaddr_in",
         fields=[("sin_family", 0, 2), ("sin_port", 2, 2), ("sin_addr", 4, 4),
                 ("sin_zero", 8, 8)], size=16,
         c_type="struct sockaddr_in", c_include="netinet/in.h",
         c_fields=[("sin_family", 0), ("sin_port", 2), ("sin_addr", 4)],
     ),
     "MsgHdr": dict(
-        src="syscall", layer=LINUX_UAPI, cite="uapi/linux/socket.h struct msghdr (x86-64)",
+        src="syscall_abi", layer=LINUX_UAPI, cite="uapi/linux/socket.h struct msghdr (x86-64)",
         fields=[("msg_name", 0, 8), ("msg_namelen", 8, 4), ("_pad0", 12, 4),
                 ("msg_iov", 16, 8), ("msg_iovlen", 24, 8),
                 ("msg_control", 32, 8), ("msg_controllen", 40, 8),
@@ -374,7 +377,7 @@ STRUCT_REFS = {
         # Linux 5.6+ openat2(2). All-u64 fields defeat the in-tree size assert, so
         # a field REORDER is silent without an offset check -- exactly the drift
         # this oracle exists to catch.
-        src="syscall", layer=LINUX_UAPI_TABLE_ONLY,
+        src="syscall_abi", layer=LINUX_UAPI_TABLE_ONLY,
         cite="uapi/linux/openat2.h struct open_how (Linux 5.6+); TABLE_ONLY unless "
              "<linux/openat2.h> is present at Leg-C compile time",
         fields=[("flags", 0, 8), ("mode", 8, 8), ("resolve", 16, 8)], size=24,
@@ -385,7 +388,7 @@ STRUCT_REFS = {
         # sizeof(rust) is tail-padded to 24; the WIRE name offset is 19 (pinned
         # separately as LINUX_DIRENT64_NAME_OFFSET). R180-25: never use the struct
         # sizeof as the wire tail.
-        src="syscall", layer=LINUX_UAPI, cite="uapi/linux/dirent.h dirent64 header",
+        src="syscall_abi", layer=LINUX_UAPI, cite="uapi/linux/dirent.h dirent64 header",
         fields=[("d_ino", 0, 8), ("d_off", 8, 8), ("d_reclen", 16, 2),
                 ("d_type", 18, 1)], size=24,
         c_type="struct dirent64", c_include="dirent.h",
@@ -410,7 +413,7 @@ STRUCT_REFS = {
         # D2-ABI-STAT-LAYOUT RESOLVED (2026-07-24): converted from the former
         # 112-byte private layout to the Linux x86-64 struct stat wire layout.
         # pad0/unused0..2 are explicit zero fields (no implicit padding).
-        src="syscall", layer=LINUX_UAPI,
+        src="syscall_helpers", layer=LINUX_UAPI,
         cite="arch/x86/include/uapi/asm/stat.h struct stat (x86-64, 144B); "
              "musl reads these exact offsets",
         fields=[("dev", 0, 8), ("ino", 8, 8), ("nlink", 16, 8), ("mode", 24, 4),
@@ -429,7 +432,7 @@ STRUCT_REFS = {
     "UtsName": dict(
         # D2-ABI-STAT-LAYOUT LOW leg RESOLVED (2026-07-24): domainname added ->
         # full Linux new_utsname (6 x [u8;65] = 390B).
-        src="syscall", layer=LINUX_UAPI,
+        src="syscall_abi", layer=LINUX_UAPI,
         cite="include/uapi/linux/utsname.h struct new_utsname (390B incl. "
              "domainname); glibc/musl utsname mirrors it",
         fields=[("sysname", 0, 65), ("nodename", 65, 65), ("release", 130, 65),
@@ -509,27 +512,27 @@ CONST_REFS = {
 # serializers/decoders (which have no repr(C) struct to parse). Miss => exit 2.
 # ---------------------------------------------------------------------------
 TRIPWIRES = [
-    ("syscall", r"record\[0\.\.8\]\.copy_from_slice\(&entry\.ino\.to_ne_bytes",
+    ("syscall_fs", r"record\[0\.\.8\]\.copy_from_slice\(&entry\.ino\.to_ne_bytes",
      "dirent64 d_ino@0..8"),
-    ("syscall", r"record\[8\.\.16\]\.copy_from_slice\(&entry\.next_cookie",
+    ("syscall_fs", r"record\[8\.\.16\]\.copy_from_slice\(&entry\.next_cookie",
      "dirent64 d_off (RF180-14 resume cookie)@8..16"),
-    ("syscall", r"record\[16\.\.18\]\.copy_from_slice\(&\(reclen as u16\)",
+    ("syscall_fs", r"record\[16\.\.18\]\.copy_from_slice\(&\(reclen as u16\)",
      "dirent64 d_reclen@16..18"),
-    ("syscall", r"record\[18\] = d_type;", "dirent64 d_type@18"),
-    ("syscall", r"let name_start = LINUX_DIRENT64_NAME_OFFSET;",
+    ("syscall_fs", r"record\[18\] = d_type;", "dirent64 d_type@18"),
+    ("syscall_fs", r"let name_start = LINUX_DIRENT64_NAME_OFFSET;",
      "dirent64 name@LINUX_DIRENT64_NAME_OFFSET"),
-    ("syscall", r"\.map\(\|value\| value & !7\)", "dirent64 reclen 8-byte align"),
-    ("syscall", r"FileType::Regular => 8,", "DT_REG=8"),
-    ("syscall", r"FileType::Directory => 4,", "DT_DIR=4"),
-    ("syscall", r"FileType::CharDevice => 2,", "DT_CHR=2"),
-    ("syscall", r"FileType::BlockDevice => 6,", "DT_BLK=6"),
-    ("syscall", r"FileType::Symlink => 10,", "DT_LNK=10"),
-    ("syscall", r"FileType::Fifo => 1,", "DT_FIFO=1"),
-    ("syscall", r"FileType::Socket => 12,", "DT_SOCK=12"),
-    ("syscall", r"let handler = rd\(0\);", "rt_sigaction handler@0"),
-    ("syscall", r"let flags = rd\(8\);", "rt_sigaction flags@8"),
-    ("syscall", r"let restorer = rd\(16\);", "rt_sigaction restorer@16"),
-    ("syscall", r"let mask = rd\(24\);", "rt_sigaction mask@24"),
+    ("syscall_fs", r"\.map\(\|value\| value & !7\)", "dirent64 reclen 8-byte align"),
+    ("syscall_fs", r"FileType::Regular => 8,", "DT_REG=8"),
+    ("syscall_fs", r"FileType::Directory => 4,", "DT_DIR=4"),
+    ("syscall_fs", r"FileType::CharDevice => 2,", "DT_CHR=2"),
+    ("syscall_fs", r"FileType::BlockDevice => 6,", "DT_BLK=6"),
+    ("syscall_fs", r"FileType::Symlink => 10,", "DT_LNK=10"),
+    ("syscall_fs", r"FileType::Fifo => 1,", "DT_FIFO=1"),
+    ("syscall_fs", r"FileType::Socket => 12,", "DT_SOCK=12"),
+    ("syscall_signal", r"let handler = rd\(0\);", "rt_sigaction handler@0"),
+    ("syscall_signal", r"let flags = rd\(8\);", "rt_sigaction flags@8"),
+    ("syscall_signal", r"let restorer = rd\(16\);", "rt_sigaction restorer@16"),
+    ("syscall_signal", r"let mask = rd\(24\);", "rt_sigaction mask@24"),
 ]
 
 
