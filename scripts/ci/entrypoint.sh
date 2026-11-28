@@ -265,7 +265,9 @@ PY
         extended_ext3
         ;;
     conformance)
-        gate conformance-libc-test -- make conformance-libc-test
+        check conformance-libc-test -- make conformance-libc-test
+        check conformance-ltp -- make conformance-ltp
+        check busybox-gate -- make busybox-gate
         ;;
     extended-stress)
         # EXT-CI: one profile per job. A failed 900-second soak is reported as it

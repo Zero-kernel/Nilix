@@ -39,6 +39,7 @@ host_harness = ["mm/host_harness", "cpu_local/host_harness", "cap/host_harness"]
 namespace_probe = []
 open_fault_probe = []
 shared_fault_reentry_probe = []
+busybox_gate = []
 # Guest-only syscall fixture hooks (shared-fault verification oracle).
 syscall_test = ["lsm/syscall_test", "mm/syscall_test"]
 

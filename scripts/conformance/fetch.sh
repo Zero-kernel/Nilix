@@ -50,7 +50,16 @@ fi
 
 DOWNLOAD_DIR="$DEST_ROOT/downloads"
 SRC_DIR="$DEST_ROOT/src/$SUITE"
-ARCHIVE="$DOWNLOAD_DIR/$SUITE-$VERSION.tar.gz"
+case "$URL" in
+    *.tar.bz2) EXT=".tar.bz2" ;;
+    *.tar.xz)  EXT=".tar.xz" ;;
+    *.tar.gz|*.tgz) EXT=".tar.gz" ;;
+    *)
+        echo "CONFORMANCE-FETCH ERROR: unsupported archive extension in URL: $URL" >&2
+        exit 2
+        ;;
+esac
+ARCHIVE="$DOWNLOAD_DIR/$SUITE-$VERSION$EXT"
 STAMP="$SRC_DIR/.fetched-$EXPECTED_SHA"
 
 mkdir -p "$DOWNLOAD_DIR"
@@ -94,7 +103,7 @@ fi
 if [ ! -f "$STAMP" ]; then
     rm -rf "$SRC_DIR"
     mkdir -p "$SRC_DIR"
-    tar -xzf "$ARCHIVE" -C "$SRC_DIR" --strip-components=1
+    tar -xf "$ARCHIVE" -C "$SRC_DIR" --strip-components=1
     printf '%s %s\n' "$VERSION" "$EXPECTED_SHA" > "$STAMP"
 fi
 

@@ -185,6 +185,15 @@ impl TimeSpec {
         let ms = kernel_core::current_timestamp_ms();
         Self::from_ms(ms)
     }
+
+    /// Get wall-clock POSIX epoch time (`CLOCK_REALTIME`) for filesystem timestamps.
+    pub fn realtime_now() -> Self {
+        let ns = kernel_core::time::realtime_ns();
+        Self {
+            sec: (ns / 1_000_000_000) as i64,
+            nsec: (ns % 1_000_000_000) as i64,
+        }
+    }
 }
 
 /// File status structure (similar to POSIX struct stat)

@@ -226,6 +226,11 @@ raise SystemExit(int(os.environ.get('FAIL_REPORT', '0')))
                 self.assertEqual(status, 0)
                 self.assertEqual(events, gates)
 
+    def test_conformance_group_runs_libc_test_ltp_and_busybox_gate(self):
+        status, events = self.run_group('conformance', FAIL_GATE='conformance-ltp')
+        self.assertEqual(status, 1)
+        self.assertEqual(events, ['conformance-libc-test', 'conformance-ltp', 'busybox-gate', 'report'])
+
     def test_missing_stress_prerequisite_cannot_be_accepted_as_qualified(self):
         scripts = Path(__file__).resolve().parents[1]
         artifacts = self.root / 'stress-artifacts'

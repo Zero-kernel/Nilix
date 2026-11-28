@@ -275,6 +275,12 @@ static USER_ELF_ALIGNED: AlignedElfData<
     { include_bytes!(env!("ZERO_OS_CONFORMANCE_RUNNER_ELF")).len() },
 > = AlignedElfData(*include_bytes!(env!("ZERO_OS_CONFORMANCE_RUNNER_ELF")));
 
+/// Embedded Ring-3 BusyBox boot gate init wrapper (N2, #66).
+#[cfg(feature = "busybox_gate")]
+static USER_ELF_ALIGNED: AlignedElfData<
+    { include_bytes!(env!("ZERO_OS_BUSYBOX_INIT_ELF")).len() },
+> = AlignedElfData(*include_bytes!(env!("ZERO_OS_BUSYBOX_INIT_ELF")));
+
 /// Embedded Ring 3 test program (hello.elf) with proper alignment
 ///
 /// This is a minimal user-space program that tests:
@@ -289,6 +295,7 @@ static USER_ELF_ALIGNED: AlignedElfData<
     feature = "clone_test",
     feature = "stress_runner",
     feature = "conformance_runner",
+    feature = "busybox_gate",
     feature = "fuzz_runner",
     feature = "syz_executor"
 )))]
@@ -367,6 +374,8 @@ const PROCESS_NAME: &str = "clone_test";
 const PROCESS_NAME: &str = "stress_runner";
 #[cfg(feature = "conformance_runner")]
 const PROCESS_NAME: &str = "conformance_runner";
+#[cfg(feature = "busybox_gate")]
+const PROCESS_NAME: &str = "busybox_init";
 #[cfg(feature = "fuzz_runner")]
 const PROCESS_NAME: &str = "fuzz_runner";
 #[cfg(feature = "syz_executor")]
@@ -378,6 +387,7 @@ const PROCESS_NAME: &str = "syz_executor";
     feature = "clone_test",
     feature = "stress_runner",
     feature = "conformance_runner",
+    feature = "busybox_gate",
     feature = "fuzz_runner",
     feature = "syz_executor"
 )))]

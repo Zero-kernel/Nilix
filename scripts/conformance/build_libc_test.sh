@@ -71,6 +71,14 @@ build_one() {
             skipped_count=$((skipped_count + 1))
             return 0
             ;;
+        raise-race)
+            # Forks ~50 SIGSEGVing children inside a pthread SIGRTMIN+1 handler
+            # before timing out, poisoning UID-0's 256 KiB non-exec headroom for
+            # subsequent tests in the same guest boot.
+            printf '%s\tpthread-signal-fork-oom-poison\n' "$name" >> "$UNBUILDABLE"
+            skipped_count=$((skipped_count + 1))
+            return 0
+            ;;
     esac
 
     # Skip files with a custom .mk requiring extra .so / multi-object linking.

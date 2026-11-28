@@ -1094,6 +1094,9 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
     #[cfg(feature = "iommu_init_probe")]
     iommu::run_init_failure_probe(rsdp_phys);
 
+    kernel_core::register_soft_progress_callback(kernel_core::tty::drain_pending_tty_signals)
+        .expect("Console TTY deferred signal callback slots exhausted");
+
     match iommu::init(rsdp_phys) {
         Ok(units) => {
             // Register the process drain before exposing the IRQ producer.

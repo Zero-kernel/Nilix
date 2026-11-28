@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm test-strict test-strict-smp4 boot-check musl-check test-smp test-smp-4core test-smp-extended test-smp-32core stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress build-conformance-runner build-conformance conformance-libc-test test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm test-strict test-strict-smp4 boot-check musl-check test-smp test-smp-4core test-smp-extended test-smp-32core stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress build-conformance-runner build-conformance conformance-libc-test conformance-ltp build-busybox-init build-busybox busybox-gate test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -40,6 +40,11 @@ CONFORMANCE_KERNEL := $(CONFORMANCE_TARGET_DIR)/x86_64-unknown-none/release/kern
 CONFORMANCE_ESP := esp-conformance
 CONFORMANCE_ESP_DIR := $(CURDIR)/$(CONFORMANCE_ESP)/EFI/BOOT
 CONFORMANCE_RUNNER_ELF := $(CURDIR)/target/conformance/conformance_runner.elf
+BUSYBOX_TARGET_DIR := kernel-target/busybox
+BUSYBOX_KERNEL := $(BUSYBOX_TARGET_DIR)/x86_64-unknown-none/release/kernel
+BUSYBOX_ESP := esp-busybox
+BUSYBOX_ESP_DIR := $(CURDIR)/$(BUSYBOX_ESP)/EFI/BOOT
+BUSYBOX_INIT_ELF := $(CURDIR)/target/conformance/busybox_init.elf
 KCOV_TARGET_DIR := kernel-target/kcov
 KCOV_KERNEL := $(KCOV_TARGET_DIR)/x86_64-unknown-none/release/kernel
 KCOV_ESP := esp-kcov
@@ -320,6 +325,57 @@ conformance-libc-test: build-conformance
 		--disk target/conformance/libc-test.img \
 		--manifest target/conformance/build/libc-test/manifest.txt \
 		--passlist scripts/conformance/libc-test.pass
+
+conformance-ltp: build-conformance
+	@echo "=== Building LTP syscall conformance suite and ext3 disk image ==="
+	bash scripts/conformance/build_ltp.sh target/conformance
+	bash scripts/conformance/make_image.sh \
+		target/conformance/build/ltp/bin \
+		target/conformance/build/ltp/manifest.txt \
+		target/conformance/ltp.img
+	@echo "=== Running LTP conformance gate ==="
+	OVMF_PATH="$(OVMF_PATH)" python3 scripts/gates/conformance/conformance_gate.py \
+		--suite ltp \
+		--esp "$(CONFORMANCE_ESP)" \
+		--disk target/conformance/ltp.img \
+		--manifest target/conformance/build/ltp/manifest.txt \
+		--passlist scripts/conformance/ltp.pass
+
+# N2 (#66): isolated BusyBox boot gate (scripted + interactive serial ^Z/bg/fg/^C + reboot persistence).
+build-busybox-init:
+	@echo "=== Building static musl BusyBox init wrapper ==="
+	mkdir -p target/conformance
+	musl-gcc -std=c11 -static -no-pie -O2 -Wall -Wextra -Werror \
+		-o "$(BUSYBOX_INIT_ELF)" userspace/busybox_init.c
+	@echo "BusyBox init SHA-256: $$(sha256sum "$(BUSYBOX_INIT_ELF)" | awk '{print $$1}')"
+	@readelf -h "$(BUSYBOX_INIT_ELF)" | grep "Entry\|Type"
+
+build-busybox: build-busybox-init
+	@echo "=== Building bootloader for BusyBox gate ==="
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
+
+	@echo "=== Building isolated BusyBox gate kernel ==="
+	cd kernel && \
+	CARGO_TARGET_DIR=../$(BUSYBOX_TARGET_DIR) \
+	ZERO_OS_BUSYBOX_INIT_ELF="$(BUSYBOX_INIT_ELF)" \
+	RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features busybox_gate
+
+	@echo "=== Preparing isolated BusyBox ESP ==="
+	mkdir -p "$(BUSYBOX_ESP_DIR)"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi "$(BUSYBOX_ESP_DIR)/BOOTX64.EFI"
+	cp "$(BUSYBOX_KERNEL)" "$(BUSYBOX_ESP)/kernel.elf"
+	@cmp -s "$(BUSYBOX_KERNEL)" "$(BUSYBOX_ESP)/kernel.elf"
+	@echo "BusyBox kernel SHA-256: $$(sha256sum "$(BUSYBOX_ESP)/kernel.elf" | awk '{print $$1}')"
+
+busybox-gate: build-busybox
+	@echo "=== Building pinned static musl BusyBox ==="
+	bash scripts/conformance/build_busybox.sh target/conformance
+	@echo "=== Running BusyBox boot gate ==="
+	OVMF_PATH="$(OVMF_PATH)" python3 scripts/gates/conformance/busybox_gate.py \
+		--esp "$(BUSYBOX_ESP)" \
+		--busybox target/conformance/build/busybox/busybox
 
 # Compatibility alias for the deterministic KCOV guest executor build.
 build-fuzz-runner: build-kcov

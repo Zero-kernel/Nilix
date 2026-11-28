@@ -1,4 +1,4 @@
-# Pinned third-party conformance test suites for Nilix (N2.2, #66).
+# Pinned third-party conformance test suites for Nilix (N2.2 / BusyBox gate, #66).
 #
 # External source archives are never committed to this repository.
 # scripts/conformance/fetch.sh verifies the exact SHA-256 before extraction
@@ -6,3 +6,5 @@
 #
 # Format: <suite> <version> <sha256> <url>
 libc-test 63e36e934e8f2bedf645303a90b64098e2af6c8f 1618dfc26618f9ca9a6e210404e282ccd4fa4fe4598344bada5c2ad40643aaa8 https://repo.or.cz/libc-test.git/snapshot/63e36e934e8f2bedf645303a90b64098e2af6c8f.tar.gz
+busybox 1.36.1 b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314 https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+ltp 20250130 02e4ec326be54c3fd92968229a468c02c665d168a8a673edc38a891f7395ae10 https://github.com/linux-test-project/ltp/releases/download/20250130/ltp-full-20250130.tar.xz

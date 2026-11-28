@@ -533,7 +533,9 @@ pub fn console_input_allowed() -> bool {
     let tgid = current_pid()
         .and_then(get_process)
         .map(|proc| proc.lock().tgid);
-    console_owner_allows(compliance::policy().debug_interfaces_enabled, tgid)
+    let ring0_debug_shell_owns_console =
+        compliance::policy().debug_interfaces_enabled && !cfg!(feature = "busybox_gate");
+    console_owner_allows(ring0_debug_shell_owns_console, tgid)
 }
 
 #[cfg(test)]
@@ -13171,6 +13173,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let mut dropped_handoff: Option<Box<ExecHandoff>> = None;
         let retarget_group: Option<Arc<ThreadGroup>>;
         let mut handoff_fds = AdmittedMap::new(HeapClass::CoreProcess);
+        let exit_fds: AdmittedMap<i32, FileDescriptor>;
         // RF184-1: Removed mmap_snapshot (allocation-free validation)
 
         {
@@ -13265,6 +13268,17 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 }
                 dropped_handoff = Some(handoff);
             }
+            // POSIX exit_files(2) semantics: close this task's file descriptors
+            // when transitioning to Zombie (before parent waitpid/reap) so pipes,
+            // FIFOs, and sockets observe EOF immediately (required by shell $(...)
+            // command substitution and popen()). `files_released` keeps
+            // `free_process_resources()` idempotent at reap time.
+            exit_fds = if core::mem::replace(&mut proc.files_released, true) {
+                AdmittedMap::new(HeapClass::CoreProcess)
+            } else {
+                let files = Arc::clone(&proc.files);
+                release_files_owner_locked(&proc, &files)
+            };
             own_group = Arc::clone(&proc.thread_group);
             pid_ns_chain = if !last_live && proc.tgid == pid {
                 AdmittedVec::new(HeapClass::CoreProcess)
@@ -13294,6 +13308,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         }
         drop(dropped_handoff);
         drop(handoff_fds);
+        drop(exit_fds);
         if let Some(group) = retarget_group {
             retarget_shared_signals(pid, &group);
         }

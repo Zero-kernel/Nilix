@@ -2675,6 +2675,7 @@ extern "C" fn serial_interrupt_handler(_stack_frame: &mut InterruptStackFrameVal
     }
 
     let mut received_any = false;
+    let mut tty_signal_latched = false;
 
     // Drain RX FIFO, then emit one bounded async TX burst, then re-check RX
     // once so an RX byte arriving during TX drain never leaves edge-triggered
@@ -2698,10 +2699,17 @@ extern "C" fn serial_interrupt_handler(_stack_frame: &mut InterruptStackFrameVal
                 core::arch::asm!("in al, dx", out("al") data, in("dx") SERIAL_PORT, options(nostack, nomem));
             }
 
-            // 将串口数据放入键盘缓冲区（模拟键盘输入）
-            // 串口数据已经是 ASCII，不需要扫描码转换
-            if drivers::keyboard::push_char(data) {
-                received_any = true;
+            // N2.5 / BusyBox: classify control characters (^C/^Z/^\) lock-free
+            // in IRQ context and push ordinary data (with ICRNL translation).
+            match kernel_core::tty::on_rx_byte_irq(data) {
+                kernel_core::tty::RxAction::Signal => {
+                    tty_signal_latched = true;
+                }
+                kernel_core::tty::RxAction::Data(ch) => {
+                    if drivers::keyboard::push_char(ch) {
+                        received_any = true;
+                    }
+                }
             }
         }
 
@@ -2728,8 +2736,11 @@ extern "C" fn serial_interrupt_handler(_stack_frame: &mut InterruptStackFrameVal
         }
     }
 
-    // 如果收到了输入，唤醒等待输入的进程并请求重调度
-    if received_any {
+    // 如果收到了输入或锁存了 TTY 作业控制信号，唤醒等待输入的进程并请求重调度
+    if tty_signal_latched {
+        kernel_core::request_soft_progress_from_irq();
+    }
+    if received_any || tty_signal_latched {
         // R23-5 fix: 唤醒等待 stdin 输入的进程
         kernel_core::wake_stdin_waiters();
         kernel_core::request_resched_from_irq();

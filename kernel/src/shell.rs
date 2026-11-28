@@ -672,11 +672,11 @@ static SHELL: spin::Once<Shell> = spin::Once::new();
 
 /// Initialize and run the shell
 pub fn init_and_run() -> ! {
-    if compliance::policy().debug_interfaces_enabled {
+    if compliance::policy().debug_interfaces_enabled && !cfg!(feature = "busybox_gate") {
         let shell = SHELL.call_once(|| Shell::new());
         shell.run();
     } else {
-        klog_always!("Ring-0 debug shell disabled by hardening policy");
+        klog_always!("Ring-0 debug shell disabled (Ring-3 console active or hardening policy)");
         sched::enhanced_scheduler::Scheduler::reschedule_now(
             true,
             kernel_core::ReschedOrigin::Process,

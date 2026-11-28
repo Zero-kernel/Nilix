@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -57,6 +58,35 @@ static long elapsed_ms(const struct timespec *start, const struct timespec *now)
     return sec * 1000L + nsec / 1000000L;
 }
 
+static void clean_dir_contents(const char *dir_path, int depth) {
+    if (depth > 8) {
+        return;
+    }
+    DIR *dp = opendir(dir_path);
+    if (!dp) {
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        char child[512];
+        int n = snprintf(child, sizeof(child), "%s/%s", dir_path, ent->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(child)) {
+            continue;
+        }
+        struct stat st;
+        if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            clean_dir_contents(child, depth + 1);
+            (void)rmdir(child);
+        } else {
+            (void)unlink(child);
+        }
+    }
+    closedir(dp);
+}
+
 static int run_one_case(
     const char *suite,
     const char *name,
@@ -81,6 +111,7 @@ static int run_one_case(
 
     if (pid == 0) {
         close(err_pipe[0]);
+        (void)setpgid(0, 0);
         (void)chdir(WORK_DIR);
         int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0) {
@@ -138,6 +169,7 @@ static int run_one_case(
     }
 
     if (!reaped) {
+        (void)kill(-pid, SIGKILL);
         (void)kill(pid, SIGKILL);
         for (int i = 0; i < 200; i++) {
             pid_t r = waitpid(pid, &status, WNOHANG);
@@ -244,9 +276,10 @@ int main(void) {
         );
         emit_line(out);
 
-        /* Reap any grandchildren reparented to PID 1 by the finished test case. */
+        /* Reap any grandchildren reparented to PID 1 and reclaim /tmp files. */
         while (waitpid(-1, NULL, WNOHANG) > 0) {
         }
+        clean_dir_contents(WORK_DIR, 0);
     }
 
     fclose(fp);
