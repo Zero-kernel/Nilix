@@ -154,6 +154,7 @@ N2.8 sendmsg/recvmsg scatter-gather, MSG_TRUNC, EOPNOTSUPP control, and multi-io
 N2.5 pgid/sid, controlling terminal ioctls, kill(-pgid), wait4/waitid stop & continue
 N2.1 >256 KiB exec image, >1 MiB PT_LOAD segment, and 1024 fd ceiling
 N2.4 set*id, supplementary groups, capget/capset, and privilege drop
+N2.7 /dev/urandom, /dev/tty, /proc/mounts, getrusage, times, sysinfo, priority, and getcpu
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.

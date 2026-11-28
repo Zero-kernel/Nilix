@@ -30,6 +30,7 @@ mm = { path = "../mm" }
 cap = { path = "../cap" }
 klog = { path = "../klog" }
 kernel_crypto = { package = "crypto", path = "../crypto" }
+security = { path = "../security" }
 
 [[example]]
 name = "ext2_mut_image"

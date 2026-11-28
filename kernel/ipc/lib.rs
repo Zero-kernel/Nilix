@@ -703,6 +703,7 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
         FsError::NotEmpty => SyscallError::ENOTEMPTY,
         FsError::Busy => SyscallError::EBUSY,
         FsError::Again => SyscallError::EAGAIN,
+        FsError::NoDevice => SyscallError::ENXIO,
     }
 }
 

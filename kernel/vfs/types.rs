@@ -241,6 +241,8 @@ pub enum FsError {
     Seek,
     /// A requested cached-only lookup cannot be completed without I/O/work.
     Again,
+    /// No such device or address (ENXIO, e.g., /dev/tty without a controlling terminal).
+    NoDevice,
 }
 
 impl FsError {
@@ -268,6 +270,7 @@ impl FsError {
             FsError::SymlinkLoop => -40,  // ELOOP
             FsError::Seek => -29,         // ESPIPE
             FsError::Again => -11,        // EAGAIN
+            FsError::NoDevice => -6,      // ENXIO
         }
     }
 }
@@ -339,6 +342,7 @@ impl From<FsError> for SyscallError {
             FsError::NameTooLong => SyscallError::ENAMETOOLONG,
             FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
             FsError::Again => SyscallError::EAGAIN,
+            FsError::NoDevice => SyscallError::ENXIO,
             FsError::CrossDev => SyscallError::EXDEV,
             FsError::SymlinkLoop => SyscallError::ELOOP,
             FsError::NotSupported => SyscallError::ENOSYS,

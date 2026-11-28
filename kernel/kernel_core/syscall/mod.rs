@@ -906,8 +906,14 @@ pub fn syscall_dispatcher(
                 arg3 as *mut TimeSpec,
             ),
 
-            // 系统信息
+            // 系统信息 & N2.7 资源使用/优先级/CPU
             Sc::Uname => sys_uname(arg0 as *mut UtsName),
+            Sc::Getrusage => sys_getrusage(arg0 as i32, arg1 as *mut u8),
+            Sc::Sysinfo => sys_sysinfo(arg0 as *mut u8),
+            Sc::Times => sys_times(arg0 as *mut u8),
+            Sc::Getpriority => sys_getpriority(arg0 as i32, arg1 as u32),
+            Sc::Setpriority => sys_setpriority(arg0 as i32, arg1 as u32, arg2 as i32),
+            Sc::Getcpu => sys_getcpu(arg0 as *mut u32, arg1 as *mut u32, arg2 as usize),
 
             // 其他
             Sc::SchedYield => sys_yield(),

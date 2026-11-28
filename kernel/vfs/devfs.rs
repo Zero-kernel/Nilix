@@ -4,6 +4,8 @@
 //! - /dev/null - Discards all writes, returns EOF on read
 //! - /dev/zero - Returns infinite zeros on read, discards writes
 //! - /dev/console - Kernel console (serial output)
+//! - /dev/tty - Controlling terminal of the current process (N2.7)
+//! - /dev/urandom, /dev/random - Cryptographic random byte stream (N2.7)
 //! - /dev/vdX - Block devices (virtio-blk, etc.)
 
 use crate::traits::{FileSystem, Inode, PreparedFileHandle};
@@ -41,7 +43,7 @@ impl DevFs {
         // reach DRIVER_OK. Later publication uses insert_unique_reserved and is
         // therefore allocator-independent.
         devices
-            .try_reserve_exact(3 + block::MAX_BLOCK_DEVICES)
+            .try_reserve_exact(6 + block::MAX_BLOCK_DEVICES)
             .expect("devfs: boot block-node slot reservation OOM");
 
         let null_inode = Arc::new(NullDevInode::new(fs_id));
@@ -57,6 +59,21 @@ impl DevFs {
         let console_inode = Arc::new(ConsoleDevInode::new(fs_id));
         devices
             .try_insert("console".into(), console_inode)
+            .expect("devfs: boot device registration OOM");
+
+        let tty_inode = Arc::new(TtyDevInode::new(fs_id));
+        devices
+            .try_insert("tty".into(), tty_inode)
+            .expect("devfs: boot device registration OOM");
+
+        let urandom_inode = Arc::new(UrandomDevInode::new_urandom(fs_id));
+        devices
+            .try_insert("urandom".into(), urandom_inode)
+            .expect("devfs: boot device registration OOM");
+
+        let random_inode = Arc::new(UrandomDevInode::new_random(fs_id));
+        devices
+            .try_insert("random".into(), random_inode)
             .expect("devfs: boot device registration OOM");
 
         let root = Arc::new(DevDirInode {
@@ -483,6 +500,205 @@ impl Inode for ConsoleDevInode {
                 session.write_str((b as char).encode_utf8(&mut utf8));
             }
         }
+        Ok(data.len())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// ============================================================================
+// /dev/tty implementation (N2.7)
+// ============================================================================
+
+/// /dev/tty inode - refers to the controlling terminal of the calling process.
+pub(crate) struct TtyDevInode {
+    fs_id: u64,
+    ino: u64,
+}
+
+impl TtyDevInode {
+    fn new(fs_id: u64) -> Self {
+        Self { fs_id, ino: 5 }
+    }
+}
+
+impl Inode for TtyDevInode {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: self.ino,
+            mode: FileMode::char_device(0o666),
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: make_dev(5, 0), // major 5, minor 0 = /dev/tty
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        // POSIX/Linux: opening /dev/tty fails with ENXIO when the caller has
+        // no controlling terminal (O_PATH is allowed for path-only inspection).
+        if !flags.is_path() {
+            let pid = kernel_core::current_pid().ok_or(FsError::NoDevice)?;
+            let proc_arc = kernel_core::get_process(pid).ok_or(FsError::NoDevice)?;
+            let has_ctty = proc_arc.lock().thread_group.has_ctty();
+            if !has_ctty {
+                return Err(FsError::NoDevice);
+            }
+        }
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
+    }
+
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        if !kernel_core::process::console_input_allowed() {
+            return Err(FsError::NotPermitted);
+        }
+        Ok(drivers::keyboard_read(buf))
+    }
+
+    fn read_at_with_commit(
+        &self,
+        _offset: u64,
+        buf: &mut [u8],
+        commit: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
+    ) -> Result<usize, FsError> {
+        if !kernel_core::process::console_input_allowed() {
+            return Err(FsError::NotPermitted);
+        }
+        drivers::keyboard_read_with_commit(buf, commit)
+    }
+
+    fn write_at(&self, _offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        let mut session =
+            drivers::vga_buffer::ConsoleWrite::begin(kernel_core::current_pid().unwrap_or(0));
+        if let Ok(s) = core::str::from_utf8(data) {
+            session.write_str(s);
+        } else {
+            let mut utf8 = [0u8; 4];
+            for &b in data {
+                session.write_str((b as char).encode_utf8(&mut utf8));
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// ============================================================================
+// /dev/urandom and /dev/random implementation (N2.7)
+// ============================================================================
+
+/// /dev/urandom (1:9) and /dev/random (1:8) CSPRNG character device inode.
+struct UrandomDevInode {
+    fs_id: u64,
+    ino: u64,
+    minor: u32,
+}
+
+impl UrandomDevInode {
+    fn new_urandom(fs_id: u64) -> Self {
+        Self {
+            fs_id,
+            ino: 6,
+            minor: 9,
+        }
+    }
+
+    fn new_random(fs_id: u64) -> Self {
+        Self {
+            fs_id,
+            ino: 7,
+            minor: 8,
+        }
+    }
+}
+
+impl Inode for UrandomDevInode {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: self.ino,
+            mode: FileMode::char_device(0o666),
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: make_dev(1, self.minor), // major 1, minor 9 (urandom) or 8 (random)
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, false))
+    }
+
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match security::rng::fill_random(buf) {
+            Ok(()) => Ok(buf.len()),
+            Err(security::rng::RngError::FipsBlocked) => Err(FsError::NotPermitted),
+            Err(security::rng::RngError::NotInitialized) => {
+                security::rng::init_global().map_err(|_| FsError::Again)?;
+                security::rng::fill_random(buf).map_err(|_| FsError::Io)?;
+                Ok(buf.len())
+            }
+            Err(_) => Err(FsError::Io),
+        }
+    }
+
+    fn write_at(&self, _offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        // Linux accepts writes to /dev/urandom and /dev/random (entropy mixing no-op).
         Ok(data.len())
     }
 
@@ -982,5 +1198,75 @@ pub(crate) mod block_geometry_tests {
             Err(FsError::Invalid)
         ));
         assert_eq!(device.calls.lock().as_slice(), &[(false, 0, 4096)]);
+    }
+
+    #[test]
+    fn devfs_exposes_tty_urandom_and_random_with_linux_rdev() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        let devfs = DevFs::new();
+        let root = devfs.root_inode();
+
+        let tty = devfs.lookup(&root, "tty").expect("/dev/tty exists");
+        let tty_st = tty.stat().expect("/dev/tty stat");
+        assert!(tty_st.mode.is_char_device());
+        assert_eq!(tty_st.mode.perm, 0o666);
+        assert_eq!(tty_st.rdev, make_dev(5, 0));
+
+        let urandom = devfs.lookup(&root, "urandom").expect("/dev/urandom exists");
+        let urandom_st = urandom.stat().expect("/dev/urandom stat");
+        assert!(urandom_st.mode.is_char_device());
+        assert_eq!(urandom_st.mode.perm, 0o666);
+        assert_eq!(urandom_st.rdev, make_dev(1, 9));
+
+        let random = devfs.lookup(&root, "random").expect("/dev/random exists");
+        let random_st = random.stat().expect("/dev/random stat");
+        assert!(random_st.mode.is_char_device());
+        assert_eq!(random_st.mode.perm, 0o666);
+        assert_eq!(random_st.rdev, make_dev(1, 8));
+    }
+
+    #[test]
+    fn devfs_urandom_produces_random_bytes_and_accepts_writes() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        let devfs = DevFs::new();
+        let root = devfs.root_inode();
+        let urandom = devfs.lookup(&root, "urandom").expect("/dev/urandom");
+
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        assert_eq!(urandom.read_at(0, &mut a), Ok(32));
+        assert_eq!(urandom.read_at(0, &mut b), Ok(32));
+        assert!(a.iter().any(|&x| x != 0), "urandom output must be non-zero");
+        assert_ne!(a, b, "consecutive 32-byte urandom reads must differ");
+        assert_eq!(urandom.read_at(0, &mut []), Ok(0));
+        assert_eq!(urandom.write_at(0, b"entropy"), Ok(7));
+    }
+
+    #[test]
+    fn devfs_tty_open_fails_enxio_without_controlling_terminal() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        let devfs = DevFs::new();
+        let root = devfs.root_inode();
+        let tty = devfs.lookup(&root, "tty").expect("/dev/tty");
+
+        // Hosted test has no current process with a controlling terminal -> ENXIO.
+        let prepared = PreparedFileHandle::try_new()
+            .expect("prepared handle")
+            .bind_filesystem(devfs.clone());
+        let err = tty
+            .clone()
+            .open(OpenFlags::new(OpenFlags::O_RDWR), prepared)
+            .err()
+            .expect("/dev/tty open without ctty must fail");
+        assert_eq!(err, FsError::NoDevice);
+        assert_eq!(err.to_errno(), -6);
+
+        // O_PATH still succeeds for path-only descriptors.
+        let prepared_path = PreparedFileHandle::try_new()
+            .expect("prepared handle")
+            .bind_filesystem(devfs);
+        assert!(tty
+            .open(OpenFlags::new(OpenFlags::O_PATH), prepared_path)
+            .is_ok());
     }
 }

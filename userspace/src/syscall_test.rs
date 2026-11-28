@@ -402,6 +402,8 @@ pub extern "C" fn _start() -> ! {
     test_n2_1_exec_segment_and_fd_ceilings(&mut results);
     // N2.4: set*id, supplementary groups, and capget/capset.
     test_n2_4_credentials_groups_and_caps(&mut results);
+    // N2.7: /dev/urandom, /dev/tty, /proc/mounts, getrusage, times, sysinfo, priority, getcpu.
+    test_n2_7_devices_proc_mounts_and_sysinfo_syscalls(&mut results);
 
     // Print summary
     println("");
@@ -13347,4 +13349,268 @@ fn test_n2_4_credentials_groups_and_caps(results: &mut TestResult) {
     }
 
     results.pass("N2.4 set*id, supplementary groups, capget/capset, and privilege drop");
+}
+
+// ============================================================================
+// N2.7: /dev/urandom, /dev/tty, /proc/mounts, getrusage, times, sysinfo,
+//       getpriority/setpriority, getcpu
+// ============================================================================
+
+const N27_SYS_OPEN: u64 = 2;
+const N27_SYS_CLOSE: u64 = 3;
+const N27_SYS_READ: u64 = 0;
+const N27_SYS_WRITE: u64 = 1;
+const N27_SYS_IOCTL: u64 = 16;
+const N27_SYS_FORK: u64 = 57;
+const N27_SYS_GETRUSAGE: u64 = 98;
+const N27_SYS_SYSINFO: u64 = 99;
+const N27_SYS_TIMES: u64 = 100;
+const N27_SYS_GETPRIORITY: u64 = 140;
+const N27_SYS_SETPRIORITY: u64 = 141;
+const N27_SYS_GETCPU: u64 = 309;
+
+const N27_O_RDONLY: u64 = 0;
+const N27_O_RDWR: u64 = 2;
+const N27_TCGETS: u64 = 0x5401;
+const N27_TIOCGPGRP: u64 = 0x540F;
+
+const N27_ENXIO: i32 = 6;
+const N27_EACCES: i32 = 13;
+const N27_EFAULT: i32 = 14;
+const N27_EINVAL: i32 = 22;
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn test_n2_7_devices_proc_mounts_and_sysinfo_syscalls(results: &mut TestResult) {
+    // 1. /dev/urandom: open, read two distinct non-zero 32-byte samples, write succeeds.
+    let urandom_path = b"/dev/urandom\0";
+    let fd_ur = unsafe { syscall3(N27_SYS_OPEN, urandom_path.as_ptr() as u64, N27_O_RDWR, 0) };
+    if is_error(fd_ur) {
+        results.fail("n2_7: open(/dev/urandom) failed");
+        return;
+    }
+    let mut rnd1 = [0u8; 32];
+    let mut rnd2 = [0u8; 32];
+    let n1 = unsafe { syscall3(N27_SYS_READ, fd_ur, rnd1.as_mut_ptr() as u64, 32) };
+    let n2 = unsafe { syscall3(N27_SYS_READ, fd_ur, rnd2.as_mut_ptr() as u64, 32) };
+    let nw = unsafe { syscall3(N27_SYS_WRITE, fd_ur, b"seed".as_ptr() as u64, 4) };
+    let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_ur) };
+    if n1 != 32 || n2 != 32 || nw != 4 || rnd1 == [0u8; 32] || rnd1 == rnd2 {
+        results.fail("n2_7: /dev/urandom read/write semantics failed");
+        return;
+    }
+
+    // 2. /dev/tty: succeeds with controlling terminal + supports TCGETS & TIOCGPGRP.
+    let tty_path = b"/dev/tty\0";
+    let fd_tty = unsafe { syscall3(N27_SYS_OPEN, tty_path.as_ptr() as u64, N27_O_RDWR, 0) };
+    if is_error(fd_tty) {
+        results.fail("n2_7: open(/dev/tty) with ctty failed");
+        return;
+    }
+    let mut termios = [0u8; 60];
+    let r_tcgets = unsafe {
+        syscall3(
+            N27_SYS_IOCTL,
+            fd_tty,
+            N27_TCGETS,
+            termios.as_mut_ptr() as u64,
+        )
+    };
+    let mut fg_pgid: i32 = -1;
+    let r_gpgrp = unsafe {
+        syscall3(
+            N27_SYS_IOCTL,
+            fd_tty,
+            N27_TIOCGPGRP,
+            &mut fg_pgid as *mut i32 as u64,
+        )
+    };
+    let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_tty) };
+    if is_error(r_tcgets) || is_error(r_gpgrp) || fg_pgid <= 0 {
+        results.fail("n2_7: /dev/tty TCGETS or TIOCGPGRP failed");
+        return;
+    }
+
+    // 3. /proc/mounts: contains root ramfs, /dev devfs, and /proc proc.
+    let mounts_path = b"/proc/mounts\0";
+    let fd_mounts = unsafe { syscall3(N27_SYS_OPEN, mounts_path.as_ptr() as u64, N27_O_RDONLY, 0) };
+    if is_error(fd_mounts) {
+        results.fail("n2_7: open(/proc/mounts) failed");
+        return;
+    }
+    let mut mounts_buf = [0u8; 1024];
+    let nr_mounts = unsafe {
+        syscall3(
+            N27_SYS_READ,
+            fd_mounts,
+            mounts_buf.as_mut_ptr() as u64,
+            mounts_buf.len() as u64,
+        )
+    };
+    let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_mounts) };
+    if is_error(nr_mounts) || nr_mounts == 0 {
+        results.fail("n2_7: read(/proc/mounts) failed");
+        return;
+    }
+    let mounts_slice = &mounts_buf[..nr_mounts as usize];
+    if !bytes_contain(mounts_slice, b" / ramfs ")
+        || !bytes_contain(mounts_slice, b" /dev devfs ")
+        || !bytes_contain(mounts_slice, b" /proc proc ")
+    {
+        results.fail("n2_7: /proc/mounts missing expected mount lines");
+        return;
+    }
+
+    // 4. getrusage(RUSAGE_SELF / RUSAGE_CHILDREN / RUSAGE_THREAD) + negative checks.
+    let mut ru = [0u8; 144];
+    let r_self = unsafe { syscall2(N27_SYS_GETRUSAGE, 0, ru.as_mut_ptr() as u64) };
+    let r_child = unsafe { syscall2(N27_SYS_GETRUSAGE, (-1i64) as u64, ru.as_mut_ptr() as u64) };
+    let r_thr = unsafe { syscall2(N27_SYS_GETRUSAGE, 1, ru.as_mut_ptr() as u64) };
+    let r_bad_who = unsafe { syscall2(N27_SYS_GETRUSAGE, 77, ru.as_mut_ptr() as u64) };
+    let r_null_ru = unsafe { syscall2(N27_SYS_GETRUSAGE, 0, 0) };
+    if is_error(r_self)
+        || is_error(r_child)
+        || is_error(r_thr)
+        || !is_error(r_bad_who)
+        || errno(r_bad_who) != N27_EINVAL
+        || !is_error(r_null_ru)
+        || errno(r_null_ru) != N27_EFAULT
+    {
+        results.fail("n2_7: getrusage checks failed");
+        return;
+    }
+
+    // 5. times(&tms) and times(NULL) monotonicity.
+    let mut tms = [0i64; 4];
+    let t1 = unsafe { syscall1(N27_SYS_TIMES, tms.as_mut_ptr() as u64) };
+    let t2 = unsafe { syscall1(N27_SYS_TIMES, 0) };
+    if is_error(t1) || is_error(t2) || t2 < t1 || tms[0] < 0 {
+        results.fail("n2_7: times() checks failed");
+        return;
+    }
+
+    // 6. sysinfo(&info) layout & values + NULL EFAULT.
+    let mut sinfo = [0u8; 112];
+    let r_si = unsafe { syscall1(N27_SYS_SYSINFO, sinfo.as_mut_ptr() as u64) };
+    let r_si_null = unsafe { syscall1(N27_SYS_SYSINFO, 0) };
+    let uptime = i64::from_le_bytes(sinfo[0..8].try_into().unwrap());
+    let totalram = u64::from_le_bytes(sinfo[32..40].try_into().unwrap());
+    let freeram = u64::from_le_bytes(sinfo[40..48].try_into().unwrap());
+    let procs = u16::from_le_bytes(sinfo[80..82].try_into().unwrap());
+    let mem_unit = u32::from_le_bytes(sinfo[104..108].try_into().unwrap());
+    if is_error(r_si)
+        || !is_error(r_si_null)
+        || errno(r_si_null) != N27_EFAULT
+        || uptime < 0
+        || totalram == 0
+        || freeram > totalram
+        || procs == 0
+        || mem_unit != 1
+    {
+        results.fail("n2_7: sysinfo checks failed");
+        return;
+    }
+
+    // 7. getcpu(&cpu, &node, 0) and getcpu(NULL, NULL, 0).
+    let mut cpu: u32 = u32::MAX;
+    let mut node: u32 = u32::MAX;
+    let r_gc = unsafe {
+        syscall3(
+            N27_SYS_GETCPU,
+            &mut cpu as *mut u32 as u64,
+            &mut node as *mut u32 as u64,
+            0,
+        )
+    };
+    let r_gc_null = unsafe { syscall3(N27_SYS_GETCPU, 0, 0, 0) };
+    if is_error(r_gc) || is_error(r_gc_null) || cpu >= 64 || node != 0 {
+        results.fail("n2_7: getcpu checks failed");
+        return;
+    }
+
+    // 8. Isolated child: /dev/tty ENXIO after setsid() + getpriority/setpriority matrix.
+    let child = unsafe { syscall0(N27_SYS_FORK) };
+    if is_error(child) {
+        results.fail("n2_7: fork failed");
+        return;
+    }
+    if child == 0 {
+        // Detach ctty via setsid(); /dev/tty must now return ENXIO.
+        if is_error(unsafe { syscall0(N25_SYS_SETSID) }) {
+            unsafe { userspace::syscall::sys_exit(10) };
+        }
+        let r_tty_noctty =
+            unsafe { syscall3(N27_SYS_OPEN, tty_path.as_ptr() as u64, N27_O_RDWR, 0) };
+        if !is_error(r_tty_noctty) || errno(r_tty_noctty) != N27_ENXIO {
+            unsafe { userspace::syscall::sys_exit(11) };
+        }
+
+        // Initial nice = 0 => getpriority returns 20 - 0 = 20.
+        let p0 = unsafe { syscall2(N27_SYS_GETPRIORITY, 0, 0) };
+        if p0 != 20 {
+            unsafe { userspace::syscall::sys_exit(12) };
+        }
+        // Root sets nice = 5 => getpriority returns 15.
+        if is_error(unsafe { syscall3(N27_SYS_SETPRIORITY, 0, 0, 5) })
+            || unsafe { syscall2(N27_SYS_GETPRIORITY, 0, 0) } != 15
+        {
+            unsafe { userspace::syscall::sys_exit(13) };
+        }
+        // Root lowers nice to -5 => getpriority returns 25.
+        if is_error(unsafe { syscall3(N27_SYS_SETPRIORITY, 0, 0, (-5i64) as u64) })
+            || unsafe { syscall2(N27_SYS_GETPRIORITY, 0, 0) } != 25
+        {
+            unsafe { userspace::syscall::sys_exit(14) };
+        }
+        // Clamping: prio=100 clamps to nice=19 => getpriority returns 1.
+        if is_error(unsafe { syscall3(N27_SYS_SETPRIORITY, 0, 0, 100) })
+            || unsafe { syscall2(N27_SYS_GETPRIORITY, 0, 0) } != 1
+        {
+            unsafe { userspace::syscall::sys_exit(15) };
+        }
+        // Reset to nice = 0, then drop privilege via setuid(1000).
+        if is_error(unsafe { syscall3(N27_SYS_SETPRIORITY, 0, 0, 0) })
+            || is_error(unsafe { syscall1(N24_SYS_SETUID, 1000) })
+        {
+            unsafe { userspace::syscall::sys_exit(16) };
+        }
+        // Unprivileged: raising nice (0 -> 7) succeeds, lowering nice (7 -> 3) fails EACCES.
+        if is_error(unsafe { syscall3(N27_SYS_SETPRIORITY, 0, 0, 7) })
+            || unsafe { syscall2(N27_SYS_GETPRIORITY, 0, 0) } != 13
+        {
+            unsafe { userspace::syscall::sys_exit(17) };
+        }
+        let r_lower = unsafe { syscall3(N27_SYS_SETPRIORITY, 0, 0, 3) };
+        if !is_error(r_lower) || errno(r_lower) != N27_EACCES {
+            unsafe { userspace::syscall::sys_exit(18) };
+        }
+        let r_bad_which = unsafe { syscall2(N27_SYS_GETPRIORITY, 99, 0) };
+        if !is_error(r_bad_which) || errno(r_bad_which) != N27_EINVAL {
+            unsafe { userspace::syscall::sys_exit(19) };
+        }
+        unsafe { userspace::syscall::sys_exit(0) };
+    }
+
+    let mut status: i32 = -1;
+    let r_wait = unsafe { syscall4(N25_SYS_WAIT4, child, &mut status as *mut i32 as u64, 0, 0) };
+    if r_wait != child || status != 0 {
+        results.fail("n2_7: /dev/tty ENXIO or getpriority/setpriority child failed");
+        return;
+    }
+
+    results.pass(
+        "N2.7 /dev/urandom, /dev/tty, /proc/mounts, getrusage, times, sysinfo, priority, and getcpu",
+    );
 }

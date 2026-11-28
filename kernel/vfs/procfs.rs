@@ -132,6 +132,7 @@ impl ProcFs {
             "version",
             "waitstat",
             "schedstat",
+            "mounts",
         ] {
             let inode = fs
                 .lookup(&root, name)
@@ -358,6 +359,10 @@ impl ProcRootInode {
                 fs_id: self.fs_id,
                 _heap_charge: Some(charge),
             })?),
+            "mounts" => Ok(try_new_procfs_arc(|charge| ProcMountsInode {
+                fs_id: self.fs_id,
+                _heap_charge: Some(charge),
+            })?),
             _ => {
                 // Try to parse as PID
                 if let Ok(ns_pid) = name.parse::<u32>() {
@@ -430,6 +435,7 @@ impl Inode for ProcRootInode {
             "waitstat",
             "schedstat",
             "thread-self",
+            "mounts",
         ];
 
         if offset < static_entries.len() {
@@ -2066,6 +2072,67 @@ impl Inode for ProcSchedstatInode {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let content = generate_schedstat()?;
+        read_from_content(&content, offset, buf)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+// ============================================================================
+// /proc/mounts (N2.7)
+// ============================================================================
+
+/// N2.7: Lists active mounts visible in the calling process's mount namespace
+/// and root confinement (`<source> <target> <fstype> rw 0 0`).
+struct ProcMountsInode {
+    fs_id: u64,
+    _heap_charge: Option<HeapCharge>,
+}
+
+impl Inode for ProcMountsInode {
+    fn ino(&self) -> u64 {
+        10
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: 10,
+            mode: FileMode::regular(0o444),
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(
+        self: Arc<Self>,
+        flags: OpenFlags,
+        prepared: PreparedFileHandle,
+    ) -> Result<FileDescriptor, FsError> {
+        let inode: Arc<dyn Inode> = self;
+        Ok(prepared.finalize(inode, flags, true))
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let content = crate::VFS.render_mounts()?;
         read_from_content(&content, offset, buf)
     }
 
@@ -3862,5 +3929,73 @@ mod thread_listing_tests {
         drop(detached);
         drop(group);
         drop((leader, thread, second, impostor));
+    }
+
+    #[test]
+    fn proc_mounts_exposes_active_namespace_mounts() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        let fs = ProcFs::try_new().expect("procfs fixture");
+        let root = fs.root_inode();
+
+        // /proc root lists "mounts" and resolves to regular 0o444 inode #10.
+        let mut found_mounts = false;
+        let mut off = 0usize;
+        while let Some((next, entry)) = root.readdir(off).expect("proc root readdir") {
+            if entry.name == "mounts" {
+                assert_eq!(entry.ino, 10);
+                assert_eq!(entry.file_type, FileType::Regular);
+                found_mounts = true;
+            }
+            off = next;
+        }
+        assert!(found_mounts, "/proc readdir must include mounts");
+
+        let mounts_inode = fs.lookup(&root, "mounts").expect("/proc/mounts lookup");
+        let st = mounts_inode.stat().expect("/proc/mounts stat");
+        assert!(st.mode.is_file());
+        assert_eq!(st.mode.perm, 0o444);
+        assert_eq!(st.ino, 10);
+
+        // Verify mount rendering on a private VFS + mount namespace with /, /dev, /proc.
+        let vfs = crate::manager::Vfs::new();
+        let ns = kernel_core::ROOT_MNT_NAMESPACE.clone();
+        let root_ramfs = crate::RamFs::try_new().expect("ramfs");
+        let dev_fs = crate::DevFs::new();
+        vfs.mount_in_namespace(&ns, "/", root_ramfs.clone())
+            .expect("mount /");
+        {
+            let guard = crate::topology::write();
+            let ctx = guard.setup(0, 0);
+            let ram_root = root_ramfs.root_inode();
+            root_ramfs
+                .create(&ram_root, "dev", FileMode::directory(0o755), &ctx)
+                .expect("mkdir /dev");
+            root_ramfs
+                .create(&ram_root, "proc", FileMode::directory(0o755), &ctx)
+                .expect("mkdir /proc");
+        }
+        vfs.mount_in_namespace(&ns, "/dev", dev_fs)
+            .expect("mount /dev");
+        vfs.mount_in_namespace(&ns, "/proc", fs.clone())
+            .expect("mount /proc");
+
+        let rendered = vfs
+            .render_mounts_in_namespace(&ns)
+            .expect("render /proc/mounts");
+        assert!(
+            rendered.contains("ramfs / ramfs rw 0 0\n"),
+            "missing root ramfs line: {rendered}"
+        );
+        assert!(
+            rendered.contains("devfs /dev devfs rw 0 0\n"),
+            "missing /dev devfs line: {rendered}"
+        );
+        assert!(
+            rendered.contains("proc /proc proc rw 0 0\n"),
+            "missing /proc proc line: {rendered}"
+        );
+
+        let _ = vfs.umount_in_namespace(&ns, "/proc");
+        let _ = vfs.umount_in_namespace(&ns, "/dev");
     }
 }
