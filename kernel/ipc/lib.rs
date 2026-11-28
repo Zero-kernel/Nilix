@@ -457,6 +457,22 @@ fn fd_read_callback(
         if !file_clone.flags().is_readable() {
             return Err(SyscallError::EBADF);
         }
+        if file_clone.is_fifo() {
+            let mut commit_error = None;
+            let mut commit = |bytes: &[u8]| match copyout(bytes) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    commit_error = Some(error);
+                    Err(vfs::types::FsError::Io)
+                }
+            };
+            let res = file_clone.fifo_read_with_commit(buf, &mut commit);
+            drop(commit);
+            if let Some(error) = commit_error {
+                return Err(error);
+            }
+            return res.map_err(fs_error_to_syscall);
+        }
 
         // R180-L1: serialize the shared open-file description, read at the
         // current offset, copy out, and publish the new offset last. A usercopy
@@ -704,6 +720,8 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
         FsError::Busy => SyscallError::EBUSY,
         FsError::Again => SyscallError::EAGAIN,
         FsError::NoDevice => SyscallError::ENXIO,
+        FsError::Interrupted => SyscallError::EINTR,
+        FsError::OpNotSupp => SyscallError::EOPNOTSUPP,
     }
 }
 

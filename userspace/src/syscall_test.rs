@@ -404,6 +404,8 @@ pub extern "C" fn _start() -> ! {
     test_n2_4_credentials_groups_and_caps(&mut results);
     // N2.7: /dev/urandom, /dev/tty, /proc/mounts, getrusage, times, sysinfo, priority, getcpu.
     test_n2_7_devices_proc_mounts_and_sysinfo_syscalls(&mut results);
+    // N2.3: dirfd/*at family, fchdir, truncate, setattr/chmod/chown/utimensat, hard links, statx, statfs, FIFOs.
+    test_n2_3_vfs_at_setattr_statfs_and_fifo(&mut results);
 
     // Print summary
     println("");
@@ -13612,5 +13614,576 @@ fn test_n2_7_devices_proc_mounts_and_sysinfo_syscalls(results: &mut TestResult) 
 
     results.pass(
         "N2.7 /dev/urandom, /dev/tty, /proc/mounts, getrusage, times, sysinfo, priority, and getcpu",
+    );
+}
+
+// ============================================================================
+// N2.3: General dirfd resolution, *at family, fchdir, truncate, VFS setattr,
+//       chmod, chown, statx, utimensat, hard links, statfs, FIFOs
+// ============================================================================
+
+const N23_SYS_TRUNCATE: u64 = 76;
+const N23_SYS_GETCWD: u64 = 79;
+const N23_SYS_CHDIR: u64 = 80;
+const N23_SYS_FCHDIR: u64 = 81;
+const N23_SYS_LINK: u64 = 86;
+const N23_SYS_CHMOD: u64 = 90;
+const N23_SYS_FCHMOD: u64 = 91;
+const N23_SYS_CHOWN: u64 = 92;
+const N23_SYS_FCHOWN: u64 = 93;
+const N23_SYS_LCHOWN: u64 = 94;
+const N23_SYS_STATFS: u64 = 137;
+const N23_SYS_FSTATFS: u64 = 138;
+const N23_SYS_OPENAT: u64 = 257;
+const N23_SYS_MKDIRAT: u64 = 258;
+const N23_SYS_MKNODAT: u64 = 259;
+const N23_SYS_FCHOWNAT: u64 = 260;
+const N23_SYS_FSTATAT: u64 = 262;
+const N23_SYS_UNLINKAT: u64 = 263;
+const N23_SYS_RENAMEAT: u64 = 264;
+const N23_SYS_LINKAT: u64 = 265;
+const N23_SYS_SYMLINKAT: u64 = 266;
+const N23_SYS_READLINKAT: u64 = 267;
+const N23_SYS_FCHMODAT: u64 = 268;
+const N23_SYS_FACCESSAT: u64 = 269;
+const N23_SYS_UTIMENSAT: u64 = 280;
+const N23_SYS_RENAMEAT2: u64 = 316;
+const N23_SYS_STATX: u64 = 332;
+const N23_SYS_FACCESSAT2: u64 = 439;
+const N23_SYS_FCHMODAT2: u64 = 452;
+
+const N23_AT_FDCWD: u64 = (-100i64) as u64;
+const N23_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const N23_AT_REMOVEDIR: u64 = 0x200;
+const N23_AT_EMPTY_PATH: u64 = 0x1000;
+const N23_O_CREAT: u64 = 0o100;
+const N23_O_NONBLOCK: u64 = 0o4000;
+const N23_O_DIRECTORY: u64 = 0o200000;
+const N23_S_IFIFO: u64 = 0o010000;
+const N23_UTIME_OMIT: i64 = 0x3fff_fffe;
+const N23_EPERM: i32 = 1;
+const N23_ENXIO: i32 = 6;
+const N23_EEXIST: i32 = 17;
+const N23_EOPNOTSUPP: i32 = 95;
+
+fn test_n2_3_vfs_at_setattr_statfs_and_fifo(results: &mut TestResult) {
+    // 1. mkdirat + dirfd open + openat + newfstatat(dirfd & AT_EMPTY_PATH) + renameat/renameat2.
+    let dir_path = b"/n23_dir\0";
+    if is_error(unsafe {
+        syscall3(
+            N23_SYS_MKDIRAT,
+            N23_AT_FDCWD,
+            dir_path.as_ptr() as u64,
+            0o755,
+        )
+    }) {
+        results.fail("n2_3: mkdirat(/n23_dir) failed");
+        return;
+    }
+    let dirfd = unsafe {
+        syscall4(
+            N23_SYS_OPENAT,
+            N23_AT_FDCWD,
+            dir_path.as_ptr() as u64,
+            N27_O_RDONLY | N23_O_DIRECTORY,
+            0,
+        )
+    };
+    if is_error(dirfd) {
+        results.fail("n2_3: openat(/n23_dir) failed");
+        return;
+    }
+    if is_error(unsafe { syscall3(N23_SYS_MKDIRAT, dirfd, b"sub\0".as_ptr() as u64, 0o755) }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: mkdirat(dirfd, sub) failed");
+        return;
+    }
+    let fd_a = unsafe {
+        syscall4(
+            N23_SYS_OPENAT,
+            dirfd,
+            b"sub/a.txt\0".as_ptr() as u64,
+            N27_O_RDWR | N23_O_CREAT,
+            0o644,
+        )
+    };
+    if is_error(fd_a)
+        || unsafe { syscall3(N27_SYS_WRITE, fd_a, b"hello world".as_ptr() as u64, 11) } != 11
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: openat(dirfd, sub/a.txt) write failed");
+        return;
+    }
+    let mut st1 = [0u8; 144];
+    let mut st2 = [0u8; 144];
+    let r_st1 = unsafe {
+        syscall4(
+            N23_SYS_FSTATAT,
+            dirfd,
+            b"sub/a.txt\0".as_ptr() as u64,
+            st1.as_mut_ptr() as u64,
+            0,
+        )
+    };
+    let r_st2 = unsafe {
+        syscall4(
+            N23_SYS_FSTATAT,
+            fd_a,
+            b"\0".as_ptr() as u64,
+            st2.as_mut_ptr() as u64,
+            N23_AT_EMPTY_PATH,
+        )
+    };
+    let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_a) };
+    let ino1 = u64::from_le_bytes(st1[8..16].try_into().unwrap());
+    let ino2 = u64::from_le_bytes(st2[8..16].try_into().unwrap());
+    let size1 = i64::from_le_bytes(st1[48..56].try_into().unwrap());
+    if is_error(r_st1) || is_error(r_st2) || ino1 != ino2 || size1 != 11 {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: newfstatat(dirfd / AT_EMPTY_PATH) failed");
+        return;
+    }
+
+    // 2. renameat + renameat2(RENAME_NOREPLACE) + symlinkat + readlinkat + faccessat/faccessat2.
+    if is_error(unsafe {
+        syscall4(
+            N23_SYS_RENAMEAT,
+            dirfd,
+            b"sub/a.txt\0".as_ptr() as u64,
+            dirfd,
+            b"sub/b.txt\0".as_ptr() as u64,
+        )
+    }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: renameat(dirfd) failed");
+        return;
+    }
+    let r_norep = unsafe {
+        syscall5(
+            N23_SYS_RENAMEAT2,
+            dirfd,
+            b"sub/b.txt\0".as_ptr() as u64,
+            dirfd,
+            b"sub/b.txt\0".as_ptr() as u64,
+            1, // RENAME_NOREPLACE
+        )
+    };
+    if !is_error(r_norep) || errno(r_norep) != N23_EEXIST {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: renameat2(RENAME_NOREPLACE) did not return EEXIST");
+        return;
+    }
+    if is_error(unsafe {
+        syscall3(
+            N23_SYS_SYMLINKAT,
+            b"b.txt\0".as_ptr() as u64,
+            dirfd,
+            b"sub/sym\0".as_ptr() as u64,
+        )
+    }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: symlinkat(dirfd) failed");
+        return;
+    }
+    let mut rl_buf = [0u8; 32];
+    let rl_n = unsafe {
+        syscall4(
+            N23_SYS_READLINKAT,
+            dirfd,
+            b"sub/sym\0".as_ptr() as u64,
+            rl_buf.as_mut_ptr() as u64,
+            rl_buf.len() as u64,
+        )
+    };
+    if rl_n != 5 || &rl_buf[..5] != b"b.txt" {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: readlinkat(dirfd) failed");
+        return;
+    }
+    if is_error(unsafe { syscall3(N23_SYS_FACCESSAT, dirfd, b"sub/b.txt\0".as_ptr() as u64, 6) })
+        || is_error(unsafe {
+            syscall4(
+                N23_SYS_FACCESSAT2,
+                dirfd,
+                b"sub/sym\0".as_ptr() as u64,
+                0,
+                N23_AT_SYMLINK_NOFOLLOW,
+            )
+        })
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: faccessat/faccessat2 failed");
+        return;
+    }
+
+    // 3. fchdir + getcwd + restore cwd.
+    let mut cwd_buf = [0u8; 64];
+    if is_error(unsafe { syscall1(N23_SYS_FCHDIR, dirfd) }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: fchdir(dirfd) failed");
+        return;
+    }
+    let cwd_n = unsafe { syscall2(N23_SYS_GETCWD, cwd_buf.as_mut_ptr() as u64, 64) };
+    let _ = unsafe { syscall1(N23_SYS_CHDIR, b"/\0".as_ptr() as u64) };
+    if is_error(cwd_n) || !bytes_contain(&cwd_buf[..cwd_n as usize], b"/n23_dir") {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: fchdir getcwd check failed");
+        return;
+    }
+
+    // 4. chmod / fchmod / fchmodat / fchmodat2 + chown / fchown / lchown / fchownat + truncate + utimensat.
+    let b_abs = b"/n23_dir/sub/b.txt\0";
+    if is_error(unsafe { syscall2(N23_SYS_CHMOD, b_abs.as_ptr() as u64, 0o4750) })
+        || is_error(unsafe {
+            syscall3(
+                N23_SYS_FCHMODAT,
+                dirfd,
+                b"sub/b.txt\0".as_ptr() as u64,
+                0o4640,
+            )
+        })
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: chmod/fchmodat failed");
+        return;
+    }
+    let r_sym_chmod = unsafe {
+        syscall4(
+            N23_SYS_FCHMODAT2,
+            dirfd,
+            b"sub/sym\0".as_ptr() as u64,
+            0o777,
+            N23_AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if !is_error(r_sym_chmod) || errno(r_sym_chmod) != N23_EOPNOTSUPP {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: fchmodat2(AT_SYMLINK_NOFOLLOW) on symlink did not fail EOPNOTSUPP");
+        return;
+    }
+    // chown clears S_ISUID (0o4000) and updates uid/gid.
+    if is_error(unsafe { syscall3(N23_SYS_CHOWN, b_abs.as_ptr() as u64, 1000, 2000) })
+        || is_error(unsafe {
+            syscall3(
+                N23_SYS_LCHOWN,
+                b"/n23_dir/sub/sym\0".as_ptr() as u64,
+                1000,
+                2000,
+            )
+        })
+        || is_error(unsafe {
+            syscall5(
+                N23_SYS_FCHOWNAT,
+                dirfd,
+                b"sub/b.txt\0".as_ptr() as u64,
+                1001,
+                2001,
+                0,
+            )
+        })
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: chown/lchown/fchownat failed");
+        return;
+    }
+    let fd_b = unsafe {
+        syscall4(
+            N23_SYS_OPENAT,
+            dirfd,
+            b"sub/b.txt\0".as_ptr() as u64,
+            N27_O_RDWR,
+            0,
+        )
+    };
+    if is_error(fd_b)
+        || is_error(unsafe { syscall2(N23_SYS_FCHMOD, fd_b, 0o644) })
+        || is_error(unsafe { syscall3(N23_SYS_FCHOWN, fd_b, 1000, 2000) })
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: fchmod/fchown failed");
+        return;
+    }
+    if is_error(unsafe { syscall2(N23_SYS_TRUNCATE, b_abs.as_ptr() as u64, 5) }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_b) };
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: truncate failed");
+        return;
+    }
+    let times1: [i64; 4] = [123_456, 789, 654_321, 123];
+    let times2: [i64; 4] = [0, N23_UTIME_OMIT, 777_777, 0];
+    if is_error(unsafe {
+        syscall4(
+            N23_SYS_UTIMENSAT,
+            dirfd,
+            b"sub/b.txt\0".as_ptr() as u64,
+            times1.as_ptr() as u64,
+            0,
+        )
+    }) || is_error(unsafe { syscall4(N23_SYS_UTIMENSAT, fd_b, 0, times2.as_ptr() as u64, 0) })
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_b) };
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: utimensat / futimens failed");
+        return;
+    }
+    let mut st_b = [0u8; 144];
+    let _ = unsafe {
+        syscall4(
+            N23_SYS_FSTATAT,
+            fd_b,
+            b"\0".as_ptr() as u64,
+            st_b.as_mut_ptr() as u64,
+            N23_AT_EMPTY_PATH,
+        )
+    };
+    let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_b) };
+    let b_mode = u32::from_le_bytes(st_b[24..28].try_into().unwrap());
+    let b_uid = u32::from_le_bytes(st_b[28..32].try_into().unwrap());
+    let b_gid = u32::from_le_bytes(st_b[32..36].try_into().unwrap());
+    let b_size = i64::from_le_bytes(st_b[48..56].try_into().unwrap());
+    let b_atime = i64::from_le_bytes(st_b[72..80].try_into().unwrap());
+    let b_mtime = i64::from_le_bytes(st_b[88..96].try_into().unwrap());
+    if (b_mode & 0o7777) != 0o644
+        || b_uid != 1000
+        || b_gid != 2000
+        || b_size != 5
+        || b_atime != 123_456
+        || b_mtime != 777_777
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: setattr / truncate / utimensat stat verification failed");
+        return;
+    }
+
+    // 5. Hard links: linkat + unlink old + surviving link reads data + dir hardlink EPERM.
+    if is_error(unsafe {
+        syscall5(
+            N23_SYS_LINKAT,
+            dirfd,
+            b"sub/b.txt\0".as_ptr() as u64,
+            dirfd,
+            b"sub/hard\0".as_ptr() as u64,
+            0,
+        )
+    }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: linkat failed");
+        return;
+    }
+    let r_dirlink = unsafe {
+        syscall2(
+            N23_SYS_LINK,
+            b"/n23_dir/sub\0".as_ptr() as u64,
+            b"/n23_dir/dirlink\0".as_ptr() as u64,
+        )
+    };
+    if !is_error(r_dirlink) || errno(r_dirlink) != N23_EPERM {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: directory hardlink did not return EPERM");
+        return;
+    }
+    let mut st_hard = [0u8; 144];
+    let _ = unsafe {
+        syscall4(
+            N23_SYS_FSTATAT,
+            dirfd,
+            b"sub/hard\0".as_ptr() as u64,
+            st_hard.as_mut_ptr() as u64,
+            0,
+        )
+    };
+    let hard_ino = u64::from_le_bytes(st_hard[8..16].try_into().unwrap());
+    let hard_nlink = u64::from_le_bytes(st_hard[16..24].try_into().unwrap());
+    if hard_ino != ino1 || hard_nlink != 2 {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: hardlink ino or nlink!=2 failed");
+        return;
+    }
+    if is_error(unsafe { syscall3(N23_SYS_UNLINKAT, dirfd, b"sub/b.txt\0".as_ptr() as u64, 0) }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: unlinkat(sub/b.txt) failed");
+        return;
+    }
+    let fd_h = unsafe {
+        syscall4(
+            N23_SYS_OPENAT,
+            dirfd,
+            b"sub/hard\0".as_ptr() as u64,
+            N27_O_RDONLY,
+            0,
+        )
+    };
+    let mut hbuf = [0u8; 8];
+    let hn = unsafe { syscall3(N27_SYS_READ, fd_h, hbuf.as_mut_ptr() as u64, 8) };
+    let _ = unsafe { syscall1(N27_SYS_CLOSE, fd_h) };
+    if is_error(fd_h) || hn != 5 || &hbuf[..5] != b"hello" {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: surviving hardlink read failed");
+        return;
+    }
+
+    // 6. statx + statfs + fstatfs.
+    let mut stx = [0u8; 256];
+    let r_stx = unsafe {
+        syscall5(
+            N23_SYS_STATX,
+            dirfd,
+            b"sub/hard\0".as_ptr() as u64,
+            0,
+            0x17ff,
+            stx.as_mut_ptr() as u64,
+        )
+    };
+    let stx_ino = u64::from_le_bytes(stx[32..40].try_into().unwrap());
+    let stx_size = u64::from_le_bytes(stx[40..48].try_into().unwrap());
+    let stx_mnt_id = u64::from_le_bytes(stx[144..152].try_into().unwrap());
+    if is_error(r_stx) || stx_ino != hard_ino || stx_size != 5 || stx_mnt_id == 0 {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: statx verification failed");
+        return;
+    }
+    let mut sfs1 = [0u8; 120];
+    let mut sfs2 = [0u8; 120];
+    if is_error(unsafe {
+        syscall2(
+            N23_SYS_STATFS,
+            dir_path.as_ptr() as u64,
+            sfs1.as_mut_ptr() as u64,
+        )
+    }) || is_error(unsafe { syscall2(N23_SYS_FSTATFS, dirfd, sfs2.as_mut_ptr() as u64) })
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: statfs/fstatfs failed");
+        return;
+    }
+    let f_type1 = i64::from_le_bytes(sfs1[0..8].try_into().unwrap());
+    let f_type2 = i64::from_le_bytes(sfs2[0..8].try_into().unwrap());
+    let f_bsize = i64::from_le_bytes(sfs1[8..16].try_into().unwrap());
+    let f_namelen = i64::from_le_bytes(sfs1[64..72].try_into().unwrap());
+    if f_type1 != 0x8584_58f6 || f_type2 != f_type1 || f_bsize != 4096 || f_namelen != 255 {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: statfs field values mismatch");
+        return;
+    }
+
+    // 7. Named FIFO via mknodat: O_WRONLY|O_NONBLOCK ENXIO + fork blocking open/write/read/EOF.
+    if is_error(unsafe {
+        syscall4(
+            N23_SYS_MKNODAT,
+            dirfd,
+            b"sub/fifo\0".as_ptr() as u64,
+            N23_S_IFIFO | 0o666,
+            0,
+        )
+    }) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: mknodat(S_IFIFO) failed");
+        return;
+    }
+    let r_w_enxio = unsafe {
+        syscall4(
+            N23_SYS_OPENAT,
+            dirfd,
+            b"sub/fifo\0".as_ptr() as u64,
+            1 | N23_O_NONBLOCK, // O_WRONLY | O_NONBLOCK
+            0,
+        )
+    };
+    if !is_error(r_w_enxio) || errno(r_w_enxio) != N23_ENXIO {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: FIFO O_WRONLY|O_NONBLOCK without reader did not fail ENXIO");
+        return;
+    }
+    let child = unsafe { syscall0(N27_SYS_FORK) };
+    if is_error(child) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: fork for FIFO test failed");
+        return;
+    }
+    if child == 0 {
+        let wfd = unsafe {
+            syscall4(
+                N23_SYS_OPENAT,
+                dirfd,
+                b"sub/fifo\0".as_ptr() as u64,
+                1, // O_WRONLY (blocks until parent opens reader)
+                0,
+            )
+        };
+        if is_error(wfd) {
+            unsafe { userspace::syscall::sys_exit(10) };
+        }
+        let nw = unsafe { syscall3(N27_SYS_WRITE, wfd, b"fifo-ok!".as_ptr() as u64, 8) };
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, wfd) };
+        if nw != 8 {
+            unsafe { userspace::syscall::sys_exit(11) };
+        }
+        unsafe { userspace::syscall::sys_exit(0) };
+    }
+    let rfd = unsafe {
+        syscall4(
+            N23_SYS_OPENAT,
+            dirfd,
+            b"sub/fifo\0".as_ptr() as u64,
+            N27_O_RDONLY,
+            0,
+        )
+    };
+    let mut fbuf = [0u8; 16];
+    let n_read = if is_error(rfd) {
+        rfd
+    } else {
+        unsafe { syscall3(N27_SYS_READ, rfd, fbuf.as_mut_ptr() as u64, 16) }
+    };
+    let n_eof = if is_error(rfd) {
+        -1i64 as u64
+    } else {
+        unsafe { syscall3(N27_SYS_READ, rfd, fbuf.as_mut_ptr() as u64, 16) }
+    };
+    if !is_error(rfd) {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, rfd) };
+    }
+    let mut status: i32 = -1;
+    let r_wait = unsafe { syscall4(N25_SYS_WAIT4, child, &mut status as *mut i32 as u64, 0, 0) };
+    if is_error(rfd)
+        || n_read != 8
+        || &fbuf[..8] != b"fifo-ok!"
+        || n_eof != 0
+        || r_wait != child
+        || status != 0
+    {
+        let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+        results.fail("n2_3: blocking FIFO open/write/read/EOF failed");
+        return;
+    }
+
+    // 8. Clean up via unlinkat (files + AT_REMOVEDIR).
+    let _ = unsafe { syscall3(N23_SYS_UNLINKAT, dirfd, b"sub/fifo\0".as_ptr() as u64, 0) };
+    let _ = unsafe { syscall3(N23_SYS_UNLINKAT, dirfd, b"sub/hard\0".as_ptr() as u64, 0) };
+    let _ = unsafe { syscall3(N23_SYS_UNLINKAT, dirfd, b"sub/sym\0".as_ptr() as u64, 0) };
+    let r_rm_sub = unsafe {
+        syscall3(
+            N23_SYS_UNLINKAT,
+            dirfd,
+            b"sub\0".as_ptr() as u64,
+            N23_AT_REMOVEDIR,
+        )
+    };
+    let _ = unsafe { syscall1(N27_SYS_CLOSE, dirfd) };
+    let r_rm_root = unsafe {
+        syscall3(
+            N23_SYS_UNLINKAT,
+            N23_AT_FDCWD,
+            dir_path.as_ptr() as u64,
+            N23_AT_REMOVEDIR,
+        )
+    };
+    if is_error(r_rm_sub) || is_error(r_rm_root) {
+        results.fail("n2_3: unlinkat(AT_REMOVEDIR) cleanup failed");
+        return;
+    }
+
+    results.pass(
+        "N2.3 dirfd/*at family, fchdir, truncate, setattr/chmod/chown/utimensat, hard links, statx, statfs, and FIFOs",
     );
 }

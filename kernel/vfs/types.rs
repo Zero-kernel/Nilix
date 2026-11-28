@@ -88,6 +88,11 @@ impl FileMode {
         Self::new(FileType::Symlink, perm)
     }
 
+    /// Create mode for FIFO (named pipe) with given permissions
+    pub const fn fifo(perm: u16) -> Self {
+        Self::new(FileType::Fifo, perm)
+    }
+
     /// Convert to raw st_mode value
     pub fn to_raw(&self) -> u32 {
         self.file_type.to_mode_bits() | (self.perm as u32)
@@ -112,6 +117,44 @@ impl FileMode {
     pub fn is_symlink(&self) -> bool {
         self.file_type == FileType::Symlink
     }
+
+    /// Check if this is a FIFO (named pipe)
+    pub fn is_fifo(&self) -> bool {
+        self.file_type == FileType::Fifo
+    }
+}
+
+/// N2.3: Inode attribute update payload for `chmod`/`chown`/`utimensat`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SetAttr {
+    /// New permission + special bits (`0o7777` mask).
+    pub mode: Option<u16>,
+    /// New host-mapped owner UID.
+    pub uid: Option<u32>,
+    /// New host-mapped owner GID.
+    pub gid: Option<u32>,
+    /// New access timestamp.
+    pub atime: Option<TimeSpec>,
+    /// New modification timestamp.
+    pub mtime: Option<TimeSpec>,
+    /// Clear setuid/setgid bits on ownership change (POSIX non-directory chown).
+    pub clear_setid: bool,
+}
+
+/// N2.3: Filesystem statistics for `statfs(2)` / `fstatfs(2)` (Linux x86_64 ABI).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FsStat {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
 }
 
 /// Timestamp for file metadata
@@ -243,6 +286,10 @@ pub enum FsError {
     Again,
     /// No such device or address (ENXIO, e.g., /dev/tty without a controlling terminal).
     NoDevice,
+    /// Interrupted system call (EINTR, e.g., blocking FIFO open/read/write).
+    Interrupted,
+    /// Operation not supported on this object/flag combination (EOPNOTSUPP).
+    OpNotSupp,
 }
 
 impl FsError {
@@ -271,6 +318,8 @@ impl FsError {
             FsError::Seek => -29,         // ESPIPE
             FsError::Again => -11,        // EAGAIN
             FsError::NoDevice => -6,      // ENXIO
+            FsError::Interrupted => -4,   // EINTR
+            FsError::OpNotSupp => -95,    // EOPNOTSUPP
         }
     }
 }
@@ -343,6 +392,8 @@ impl From<FsError> for SyscallError {
             FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
             FsError::Again => SyscallError::EAGAIN,
             FsError::NoDevice => SyscallError::ENXIO,
+            FsError::Interrupted => SyscallError::EINTR,
+            FsError::OpNotSupp => SyscallError::EOPNOTSUPP,
             FsError::CrossDev => SyscallError::EXDEV,
             FsError::SymlinkLoop => SyscallError::ELOOP,
             FsError::NotSupported => SyscallError::ENOSYS,

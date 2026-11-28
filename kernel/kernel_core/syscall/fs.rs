@@ -1917,21 +1917,43 @@ pub(super) fn sys_rmdir(path: *const u8) -> SyscallResult {
 ///
 /// # Returns
 ///
-/// EPERM (hard links not supported yet)
+/// sys_link - 创建硬链接 (N2.3: wired to VFS link + LSM hook_file_link)
 pub(super) fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
-    // R173-09 FIX: Return EPERM immediately after null check
-    // Skip usercopy validation for unimplemented stub (low-priority efficiency fix)
+    sys_linkat(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0)
+}
+
+/// sys_linkat(265) - create hard link relative to directory fds.
+pub(super) fn sys_linkat(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: i32,
+) -> SyscallResult {
+    const AT_SYMLINK_FOLLOW: i32 = 0x400;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
     if oldpath.is_null() || newpath.is_null() {
         return Err(SyscallError::EFAULT);
     }
-
-    // Hard links require:
-    // 1. VFS inode link count tracking
-    // 2. ramfs/ext2 support for multiple directory entries pointing to same inode
-    // 3. Proper handling of link count in unlink/rmdir
-    //
-    // TODO: Implement when VFS gains hard link support
-    Err(SyscallError::EPERM)
+    let old_bytes =
+        crate::usercopy::copy_user_cstring(oldpath).map_err(|_| SyscallError::EFAULT)?;
+    let new_bytes =
+        crate::usercopy::copy_user_cstring(newpath).map_err(|_| SyscallError::EFAULT)?;
+    let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.link_at)(
+        olddirfd,
+        old_str,
+        newdirfd,
+        new_str,
+        flags & AT_SYMLINK_FOLLOW != 0,
+        flags & AT_EMPTY_PATH != 0,
+    )?;
+    Ok(0)
 }
 
 /// sys_symlink - create symbolic link
@@ -2068,41 +2090,26 @@ pub(super) fn sys_rename(oldp: *const u8, newp: *const u8) -> SyscallResult {
     do_rename_str(old_str, new_str, false)
 }
 
-/// Absolute paths ignore dirfd. Relative AT_FDCWD paths use the stored cwd;
-/// other dirfd-relative combinations remain explicitly unsupported.
-pub(super) fn rename_at_paths_supported(
-    old_dirfd: i32,
-    old_str: &str,
-    new_dirfd: i32,
-    new_str: &str,
-) -> Result<(), SyscallError> {
-    if (!old_str.starts_with('/') && old_dirfd != AT_FDCWD)
-        || (!new_str.starts_with('/') && new_dirfd != AT_FDCWD)
-    {
-        return Err(SyscallError::EOPNOTSUPP);
-    }
-    Ok(())
-}
-
-/// sys_renameat(264).
+/// sys_renameat(264) - N2.3: full general dirfd resolution.
 pub(super) fn sys_renameat(
-    _olddirfd: i32,
+    olddirfd: i32,
     oldp: *const u8,
-    _newdirfd: i32,
+    newdirfd: i32,
     newp: *const u8,
 ) -> SyscallResult {
     let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
     let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
     let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
-    rename_at_paths_supported(_olddirfd, old_str, _newdirfd, new_str)?;
-    do_rename_str(old_str, new_str, false)
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.rename_at)(olddirfd, old_str, newdirfd, new_str, false)?;
+    Ok(0)
 }
 
-/// sys_renameat2(316). RENAME_NOREPLACE implemented; EXCHANGE/WHITEOUT/unknown-bit => EINVAL.
+/// sys_renameat2(316). RENAME_NOREPLACE + general dirfd; EXCHANGE/WHITEOUT/unknown-bit => EINVAL.
 pub(super) fn sys_renameat2(
-    _olddirfd: i32,
+    olddirfd: i32,
     oldp: *const u8,
-    _newdirfd: i32,
+    newdirfd: i32,
     newp: *const u8,
     flags: u32,
 ) -> SyscallResult {
@@ -2116,8 +2123,9 @@ pub(super) fn sys_renameat2(
     let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
     let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
     let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
-    rename_at_paths_supported(_olddirfd, old_str, _newdirfd, new_str)?;
-    do_rename_str(old_str, new_str, noreplace)
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.rename_at)(olddirfd, old_str, newdirfd, new_str, noreplace)?;
+    Ok(0)
 }
 
 /// sys_access - 检查文件访问权限
@@ -2197,132 +2205,167 @@ pub(super) fn sys_fstatat(
 ) -> SyscallResult {
     use crate::usercopy::copy_user_cstring;
 
-    if path.is_null() {
-        return Err(SyscallError::EFAULT);
-    }
-    if statbuf.is_null() {
+    if path.is_null() || statbuf.is_null() {
         return Err(SyscallError::EFAULT);
     }
 
-    // M0-6 SLICE 3: Validate flags (only AT_SYMLINK_NOFOLLOW is defined).
     const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
-    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+    const AT_NO_AUTOMOUNT: i32 = 0x800;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH) != 0 {
         return Err(SyscallError::EINVAL);
     }
 
-    // R96-5 FIX: Copy the entire path once to eliminate TOCTOU window.
-    // Previously we copied only the first byte, then called sys_stat which
-    // would copy the path again. An attacker could modify the path between
-    // the two copies.
     let path_str = {
         let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
-        if path_bytes.is_empty() {
-            return Err(SyscallError::EINVAL);
+        if path_bytes.is_empty() && (flags & AT_EMPTY_PATH == 0) {
+            return Err(SyscallError::ENOENT);
         }
         try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?
     };
 
-    // Check from kernel copy - no TOCTOU possible
-    let first_byte = path_str.as_bytes().first().copied().unwrap_or(0);
-    if dirfd != AT_FDCWD && first_byte != b'/' {
-        // 相对路径 + 非AT_FDCWD: 暂不支持
-        return Err(SyscallError::EOPNOTSUPP);
-    }
-
-    // M0-6 SLICE 3: Honor AT_SYMLINK_NOFOLLOW — route to lstat when set,
-    // otherwise route to stat (follow symlinks).
-    if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        sys_lstat_internal(&path_str, statbuf)
-    } else {
-        sys_stat_internal(&path_str, statbuf)
-    }
+    let ext = get_vfs_extended_callbacks()?;
+    let (stat, _) = (ext.stat_at)(
+        dirfd,
+        &path_str,
+        flags & AT_SYMLINK_NOFOLLOW == 0,
+        flags & AT_EMPTY_PATH != 0,
+    )?;
+    copy_vfs_stat_to_user(statbuf, &stat)?;
+    Ok(0)
 }
 
-/// sys_statx - extended file status (modern stat interface)
-///
-/// # M0-6 SLICE 5+ Implementation
-/// Minimal stub returning ENOSYS. Full statx provides:
-/// - Extended attributes (birth time, mount ID, inode flags)
-/// - Fine-grained control over what's returned (mask parameter)
-/// - Better timestamp precision (nanoseconds)
-///
-/// # Arguments
-/// - `dirfd`: directory fd for relative paths (AT_FDCWD for current)
-/// - `pathname`: path to stat
-/// - `flags`: AT_* flags (AT_SYMLINK_NOFOLLOW, AT_STATX_SYNC_*, etc.)
-/// - `mask`: STATX_* mask for what fields to return
-/// - `statxbuf`: pointer to struct statx (256 bytes)
+/// Serialize a `VfsStat` + `mnt_id` into Linux x86_64 256-byte `struct statx`.
+pub(super) fn serialize_statx(stat: &VfsStat, mnt_id: u64) -> [u8; 256] {
+    const STATX_BASIC_STATS: u32 = 0x07ff;
+    const STATX_MNT_ID: u32 = 0x1000;
+    let mut out = [0u8; 256];
+    let mask = STATX_BASIC_STATS | STATX_MNT_ID;
+    let dev_major = (((stat.dev >> 8) & 0xfff) | ((stat.dev >> 32) & !0xfff)) as u32;
+    let dev_minor = ((stat.dev & 0xff) | ((stat.dev >> 12) & !0xff)) as u32;
+    let rdev_major = (((stat.rdev >> 8) & 0xfff) | ((stat.rdev >> 32) & !0xfff)) as u32;
+    let rdev_minor = ((stat.rdev & 0xff) | ((stat.rdev >> 12) & !0xff)) as u32;
+
+    out[0..4].copy_from_slice(&mask.to_le_bytes());
+    out[4..8].copy_from_slice(&(stat.blksize as u32).to_le_bytes());
+    // stx_attributes @ 8..16 = 0
+    out[16..20].copy_from_slice(&(stat.nlink as u32).to_le_bytes());
+    out[20..24].copy_from_slice(&stat.uid.to_le_bytes());
+    out[24..28].copy_from_slice(&stat.gid.to_le_bytes());
+    out[28..30].copy_from_slice(&(stat.mode as u16).to_le_bytes());
+    // pad @ 30..32 = 0
+    out[32..40].copy_from_slice(&stat.ino.to_le_bytes());
+    out[40..48].copy_from_slice(&(stat.size as u64).to_le_bytes());
+    out[48..56].copy_from_slice(&(stat.blocks as u64).to_le_bytes());
+    // stx_attributes_mask @ 56..64 = 0
+    // stx_atime @ 64..80
+    out[64..72].copy_from_slice(&stat.atime_sec.to_le_bytes());
+    out[72..76].copy_from_slice(&(stat.atime_nsec as u32).to_le_bytes());
+    // stx_btime @ 80..96 = 0
+    // stx_ctime @ 96..112
+    out[96..104].copy_from_slice(&stat.ctime_sec.to_le_bytes());
+    out[104..108].copy_from_slice(&(stat.ctime_nsec as u32).to_le_bytes());
+    // stx_mtime @ 112..128
+    out[112..120].copy_from_slice(&stat.mtime_sec.to_le_bytes());
+    out[120..124].copy_from_slice(&(stat.mtime_nsec as u32).to_le_bytes());
+    // stx_rdev_major/minor @ 128..136
+    out[128..132].copy_from_slice(&rdev_major.to_le_bytes());
+    out[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
+    // stx_dev_major/minor @ 136..144
+    out[136..140].copy_from_slice(&dev_major.to_le_bytes());
+    out[140..144].copy_from_slice(&dev_minor.to_le_bytes());
+    // stx_mnt_id @ 144..152
+    out[144..152].copy_from_slice(&mnt_id.to_le_bytes());
+    out
+}
+
+/// sys_statx(332) - extended file status (N2.3: full 256-byte Linux struct statx).
 pub(super) fn sys_statx(
-    _dirfd: i32,
-    _pathname: *const u8,
-    _flags: i32,
+    dirfd: i32,
+    pathname: *const u8,
+    flags: i32,
     _mask: u32,
-    _statxbuf: *mut u8,
+    statxbuf: *mut u8,
 ) -> SyscallResult {
-    // M0-6: statx is the modern stat interface used by new code
-    // For M0 compatibility, programs fall back to fstatat/stat
-    // Full implementation would:
-    // 1. Parse AT_* flags and STATX_* mask
-    // 2. Lookup path (with/without symlink following per flags)
-    // 3. Fill struct statx (256 bytes) with requested fields
-    // 4. Include extended attributes (btime, mount_id, inode_flags)
-    Err(SyscallError::ENOSYS)
+    use crate::usercopy::copy_user_cstring;
+
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_NO_AUTOMOUNT: i32 = 0x800;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    const AT_STATX_SYNC_TYPE: i32 = 0x6000;
+    const ALLOWED_FLAGS: i32 =
+        AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
+
+    if pathname.is_null() || statxbuf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    if flags & !ALLOWED_FLAGS != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let path_bytes = copy_user_cstring(pathname).map_err(|_| SyscallError::EFAULT)?;
+    if path_bytes.is_empty() && (flags & AT_EMPTY_PATH == 0) {
+        return Err(SyscallError::ENOENT);
+    }
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    let (stat, mnt_id) = (ext.stat_at)(
+        dirfd,
+        path_str,
+        flags & AT_SYMLINK_NOFOLLOW == 0,
+        flags & AT_EMPTY_PATH != 0,
+    )?;
+    let wire = serialize_statx(&stat, mnt_id);
+    crate::usercopy::copy_to_user_safe(statxbuf, &wire).map_err(|_| SyscallError::EFAULT)?;
+    Ok(0)
 }
 
-/// sys_openat - 相对路径打开文件
-///
-/// 当前仅支持AT_FDCWD或绝对路径。
-///
-/// # R96-5 FIX: TOCTOU Protection
-/// Copies the entire path once and uses the kernel copy for both the
-/// check and the actual operation, eliminating the window where an
-/// attacker could modify the path between check and use.
+/// sys_openat - N2.3: full general dirfd open.
 pub(super) fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResult {
     use crate::usercopy::copy_user_cstring;
 
     if path.is_null() {
         return Err(SyscallError::EFAULT);
     }
-
-    // R96-5 FIX: Copy the entire path once to eliminate TOCTOU window.
-    // Previously we copied only the first byte, then called sys_open which
-    // would copy the path again. An attacker could modify the path between
-    // the two copies.
     let path_str = {
         let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
         if path_bytes.is_empty() {
-            return Err(SyscallError::EINVAL);
+            return Err(SyscallError::ENOENT);
         }
         try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?
     };
 
-    // Check from kernel copy - no TOCTOU possible
-    let first_byte = path_str.as_bytes().first().copied().unwrap_or(0);
-    if dirfd != AT_FDCWD && first_byte != b'/' {
-        // 相对路径 + 非AT_FDCWD: 暂不支持
-        return Err(SyscallError::EOPNOTSUPP);
+    if dirfd == AT_FDCWD || path_str.starts_with('/') {
+        return sys_open_internal(&path_str, flags, mode);
     }
 
-    // Use internal helper with already-copied path
-    sys_open_internal(&path_str, flags, mode)
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let open_flags = flags as u32;
+    let credentials = process.lock().shared_credentials();
+    let credential_authorization = credentials.begin_authorization();
+    let cred_gen_before = credentials.generation();
+    let ext = get_vfs_extended_callbacks()?;
+    let fd_reservation =
+        FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
+    let prepared = (ext.open_at)(
+        dirfd,
+        &path_str,
+        open_flags,
+        mode,
+        0,
+        &credential_authorization,
+    )?;
+    publish_prepared_open(
+        &process,
+        open_flags,
+        prepared,
+        fd_reservation,
+        credential_authorization,
+        cred_gen_before,
+    )
 }
 
-/// sys_openat2 - open with extended flags and resolve options (Linux 5.6+)
-///
-/// # Arguments
-/// * `dirfd` - Base directory fd (AT_FDCWD for current directory)
-/// * `path` - File path (user space pointer)
-/// * `how` - Pointer to struct open_how (flags, mode, resolve)
-/// * `size` - Size of the open_how structure
-///
-/// # Returns
-/// File descriptor on success, error code on failure
-///
-/// # Security
-/// - RESOLVE_NO_SYMLINKS: Reject any symlink in path (ELOOP)
-/// - RESOLVE_BENEATH: Reject paths escaping starting point (EXDEV)
-/// - RESOLVE_NO_MAGICLINKS: Block /proc magic symlinks (ELOOP)
-/// - RESOLVE_NO_XDEV: Don't cross mount boundaries (EXDEV)
+/// sys_openat2 - N2.3: full general dirfd + RESOLVE_BENEATH / RESOLVE_IN_ROOT support.
 pub(super) fn sys_openat2(
     dirfd: i32,
     path: *const u8,
@@ -2331,22 +2374,16 @@ pub(super) fn sys_openat2(
 ) -> SyscallResult {
     use crate::usercopy::{copy_from_user, copy_user_cstring, UserPtr};
 
-    // Validate pointers
     if path.is_null() || how.is_null() {
         return Err(SyscallError::EFAULT);
     }
-
-    // Validate size (must be at least as large as our struct)
     if size < core::mem::size_of::<OpenHow>() {
         return Err(SyscallError::EINVAL);
     }
-
-    // Copy open_how from user space
     let mut how_local = OpenHow::default();
     let how_ptr = UserPtr::<OpenHow>::new(how as *mut OpenHow).map_err(|_| SyscallError::EFAULT)?;
     copy_from_user(&mut how_local, how_ptr).map_err(|_| SyscallError::EFAULT)?;
 
-    // Copy path from user space
     let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
     if path_bytes.is_empty() {
         return Err(SyscallError::EINVAL);
@@ -2354,88 +2391,30 @@ pub(super) fn sys_openat2(
     let path_str =
         try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?;
 
-    // Get current process
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-
-    // R65-22 FIX: Handle dirfd for relative paths
-    // Resolve relative paths against the directory referenced by dirfd
-    // R164-3 FIX: Use fallible allocation for resolved path construction.
-    // R165-5 FIX: Move (not clone) path_str on the absolute-path arm. The prior
-    // `path_str.clone()` was an infallible String allocation of up to
-    // MAX_ARG_STRLEN+1 = 4097 user-controlled bytes — an OOM-time kernel panic.
-    // path_str is not used after this if/else, so the move is sound.
-    let resolved_path = if path_str.starts_with('/') || dirfd == AT_FDCWD {
-        path_str
-    } else {
-        let fd = {
-            let proc = process.lock();
-            let cloned = proc
-                .get_fd(dirfd)
-                .ok_or(SyscallError::EBADF)?
-                .try_clone_box()
-                .map_err(|_| SyscallError::ENOMEM)?;
-            cloned
-        };
-        if !is_directory_mode(fd.stat()?.mode) {
-            return Err(SyscallError::ENOTDIR);
-        }
-        return Err(SyscallError::EOPNOTSUPP);
-    };
-
-    // R65-22 FIX: Validate RESOLVE_BENEATH/RESOLVE_IN_ROOT constraints
-    // These flags should confine path resolution to the anchor directory.
-    // Without proper dirfd tracking, we cannot fully enforce these flags for
-    // non-AT_FDCWD dirfd, so we reject such combinations.
-    //
-    // R72-ENOSYS FIX: Return EINVAL instead of ENOSYS. The syscall exists but
-    // this specific flag combination is invalid for our current implementation.
-    let resolve = how_local.resolve;
-    if dirfd != AT_FDCWD && (resolve & 0x08 != 0 || resolve & 0x10 != 0) {
-        // RESOLVE_BENEATH (0x08) or RESOLVE_IN_ROOT (0x10) with non-AT_FDCWD dirfd
-        // Cannot properly enforce without fd_path tracking
-        return Err(SyscallError::EINVAL);
-    }
-
-    // Validate flags: reject unknown flags
-    let known_flags: u64 = 0o17777777; // All valid O_* flags
+    let known_flags: u64 = 0o17777777;
     if how_local.flags & !known_flags != 0 {
         return Err(SyscallError::EINVAL);
     }
-
-    // Validate resolve: reject unknown resolve flags
-    let known_resolve: u64 = 0x3F; // RESOLVE_NO_XDEV | NO_MAGICLINKS | NO_SYMLINKS | BENEATH | IN_ROOT | CACHED
+    let known_resolve: u64 = 0x3F;
     if how_local.resolve & !known_resolve != 0 {
         return Err(SyscallError::EINVAL);
     }
 
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
     let open_flags = how_local.flags as u32;
     let mode = how_local.mode as u32;
-    // Note: `resolve` already defined above for R65-22 validation
+    let resolve = how_local.resolve;
 
-    // R105-1 FIX: Removed duplicate LSM hooks — VFS layer enforces
-    // hook_file_create and hook_file_open with real inode context.
-    // See sys_open_internal R105-1 comment for rationale.
-
-    // RF186-7: serialize credential mutation against the full resolve/open and
-    // publication span, including create/truncate side effects.
     let credentials = process.lock().shared_credentials();
     let credential_authorization = credentials.begin_authorization();
     let cred_gen_before = credentials.generation();
-
-    // Get VFS callback with resolve support
-    let open_fn = {
-        let callback = VFS_OPEN_WITH_RESOLVE_CALLBACK.lock();
-        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
-    };
-
-    // R180-23: admit FD slot + files.max before resolve/open can create or
-    // truncate. The reservation remains invisible to guessed FD lookups.
+    let ext = get_vfs_extended_callbacks()?;
     let fd_reservation =
         FdPublicationReservation::try_new(process.clone(), open_flags & 0x80000 != 0)?;
-
-    let prepared = open_fn(
-        &resolved_path,
+    let prepared = (ext.open_at)(
+        dirfd,
+        &path_str,
         open_flags,
         mode,
         resolve,
@@ -2688,23 +2667,37 @@ pub(super) fn sys_sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32)
 ///
 /// 当前VFS不支持chmod操作。
 ///
-/// # R72-ENOSYS FIX
-/// Returns EOPNOTSUPP instead of ENOSYS since the syscall IS implemented,
-/// but the operation is not supported by the current VFS backend.
-pub(super) fn sys_chmod(_path: *const u8, _mode: u32) -> SyscallResult {
-    // VFS trait未提供chmod方法
-    Err(SyscallError::EOPNOTSUPP)
+/// sys_chmod(90) - N2.3: wired to VFS setattr + LSM hook_file_chmod.
+pub(super) fn sys_chmod(path: *const u8, mode: u32) -> SyscallResult {
+    sys_fchmodat2(AT_FDCWD, path, mode, 0)
 }
 
-/// sys_fchmod - 修改文件权限(通过fd)
-///
-/// 当前VFS不支持chmod操作。
-///
-/// # R72-ENOSYS FIX
-/// Returns EOPNOTSUPP instead of ENOSYS since the syscall IS implemented,
-/// but the operation is not supported by the current VFS backend.
-pub(super) fn sys_fchmod(_fd: i32, _mode: u32) -> SyscallResult {
-    Err(SyscallError::EOPNOTSUPP)
+/// sys_fchmod(91) - N2.3: wired to VFS setattr + LSM hook_file_chmod.
+pub(super) fn sys_fchmod(fd: i32, mode: u32) -> SyscallResult {
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.fchmod)(fd, mode)?;
+    Ok(0)
+}
+
+/// sys_fchmodat(268) - 3-arg Linux syscall (dirfd, path, mode).
+pub(super) fn sys_fchmodat(dirfd: i32, path: *const u8, mode: u32) -> SyscallResult {
+    sys_fchmodat2(dirfd, path, mode, 0)
+}
+
+/// sys_fchmodat2(452) - 4-arg Linux syscall supporting AT_SYMLINK_NOFOLLOW.
+pub(super) fn sys_fchmodat2(dirfd: i32, path: *const u8, mode: u32, flags: i32) -> SyscallResult {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.chmod_at)(dirfd, path_str, mode, flags & AT_SYMLINK_NOFOLLOW != 0)?;
+    Ok(0)
 }
 
 /// sys_umask - 设置文件创建掩码
@@ -2872,22 +2865,382 @@ pub(super) fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallRes
     readdir_fn(fd, budget, dirp, copy_dirents_to_user)
 }
 
-/// chown(2) - change file ownership
+/// chown(92) - change file ownership (N2.3: VFS setattr + LSM hook_file_chown).
+pub(super) fn sys_chown(path: *const u8, uid: u32, gid: u32) -> Result<usize, SyscallError> {
+    sys_fchownat(AT_FDCWD, path, uid, gid, 0)
+}
+
+/// fchown(93) - change file ownership by fd.
+pub(super) fn sys_fchown(fd: i32, uid: u32, gid: u32) -> Result<usize, SyscallError> {
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.fchown)(fd, uid, gid)?;
+    Ok(0)
+}
+
+/// lchown(94) - change symlink ownership (don't follow final symlink).
+pub(super) fn sys_lchown(path: *const u8, uid: u32, gid: u32) -> Result<usize, SyscallError> {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    sys_fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)
+}
+
+/// fchownat(260) - change ownership relative to directory fd.
+pub(super) fn sys_fchownat(
+    dirfd: i32,
+    path: *const u8,
+    uid: u32,
+    gid: u32,
+    flags: i32,
+) -> SyscallResult {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_EMPTY_PATH: i32 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.chown_at)(
+        dirfd,
+        path_str,
+        uid,
+        gid,
+        flags & AT_SYMLINK_NOFOLLOW != 0,
+        flags & AT_EMPTY_PATH != 0,
+    )?;
+    Ok(0)
+}
+
+/// truncate(76) - truncate a regular file by path.
+pub(super) fn sys_truncate(path: *const u8, length: i64) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    if length < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.truncate_path)(path_str, length as u64)?;
+    Ok(0)
+}
+
+/// fchdir(81) - change current working directory by open directory fd.
+pub(super) fn sys_fchdir(fd: i32) -> SyscallResult {
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.fchdir)(fd)?;
+    Ok(0)
+}
+
+/// mkdirat(258) - create directory relative to directory fd.
+pub(super) fn sys_mkdirat(dirfd: i32, path: *const u8, mode: u32) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.create_at)(dirfd, path_str, 0o040000 | (mode & 0o7777))?;
+    Ok(0)
+}
+
+/// mknod(133) - create special or regular file (supports S_IFIFO and S_IFREG).
+pub(super) fn sys_mknod(path: *const u8, mode: u32, dev: u64) -> SyscallResult {
+    sys_mknodat(AT_FDCWD, path, mode, dev)
+}
+
+/// mknodat(259) - create special or regular file relative to directory fd.
+pub(super) fn sys_mknodat(dirfd: i32, path: *const u8, mode: u32, _dev: u64) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let ftype = mode & 0o170000;
+    match ftype {
+        0 | 0o100000 | 0o010000 => {} // S_IFREG (or 0 => S_IFREG) or S_IFIFO
+        0o020000 | 0o060000 => {
+            // S_IFCHR / S_IFBLK require CAP_MKNOD (root) and custom device nodes are unsupported.
+            if !crate::current_is_host_root() {
+                return Err(SyscallError::EPERM);
+            }
+            return Err(SyscallError::EOPNOTSUPP);
+        }
+        _ => return Err(SyscallError::EINVAL),
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.create_at)(dirfd, path_str, mode)?;
+    Ok(0)
+}
+
+/// unlinkat(263) - remove file or empty directory (with AT_REMOVEDIR).
+pub(super) fn sys_unlinkat(dirfd: i32, path: *const u8, flags: i32) -> SyscallResult {
+    const AT_REMOVEDIR: i32 = 0x200;
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let must_dir = Some(flags & AT_REMOVEDIR != 0);
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.unlink_at)(dirfd, path_str, must_dir)?;
+    Ok(0)
+}
+
+/// symlinkat(266) - create symbolic link at (newdirfd, linkpath) pointing to target.
+pub(super) fn sys_symlinkat(
+    target: *const u8,
+    newdirfd: i32,
+    linkpath: *const u8,
+) -> SyscallResult {
+    if target.is_null() || linkpath.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let target_bytes =
+        crate::usercopy::copy_user_cstring(target).map_err(|_| SyscallError::EFAULT)?;
+    let target_str = core::str::from_utf8(&target_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let link_bytes =
+        crate::usercopy::copy_user_cstring(linkpath).map_err(|_| SyscallError::EFAULT)?;
+    let link_str = core::str::from_utf8(&link_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.symlink_at)(target_str, newdirfd, link_str)?;
+    Ok(0)
+}
+
+/// readlinkat(267) - read symbolic link target relative to directory fd.
+pub(super) fn sys_readlinkat(
+    dirfd: i32,
+    path: *const u8,
+    buf: *mut u8,
+    bufsiz: usize,
+) -> SyscallResult {
+    if path.is_null() || buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    if bufsiz == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    let target = (ext.readlink_at)(dirfd, path_str)?;
+    let copy_len = target.len().min(bufsiz);
+    if copy_len > 0 {
+        crate::usercopy::copy_to_user_safe(buf, &target.as_bytes()[..copy_len])
+            .map_err(|_| SyscallError::EFAULT)?;
+    }
+    Ok(copy_len)
+}
+
+/// faccessat(269) - 3-arg Linux syscall (dirfd, path, mode).
+pub(super) fn sys_faccessat(dirfd: i32, path: *const u8, mode: i32) -> SyscallResult {
+    sys_faccessat2(dirfd, path, mode, 0)
+}
+
+/// faccessat2(439) - check access permissions with AT_SYMLINK_NOFOLLOW / AT_EACCESS.
+pub(super) fn sys_faccessat2(dirfd: i32, path: *const u8, mode: i32, flags: i32) -> SyscallResult {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    const AT_EACCESS: i32 = 0x200;
+    if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.access_at)(dirfd, path_str, mode, flags)?;
+    Ok(0)
+}
+
+/// Parse one Linux `struct timespec` (16 bytes) for `utimensat(2)`.
+pub(super) fn parse_utime_spec(sec: i64, nsec: i64) -> Result<VfsUtimeSpec, SyscallError> {
+    const UTIME_NOW: i64 = 0x3fff_ffff;
+    const UTIME_OMIT: i64 = 0x3fff_fffe;
+    if nsec == UTIME_OMIT {
+        Ok(VfsUtimeSpec::Omit)
+    } else if nsec == UTIME_NOW {
+        Ok(VfsUtimeSpec::Now)
+    } else if (0..1_000_000_000).contains(&nsec) {
+        Ok(VfsUtimeSpec::Set { sec, nsec })
+    } else {
+        Err(SyscallError::EINVAL)
+    }
+}
+
+/// utimensat(280) - update file timestamps with nanosecond precision.
 ///
-/// # M0-6 Implementation Strategy
-/// Dispatch-or-stub per plan. Stub for now as VFS lacks full ownership tracking.
-pub(super) fn sys_chown(_path: *const u8, _uid: u32, _gid: u32) -> Result<usize, SyscallError> {
-    // M0-6: chown requires VFS inode ownership + DAC checks
-    // Current VFS has minimal ownership tracking
-    Err(SyscallError::ENOSYS)
+/// Linux `futimens(fd, times)` invokes `utimensat(fd, NULL, times, 0)`.
+pub(super) fn sys_utimensat(
+    dirfd: i32,
+    path: *const u8,
+    times: *const u8,
+    flags: i32,
+) -> SyscallResult {
+    const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if path.is_null() && (flags & AT_SYMLINK_NOFOLLOW != 0) {
+        return Err(SyscallError::EINVAL);
+    }
+    let (atime, mtime) = if times.is_null() {
+        (VfsUtimeSpec::Now, VfsUtimeSpec::Now)
+    } else {
+        let mut raw = [0u8; 32];
+        crate::usercopy::copy_from_user_safe(&mut raw, times).map_err(|_| SyscallError::EFAULT)?;
+        let a_sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let a_nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let m_sec = i64::from_le_bytes(raw[16..24].try_into().unwrap());
+        let m_nsec = i64::from_le_bytes(raw[24..32].try_into().unwrap());
+        (
+            parse_utime_spec(a_sec, a_nsec)?,
+            parse_utime_spec(m_sec, m_nsec)?,
+        )
+    };
+    let path_owned = if path.is_null() {
+        None
+    } else {
+        let bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+        let s = core::str::from_utf8(&bytes).map_err(|_| SyscallError::EINVAL)?;
+        Some(try_str_to_string(s)?)
+    };
+    let ext = get_vfs_extended_callbacks()?;
+    (ext.utimens_at)(
+        dirfd,
+        path_owned.as_deref(),
+        atime,
+        mtime,
+        flags & AT_SYMLINK_NOFOLLOW != 0,
+    )?;
+    Ok(0)
 }
 
-/// fchown(2) - change file ownership by fd
-pub(super) fn sys_fchown(_fd: i32, _uid: u32, _gid: u32) -> Result<usize, SyscallError> {
-    Err(SyscallError::ENOSYS)
+/// statfs(137) - get filesystem statistics by path (120-byte Linux struct statfs).
+pub(super) fn sys_statfs(path: *const u8, buf: *mut u8) -> SyscallResult {
+    if path.is_null() || buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let ext = get_vfs_extended_callbacks()?;
+    let st = (ext.statfs)(path_str)?;
+    let wire = st.to_le_bytes();
+    crate::usercopy::copy_to_user_safe(buf, &wire).map_err(|_| SyscallError::EFAULT)?;
+    Ok(0)
 }
 
-/// lchown(2) - change symlink ownership (don't follow link)
-pub(super) fn sys_lchown(_path: *const u8, _uid: u32, _gid: u32) -> Result<usize, SyscallError> {
-    Err(SyscallError::ENOSYS)
+/// fstatfs(138) - get filesystem statistics by open file descriptor.
+pub(super) fn sys_fstatfs(fd: i32, buf: *mut u8) -> SyscallResult {
+    if buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let ext = get_vfs_extended_callbacks()?;
+    let st = (ext.fstatfs)(fd)?;
+    let wire = st.to_le_bytes();
+    crate::usercopy::copy_to_user_safe(buf, &wire).map_err(|_| SyscallError::EFAULT)?;
+    Ok(0)
+}
+
+#[cfg(test)]
+mod n2_3_vfs_abi_tests {
+    use super::*;
+
+    #[test]
+    fn n2_3_statx_and_statfs_wire_layouts_match_linux_x86_64() {
+        let vstat = VfsStat {
+            dev: (5 << 8) | 1,
+            ino: 42,
+            nlink: 2,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            pad0: 0,
+            rdev: (1 << 8) | 9,
+            size: 1234,
+            blksize: 4096,
+            blocks: 8,
+            atime_sec: 100,
+            atime_nsec: 200,
+            mtime_sec: 300,
+            mtime_nsec: 400,
+            ctime_sec: 500,
+            ctime_nsec: 600,
+            unused0: 0,
+            unused1: 0,
+            unused2: 0,
+        };
+        let stx = serialize_statx(&vstat, 77);
+        assert_eq!(stx.len(), 256);
+        assert_eq!(u32::from_le_bytes(stx[0..4].try_into().unwrap()), 0x17ff);
+        assert_eq!(u32::from_le_bytes(stx[4..8].try_into().unwrap()), 4096);
+        assert_eq!(u32::from_le_bytes(stx[16..20].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(stx[20..24].try_into().unwrap()), 1000);
+        assert_eq!(
+            u16::from_le_bytes(stx[28..30].try_into().unwrap()),
+            0o100644u32 as u16
+        );
+        assert_eq!(u64::from_le_bytes(stx[32..40].try_into().unwrap()), 42);
+        assert_eq!(u64::from_le_bytes(stx[40..48].try_into().unwrap()), 1234);
+        assert_eq!(i64::from_le_bytes(stx[64..72].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(stx[72..76].try_into().unwrap()), 200);
+        assert_eq!(i64::from_le_bytes(stx[96..104].try_into().unwrap()), 500);
+        assert_eq!(i64::from_le_bytes(stx[112..120].try_into().unwrap()), 300);
+        assert_eq!(u32::from_le_bytes(stx[128..132].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(stx[132..136].try_into().unwrap()), 9);
+        assert_eq!(u32::from_le_bytes(stx[136..140].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(stx[140..144].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(stx[144..152].try_into().unwrap()), 77);
+
+        let fs = VfsStatFs {
+            f_type: 0x8584_58f6,
+            f_bsize: 4096,
+            f_blocks: 1024,
+            f_bfree: 512,
+            f_bavail: 512,
+            f_files: 65536,
+            f_ffree: 65000,
+            f_fsid: [1, 2],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+        };
+        let wire = fs.to_le_bytes();
+        assert_eq!(wire.len(), 120);
+        assert_eq!(
+            i64::from_le_bytes(wire[0..8].try_into().unwrap()),
+            0x8584_58f6
+        );
+        assert_eq!(i64::from_le_bytes(wire[8..16].try_into().unwrap()), 4096);
+        assert_eq!(u64::from_le_bytes(wire[16..24].try_into().unwrap()), 1024);
+        assert_eq!(i32::from_le_bytes(wire[56..60].try_into().unwrap()), 1);
+        assert_eq!(i32::from_le_bytes(wire[60..64].try_into().unwrap()), 2);
+        assert_eq!(i64::from_le_bytes(wire[64..72].try_into().unwrap()), 255);
+        assert_eq!(i64::from_le_bytes(wire[72..80].try_into().unwrap()), 4096);
+    }
+
+    #[test]
+    fn n2_3_utime_spec_validation() {
+        assert_eq!(parse_utime_spec(0, 0x3fff_fffe), Ok(VfsUtimeSpec::Omit));
+        assert_eq!(parse_utime_spec(0, 0x3fff_ffff), Ok(VfsUtimeSpec::Now));
+        assert_eq!(
+            parse_utime_spec(123, 999_999_999),
+            Ok(VfsUtimeSpec::Set {
+                sec: 123,
+                nsec: 999_999_999
+            })
+        );
+        assert_eq!(parse_utime_spec(0, -1), Err(SyscallError::EINVAL));
+        assert_eq!(
+            parse_utime_spec(0, 1_000_000_000),
+            Err(SyscallError::EINVAL)
+        );
+    }
 }

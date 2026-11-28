@@ -1396,6 +1396,96 @@ pub struct VfsStat {
 const _: [(); 144] = [(); core::mem::size_of::<VfsStat>()];
 const _: [(); 8] = [(); core::mem::align_of::<VfsStat>()];
 
+/// N2.3: Linux x86_64 `struct statfs` (120 bytes) payload passed across VFS boundary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VfsStatFs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+}
+
+impl VfsStatFs {
+    /// Serialize to Linux x86_64 120-byte `struct statfs` layout (zero padding).
+    pub fn to_le_bytes(self) -> [u8; 120] {
+        let mut out = [0u8; 120];
+        out[0..8].copy_from_slice(&self.f_type.to_le_bytes());
+        out[8..16].copy_from_slice(&self.f_bsize.to_le_bytes());
+        out[16..24].copy_from_slice(&self.f_blocks.to_le_bytes());
+        out[24..32].copy_from_slice(&self.f_bfree.to_le_bytes());
+        out[32..40].copy_from_slice(&self.f_bavail.to_le_bytes());
+        out[40..48].copy_from_slice(&self.f_files.to_le_bytes());
+        out[48..56].copy_from_slice(&self.f_ffree.to_le_bytes());
+        out[56..60].copy_from_slice(&self.f_fsid[0].to_le_bytes());
+        out[60..64].copy_from_slice(&self.f_fsid[1].to_le_bytes());
+        out[64..72].copy_from_slice(&self.f_namelen.to_le_bytes());
+        out[72..80].copy_from_slice(&self.f_frsize.to_le_bytes());
+        out[80..88].copy_from_slice(&self.f_flags.to_le_bytes());
+        // Bytes 88..120: f_spare[4] (zeros).
+        out
+    }
+}
+
+/// N2.3: Timestamp update specification for `utimensat(2)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsUtimeSpec {
+    Omit,
+    Now,
+    Set { sec: i64, nsec: i64 },
+}
+
+/// N2.3: Consolidated VFS callbacks for general `dirfd` `*at` syscalls,
+/// `fchdir`, `truncate`, `setattr` (`chmod`/`chown`/`utimensat`), `link`/`linkat`,
+/// `mknod`/`mknodat`, `statx`, and `statfs`/`fstatfs`.
+#[derive(Clone, Copy)]
+pub struct VfsExtendedCallbacks {
+    pub open_at: fn(
+        i32,
+        &str,
+        u32,
+        u32,
+        u64,
+        &crate::process::CredentialAuthorization,
+    ) -> Result<PreparedVfsOpen, SyscallError>,
+    pub stat_at: fn(i32, &str, bool, bool) -> Result<(VfsStat, u64), SyscallError>,
+    pub create_at: fn(i32, &str, u32) -> Result<(), SyscallError>,
+    pub unlink_at: fn(i32, &str, Option<bool>) -> Result<(), SyscallError>,
+    pub rename_at: fn(i32, &str, i32, &str, bool) -> Result<(), SyscallError>,
+    pub symlink_at: fn(&str, i32, &str) -> Result<(), SyscallError>,
+    pub readlink_at: fn(i32, &str) -> Result<alloc::string::String, SyscallError>,
+    pub access_at: fn(i32, &str, i32, i32) -> Result<(), SyscallError>,
+    pub fchdir: fn(i32) -> Result<(), SyscallError>,
+    pub truncate_path: fn(&str, u64) -> Result<(), SyscallError>,
+    pub chmod_at: fn(i32, &str, u32, bool) -> Result<(), SyscallError>,
+    pub fchmod: fn(i32, u32) -> Result<(), SyscallError>,
+    pub chown_at: fn(i32, &str, u32, u32, bool, bool) -> Result<(), SyscallError>,
+    pub fchown: fn(i32, u32, u32) -> Result<(), SyscallError>,
+    pub utimens_at:
+        fn(i32, Option<&str>, VfsUtimeSpec, VfsUtimeSpec, bool) -> Result<(), SyscallError>,
+    pub link_at: fn(i32, &str, i32, &str, bool, bool) -> Result<(), SyscallError>,
+    pub statfs: fn(&str) -> Result<VfsStatFs, SyscallError>,
+    pub fstatfs: fn(i32) -> Result<VfsStatFs, SyscallError>,
+}
+
+pub(super) static VFS_EXTENDED_CALLBACKS: spin::Once<VfsExtendedCallbacks> = spin::Once::new();
+
+/// Register N2.3 extended VFS callbacks.
+pub fn register_vfs_extended_callbacks(callbacks: VfsExtendedCallbacks) {
+    VFS_EXTENDED_CALLBACKS.call_once(|| callbacks);
+}
+
+#[inline]
+pub(super) fn get_vfs_extended_callbacks() -> Result<&'static VfsExtendedCallbacks, SyscallError> {
+    VFS_EXTENDED_CALLBACKS.get().ok_or(SyscallError::ENOSYS)
+}
+
 /// Lock-free hot-path syscall callbacks (registered once at boot by `ipc::init`;
 /// read via single Acquire load on every pipe/read/write/close syscall).
 pub(super) static PIPE_CREATE_CALLBACK: spin::Once<PipeCreateCallback> = spin::Once::new();

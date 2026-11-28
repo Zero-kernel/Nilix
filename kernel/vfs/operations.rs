@@ -399,14 +399,37 @@ impl Vfs {
     where
         P: FnOnce() -> Result<PreparedFileHandle, FsError>,
     {
-        self.open_authorized(
+        self.open_at_with_resolve_using(-100, name, flags, mode, resolve, prepare, context)
+    }
+
+    pub(super) fn open_at_with_resolve_using<P>(
+        &self,
+        dirfd: i32,
+        name: &str,
+        flags: OpenFlags,
+        mode: u16,
+        resolve: ResolveFlags,
+        prepare: P,
+        context: OperationContext,
+    ) -> Result<FileDescriptor, FsError>
+    where
+        P: FnOnce() -> Result<PreparedFileHandle, FsError>,
+    {
+        let base_handle = Self::dirfd_base_handle(
+            &context,
+            dirfd,
+            name,
+            resolve.beneath() || resolve.in_root(),
+        )?;
+        self.open_at_authorized(
+            base_handle.as_ref(),
             name,
             flags,
             mode,
             resolve,
             prepare,
             context,
-            |context, path, stat| {
+            |context, _path, stat| {
                 lsm::hook_file_open(
                     &context.subject,
                     stat.ino,
@@ -420,6 +443,27 @@ impl Vfs {
 
     fn open_authorized<P, H>(
         &self,
+        name: &str,
+        flags: OpenFlags,
+        mode: u16,
+        resolve: ResolveFlags,
+        prepare: P,
+        context: OperationContext,
+        authorize: H,
+    ) -> Result<FileDescriptor, FsError>
+    where
+        P: FnOnce() -> Result<PreparedFileHandle, FsError>,
+        H: FnMut(&OperationContext, &ResolvedPath, &Stat) -> Result<(), FsError>,
+    {
+        self.open_at_authorized(
+            None, name, flags, mode, resolve, prepare, context, authorize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_at_authorized<P, H>(
+        &self,
+        base_handle: Option<&FileHandle>,
         name: &str,
         flags: OpenFlags,
         mode: u16,
@@ -457,7 +501,19 @@ impl Vfs {
             Ok(stat)
         };
         let plan = self.observe(&context, |view| {
-            path::resolve(&context, view, name, resolve, final_link, flags.is_create())
+            let base = match base_handle {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            path::resolve_at(
+                &context,
+                view,
+                base.as_ref(),
+                name,
+                resolve,
+                final_link,
+                flags.is_create(),
+            )
         })?;
         let mut authorized_mode = None;
         match &plan {
@@ -485,9 +541,14 @@ impl Vfs {
             let mutation = topology.context(&context);
             let view = table.view.read();
             context.revalidate()?;
-            let current = path::resolve(
+            let base = match base_handle {
+                Some(h) => Some(h.resolved_path(&view)?),
+                None => None,
+            };
+            let current = path::resolve_at(
                 &context,
                 &view,
+                base.as_ref(),
                 name,
                 resolve,
                 final_link,
@@ -538,8 +599,20 @@ impl Vfs {
             let _topology = topology::read();
             let view = table.view.read();
             context.revalidate()?;
-            let current =
-                path::resolve(&context, &view, name, resolve, final_link, false)?.found()?;
+            let base = match base_handle {
+                Some(h) => Some(h.resolved_path(&view)?),
+                None => None,
+            };
+            let current = path::resolve_at(
+                &context,
+                &view,
+                base.as_ref(),
+                name,
+                resolve,
+                final_link,
+                false,
+            )?
+            .found()?;
             if !current.same(&resolved) || check_file(&current)?.mode.to_raw() != stat.mode.to_raw()
             {
                 return Err(FsError::Again);
@@ -1192,6 +1265,902 @@ impl Vfs {
         };
         drop(old);
         Ok(())
+    }
+
+    // ========================================================================
+    // N2.3: General dirfd resolution, *at family, fchdir, truncate, setattr
+    //       (chmod/chown/utimensat), hard links, statx, statfs/fstatfs
+    // ========================================================================
+
+    /// Extract a cloned VFS `FileHandle` from `fd` in the calling process.
+    fn fd_file_handle(context: &OperationContext, fd: i32) -> Result<FileHandle, FsError> {
+        if fd < 0 {
+            return Err(FsError::BadFd);
+        }
+        let process = context.process.as_ref().ok_or(FsError::BadFd)?;
+        let proc = process.lock();
+        let desc = proc.get_fd(fd).ok_or(FsError::BadFd)?;
+        let handle = desc
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .ok_or(FsError::NotDir)?
+            .clone();
+        Ok(handle)
+    }
+
+    /// Resolve an optional base `FileHandle` for a `dirfd` + `path` pair.
+    /// Returns `None` when `dirfd == AT_FDCWD` (-100) or when `path` is absolute
+    /// (unless `force_base` is set for `RESOLVE_BENEATH` / `RESOLVE_IN_ROOT`).
+    fn dirfd_base_handle(
+        context: &OperationContext,
+        dirfd: i32,
+        path: &str,
+        force_base: bool,
+    ) -> Result<Option<FileHandle>, FsError> {
+        const AT_FDCWD: i32 = -100;
+        if dirfd == AT_FDCWD || (!force_base && path.starts_with('/')) {
+            return Ok(None);
+        }
+        let handle = Self::fd_file_handle(context, dirfd)?;
+        if !handle.inode().is_dir() {
+            return Err(FsError::NotDir);
+        }
+        Ok(Some(handle))
+    }
+
+    /// Resolve a `(dirfd, path, empty_path)` target under one `MountView`.
+    fn resolve_target_in_view(
+        context: &OperationContext,
+        view: &MountView,
+        dirfd: i32,
+        base_handle: Option<&FileHandle>,
+        path: &str,
+        final_link: FinalLink,
+        empty_path: bool,
+    ) -> Result<ResolvedPath, FsError> {
+        const AT_FDCWD: i32 = -100;
+        if path.is_empty() {
+            if !empty_path {
+                return Err(FsError::NotFound);
+            }
+            if dirfd == AT_FDCWD {
+                return path::handle_path(&context.fs.cwd, view);
+            }
+            let handle = base_handle.ok_or(FsError::BadFd)?;
+            return handle.resolved_path(view);
+        }
+        let base = match base_handle {
+            Some(h) => Some(h.resolved_path(view)?),
+            None => None,
+        };
+        path::resolve_at(
+            context,
+            view,
+            base.as_ref(),
+            path,
+            ResolveFlags::empty(),
+            final_link,
+            false,
+        )?
+        .found()
+    }
+
+    /// Extract the base handle when `empty_path` may target a non-directory fd.
+    fn target_base_handle(
+        context: &OperationContext,
+        dirfd: i32,
+        path: &str,
+        empty_path: bool,
+    ) -> Result<Option<FileHandle>, FsError> {
+        const AT_FDCWD: i32 = -100;
+        if path.is_empty() {
+            if !empty_path {
+                return Err(FsError::NotFound);
+            }
+            if dirfd == AT_FDCWD {
+                return Ok(None);
+            }
+            return Ok(Some(Self::fd_file_handle(context, dirfd)?));
+        }
+        Self::dirfd_base_handle(context, dirfd, path, false)
+    }
+
+    pub fn stat_at(
+        &self,
+        dirfd: i32,
+        name: &str,
+        follow: bool,
+        empty_path: bool,
+    ) -> Result<(Stat, u64), FsError> {
+        let context = OperationContext::current()?;
+        let base_handle = Self::target_base_handle(&context, dirfd, name, empty_path)?;
+        let final_link = if follow {
+            FinalLink::Follow
+        } else {
+            FinalLink::Return
+        };
+        let resolved = self.observe(&context, |view| {
+            Self::resolve_target_in_view(
+                &context,
+                view,
+                dirfd,
+                base_handle.as_ref(),
+                name,
+                final_link,
+                empty_path,
+            )
+        })?;
+        let stat = resolved.inode.stat()?;
+        lsm::hook_file_permission(&context.subject, stat.ino, 0)
+            .map_err(|_| FsError::PermDenied)?;
+        Ok((stat, resolved.mount.id))
+    }
+
+    pub fn create_at(
+        &self,
+        dirfd: i32,
+        input: &str,
+        mode: FileMode,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        let context = OperationContext::current()?;
+        let base_handle = Self::dirfd_base_handle(&context, dirfd, input, false)?;
+        let (parent, name, trailing) = self.observe(&context, |view| {
+            let base = match base_handle.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            path::resolve_parent_at(&context, view, base.as_ref(), input)
+        })?;
+        if trailing && !mode.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        let stat = parent.inode.stat()?;
+        if !context.permits(&stat, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        let mode = context.creation_mode(mode);
+        if mode.is_dir() {
+            lsm::hook_file_mkdir(&context.subject, stat.ino, hash_path(&name), mode.to_raw())
+                .map_err(|_| FsError::PermDenied)?;
+        } else {
+            lsm::hook_file_create(&context.subject, stat.ino, hash_path(&name), mode.to_raw())
+                .map_err(|_| FsError::PermDenied)?;
+        }
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let topology = topology::write();
+        let mutation = topology.context(&context);
+        let view = table.view.read();
+        context.revalidate()?;
+        let base = match base_handle.as_ref() {
+            Some(h) => Some(h.resolved_path(&view)?),
+            None => None,
+        };
+        let (current, current_name, _) =
+            path::resolve_parent_at(&context, &view, base.as_ref(), input)?;
+        if !current.same(&parent) || current_name != name {
+            return Err(FsError::Again);
+        }
+        if !context.permits(&current.inode.stat()?, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        current
+            .mount
+            .fs
+            .create(&current.inode, &name, mode, &mutation)
+    }
+
+    pub fn unlink_at(
+        &self,
+        dirfd: i32,
+        input: &str,
+        must_dir: Option<bool>,
+    ) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let base_handle = Self::dirfd_base_handle(&context, dirfd, input, false)?;
+        let plan = |view: &MountView| {
+            let base = match base_handle.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            let (parent, name, trailing) =
+                path::resolve_parent_at(&context, view, base.as_ref(), input)?;
+            let victim = parent.mount.fs.lookup(&parent.inode, &name)?;
+            let stat = parent.inode.stat()?;
+            let child = victim.stat()?;
+            if trailing && !child.mode.is_dir() {
+                return Err(FsError::NotDir);
+            }
+            if !context.permits(&stat, false, true, true) {
+                return Err(FsError::PermDenied);
+            }
+            Self::sticky(&context, &stat, &child)?;
+            Ok((parent, name, victim))
+        };
+        let (parent, name, victim) = self.observe(&context, plan)?;
+        if must_dir == Some(true) {
+            lsm::hook_file_rmdir(&context.subject, parent.inode.ino(), hash_path(&name))
+                .map_err(|_| FsError::PermDenied)?;
+        } else {
+            lsm::hook_file_unlink(&context.subject, parent.inode.ino(), hash_path(&name))
+                .map_err(|_| FsError::PermDenied)?;
+        }
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let topology = topology::write();
+        let mutation = topology.context(&context);
+        let view = table.view.read();
+        context.revalidate()?;
+        let (current, current_name, current_victim) = plan(&view)?;
+        if !current.same(&parent) || current_name != name || current_victim.ino() != victim.ino() {
+            return Err(FsError::Again);
+        }
+        if self.covered_in_any_namespace(&current_victim) {
+            return Err(FsError::Busy);
+        }
+        let victim_ino = victim.ino();
+        drop(current_victim);
+        drop(victim);
+        current
+            .mount
+            .fs
+            .unlink(&current.inode, &name, victim_ino, must_dir, &mutation)
+    }
+
+    pub fn rename_at(
+        &self,
+        olddirfd: i32,
+        old: &str,
+        newdirfd: i32,
+        new: &str,
+        noreplace: bool,
+    ) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let old_base = Self::dirfd_base_handle(&context, olddirfd, old, false)?;
+        let new_base = Self::dirfd_base_handle(&context, newdirfd, new, false)?;
+        let plan = |view: &MountView| {
+            let ob = match old_base.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            let nb = match new_base.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            let (old_parent, old_name, old_trailing) =
+                path::resolve_parent_at(&context, view, ob.as_ref(), old)?;
+            let (new_parent, new_name, new_trailing) =
+                path::resolve_parent_at(&context, view, nb.as_ref(), new)?;
+            if old_parent.mount.id != new_parent.mount.id {
+                return Err(FsError::CrossDev);
+            }
+            let fs = &old_parent.mount.fs;
+            let source = fs.lookup(&old_parent.inode, &old_name)?;
+            let dest = match fs.lookup(&new_parent.inode, &new_name) {
+                Ok(inode) => Some(inode),
+                Err(FsError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            let source_stat = source.stat()?;
+            if (old_trailing || new_trailing) && !source_stat.mode.is_dir() {
+                return Err(FsError::NotDir);
+            }
+            let old_stat = old_parent.inode.stat()?;
+            let new_stat = new_parent.inode.stat()?;
+            if !context.permits(&old_stat, false, true, true)
+                || !context.permits(&new_stat, false, true, true)
+            {
+                return Err(FsError::PermDenied);
+            }
+            Self::sticky(&context, &old_stat, &source_stat)?;
+            if let Some(dest) = &dest {
+                Self::sticky(&context, &new_stat, &dest.stat()?)?;
+            }
+            Ok((old_parent, old_name, new_parent, new_name, source, dest))
+        };
+        let (old_parent, old_name, new_parent, new_name, source, dest) =
+            self.observe(&context, plan)?;
+        lsm::hook_file_rename(
+            &context.subject,
+            old_parent.inode.ino(),
+            hash_path(&old_name),
+            new_parent.inode.ino(),
+            hash_path(&new_name),
+        )
+        .map_err(|_| FsError::PermDenied)?;
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let topology = topology::write();
+        let mutation = topology.context(&context);
+        let view = table.view.read();
+        context.revalidate()?;
+        let (
+            current_old,
+            current_old_name,
+            current_new,
+            current_new_name,
+            current_source,
+            current_dest,
+        ) = plan(&view)?;
+        if !current_old.same(&old_parent)
+            || current_old_name != old_name
+            || !current_new.same(&new_parent)
+            || current_new_name != new_name
+            || current_source.ino() != source.ino()
+            || current_dest.as_ref().map(|inode| inode.ino())
+                != dest.as_ref().map(|inode| inode.ino())
+        {
+            return Err(FsError::Again);
+        }
+        if let Some(dest) = &current_dest {
+            if self.covered_in_any_namespace(dest) {
+                return Err(FsError::Busy);
+            }
+        }
+        current_old.mount.fs.rename(
+            &current_old.inode,
+            &old_name,
+            &current_new.inode,
+            &new_name,
+            noreplace,
+            source.ino(),
+            dest.as_ref().map(|dest| dest.ino()),
+            &mutation,
+        )
+    }
+
+    pub fn symlink_at(&self, target: &str, newdirfd: i32, linkpath: &str) -> Result<(), FsError> {
+        if target.is_empty() {
+            return Err(FsError::NotFound);
+        }
+        if target.len() > 4096 || target.contains('\0') {
+            return Err(FsError::NameTooLong);
+        }
+        let context = OperationContext::current()?;
+        let base_handle = Self::dirfd_base_handle(&context, newdirfd, linkpath, false)?;
+        let (parent, name, trailing) = self.observe(&context, |view| {
+            let base = match base_handle.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            path::resolve_parent_at(&context, view, base.as_ref(), linkpath)
+        })?;
+        if trailing {
+            return Err(FsError::NotDir);
+        }
+        let stat = parent.inode.stat()?;
+        if !context.permits(&stat, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        lsm::hook_file_symlink(
+            &context.subject,
+            stat.ino,
+            hash_path(&name),
+            hash_path(target),
+        )
+        .map_err(|_| FsError::PermDenied)?;
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let topology = topology::write();
+        let mutation = topology.context(&context);
+        let view = table.view.read();
+        context.revalidate()?;
+        let base = match base_handle.as_ref() {
+            Some(h) => Some(h.resolved_path(&view)?),
+            None => None,
+        };
+        let (current, current_name, _) =
+            path::resolve_parent_at(&context, &view, base.as_ref(), linkpath)?;
+        if !current.same(&parent) || current_name != name {
+            return Err(FsError::Again);
+        }
+        if !context.permits(&current.inode.stat()?, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        current
+            .mount
+            .fs
+            .symlink(&current.inode, &name, target, &mutation)
+            .map(|_| ())
+    }
+
+    pub fn readlink_at(&self, dirfd: i32, name: &str) -> Result<String, FsError> {
+        let context = OperationContext::current()?;
+        let base_handle = Self::dirfd_base_handle(&context, dirfd, name, false)?;
+        let path = self.observe(&context, |view| {
+            let base = match base_handle.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            path::resolve_at(
+                &context,
+                view,
+                base.as_ref(),
+                name,
+                ResolveFlags::empty(),
+                FinalLink::Return,
+                false,
+            )?
+            .found()
+        })?;
+        if !path.inode.is_symlink() {
+            return Err(FsError::Invalid);
+        }
+        lsm::hook_file_permission(&context.subject, path.inode.ino(), 0)
+            .map_err(|_| FsError::PermDenied)?;
+        let mut bytes = try_zeroed_buf(4097)?;
+        let size = path.inode.read_at(0, &mut bytes)?;
+        if size > 4096 {
+            return Err(FsError::NameTooLong);
+        }
+        try_string_from_utf8_slice(&bytes[..size])
+    }
+
+    pub fn access_at(&self, dirfd: i32, name: &str, mode: i32, flags: i32) -> Result<(), FsError> {
+        const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+        const AT_EACCESS: i32 = 0x200;
+        if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS) != 0 {
+            return Err(FsError::Invalid);
+        }
+        let context = OperationContext::current()?;
+        let base_handle = Self::dirfd_base_handle(&context, dirfd, name, false)?;
+        let final_link = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            FinalLink::Return
+        } else {
+            FinalLink::Follow
+        };
+        let use_effective = flags & AT_EACCESS != 0;
+        let check_dac = |stat: &Stat| -> Result<(), FsError> {
+            let (check_uid, check_gid) = if use_effective {
+                (context.uid, context.gid)
+            } else {
+                (context.subject.uid, context.subject.gid)
+            };
+            if !permission_bits_allow(
+                check_uid,
+                check_gid,
+                context.groups.as_slice(),
+                stat,
+                mode & 4 != 0,
+                mode & 2 != 0,
+                mode & 1 != 0,
+            ) {
+                return Err(FsError::PermDenied);
+            }
+            Ok(())
+        };
+        let resolve = |view: &MountView| {
+            let base = match base_handle.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            let resolved = path::resolve_at(
+                &context,
+                view,
+                base.as_ref(),
+                name,
+                ResolveFlags::empty(),
+                final_link,
+                false,
+            )?
+            .found()?;
+            let stat = resolved.inode.stat()?;
+            check_dac(&stat)?;
+            Ok(resolved)
+        };
+        let expected = self.observe(&context, resolve)?;
+        lsm::hook_file_permission(&context.subject, expected.inode.ino(), mode as u32)
+            .map_err(|_| FsError::PermDenied)?;
+        self.observe(&context, |view| {
+            let current = resolve(view)?;
+            if current.same(&expected) {
+                Ok(())
+            } else {
+                Err(FsError::Again)
+            }
+        })
+    }
+
+    pub fn fchdir(&self, fd: i32) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let handle = Self::fd_file_handle(&context, fd)?;
+        if handle.flags().is_path() {
+            return Err(FsError::BadFd);
+        }
+        let stat = handle.inode().stat()?;
+        if !stat.mode.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        if !context.permits(&stat, false, false, true) {
+            return Err(FsError::PermDenied);
+        }
+        lsm::hook_file_permission(&context.subject, stat.ino, 1)
+            .map_err(|_| FsError::PermDenied)?;
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let old = {
+            let _topology = topology::write();
+            let view = table.view.read();
+            context.revalidate()?;
+            let current = handle.resolved_path(&view)?;
+            if !context.permits(&current.inode.stat()?, false, false, true) {
+                return Err(FsError::PermDenied);
+            }
+            let dir_handle = current.directory_handle()?;
+            let mut replacement = context.fs.clone();
+            replacement.generation = replacement
+                .generation
+                .checked_add(1)
+                .ok_or(FsError::Again)?;
+            replacement.cwd = Some(dir_handle);
+            let process = context.process.as_ref().ok_or(FsError::PermDenied)?;
+            let proc = process.lock();
+            let published = if !Arc::ptr_eq(&proc.mount_ns, &context.namespace)
+                || !Arc::ptr_eq(&proc.user_ns, &context.user_namespace)
+                || !context
+                    .authorization
+                    .as_ref()
+                    .map(|auth| proc.credentials_match_authorization(auth))
+                    .unwrap_or(false)
+            {
+                Err(replacement)
+            } else {
+                proc.fs.replace_if_matches(&context.fs, replacement)
+            };
+            drop(proc);
+            match published {
+                Ok(displaced) => displaced,
+                Err(rejected) => {
+                    drop(rejected);
+                    return Err(FsError::Again);
+                }
+            }
+        };
+        drop(old);
+        Ok(())
+    }
+
+    pub fn truncate_path(&self, name: &str, len: u64) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let resolved =
+            self.lookup_using(name, ResolveFlags::empty(), FinalLink::Follow, &context)?;
+        let stat = resolved.inode.stat()?;
+        if stat.mode.is_dir() {
+            return Err(FsError::IsDir);
+        }
+        if !stat.mode.is_file() {
+            return Err(FsError::Invalid);
+        }
+        if !context.permits(&stat, false, true, false) {
+            return Err(FsError::PermDenied);
+        }
+        lsm::hook_file_truncate(&context.subject, stat.ino, len)
+            .map_err(|_| FsError::PermDenied)?;
+        resolved.inode.truncate(len)
+    }
+
+    fn apply_chmod_on_inode(
+        &self,
+        context: &OperationContext,
+        inode: &Arc<dyn Inode>,
+        mode: u32,
+    ) -> Result<(), FsError> {
+        let stat = inode.stat()?;
+        if stat.mode.is_symlink() {
+            return Err(FsError::OpNotSupp);
+        }
+        if context.uid != 0 && context.uid != stat.uid {
+            return Err(FsError::NotPermitted);
+        }
+        let mut new_perm = (mode & 0o7777) as u16;
+        // POSIX: strip S_ISGID if caller is non-root and not in the file's group.
+        if context.uid != 0
+            && (new_perm & 0o2000 != 0)
+            && context.gid != stat.gid
+            && !context.groups.as_slice().contains(&stat.gid)
+        {
+            new_perm &= !0o2000;
+        }
+        lsm::hook_file_chmod(&context.subject, stat.ino, u32::from(new_perm))
+            .map_err(|_| FsError::PermDenied)?;
+        let topology = topology::write();
+        let mutation = topology.context(context);
+        let attr = crate::types::SetAttr {
+            mode: Some(new_perm),
+            ..Default::default()
+        };
+        inode.setattr(&attr, &mutation)
+    }
+
+    pub fn chmod_at(
+        &self,
+        dirfd: i32,
+        name: &str,
+        mode: u32,
+        nofollow: bool,
+    ) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let base_handle = Self::dirfd_base_handle(&context, dirfd, name, false)?;
+        let final_link = if nofollow {
+            FinalLink::Return
+        } else {
+            FinalLink::Follow
+        };
+        let resolved = self.observe(&context, |view| {
+            Self::resolve_target_in_view(
+                &context,
+                view,
+                dirfd,
+                base_handle.as_ref(),
+                name,
+                final_link,
+                false,
+            )
+        })?;
+        self.apply_chmod_on_inode(&context, &resolved.inode, mode)
+    }
+
+    pub fn fchmod(&self, fd: i32, mode: u32) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let handle = Self::fd_file_handle(&context, fd)?;
+        if handle.flags().is_path() {
+            return Err(FsError::BadFd);
+        }
+        self.apply_chmod_on_inode(&context, handle.inode(), mode)
+    }
+
+    fn apply_chown_on_inode(
+        &self,
+        context: &OperationContext,
+        inode: &Arc<dyn Inode>,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), FsError> {
+        let stat = inode.stat()?;
+        let req_uid = if uid == u32::MAX {
+            None
+        } else {
+            Some(
+                context
+                    .user_namespace
+                    .map_uid_from_ns(uid)
+                    .ok_or(FsError::Invalid)?,
+            )
+        };
+        let req_gid = if gid == u32::MAX {
+            None
+        } else {
+            Some(
+                context
+                    .user_namespace
+                    .map_gid_from_ns(gid)
+                    .ok_or(FsError::Invalid)?,
+            )
+        };
+        if context.uid != 0 {
+            if context.uid != stat.uid {
+                return Err(FsError::NotPermitted);
+            }
+            if let Some(new_u) = req_uid {
+                if new_u != stat.uid {
+                    return Err(FsError::NotPermitted);
+                }
+            }
+            if let Some(new_g) = req_gid {
+                if new_g != stat.gid
+                    && new_g != context.gid
+                    && !context.groups.as_slice().contains(&new_g)
+                {
+                    return Err(FsError::NotPermitted);
+                }
+            }
+        }
+        let target_uid = req_uid.unwrap_or(stat.uid);
+        let target_gid = req_gid.unwrap_or(stat.gid);
+        lsm::hook_file_chown(&context.subject, stat.ino, target_uid, target_gid)
+            .map_err(|_| FsError::PermDenied)?;
+        let topology = topology::write();
+        let mutation = topology.context(context);
+        let attr = crate::types::SetAttr {
+            uid: req_uid,
+            gid: req_gid,
+            clear_setid: req_uid.is_some() || req_gid.is_some(),
+            ..Default::default()
+        };
+        inode.setattr(&attr, &mutation)
+    }
+
+    pub fn chown_at(
+        &self,
+        dirfd: i32,
+        name: &str,
+        uid: u32,
+        gid: u32,
+        nofollow: bool,
+        empty_path: bool,
+    ) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let base_handle = Self::target_base_handle(&context, dirfd, name, empty_path)?;
+        let final_link = if nofollow {
+            FinalLink::Return
+        } else {
+            FinalLink::Follow
+        };
+        let resolved = self.observe(&context, |view| {
+            Self::resolve_target_in_view(
+                &context,
+                view,
+                dirfd,
+                base_handle.as_ref(),
+                name,
+                final_link,
+                empty_path,
+            )
+        })?;
+        self.apply_chown_on_inode(&context, &resolved.inode, uid, gid)
+    }
+
+    pub fn fchown(&self, fd: i32, uid: u32, gid: u32) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let handle = Self::fd_file_handle(&context, fd)?;
+        if handle.flags().is_path() {
+            return Err(FsError::BadFd);
+        }
+        self.apply_chown_on_inode(&context, handle.inode(), uid, gid)
+    }
+
+    pub fn utimens_at(
+        &self,
+        dirfd: i32,
+        name: Option<&str>,
+        atime: kernel_core::syscall::VfsUtimeSpec,
+        mtime: kernel_core::syscall::VfsUtimeSpec,
+        nofollow: bool,
+    ) -> Result<(), FsError> {
+        use kernel_core::syscall::VfsUtimeSpec;
+        let context = OperationContext::current()?;
+        let inode: Arc<dyn Inode> = match name {
+            None => {
+                // Linux futimens: utimensat(fd, NULL, times, 0) operates on dirfd.
+                let handle = Self::fd_file_handle(&context, dirfd)?;
+                if handle.flags().is_path() {
+                    return Err(FsError::BadFd);
+                }
+                handle.inode().clone()
+            }
+            Some(path_str) => {
+                let base_handle = Self::dirfd_base_handle(&context, dirfd, path_str, false)?;
+                let final_link = if nofollow {
+                    FinalLink::Return
+                } else {
+                    FinalLink::Follow
+                };
+                let resolved = self.observe(&context, |view| {
+                    Self::resolve_target_in_view(
+                        &context,
+                        view,
+                        dirfd,
+                        base_handle.as_ref(),
+                        path_str,
+                        final_link,
+                        false,
+                    )
+                })?;
+                resolved.inode
+            }
+        };
+
+        let stat = inode.stat()?;
+        let both_omit = matches!(atime, VfsUtimeSpec::Omit) && matches!(mtime, VfsUtimeSpec::Omit);
+        if both_omit {
+            return Ok(());
+        }
+        let has_explicit_set =
+            matches!(atime, VfsUtimeSpec::Set { .. }) || matches!(mtime, VfsUtimeSpec::Set { .. });
+        if context.uid != 0 && context.uid != stat.uid {
+            if has_explicit_set {
+                return Err(FsError::NotPermitted);
+            }
+            if !context.permits(&stat, false, true, false) {
+                return Err(FsError::PermDenied);
+            }
+        }
+        let now = crate::types::TimeSpec::now();
+        let to_ts = |spec: VfsUtimeSpec| -> Option<crate::types::TimeSpec> {
+            match spec {
+                VfsUtimeSpec::Omit => None,
+                VfsUtimeSpec::Now => Some(now),
+                VfsUtimeSpec::Set { sec, nsec } => Some(crate::types::TimeSpec { sec, nsec }),
+            }
+        };
+        let topology = topology::write();
+        let mutation = topology.context(&context);
+        let attr = crate::types::SetAttr {
+            atime: to_ts(atime),
+            mtime: to_ts(mtime),
+            ..Default::default()
+        };
+        inode.setattr(&attr, &mutation)
+    }
+
+    pub fn link_at(
+        &self,
+        olddirfd: i32,
+        oldpath: &str,
+        newdirfd: i32,
+        newpath: &str,
+        follow: bool,
+        empty_path: bool,
+    ) -> Result<(), FsError> {
+        let context = OperationContext::current()?;
+        let old_base = Self::target_base_handle(&context, olddirfd, oldpath, empty_path)?;
+        let new_base = Self::dirfd_base_handle(&context, newdirfd, newpath, false)?;
+        let final_link = if follow {
+            FinalLink::Follow
+        } else {
+            FinalLink::Return
+        };
+        let plan = |view: &MountView| {
+            let target = Self::resolve_target_in_view(
+                &context,
+                view,
+                olddirfd,
+                old_base.as_ref(),
+                oldpath,
+                final_link,
+                empty_path,
+            )?;
+            let nb = match new_base.as_ref() {
+                Some(h) => Some(h.resolved_path(view)?),
+                None => None,
+            };
+            let (new_parent, new_name, trailing) =
+                path::resolve_parent_at(&context, view, nb.as_ref(), newpath)?;
+            if trailing {
+                return Err(FsError::NotDir);
+            }
+            if target.mount.id != new_parent.mount.id {
+                return Err(FsError::CrossDev);
+            }
+            let target_stat = target.inode.stat()?;
+            if target_stat.mode.is_dir() {
+                return Err(FsError::NotPermitted);
+            }
+            let parent_stat = new_parent.inode.stat()?;
+            if !context.permits(&parent_stat, false, true, true) {
+                return Err(FsError::PermDenied);
+            }
+            Ok((target, new_parent, new_name))
+        };
+        let (target, new_parent, new_name) = self.observe(&context, plan)?;
+        lsm::hook_file_link(
+            &context.subject,
+            target.inode.ino(),
+            new_parent.inode.ino(),
+            hash_path(&new_name),
+        )
+        .map_err(|_| FsError::PermDenied)?;
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let topology = topology::write();
+        let mutation = topology.context(&context);
+        let view = table.view.read();
+        context.revalidate()?;
+        let (cur_target, cur_parent, cur_name) = plan(&view)?;
+        if !cur_target.same(&target) || !cur_parent.same(&new_parent) || cur_name != new_name {
+            return Err(FsError::Again);
+        }
+        cur_parent
+            .mount
+            .fs
+            .link(&cur_parent.inode, &cur_name, &cur_target.inode, &mutation)
+    }
+
+    pub fn statfs_path(&self, name: &str) -> Result<crate::types::FsStat, FsError> {
+        let context = OperationContext::current()?;
+        let resolved =
+            self.lookup_using(name, ResolveFlags::empty(), FinalLink::Follow, &context)?;
+        resolved.mount.fs.statfs()
+    }
+
+    pub fn fstatfs(&self, fd: i32) -> Result<crate::types::FsStat, FsError> {
+        let context = OperationContext::current()?;
+        let handle = Self::fd_file_handle(&context, fd)?;
+        handle.filesystem().statfs()
     }
 
     fn pivot_pair(

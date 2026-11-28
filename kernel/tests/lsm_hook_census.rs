@@ -23,7 +23,7 @@ mod lsm_hook_census_tests {
     /// Upper bound on dormant hook families. Lower it whenever a family is
     /// wired; never raise it to admit a new unwired hook. 11 since N2.4
     /// wired `hook_task_setuid`, `hook_task_setresuid`, and `hook_task_setgroups`.
-    const MAX_FEATURE_ABSENT: usize = 11;
+    const MAX_FEATURE_ABSENT: usize = 8;
 
     fn kernel_root() -> PathBuf {
         for candidate in [".", "kernel"] {

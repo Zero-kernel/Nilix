@@ -606,6 +606,20 @@ pub(crate) fn resolve(
     final_link: FinalLink,
     allow_missing: bool,
 ) -> Result<Resolution, FsError> {
+    resolve_at(context, view, None, input, flags, final_link, allow_missing)
+}
+
+/// N2.3: General path resolution starting either from `cwd` (`base == None`,
+/// i.e. `AT_FDCWD`) or from a pinned `dirfd` directory (`base == Some(...)`).
+pub(crate) fn resolve_at(
+    context: &OperationContext,
+    view: &MountView,
+    base: Option<&ResolvedPath>,
+    input: &str,
+    flags: ResolveFlags,
+    final_link: FinalLink,
+    allow_missing: bool,
+) -> Result<Resolution, FsError> {
     validate_path(input)?;
     if flags.bits() & !0x3f != 0 || (flags.beneath() && flags.in_root()) {
         return Err(FsError::Invalid);
@@ -617,21 +631,33 @@ pub(crate) fn resolve(
         return Err(FsError::CrossDev);
     }
     let root = handle_path(&context.fs.root, view)?;
-    let cwd = handle_path(&context.fs.cwd, view)?;
-    if (!input.starts_with('/') || flags.beneath() || flags.in_root())
-        && !is_beneath(&cwd, &root, view, false)?
-    {
-        return Err(FsError::PermDenied);
-    }
+    let start_dir = match base {
+        Some(dir) => {
+            let canonical = view.canonical(dir)?;
+            if !canonical.inode.is_dir() {
+                return Err(FsError::NotDir);
+            }
+            canonical
+        }
+        None => {
+            let cwd = handle_path(&context.fs.cwd, view)?;
+            if (!input.starts_with('/') || flags.beneath() || flags.in_root())
+                && !is_beneath(&cwd, &root, view, false)?
+            {
+                return Err(FsError::PermDenied);
+            }
+            cwd
+        }
+    };
     let boundary = if flags.beneath() || flags.in_root() {
-        cwd.clone()
+        start_dir.clone()
     } else {
         root.clone()
     };
     let initial = if input.starts_with('/') {
         boundary.clone()
     } else {
-        cwd
+        start_dir
     };
     // A stored cwd/root is already an exact mount/inode capability. A later
     // overmount must not retarget it; only a name lookup enters a mount edge.
@@ -785,6 +811,15 @@ pub(crate) fn resolve_parent(
     view: &MountView,
     path: &str,
 ) -> Result<(ResolvedPath, String, bool), FsError> {
+    resolve_parent_at(context, view, None, path)
+}
+
+pub(crate) fn resolve_parent_at(
+    context: &OperationContext,
+    view: &MountView,
+    base: Option<&ResolvedPath>,
+    path: &str,
+) -> Result<(ResolvedPath, String, bool), FsError> {
     validate_path(path)?;
     let trailing = path.ends_with('/');
     let trimmed = path.trim_end_matches('/');
@@ -802,9 +837,10 @@ pub(crate) fn resolve_parent(
     if name.len() > 255 {
         return Err(FsError::NameTooLong);
     }
-    let parent = resolve(
+    let parent = resolve_at(
         context,
         view,
+        base,
         prefix,
         ResolveFlags::empty(),
         FinalLink::Follow,

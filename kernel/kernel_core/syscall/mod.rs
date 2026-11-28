@@ -116,7 +116,8 @@ pub use helpers::{
     register_pipe_callback, register_set_frame_binding_callback, register_set_frame_owner_callback,
     register_stage_pending_tls_bases_callback, register_syscall_frame_callback,
     register_syscall_frame_mut_callback, register_vfs_create_callback,
-    register_vfs_durability_callbacks, register_vfs_lseek_callback, register_vfs_open_callback,
+    register_vfs_durability_callbacks, register_vfs_extended_callbacks,
+    register_vfs_lseek_callback, register_vfs_open_callback,
     register_vfs_open_with_resolve_callback, register_vfs_pread_callback,
     register_vfs_pwrite_callback, register_vfs_read_file_callback, register_vfs_readdir_callback,
     register_vfs_readlink_callback, register_vfs_rename_callback,
@@ -132,10 +133,11 @@ pub use helpers::{
     FutexCallback, GetFrameBindingCallback, GetSyscallFrameCallback, GetSyscallFrameMutCallback,
     MountNsMaterializeCallback, MountNsMaterializeRollbackCallback, PipeCreateCallback,
     PreparedVfsOpen, SetFrameBindingCallback, SetFrameOwnerCallback, StagePendingTlsBasesCallback,
-    SyscallFrame, VfsCreateCallback, VfsDirCopyout, VfsLseekCallback, VfsOpenCallback,
-    VfsOpenWithResolveCallback, VfsPreadCallback, VfsPwriteCallback, VfsReadFileCallback,
-    VfsReaddirCallback, VfsReadlinkCallback, VfsRenameCallback, VfsStat, VfsStatCallback,
-    VfsStatNofollowCallback, VfsSymlinkCallback, VfsTruncateCallback, VfsUnlinkCallback,
+    SyscallFrame, VfsCreateCallback, VfsDirCopyout, VfsExtendedCallbacks, VfsLseekCallback,
+    VfsOpenCallback, VfsOpenWithResolveCallback, VfsPreadCallback, VfsPwriteCallback,
+    VfsReadFileCallback, VfsReaddirCallback, VfsReadlinkCallback, VfsRenameCallback, VfsStat,
+    VfsStatCallback, VfsStatFs, VfsStatNofollowCallback, VfsSymlinkCallback, VfsTruncateCallback,
+    VfsUnlinkCallback, VfsUtimeSpec,
 };
 pub(crate) use helpers::{stage_pending_tls_bases, WAITER_REGISTRY_MAX_ENTRIES};
 #[cfg(feature = "syscall_test")]
@@ -789,6 +791,7 @@ pub fn syscall_dispatcher(
             Sc::Dup2 => sys_dup2(arg0 as i32, arg1 as i32),
             Sc::Fcntl => sys_fcntl(arg0 as i32, arg1 as i32, arg2),
             Sc::Dup3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as i32),
+            Sc::Truncate => sys_truncate(arg0 as *const u8, arg1 as i64),
             Sc::Ftruncate => sys_ftruncate(arg0 as i32, arg1 as i64),
             Sc::Fsync => sys_fsync(arg0 as i32),
             Sc::Fdatasync => sys_fdatasync(arg0 as i32),
@@ -803,16 +806,13 @@ pub fn syscall_dispatcher(
             Sc::Access => sys_access(arg0 as *const u8, arg1 as i32),
             Sc::Getcwd => sys_getcwd(arg0 as *mut u8, arg1 as usize),
             Sc::Chdir => sys_chdir(arg0 as *const u8),
+            Sc::Fchdir => sys_fchdir(arg0 as i32),
             Sc::Mkdir => sys_mkdir(arg0 as *const u8, arg1 as u32),
             Sc::Rmdir => sys_rmdir(arg0 as *const u8),
             Sc::Link => sys_link(arg0 as *const u8, arg1 as *const u8),
             Sc::Unlink => sys_unlink(arg0 as *const u8),
-            // M0-6 slice 3: symlink/readlink - DEFERRED per plan
-            // Blocked on ramfs lacking Symlink NodeKind + /proc/self contradictory inode
             Sc::Symlink => sys_symlink(arg0 as *const u8, arg1 as *const u8),
             Sc::Readlink => sys_readlink(arg0 as *const u8, arg1 as *mut u8, arg2 as usize),
-            // M0-6 slice 2: rename family. 82 is pledge-promised (WPATH); 264/316 dispatch as
-            // plain unpledged arms (no seccomp constant -> default-denied for a pledged process).
             Sc::Rename => sys_rename(arg0 as *const u8, arg1 as *const u8),
             Sc::Renameat => sys_renameat(
                 arg0 as i32,
@@ -830,6 +830,48 @@ pub fn syscall_dispatcher(
             Sc::Chmod => sys_chmod(arg0 as *const u8, arg1 as u32),
             Sc::Fchmod => sys_fchmod(arg0 as i32, arg1 as u32),
             Sc::Umask => sys_umask(arg0 as u32),
+            Sc::Mknod => sys_mknod(arg0 as *const u8, arg1 as u32, arg2),
+            Sc::Statfs => sys_statfs(arg0 as *const u8, arg1 as *mut u8),
+            Sc::Fstatfs => sys_fstatfs(arg0 as i32, arg1 as *mut u8),
+            // N2.3: General *at() VFS family
+            Sc::Mkdirat => sys_mkdirat(arg0 as i32, arg1 as *const u8, arg2 as u32),
+            Sc::Mknodat => sys_mknodat(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3),
+            Sc::Fchownat => sys_fchownat(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as u32,
+                arg3 as u32,
+                arg4 as i32,
+            ),
+            Sc::Unlinkat => sys_unlinkat(arg0 as i32, arg1 as *const u8, arg2 as i32),
+            Sc::Linkat => sys_linkat(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as i32,
+                arg3 as *const u8,
+                arg4 as i32,
+            ),
+            Sc::Symlinkat => sys_symlinkat(arg0 as *const u8, arg1 as i32, arg2 as *const u8),
+            Sc::Readlinkat => sys_readlinkat(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as *mut u8,
+                arg3 as usize,
+            ),
+            Sc::Fchmodat => sys_fchmodat(arg0 as i32, arg1 as *const u8, arg2 as u32),
+            Sc::Fchmodat2 => {
+                sys_fchmodat2(arg0 as i32, arg1 as *const u8, arg2 as u32, arg3 as i32)
+            }
+            Sc::Faccessat => sys_faccessat(arg0 as i32, arg1 as *const u8, arg2 as i32),
+            Sc::Faccessat2 => {
+                sys_faccessat2(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as i32)
+            }
+            Sc::Utimensat => sys_utimensat(
+                arg0 as i32,
+                arg1 as *const u8,
+                arg2 as *const u8,
+                arg3 as i32,
+            ),
             Sc::PivotRoot => sys_pivot_root(arg0 as *const u8, arg1 as *const u8),
             Sc::Chroot => sys_chroot(arg0 as *const u8),
 
@@ -1260,7 +1302,7 @@ fn finish_syscall_tail(
 
 /// Upper bound on intentionally undispatched pledge-promised syscalls.
 /// Every future slice wiring an exemption MUST lower this ceiling.
-const MAX_EXEMPT: usize = 3;
+const MAX_EXEMPT: usize = 1;
 const _: () = assert!(seccomp::syscall_table::PLEDGE_EXEMPTION_COUNT <= MAX_EXEMPT);
 
 /// M0-6 / N2.0b: the divergence-prevention parity self-test. Asserts the single
@@ -1511,16 +1553,8 @@ mod r190_11_dispatch_parity_tests {
     /// something else for these inputs (EBADF for fd -1, EFAULT for pointer 1),
     /// which fails the checks below.
     fn probe_fixed_errno_stub(handler: &str) -> Option<(SyscallResult, SyscallError)> {
-        let inert = 1 as *const u8;
-        match handler {
-            "sys_chmod" => Some((sys_chmod(inert, 0), SyscallError::EOPNOTSUPP)),
-            "sys_fchmod" => Some((sys_fchmod(-1, 0), SyscallError::EOPNOTSUPP)),
-            "sys_chown" => Some((sys_chown(inert, 0, 0), SyscallError::ENOSYS)),
-            "sys_fchown" => Some((sys_fchown(-1, 0, 0), SyscallError::ENOSYS)),
-            "sys_lchown" => Some((sys_lchown(inert, 0, 0), SyscallError::ENOSYS)),
-            "sys_link" => Some((sys_link(inert, inert), SyscallError::EPERM)),
-            _ => None,
-        }
+        let _ = handler;
+        None
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Core traits for filesystem and inode operations.
 
 use crate::topology::MutationContext;
-use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat};
+use crate::types::{DirEntry, FileMode, FileType, FsError, FsStat, OpenFlags, SetAttr, Stat};
 use alloc::alloc::{dealloc, Layout};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -174,6 +174,44 @@ pub trait FileSystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    /// N2.3: Create a hard link `name` in `parent` pointing to existing `target`.
+    fn link(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        target: &Arc<dyn Inode>,
+        context: &MutationContext<'_>,
+    ) -> Result<(), FsError> {
+        let _ = (parent, name, target, context);
+        Err(FsError::NotSupported)
+    }
+
+    /// N2.3: Report filesystem statistics for `statfs(2)` / `fstatfs(2)`.
+    fn statfs(&self) -> Result<FsStat, FsError> {
+        let f_type = match self.fs_type() {
+            "ramfs" => 0x8584_58f6_i64,           // RAMFS_MAGIC
+            "tmpfs" | "devfs" => 0x0102_1994_i64, // TMPFS_MAGIC
+            "proc" => 0x9fa0_i64,                 // PROC_SUPER_MAGIC
+            "cgroup2" => 0x6367_7270_i64,         // CGROUP2_SUPER_MAGIC
+            "ext2" => 0xef53_i64,                 // EXT2_SUPER_MAGIC
+            _ => 0x5a45_524f_i64,                 // "ZERO" fallback magic
+        };
+        let id = self.fs_id();
+        Ok(FsStat {
+            f_type,
+            f_bsize: 4096,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_fsid: [id as i32, (id >> 32) as i32],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+        })
+    }
+
     /// ST-K4: make every write completed before this call persistent.
     ///
     /// Fails closed by default so a new persistent filesystem cannot claim
@@ -295,6 +333,12 @@ pub trait Inode: Send + Sync {
     /// Truncate file to given length
     fn truncate(&self, len: u64) -> Result<(), FsError> {
         let _ = len;
+        Err(FsError::NotSupported)
+    }
+
+    /// N2.3: Mutate inode attributes (mode, uid, gid, atime, mtime).
+    fn setattr(&self, attr: &SetAttr, context: &MutationContext<'_>) -> Result<(), FsError> {
+        let _ = (attr, context);
         Err(FsError::NotSupported)
     }
 
@@ -625,6 +669,25 @@ impl PreparedFileHandle {
         flags: OpenFlags,
         seekable: bool,
     ) -> FileDescriptor {
+        self.finalize_inner(inode, flags, seekable, None)
+    }
+
+    pub(crate) fn finalize_fifo(
+        self,
+        inode: Arc<dyn Inode>,
+        flags: OpenFlags,
+        fifo_end: crate::ramfs::FifoEnd,
+    ) -> FileDescriptor {
+        self.finalize_inner(inode, flags, false, Some(fifo_end))
+    }
+
+    fn finalize_inner(
+        self,
+        inode: Arc<dyn Inode>,
+        flags: OpenFlags,
+        seekable: bool,
+        fifo_end: Option<crate::ramfs::FifoEnd>,
+    ) -> FileDescriptor {
         let owner = self
             .owner
             .expect("direct inode open must supply its filesystem owner");
@@ -646,6 +709,7 @@ impl PreparedFileHandle {
             cap_id: spin::once::Once::new(), // U.S2 SLICE-3B: born uninitialized; set at install
             owner,
             pending_context: spin::Mutex::new(self.context),
+            fifo_end,
         })
     }
 }
@@ -673,6 +737,8 @@ pub struct FileHandle {
     /// an fd_table (e.g., open failed after PreparedFileHandle allocation but before
     /// install). The FileOps::cap_id() accessor returns None for uninstalled handles.
     pub(crate) cap_id: spin::once::Once<cap::CapId>,
+    /// N2.3: Active FIFO endpoint guard when this handle refers to an open named pipe.
+    fifo_end: Option<crate::ramfs::FifoEnd>,
 }
 
 /// R41-3 FIX: Implement Clone for FileHandle to allow dropping process lock before I/O.
@@ -703,6 +769,7 @@ impl Clone for FileHandle {
             flags: self.flags,
             seekable: self.seekable,
             cap_id,
+            fifo_end: self.fifo_end.clone(),
         }
     }
 }
@@ -764,6 +831,44 @@ impl FileHandle {
         &self.inode
     }
 
+    pub(crate) fn filesystem(&self) -> &Arc<dyn FileSystem> {
+        self.owner.filesystem()
+    }
+
+    pub(crate) fn pinned_mount(&self) -> Option<&Arc<crate::path::Mount>> {
+        match &self.owner {
+            FileLifetime::Mount(mount) => Some(mount),
+            FileLifetime::Filesystem(_) => None,
+        }
+    }
+
+    pub(crate) fn resolved_path(
+        &self,
+        view: &crate::path::MountView,
+    ) -> Result<crate::path::ResolvedPath, FsError> {
+        let mount = self.pinned_mount().ok_or(FsError::NotDir)?;
+        view.canonical(&crate::path::ResolvedPath {
+            mount: mount.clone(),
+            inode: self.inode.clone(),
+            epoch: view.epoch,
+        })
+    }
+
+    /// True if this open handle is a named FIFO endpoint.
+    pub fn is_fifo(&self) -> bool {
+        self.fifo_end.is_some()
+    }
+
+    /// N2.3: Transactional read from a named FIFO open handle (honoring O_NONBLOCK).
+    pub fn fifo_read_with_commit(
+        &self,
+        buf: &mut [u8],
+        commit: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
+    ) -> Result<usize, FsError> {
+        let fifo = self.fifo_end.as_ref().ok_or(FsError::Invalid)?;
+        fifo.read_with_commit(buf, self.flags().is_nonblock(), commit)
+    }
+
     fn try_clone_descriptor(&self) -> Result<FileDescriptor, ()> {
         let prepared = FileDescriptor::try_prepare(HeapClass::Vfs)?;
         Ok(prepared.finalize(self.clone()))
@@ -788,6 +893,10 @@ impl FileHandle {
         if !self.flags().is_readable() {
             return Err(FsError::BadFd);
         }
+        if let Some(ref fifo) = self.fifo_end {
+            let mut nop = |_: &[u8]| Ok(());
+            return fifo.read_with_commit(buf, self.flags().is_nonblock(), &mut nop);
+        }
 
         let mut offset = self.offset.lock();
         let n = self.inode.read_at(*offset, buf)?;
@@ -800,6 +909,9 @@ impl FileHandle {
         let flags = self.flags();
         if !flags.is_writable() {
             return Err(FsError::BadFd);
+        }
+        if let Some(ref fifo) = self.fifo_end {
+            return fifo.write(data, flags.is_nonblock());
         }
 
         let sync = flags.is_sync();
@@ -903,6 +1015,9 @@ impl FileHandle {
 
 impl FileOps for FileHandle {
     fn poll_arm(&self) -> kernel_core::poll::PollArm {
+        if let Some(ref fifo) = self.fifo_end {
+            return fifo.poll_arm();
+        }
         if self.inode.as_any().is::<crate::devfs::ConsoleDevInode>()
             || self.inode.as_any().is::<crate::devfs::TtyDevInode>()
         {
