@@ -595,8 +595,26 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
         }
 
         let class = mm::HeapClass::CoreProcess;
-        let baseline = mm::heap_class_snapshot(class);
+        let outer_baseline = mm::heap_class_snapshot(class);
         let result: Result<(), String> = (|| {
+            // N3.1b: On >256 MiB systems CoreProcess scales with RAM; hold any
+            // headroom above the 1x baseline window so the bounded loop below
+            // still exercises the exact live class ceiling without allocating
+            // tens of megabytes during boot self-tests.
+            let used = outer_baseline
+                .committed_bytes
+                .saturating_add(outer_baseline.reserved_bytes);
+            let headroom = outer_baseline.capacity_bytes.saturating_sub(used);
+            let extra = headroom.saturating_sub(class.limit_bytes());
+            let _scale_pressure = if extra > 0 {
+                Some(
+                    mm::try_reserve_heap(class, extra)
+                        .map_err(|e| alloc::format!("scale pressure reserve failed: {e:?}"))?,
+                )
+            } else {
+                None
+            };
+            let baseline = mm::heap_class_snapshot(class);
             let mut map: mm::AdmittedMap<usize, usize> = mm::AdmittedMap::new(class);
             let mut inserted = 0usize;
             let mut admission_failed = false;
@@ -645,8 +663,11 @@ impl RuntimeTest for VmaHeapAdmissionPressureTest {
             }
             map.clear();
             drop(map);
+            let after_inner = mm::heap_class_snapshot(class);
+            assert_admission_lanes_at_least(baseline, after_inner, 0, "pressure cleanup")?;
+            drop(_scale_pressure);
             let after = mm::heap_class_snapshot(class);
-            assert_admission_lanes_at_least(baseline, after, 0, "pressure cleanup")?;
+            assert_admission_lanes_at_least(outer_baseline, after, 0, "scale pressure cleanup")?;
             Ok(())
         })();
 
@@ -740,9 +761,28 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
             for key in 0..OVERSIZED_SNAPSHOT_ENTRIES {
                 huge_entries.push((key, key));
             }
+            // N3.1b: hold any RAM-scaled CoreProcess headroom above the 1x
+            // ceiling so the 40,000-entry (~640 KiB) snapshot still trips
+            // CoreProcess ClassLimit on >256 MiB guests without needing a
+            // multi-megabyte temporary vector during boot.
+            let pre_oversized = mm::heap_class_snapshot(class);
+            let pre_used = pre_oversized
+                .committed_bytes
+                .saturating_add(pre_oversized.reserved_bytes);
+            let pre_headroom = pre_oversized.capacity_bytes.saturating_sub(pre_used);
+            let extra = pre_headroom.saturating_sub(class.limit_bytes());
+            let _scale_pressure = if extra > 0 {
+                Some(
+                    mm::try_reserve_heap(class, extra)
+                        .map_err(|e| alloc::format!("fork scale pressure failed: {e:?}"))?,
+                )
+            } else {
+                None
+            };
             match mm::AdmittedMap::from_sorted_vec_charged(huge_entries, class) {
                 Ok(map) => {
                     drop(map);
+                    drop(_scale_pressure);
                     return Err(String::from(
                         "oversized fork snapshot unexpectedly passed CoreProcess admission",
                     ));
@@ -758,6 +798,7 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
                     ) {
                         drop(returned);
                         drop(reservation);
+                        drop(_scale_pressure);
                         return Err(alloc::format!(
                             "oversized snapshot failed for an unexpected reason: {error:?}"
                         ));
@@ -765,6 +806,7 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
                     if returned.len() != OVERSIZED_SNAPSHOT_ENTRIES {
                         drop(returned);
                         drop(reservation);
+                        drop(_scale_pressure);
                         return Err(String::from(
                             "admission failure did not return the complete snapshot",
                         ));
@@ -773,6 +815,7 @@ impl RuntimeTest for VmaForkCombinedLoadTest {
                     drop(reservation);
                 }
             }
+            drop(_scale_pressure);
             drop(parent);
             let after = mm::heap_class_snapshot(class);
             assert_admission_lanes_at_least(baseline, after, 0, "fork rollback")?;

@@ -873,7 +873,7 @@ pub fn test_heap_budget_arbiter() {
     // up as drift. Drift past the declared 64 KiB unadmitted reserve fails
     // the boot. This proves the accounting identity live, not just at rest.
     let measure = || -> (usize, usize) {
-        let allocator_used = mm::NORMAL_HEAP_SIZE_BYTES - mm::heap_free_bytes();
+        let allocator_used = mm::heap_used_bytes();
         let pagecache_meta_live = (mm::PAGE_CACHE.stats().nr_pages as usize) * 256;
         let audit_ring_live = audit::ring_capacity_bytes().unwrap_or(0);
         (allocator_used, pagecache_meta_live + audit_ring_live)
@@ -888,6 +888,17 @@ pub fn test_heap_budget_arbiter() {
     // budgeted ceiling — otherwise the drift leg would tautologically accept
     // any pre-existing unledgered footprint. Together these bound total
     // unattributed use by (boot ceiling + 64 KiB runtime reserve).
+    let slab = mm::slab_stats();
+    klog_always!(
+        "    ✓ N3.1b slab: active={} scale={}x live={} B (large={} B) backing={} pages reclaimed={} pages",
+        slab.active,
+        mm::heap_scale_factor(),
+        slab.live_bytes,
+        slab.large_live_bytes,
+        slab.backing_pages,
+        slab.reclaimed_pages
+    );
+    assert!(slab.active, "N3.1b buddy-backed slab must be active");
     assert!(
         baseline_unledgered <= mm::BOOT_UNLEDGERED_FOOTPRINT_MAX_BYTES,
         "D1-RES: boot unledgered footprint {} B exceeds budget {} B",

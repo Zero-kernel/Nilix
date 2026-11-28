@@ -119,7 +119,7 @@ fn serial_checks(kind: u32) {
     assert_eq!(resources(), baseline);
 
     // Actual class admission failure, distinct from boundary/Arc injection.
-    let limit = mm::HeapClass::CoreProcess.limit_bytes();
+    let limit = mm::HeapClass::CoreProcess.runtime_limit_bytes();
     let headroom = limit.checked_sub(baseline.0 + baseline.1).unwrap();
     let pressure = mm::try_reserve_heap(mm::HeapClass::CoreProcess, headroom)
         .expect("probe must reserve the remaining class budget");

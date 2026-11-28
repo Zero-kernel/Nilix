@@ -255,40 +255,90 @@ const BOOT_METADATA_RESERVATIONS: usize = 2;
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// D1-RES R4: monotone high-water of normal-arena USED bytes
-/// (`NORMAL_HEAP_SIZE_BYTES - free`), updated inside the single allocator lock
-/// every `alloc` already holds. Normal arena only; excludes the emergency arena.
+/// (`early_used + slab_live`), updated on every allocation. Normal arena only;
+/// excludes the emergency arena.
 static HEAP_PEAK_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-/// D1-RES R4: ZST `#[global_allocator]` shim over `ALLOCATOR`. Semantics are
-/// IDENTICAL to `linked_list_allocator::LockedHeap`'s own `GlobalAlloc` impl
-/// (delegate to `allocate_first_fit` / `deallocate` on the same inner `Heap`)
-/// plus one `fetch_max` of the used-bytes peak computed under the single
-/// already-held lock — exact, no double-acquire, no new lock-order edge. The
-/// shim itself never allocates or logs. A pre-init or OOM alloc returns
-/// `Err → null`, which `handle_alloc_error` turns into the same fail-closed halt
-/// as before this shim existed.
+/// N3.1b: live used bytes currently held inside the early boot `ALLOCATOR`
+/// (`PML4[511]/PDPT[510]`). Updated inside `ALLOCATOR`'s lock so post-boot
+/// slab allocations can read `early_used` lock-free without touching `ALLOCATOR`.
+static EARLY_USED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg_attr(feature = "host_harness", allow(dead_code))]
+#[inline]
+fn with_early_allocator_lock<R>(f: impl FnOnce(&mut linked_list_allocator::Heap) -> R) -> R {
+    #[cfg(feature = "host_harness")]
+    {
+        let mut heap = ALLOCATOR.lock();
+        f(&mut heap)
+    }
+    #[cfg(not(feature = "host_harness"))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut heap = ALLOCATOR.lock();
+            f(&mut heap)
+        })
+    }
+}
+
+/// D1-RES R4 + N3.1b (`HEAP-SCALE`): Global kernel heap dispatcher.
+///
+/// Before buddy publication, serves early boot allocations from the static 2 MiB
+/// `linked_list_allocator` in `PML4[511]/PDPT[510]`. Once buddy + `PML4[273]`
+/// are ready, routes all new allocations to the buddy-backed [`crate::slab`]
+/// allocator (up to `runtime_normal_heap_size_bytes()`). `dealloc` dispatches
+/// cleanly by disjoint address range (`[early_base, early_end)` vs `PML4[273]`).
+#[cfg_attr(feature = "host_harness", allow(dead_code))]
 struct InstrumentedKernelHeap;
 
 unsafe impl GlobalAlloc for InstrumentedKernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut heap = ALLOCATOR.lock();
-        match heap.allocate_first_fit(layout) {
-            Ok(ptr) => {
-                let used = NORMAL_HEAP_SIZE_BYTES.saturating_sub(heap.free());
-                HEAP_PEAK_USED_BYTES.fetch_max(used, Ordering::Relaxed);
-                ptr.as_ptr()
+        if layout.size() == 0 {
+            return layout.align() as *mut u8;
+        }
+        if crate::slab::is_active() {
+            let early_used = EARLY_USED_BYTES.load(Ordering::Acquire);
+            match crate::slab::alloc(layout, early_used) {
+                Some(ptr) => {
+                    let used = early_used.saturating_add(crate::slab::live_bytes());
+                    HEAP_PEAK_USED_BYTES.fetch_max(used, Ordering::Relaxed);
+                    ptr.as_ptr()
+                }
+                None => core::ptr::null_mut(),
             }
-            Err(_) => core::ptr::null_mut(),
+        } else {
+            with_early_allocator_lock(|heap| match heap.allocate_first_fit(layout) {
+                Ok(ptr) => {
+                    let used = NORMAL_HEAP_SIZE_BYTES.saturating_sub(heap.free());
+                    EARLY_USED_BYTES.store(used, Ordering::Release);
+                    HEAP_PEAK_USED_BYTES.fetch_max(used, Ordering::Relaxed);
+                    ptr.as_ptr()
+                }
+                Err(_) => core::ptr::null_mut(),
+            })
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        ALLOCATOR
-            .lock()
-            .deallocate(NonNull::new_unchecked(ptr), layout);
+        if layout.size() == 0 {
+            return;
+        }
+        let addr = ptr as usize;
+        let early_base = HEAP_BASE.load(Ordering::Acquire);
+        let early_end = early_base.saturating_add(NORMAL_HEAP_SIZE_BYTES);
+        if addr >= early_base && addr < early_end {
+            with_early_allocator_lock(|heap| {
+                heap.deallocate(NonNull::new_unchecked(ptr), layout);
+                let used = NORMAL_HEAP_SIZE_BYTES.saturating_sub(heap.free());
+                EARLY_USED_BYTES.store(used, Ordering::Release);
+            });
+        } else {
+            crate::slab::dealloc(ptr, layout);
+        }
     }
 }
 
+#[cfg_attr(feature = "host_harness", allow(dead_code))]
 #[cfg_attr(not(feature = "host_harness"), global_allocator)]
 static GLOBAL_HEAP: InstrumentedKernelHeap = InstrumentedKernelHeap;
 
@@ -345,6 +395,50 @@ pub const EMERGENCY_HEAP_SIZE_BYTES: usize = 64 * 1024;
 /// arena.  Both sizes are page multiples so the split cannot create an
 /// alignment-dependent overlap.
 pub const NORMAL_HEAP_SIZE_BYTES: usize = HEAP_SIZE_BYTES - EMERGENCY_HEAP_SIZE_BYTES;
+
+/// N3.1b (`HEAP-SCALE`, #67): maximum runtime heap scaling multiplier
+/// (`128 * 2 MiB = 256 MiB` total kernel heap cap on `>= 16 GiB` systems).
+pub const MAX_HEAP_SCALE: usize = 128;
+
+/// Maximum runtime kernel heap byte ceiling (`256 MiB`).
+pub const MAX_RUNTIME_HEAP_SIZE_BYTES: usize = HEAP_SIZE_BYTES * MAX_HEAP_SCALE;
+
+/// Managed RAM increment per `2 MiB` heap scaling step (`1/64` of RAM).
+/// Yields `1x` (2 MiB) on `<=256 MiB`, `3x` (6 MiB) on `512 MiB`, `7x` (14 MiB)
+/// on `1 GiB`, `15x` (30 MiB) on `2 GiB`, `31x` (62 MiB) on `4 GiB`, and caps
+/// at `128x` (256 MiB) at `>= 16 GiB`.
+const HEAP_SCALE_RAM_STEP_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Pure RAM -> heap scale factor formula (`1..=MAX_HEAP_SCALE`).
+#[inline]
+pub const fn compute_heap_scale_for_ram(managed_bytes: u64) -> usize {
+    let raw = (managed_bytes / HEAP_SCALE_RAM_STEP_BYTES) as usize;
+    if raw < 1 {
+        1
+    } else if raw > MAX_HEAP_SCALE {
+        MAX_HEAP_SCALE
+    } else {
+        raw
+    }
+}
+
+/// Active runtime heap scale factor (`1..=MAX_HEAP_SCALE`).
+#[inline]
+pub fn heap_scale_factor() -> usize {
+    crate::heap_admission::admission_scale()
+}
+
+/// Runtime total kernel heap capacity (normal + emergency), scaled from RAM.
+#[inline]
+pub fn runtime_heap_size_bytes() -> usize {
+    HEAP_SIZE_BYTES * heap_scale_factor()
+}
+
+/// Runtime normal kernel heap capacity (excluding the 64 KiB emergency arena).
+#[inline]
+pub fn runtime_normal_heap_size_bytes() -> usize {
+    runtime_heap_size_bytes() - EMERGENCY_HEAP_SIZE_BYTES
+}
 
 const _: () = assert!(EMERGENCY_HEAP_SIZE_BYTES >= 16 * 1024);
 const _: () = assert!(EMERGENCY_HEAP_SIZE_BYTES < HEAP_SIZE_BYTES);
@@ -616,6 +710,8 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         total_managed_bytes / (1024 * 1024)
     );
 
+    activate_scaled_slab_heap(total_managed_bytes);
+
     // 运行自测（可选）
     #[cfg(debug_assertions)]
     {
@@ -708,6 +804,8 @@ pub fn init() {
         fallback_pages,
     );
 
+    activate_scaled_slab_heap(FALLBACK_PHYS_MEM_SIZE as u64);
+
     // 运行自测（可选）
     #[cfg(debug_assertions)]
     {
@@ -721,6 +819,24 @@ pub fn init() {
 // ============================================================================
 // Partial KASLR: Heap Base Randomization
 // ============================================================================
+
+/// N3.1b (`HEAP-SCALE`, #67): scale kernel heap admission ceilings from total
+/// managed physical RAM and activate the buddy-backed slab + large-page heap.
+fn activate_scaled_slab_heap(total_managed_bytes: u64) {
+    let scale = compute_heap_scale_for_ram(total_managed_bytes);
+    crate::heap_admission::configure_for_scale(scale);
+    let runtime_total = runtime_heap_size_bytes();
+    let runtime_normal = runtime_normal_heap_size_bytes();
+    let runtime_admitted = crate::heap_admission::runtime_admitted_heap_bytes();
+    crate::slab::activate(runtime_normal);
+    klog_always!(
+        "N3.1b: Buddy-backed slab heap active: total={} MiB (scale={}x, normal={} KiB, admitted={} KiB)",
+        runtime_total / (1024 * 1024),
+        scale,
+        runtime_normal / 1024,
+        runtime_admitted / 1024
+    );
+}
 
 /// Initialize the heap allocator at a pre-selected address.
 ///
@@ -1767,24 +1883,39 @@ impl FrameAllocator {
             free_physical_pages: buddy_stats.free_pages,
             used_physical_pages: buddy_stats.used_pages,
             fragmentation_percent: (buddy_stats.fragmentation * 100.0) as u32,
-            heap_used_bytes: (NORMAL_HEAP_SIZE_BYTES - ALLOCATOR.lock().free())
-                + (EMERGENCY_HEAP_SIZE_BYTES - EMERGENCY_ALLOCATOR.lock().free()),
-            heap_total_bytes: HEAP_SIZE,
+            heap_used_bytes: heap_used_bytes()
+                + (EMERGENCY_HEAP_SIZE_BYTES - emergency_heap_free_bytes()),
+            heap_total_bytes: runtime_heap_size_bytes(),
         }
     }
 }
 
-/// R178-11: current free bytes in the kernel heap (`linked_list_allocator`).
-///
-/// Leaf call: locks `ALLOCATOR` only to read `free()` and releases immediately —
-/// the same lock every allocation already takes (and that `get_memory_stats`
-/// above reads at line ~834), so it adds no new lock-ordering hazard. Used by
-/// the page cache to refuse a metadata allocation before it can drive the
-/// 1 MiB heap to `handle_alloc_error`. Returns TOTAL free bytes, not the
-/// largest contiguous run — a necessary-not-sufficient headroom check.
+/// N3.1b: Live used bytes across the normal kernel heap (early boot arena +
+/// buddy-backed slab and large-page allocations). Lock-free.
+#[inline]
+pub fn heap_used_bytes() -> usize {
+    EARLY_USED_BYTES
+        .load(Ordering::Acquire)
+        .saturating_add(crate::slab::live_bytes())
+}
+
+/// R178-11 / N3.1b: remaining normal-arena heap headroom within the runtime
+/// RAM-scaled heap capacity (`runtime_normal_heap_size_bytes() - heap_used_bytes()`).
 #[inline]
 pub fn heap_free_bytes() -> usize {
-    ALLOCATOR.lock().free()
+    runtime_normal_heap_size_bytes().saturating_sub(heap_used_bytes())
+}
+
+/// N3.1b: observability snapshot of the buddy-backed slab allocator.
+#[inline]
+pub fn slab_stats() -> crate::slab::SlabStats {
+    crate::slab::stats()
+}
+
+/// N3.1b: flush cached empty slab pages back to the buddy allocator.
+#[inline]
+pub fn reclaim_slab_caches() -> usize {
+    crate::slab::reclaim_empty_slabs()
 }
 
 /// D1-RES R4: monotone peak of normal-arena USED bytes since allocator init.
@@ -1828,9 +1959,42 @@ pub fn run_emergency_heap_self_test() {
         .checked_add(HEAP_SIZE_BYTES)
         .expect("heap end overflow");
 
-    assert!(normal_ptr >= heap_base() && normal_ptr < emergency_base);
+    let in_early_normal = normal_ptr >= heap_base() && normal_ptr < emergency_base;
+    let dm_base = PHYSICAL_MEMORY_OFFSET as usize;
+    let dm_end = dm_base.saturating_add(direct_map_limit() as usize);
+    let in_slab_direct_map = normal_ptr >= dm_base && normal_ptr < dm_end;
+    assert!(
+        in_early_normal || in_slab_direct_map,
+        "normal allocation 0x{:x} outside early normal heap and PML4[273] slab arena",
+        normal_ptr
+    );
+    assert!(
+        !(normal_ptr >= emergency_base && normal_ptr < heap_end),
+        "normal allocation must never enter the isolated emergency arena"
+    );
     assert!(emergency_ptr >= emergency_base && emergency_ptr < heap_end);
     assert_ne!(normal_ptr, emergency_ptr);
+
+    // N3.1b: verify buddy-backed slab allocator is active and exercises both
+    // small-object slab and large-page buddy paths cleanly.
+    if crate::slab::is_active() {
+        assert!(
+            in_slab_direct_map,
+            "active buddy-backed slab must serve post-boot allocations via PML4[273]"
+        );
+        let large: alloc::vec::Vec<u8> = {
+            let mut v = alloc::vec::Vec::new();
+            v.try_reserve_exact(8192)
+                .expect("N3.1b large-page slab self-test allocation");
+            v.resize(8192, 0xA5);
+            v
+        };
+        let large_ptr = large.as_ptr() as usize;
+        assert!(large_ptr >= dm_base && large_ptr < dm_end);
+        assert_eq!(large[0], 0xA5);
+        assert_eq!(large[8191], 0xA5);
+        drop(large);
+    }
 
     drop(emergency);
     drop(normal);
@@ -1911,10 +2075,10 @@ pub fn heap_base() -> usize {
     HEAP_BASE.load(Ordering::SeqCst)
 }
 
-/// Return the heap size in bytes.
+/// Return the runtime kernel heap size in bytes (scaled from managed RAM).
 #[inline]
 pub fn heap_size() -> usize {
-    HEAP_SIZE
+    runtime_heap_size_bytes()
 }
 
 /// Check if the heap was successfully randomized using early entropy.

@@ -341,21 +341,27 @@ pub const fn hard_floors_sum_bytes() -> usize {
     HARD_FLOORS_SUM_BYTES
 }
 
-/// Residual for non-registered general use.
+/// Residual for non-registered general use (compile-time 1x baseline).
 #[inline]
 pub const fn general_residual_bytes() -> usize {
     GENERAL_RESIDUAL_BYTES
 }
 
-/// Full snapshot.
+/// N3.1b: runtime RAM-scaled residual for non-registered general use.
+#[inline]
+pub fn runtime_general_residual_bytes() -> usize {
+    heap_admission::runtime_admitted_heap_bytes()
+}
+
+/// Full snapshot (reflecting the runtime RAM-scaled heap capacity).
 #[inline]
 pub fn snapshot() -> HeapBudgetSnapshot {
     HeapBudgetSnapshot {
-        heap_total_bytes: HEAP_SIZE_BYTES,
+        heap_total_bytes: crate::memory::runtime_heap_size_bytes(),
         hard_floors_sum_bytes: HARD_FLOORS_SUM_BYTES,
         reserved_headroom_bytes: RESERVED_HEADROOM_BYTES,
         transient_peak_bytes: TRANSIENT_PEAK_BYTES,
-        general_residual_bytes: GENERAL_RESIDUAL_BYTES,
+        general_residual_bytes: heap_admission::runtime_admitted_heap_bytes(),
         published: BUDGETS_PUBLISHED.load(Ordering::Acquire),
     }
 }
@@ -382,7 +388,9 @@ pub fn is_published() -> bool {
 /// size. This is intentional fail-closed policy: shipping an over-committed
 /// budget table is a configuration bug, not a recoverable runtime condition.
 pub fn publish_and_assert() {
-    let heap = HEAP_SIZE_BYTES;
+    let heap = crate::memory::runtime_heap_size_bytes();
+    let normal = crate::memory::runtime_normal_heap_size_bytes();
+    let admitted = heap_admission::runtime_admitted_heap_bytes();
     let hard = HARD_FLOORS_SUM_BYTES;
     let head = RESERVED_HEADROOM_BYTES;
     let peak = TRANSIENT_PEAK_BYTES;
@@ -395,14 +403,11 @@ pub fn publish_and_assert() {
         heap
     );
     assert_eq!(
-        hard + NORMAL_UNADMITTED_RESERVE_BYTES + ADMITTED_HEAP_BYTES,
-        NORMAL_HEAP_SIZE_BYTES,
+        hard + NORMAL_UNADMITTED_RESERVE_BYTES + admitted,
+        normal,
         "R180 normal-arena partition mismatch"
     );
-    assert!(
-        peak <= ADMITTED_HEAP_BYTES,
-        "exec peak exceeds admitted pool"
-    );
+    assert!(peak <= admitted, "exec peak exceeds admitted pool");
 
     // Per-slot positivity (defensive against a zeroed table entry).
     let mut i = 0;
@@ -420,12 +425,13 @@ pub fn publish_and_assert() {
     BUDGETS_PUBLISHED.store(true, Ordering::Release);
 
     klog_always!(
-        "Heap budget arbiter: heap={} KiB hard_sum={} KiB headroom={} KiB peak={} KiB residual={} KiB",
+        "Heap budget arbiter: heap={} KiB (scale={}x) hard_sum={} KiB headroom={} KiB peak={} KiB residual={} KiB",
         heap / 1024,
+        crate::memory::heap_scale_factor(),
         hard / 1024,
         head / 1024,
         peak / 1024,
-        GENERAL_RESIDUAL_BYTES / 1024
+        admitted / 1024
     );
     let mut i = 0;
     while i < HARD_FLOOR_COUNT {
@@ -517,17 +523,25 @@ pub fn run_heap_budget_self_test() {
     drop(g2);
     assert_eq!(transient_peak_holders(), 0);
     // 5) Residual arithmetic is consistent with the published snapshot shape.
+    let runtime_heap = crate::memory::runtime_heap_size_bytes();
+    let runtime_normal = crate::memory::runtime_normal_heap_size_bytes();
+    let runtime_admitted = heap_admission::runtime_admitted_heap_bytes();
     let snap = snapshot();
-    assert_eq!(snap.heap_total_bytes, HEAP_SIZE_BYTES);
+    assert_eq!(snap.heap_total_bytes, runtime_heap);
     assert_eq!(snap.hard_floors_sum_bytes, HARD_FLOORS_SUM_BYTES);
     assert_eq!(snap.reserved_headroom_bytes, RESERVED_HEADROOM_BYTES);
     assert_eq!(snap.transient_peak_bytes, TRANSIENT_PEAK_BYTES);
-    assert_eq!(snap.general_residual_bytes, GENERAL_RESIDUAL_BYTES);
-    // 6) Re-check the normal-arena partition.
+    assert_eq!(snap.general_residual_bytes, runtime_admitted);
+    // 6) Re-check the normal-arena partition (both 1x baseline and runtime scaled).
     assert_eq!(
         HARD_FLOORS_SUM_BYTES + NORMAL_UNADMITTED_RESERVE_BYTES + GENERAL_RESIDUAL_BYTES,
         NORMAL_HEAP_SIZE_BYTES,
-        "normal heap partition must be exact"
+        "baseline normal heap partition must be exact"
+    );
+    assert_eq!(
+        HARD_FLOORS_SUM_BYTES + NORMAL_UNADMITTED_RESERVE_BYTES + runtime_admitted,
+        runtime_normal,
+        "runtime normal heap partition must be exact"
     );
     // 7) Historical over-claim regression: the OLD fractions must NOT reappear
     //    as the live hard floors (class re-open guard).

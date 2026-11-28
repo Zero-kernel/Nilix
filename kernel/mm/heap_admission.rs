@@ -19,9 +19,11 @@
 use alloc::sync::Arc;
 use core::fmt;
 use core::mem::{align_of, size_of};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::memory::NORMAL_HEAP_SIZE_BYTES;
+use crate::memory::{
+    EMERGENCY_HEAP_SIZE_BYTES, HEAP_SIZE_BYTES, MAX_HEAP_SCALE, NORMAL_HEAP_SIZE_BYTES,
+};
 
 #[path = "heap_uid.rs"]
 mod uid;
@@ -46,6 +48,36 @@ const COUNTER_BITS: u32 = 32;
 const COUNTER_MASK: u64 = u32::MAX as u64;
 const _: () = assert!(ADMITTED_HEAP_BYTES > 0);
 const _: () = assert!(ADMITTED_HEAP_BYTES <= u32::MAX as usize);
+const _: () = assert!(HEAP_SIZE_BYTES * MAX_HEAP_SCALE <= u32::MAX as usize);
+
+/// N3.1b (`HEAP-SCALE`, #67): runtime heap scale factor derived from managed
+/// physical RAM (`1` at <=256 MiB, up to `MAX_HEAP_SCALE` at >=16 GiB).
+static ADMISSION_SCALE: AtomicUsize = AtomicUsize::new(1);
+
+/// Current runtime heap admission scale factor (`1..=MAX_HEAP_SCALE`).
+#[inline]
+pub fn admission_scale() -> usize {
+    ADMISSION_SCALE.load(Ordering::Acquire)
+}
+
+/// Runtime-admitted normal-heap byte pool for the discovered physical RAM size.
+/// Equals [`ADMITTED_HEAP_BYTES`] when `admission_scale() == 1`.
+#[inline]
+pub fn runtime_admitted_heap_bytes() -> usize {
+    let scale = admission_scale();
+    let normal = HEAP_SIZE_BYTES * scale - EMERGENCY_HEAP_SIZE_BYTES;
+    normal - NORMAL_UNADMITTED_RESERVE_BYTES - REGISTERED_FIXED_RESERVE_BYTES
+}
+
+/// Configure runtime global and class admission ceilings from the
+/// boot-discovered RAM scale. Per-owner and per-UID anti-DoS quotas remain
+/// pinned to their audited per-principal bounds so adding RAM increases
+/// multi-tenant concurrency without enlarging a single principal's blast radius.
+/// Called once during early single-threaded MM init before [`publish`].
+pub(crate) fn configure_for_scale(scale: usize) {
+    let clamped = scale.clamp(1, MAX_HEAP_SCALE);
+    ADMISSION_SCALE.store(clamped, Ordering::Release);
+}
 
 /// Ownership classes for runtime heap reservations.
 ///
@@ -161,6 +193,23 @@ impl HeapClass {
             Self::NetnsConfig => 512 * 1024,
             Self::Coverage => 256 * 1024,
         }
+    }
+
+    /// N3.1b: Runtime RAM-scaled ceiling for this class.
+    ///
+    /// `HeapClass::Futex` remains pinned to its audited 128 KiB hard floor
+    /// (which also sizes the static `FUTEX_ARC_CHARGES` table in `ipc`).
+    /// All other classes scale proportionally with `admission_scale()` while
+    /// never exceeding `runtime_admitted_heap_bytes()`.
+    #[inline]
+    pub fn runtime_limit_bytes(self) -> usize {
+        if self == Self::Futex {
+            return self.limit_bytes();
+        }
+        let scale = admission_scale();
+        self.limit_bytes()
+            .saturating_mul(scale)
+            .min(runtime_admitted_heap_bytes())
     }
 }
 
@@ -377,8 +426,12 @@ fn reserve_pair(class: HeapClass, bytes: usize) -> Result<(), HeapAdmissionError
     if bytes == 0 {
         return Ok(());
     }
-    add_reserved(&GLOBAL_STATE, bytes, ADMITTED_HEAP_BYTES)?;
-    match add_reserved(&CLASS_STATES[class.index()], bytes, class.limit_bytes()) {
+    add_reserved(&GLOBAL_STATE, bytes, runtime_admitted_heap_bytes())?;
+    match add_reserved(
+        &CLASS_STATES[class.index()],
+        bytes,
+        class.runtime_limit_bytes(),
+    ) {
         Ok(()) => Ok(()),
         Err(HeapAdmissionError::GlobalLimit) => {
             // The second gate is the class gate; retain a precise public error.
@@ -451,9 +504,12 @@ fn release_committed_pair(class: HeapClass, bytes: usize) -> Result<(), HeapAdmi
 
 /// Publish the runtime ledger after the normal and emergency arenas exist.
 pub(crate) fn publish() {
+    let normal = crate::memory::runtime_normal_heap_size_bytes();
     assert!(
-        REGISTERED_FIXED_RESERVE_BYTES + NORMAL_UNADMITTED_RESERVE_BYTES + ADMITTED_HEAP_BYTES
-            <= NORMAL_HEAP_SIZE_BYTES,
+        REGISTERED_FIXED_RESERVE_BYTES
+            + NORMAL_UNADMITTED_RESERVE_BYTES
+            + runtime_admitted_heap_bytes()
+            <= normal,
         "R180 heap admission partition exceeds normal arena"
     );
     PUBLISHED.store(true, Ordering::Release);
@@ -973,11 +1029,11 @@ fn snapshot_cell(cell: &AtomicU64, capacity_bytes: usize) -> HeapAdmissionSnapsh
 }
 
 pub fn snapshot() -> HeapAdmissionSnapshot {
-    snapshot_cell(&GLOBAL_STATE, ADMITTED_HEAP_BYTES)
+    snapshot_cell(&GLOBAL_STATE, runtime_admitted_heap_bytes())
 }
 
 pub fn class_snapshot(class: HeapClass) -> HeapAdmissionSnapshot {
-    snapshot_cell(&CLASS_STATES[class.index()], class.limit_bytes())
+    snapshot_cell(&CLASS_STATES[class.index()], class.runtime_limit_bytes())
 }
 
 const ALLOCATOR_LINK_SLACK: usize = 2 * size_of::<usize>();
@@ -1081,8 +1137,11 @@ pub fn run_heap_admission_self_test() {
     );
 
     assert_eq!(
-        try_reserve(HeapClass::Device, HeapClass::Device.limit_bytes() + 1)
-            .expect_err("class over-limit must fail"),
+        try_reserve(
+            HeapClass::Device,
+            HeapClass::Device.runtime_limit_bytes() + 1
+        )
+        .expect_err("class over-limit must fail"),
         HeapAdmissionError::ClassLimit
     );
     assert_eq!(snapshot(), before);
@@ -1821,6 +1880,68 @@ mod tests {
         let _guard = super::TEST_LEDGER_LOCK.lock();
         super::publish();
         super::run_heap_admission_self_test();
+    }
+
+    #[test]
+    fn n3_1b_heap_scale_formula_and_runtime_budget_invariants() {
+        use crate::memory::{compute_heap_scale_for_ram, MAX_HEAP_SCALE};
+
+        // Verify RAM -> scale mapping from 64 MiB through 64 GiB.
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        assert_eq!(compute_heap_scale_for_ram(64 * MIB), 1);
+        assert_eq!(compute_heap_scale_for_ram(195 * MIB), 1);
+        assert_eq!(compute_heap_scale_for_ram(445 * MIB), 3);
+        assert_eq!(compute_heap_scale_for_ram(950 * MIB), 7);
+        assert_eq!(compute_heap_scale_for_ram(1983 * MIB), 15);
+        assert_eq!(compute_heap_scale_for_ram(4031 * MIB), 31);
+        assert_eq!(compute_heap_scale_for_ram(16 * GIB), MAX_HEAP_SCALE);
+        assert_eq!(compute_heap_scale_for_ram(64 * GIB), MAX_HEAP_SCALE);
+
+        // Verify runtime admission scaling under serialized ledger lock, then
+        // restore 1x baseline so sibling host tests observe unchanged defaults.
+        let _guard = super::TEST_LEDGER_LOCK.lock();
+        let restore_scale = super::admission_scale();
+        super::configure_for_scale(16);
+        super::publish();
+
+        let admitted_16x = super::runtime_admitted_heap_bytes();
+        assert_eq!(
+            admitted_16x,
+            16 * HEAP_SIZE_BYTES
+                - EMERGENCY_HEAP_SIZE_BYTES
+                - NORMAL_UNADMITTED_RESERVE_BYTES
+                - REGISTERED_FIXED_RESERVE_BYTES
+        );
+        // Futex stays fixed at its audited 128 KiB hard floor; other classes scale.
+        assert_eq!(
+            HeapClass::Futex.runtime_limit_bytes(),
+            HeapClass::Futex.limit_bytes()
+        );
+        assert_eq!(
+            HeapClass::CoreProcess.runtime_limit_bytes(),
+            HeapClass::CoreProcess.limit_bytes() * 16
+        );
+        // Per-principal anti-DoS ceilings remain pinned to their audited
+        // bounds while aggregate global & class capacity scales with RAM.
+        let owner = HeapOwner::try_new_for_uid(49999).expect("scaled owner");
+        assert_eq!(owner.snapshot().limit_bytes, OWNER_HEAP_BYTES);
+        assert_eq!(owner.uid_snapshot().unwrap().limit_bytes, UID_HEAP_BYTES);
+        assert!(matches!(
+            try_reserve_owned(HeapClass::BlockingIo, 1024 * 1024, Some(owner.clone())),
+            Err(HeapAdmissionError::OwnerLimit)
+        ));
+        drop(owner);
+
+        // Unowned/aggregate class reservations scale cleanly past the 1x class limit.
+        let big = try_reserve_owned(HeapClass::Vfs, 2 * 1024 * 1024, None)
+            .expect("2 MiB VFS reservation must fit under 16x scale");
+        drop(big);
+
+        // Run exhaustive boundary self-test at 16x scale!
+        super::run_heap_admission_boundary_self_test();
+
+        super::configure_for_scale(restore_scale);
     }
 }
 
