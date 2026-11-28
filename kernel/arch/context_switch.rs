@@ -439,53 +439,59 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
 ///   enter-half validates this and `ud2`s otherwise.
 /// - Must be called with the incoming address space already active and TSS RSP0 set
 ///   (the scheduler does both before calling), interrupts disabled by the caller.
+/// - When `post_switch_tail` is `Some`, `next_kstack_top` must be the non-zero,
+///   mapped, unused top of the incoming task's private kernel stack.
 #[unsafe(naked)]
-pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const Context) {
+pub unsafe extern "C" fn switch_to_user(
+    _old_ctx: *mut Context,
+    _new_ctx: *const Context,
+    _next_kstack_top: u64,
+    _post_switch_tail: Option<extern "C" fn()>,
+) {
     core::arch::naked_asm!(
-        // ================= SAVE-HALF (byte-identical to switch_context) =================
-        // rdi = old_ctx, rsi = new_ctx on entry.
+        // ================= SAVE-HALF (byte-identical semantics to switch_context) =================
+        // rdi = old_ctx, rsi = new_ctx, rdx = next_kstack_top, rcx = post_switch_tail on entry.
+        // Preserve rsi, rdx, and rcx across the save-half so the post-switch tail
+        // can switch onto `next_kstack_top` and invoke `post_switch_tail()` after
+        // `old_ctx` is completely saved.
         "pushfq",
         "pop qword ptr [rdi + 0x88]",  // save RFLAGS to old_ctx before cli
         "cli",
-        "mov [rdi + 0x10], rcx",       // save rcx (before clobbering as base)
-        "mov [rdi + 0x18], rdx",       // save rdx
-        "mov rdx, rdi",                // rdx = old_ctx base
-        "mov rcx, rsi",                // rcx = new_ctx base
-        "mov [rdx + 0x00], rax",
-        "mov [rdx + 0x08], rbx",
-        "xor rax, rax",
-        "mov [rdx + 0x20], rax",       // rsi = 0 (caller-saved)
-        "mov [rdx + 0x28], rax",       // rdi = 0 (caller-saved)
-        "mov [rdx + 0x30], rbp",
+        "mov [rdi + 0x00], rax",
+        "mov [rdi + 0x08], rbx",
+        "mov [rdi + 0x10], rcx",
+        "mov [rdi + 0x18], rdx",
+        "xor eax, eax",
+        "mov [rdi + 0x20], rax",       // rsi = 0 (caller-saved)
+        "mov [rdi + 0x28], rax",       // rdi = 0 (caller-saved)
+        "mov [rdi + 0x30], rbp",
         // ST-K3 FIX (off-by-8 resume): as-if-returned rsp — see the matching
-        // comment in switch_context's save-half. rax is 0 here (Z-5 zeroing
-        // above) — free as scratch. Keeps the save-half byte-identical to
-        // switch_context's.
+        // comment in switch_context's save-half.
         "lea rax, [rsp + 8]",
-        "mov [rdx + 0x38], rax",
-        "mov [rdx + 0x40], r8",
-        "mov [rdx + 0x48], r9",
-        "mov [rdx + 0x50], r10",
-        "mov [rdx + 0x58], r11",
-        "mov [rdx + 0x60], r12",
-        "mov [rdx + 0x68], r13",
-        "mov [rdx + 0x70], r14",
-        "mov [rdx + 0x78], r15",
+        "mov [rdi + 0x38], rax",
+        "mov [rdi + 0x40], r8",
+        "mov [rdi + 0x48], r9",
+        "mov [rdi + 0x50], r10",
+        "mov [rdi + 0x58], r11",
+        "mov [rdi + 0x60], r12",
+        "mov [rdi + 0x68], r13",
+        "mov [rdi + 0x70], r14",
+        "mov [rdi + 0x78], r15",
         // REAL kernel return rip = the instruction after `call switch_to_user`.
         "mov rax, [rsp]",
-        "mov [rdx + 0x80], rax",
+        "mov [rdi + 0x80], rax",
         // Truthful kernel segments (this runs in Ring 0).
         // ST-K3 FIX (F5): zero rax first — see the matching comment in
-        // switch_context's save-half (keeps the halves byte-identical).
+        // switch_context's save-half.
         "xor eax, eax",
         "mov ax, cs",
-        "mov [rdx + 0x90], rax",
+        "mov [rdi + 0x90], rax",
         "mov ax, ss",
-        "mov [rdx + 0x98], rax",
+        "mov [rdi + 0x98], rax",
         // ST-K3 DIAG/HARDEN: same saved-rip canonicality trap as switch_context
         // (see comment there) — the outgoing kernel context must resume at a
         // canonical-high kernel address.
-        "mov rax, [rdx + 0x80]",
+        "mov rax, [rdi + 0x80]",
         "shr rax, 47",
         "cmp rax, 0x1ffff",
         "je 6f",
@@ -495,6 +501,9 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "mov qword ptr gs:[{percpu_syscall_active}], 0",
         "mov qword ptr gs:[{percpu_frame_ptr}], 0",
         // Lazy-FPU: arm #NM for the incoming task (skip CR0 write if TS already set).
+        // Unlike `enter_usermode` (boot-only, CR0.TS=0), `switch_to_user` leaves
+        // CR0.TS=1 armed so FPU/SSE state is restored lazily on first Ring-3 use
+        // without triggering a spurious Ring-0 #NM trap with IF=0.
         "mov rax, cr0",
         "test rax, {cr0_ts}",
         "jnz 8f",
@@ -514,9 +523,26 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "mov qword ptr gs:[{percpu_dr_dirty}], 0",
         "9:",
 
-        // ================= ENTER-HALF (byte-identical to enter_usermode) =================
+        // ================= POST-SWITCH TAIL (Linux schedule_tail model) =================
+        // `old_ctx` is now completely saved. Switch onto `next`'s private kernel
+        // stack (`rdx`) before invoking `post_switch_tail` (`rcx`) so the outgoing
+        // task's kernel stack is off-CPU before its `on_cpu` gate clears and its
+        // blocked reaper/parent is woken immediately (instead of stalling until the
+        // new Ring-3 child's next syscall or timer tick).
+        "mov r12, rsi",                // callee-saved: preserve new_ctx across call
+        "test rdx, rdx",
+        "jz 7f",
+        "mov rsp, rdx",
+        "and rsp, -16",
+        "xor ebp, ebp",
+        "test rcx, rcx",
+        "jz 7f",
+        "call rcx",
+        "7:",
+
+        // ================= ENTER-HALF =================
         // Point rdi at new_ctx for the enter-half (which dereferences [rdi + ...]).
-        "mov rdi, rcx",
+        "mov rdi, r12",
         // Validate user RIP canonical + low-half.
         "mov rax, [rdi + 0x80]",
         "mov rcx, rax",
@@ -541,7 +567,6 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "or  rax, {rflags_if}",
         "mov r15, rax",
         "cli",
-        "fxrstor64 [rdi + {fxoff}]",
         // Restore general registers (RSP via IRETQ frame).
         "mov rax, [rdi + 0x00]",
         "mov rbx, [rdi + 0x08]",
@@ -583,7 +608,6 @@ pub unsafe extern "C" fn switch_to_user(_old_ctx: *mut Context, _new_ctx: *const
         "ud2",
 
         cr0_ts = const 0x8u64,
-        fxoff = const FXSAVE_OFFSET,
         rflags_if = const RFLAGS_IF,
         rflags_user_mask = const RFLAGS_USER_MASK,
         percpu_frame_ptr = const crate::syscall::PERCPU_FRAME_PTR_OFFSET,
