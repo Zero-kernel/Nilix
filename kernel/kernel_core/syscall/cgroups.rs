@@ -347,9 +347,13 @@ pub(super) fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     let pid = crate::process::current_pid().ok_or(SyscallError::ESRCH)?;
     let process = crate::process::get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    let (old_cgroup_id, memory_space) = {
+    let (old_cgroup_id, memory_space, mm_sole_owner) = {
         let proc = process.lock();
-        (proc.cgroup_id, proc.memory_space)
+        (
+            proc.cgroup_id,
+            proc.memory_space,
+            alloc::sync::Arc::strong_count(&proc.mm) == 1,
+        )
     };
 
     // R133-1 + R134-2 FIX: Snapshot host-mapped root, CAP_ADMIN, and host euid
@@ -377,7 +381,10 @@ pub(super) fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // deadlock. address_space_share_count() acquires PROCESS_TABLE then
     // iterates locking Process::inner — holding our Process::inner first
     // inverts the documented Level 5 ordering with create_process().
-    if memory_space != 0 && crate::process::address_space_share_count(memory_space) > 1 {
+    if memory_space != 0
+        && !mm_sole_owner
+        && crate::process::address_space_share_count(memory_space) > 1
+    {
         return Err(SyscallError::EBUSY);
     }
 

@@ -218,6 +218,10 @@ unsafe fn serial_outb(port: u16, val: u8) {
 #[cfg(test)]
 unsafe fn serial_outb(_port: u16, val: u8) {
     tests::PORT_LOG.lock().unwrap().push(val);
+    let inject_owner = tests::OUTB_LOCK_RING_FOR_OWNER.swap(NO_SERIAL_OWNER, Ordering::SeqCst);
+    if inject_owner != NO_SERIAL_OWNER {
+        SERIAL_OWNER_CPU.store(inject_owner, Ordering::SeqCst);
+    }
 }
 
 /// Enable or disable COM1 TX-empty interrupts (`IER` bit 1, keeping RX bit 0).
@@ -363,6 +367,26 @@ pub(crate) fn with_display<R>(f: impl FnOnce() -> R) -> Option<R> {
     Some(result)
 }
 
+/// Non-blocking counterpart to [`with_display`] for opportunistic 60 Hz
+/// framebuffer flushes and panic paths that must never spin on contention.
+pub(crate) fn try_with_display<R>(f: impl FnOnce() -> R) -> Option<R> {
+    let owner = console_owner_token();
+    if DISPLAY_OWNER_CPU
+        .compare_exchange(
+            NO_DISPLAY_OWNER,
+            owner,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    let result = f();
+    DISPLAY_OWNER_CPU.store(NO_DISPLAY_OWNER, Ordering::Release);
+    Some(result)
+}
+
 /// The calling context's owner token for the display and serial locks: its
 /// registered logical CPU, or the shared token before registration.
 #[inline]
@@ -471,8 +495,19 @@ const SERIAL_CHUNK: usize = 256;
 
 const NO_SERIAL_OWNER: usize = usize::MAX;
 
-/// TD-SERIAL-1 FIX: the serial lock and its owner in one word (the R190-7
-/// shape): `NO_SERIAL_OWNER`, or the owner token of the writing context.
+/// Outer UART hardware I/O lock (COM1 port `0x3F8`..`0x3FD`: `THR`, `IER`, `LSR`).
+///
+/// Strict acyclic lock order: `SERIAL_UART_OWNER` -> `SERIAL_OWNER_CPU`.
+/// Separating UART port I/O (`SERIAL_UART_OWNER`) from the RAM TX ring lock
+/// (`SERIAL_OWNER_CPU`) ensures `serial_emit()` in async mode only holds
+/// `SERIAL_OWNER_CPU` for a sub-microsecond RAM copy and never spins on
+/// IRQ4's slow `outb` loop.
+static SERIAL_UART_OWNER: AtomicUsize = AtomicUsize::new(NO_SERIAL_OWNER);
+
+/// TD-SERIAL-1 FIX: the serial RAM ring & line-state lock and its owner in one
+/// word (the R190-7 shape): `NO_SERIAL_OWNER`, or the owner token of the
+/// holding context. Held only for pure-RAM ring/state updates (never across
+/// UART port I/O in async/flush/IRQ4 paths).
 static SERIAL_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_SERIAL_OWNER);
 
 /// Line state on the UART: the stream whose last chunk did not end with a
@@ -519,6 +554,13 @@ static SERIAL_TX_IRQ_DEFERRED: AtomicBool = AtomicBool::new(false);
 /// the next BSP timer tick to immediately pulse `IER` for recovery.
 static SERIAL_TX_MISSED_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Set when `serial_tx_irq_drain(true)` (explicit LAPIC yield) could not
+/// acquire `SERIAL_OWNER_CPU` to record `ring.tx_irq_deferred` /
+/// `ring.defer_quiet_ticks`. Absorbed into `SerialTxRing` on the very next
+/// `SERIAL_OWNER_CPU` acquisition so producers and the first timer tick preserve
+/// the mandatory LAPIC quiet interval.
+static SERIAL_TX_YIELD_DEFER_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Monotonic drain progress counter updated under `SERIAL_OWNER_CPU` whenever
 /// bytes leave `SERIAL_TX_RING` to the UART (used by the BSP timer backstop).
 static SERIAL_TX_DRAIN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -526,6 +568,86 @@ static SERIAL_TX_DRAIN_SEQ: AtomicU64 = AtomicU64::new(0);
 /// BSP timer-tick backstop state (accessed only on CPU 0 in timer IRQ).
 static SERIAL_TX_LAST_TICK_PENDING: AtomicBool = AtomicBool::new(false);
 static SERIAL_TX_LAST_TICK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Strict FIFO ticket queue for async TX ring backpressure.
+///
+/// Whenever `BACKPRESSURE_NEXT_TICKET != BACKPRESSURE_SERVING_TICKET`, at
+/// least one writer is waiting in backpressure; fast-path async producers
+/// refrain from bypassing into `SERIAL_TX_RING` and join the FIFO queue so
+/// older (e.g. 256-byte) waiters can never be starved by repeated short writes.
+static BACKPRESSURE_NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+static BACKPRESSURE_SERVING_TICKET: AtomicU64 = AtomicU64::new(1);
+
+/// Per-CPU re-entrancy bitmap for active backpressure ticket holders (CPUs 0..63),
+/// plus a fallback flag for unregistered contexts. Prevents an NMI/exception
+/// interrupting a CPU already waiting for a backpressure turn from taking a
+/// second ticket behind itself and self-deadlocking.
+#[cfg(not(test))]
+static BACKPRESSURE_OWNER_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(test))]
+static BACKPRESSURE_UNREGISTERED_OWNER: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn backpressure_queue_active_with(
+    read_serving: impl FnOnce() -> u64,
+    read_next: impl FnOnce() -> u64,
+) -> bool {
+    // Read `SERVING` BEFORE `NEXT`: because `NEXT` is monotonically
+    // non-decreasing and `SERVING <= NEXT`, reading `SERVING` first guarantees
+    // `next >= next(t_serving) > serving` across any concurrent ticket issue
+    // and turn handoff while the queue remains non-empty.
+    let serving = read_serving();
+    let next = read_next();
+    serving != next
+}
+
+#[inline]
+fn backpressure_queue_active() -> bool {
+    backpressure_queue_active_with(
+        || BACKPRESSURE_SERVING_TICKET.load(Ordering::SeqCst),
+        || BACKPRESSURE_NEXT_TICKET.load(Ordering::SeqCst),
+    )
+}
+
+#[cfg(not(test))]
+#[inline]
+fn try_enter_backpressure_owner(owner: usize) -> bool {
+    if owner < 64 {
+        let bit = 1u64 << owner;
+        (BACKPRESSURE_OWNER_MASK.fetch_or(bit, Ordering::AcqRel) & bit) == 0
+    } else {
+        !BACKPRESSURE_UNREGISTERED_OWNER.swap(true, Ordering::AcqRel)
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn leave_backpressure_owner(owner: usize) {
+    if owner < 64 {
+        BACKPRESSURE_OWNER_MASK.fetch_and(!(1u64 << owner), Ordering::Release);
+    } else {
+        BACKPRESSURE_UNREGISTERED_OWNER.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn try_enter_backpressure_owner(_owner: usize) -> bool {
+    tests::BP_IN_WAIT.with(|flag| {
+        if flag.get() {
+            false
+        } else {
+            flag.set(true);
+            true
+        }
+    })
+}
+
+#[cfg(test)]
+#[inline]
+fn leave_backpressure_owner(_owner: usize) {
+    tests::BP_IN_WAIT.with(|flag| flag.set(false));
+}
 
 /// Fixed-size FIFO ring buffer for IRQ4-driven COM1 transmission.
 ///
@@ -636,11 +758,47 @@ impl SerialTxRing {
         self.consecutive_bursts = 0;
         SERIAL_TX_IRQ_ARMED.store(false, Ordering::Release);
         SERIAL_TX_IRQ_DEFERRED.store(false, Ordering::Release);
+        SERIAL_TX_YIELD_DEFER_PENDING.store(false, Ordering::Release);
         unsafe { serial_set_tx_irq(false) };
+    }
+
+    /// Absorb any LAPIC yield deferral recorded while `SERIAL_OWNER_CPU` was
+    /// contended during `serial_tx_irq_drain(true)`.
+    #[inline]
+    fn apply_pending_yield_deferral(&mut self) {
+        if SERIAL_TX_YIELD_DEFER_PENDING.swap(false, Ordering::AcqRel) {
+            self.tx_irq_armed = false;
+            self.tx_irq_deferred = true;
+            self.defer_quiet_ticks = self.defer_quiet_ticks.max(1);
+            self.consecutive_bursts = 0;
+            SERIAL_TX_IRQ_ARMED.store(false, Ordering::Release);
+            SERIAL_TX_IRQ_DEFERRED.store(true, Ordering::Release);
+        }
+    }
+
+    /// Pop up to `max_len` oldest bytes into `dst` (pure RAM, no port I/O)
+    /// and update `SERIAL_TX_PENDING` / `SERIAL_TX_DRAIN_SEQ`.
+    fn pop_batch(&mut self, dst: &mut [u8], max_len: usize) -> usize {
+        let count = self.len.min(max_len).min(dst.len());
+        if count == 0 {
+            return 0;
+        }
+        let first = count.min(SERIAL_TX_BUF_CAP - self.head);
+        dst[..first].copy_from_slice(&self.buf[self.head..self.head + first]);
+        let rem = count - first;
+        if rem > 0 {
+            dst[first..count].copy_from_slice(&self.buf[..rem]);
+        }
+        self.head = (self.head + count) & SERIAL_TX_BUF_MASK;
+        self.len -= count;
+        self.drained_total = self.drained_total.wrapping_add(count as u64);
+        self.sync_pending_and_seq(count);
+        count
     }
 
     /// Drain up to `limit` oldest bytes in 16-byte FIFO batches, checking
     /// `LSR_THRE` before each batch and dequeuing only bytes actually accepted.
+    #[cfg(test)]
     fn drain_ready_up_to(&mut self, limit: usize) -> usize {
         let mut drained = 0usize;
         while drained < limit && self.len > 0 {
@@ -657,20 +815,6 @@ impl SerialTxRing {
         }
         self.sync_pending_and_seq(drained);
         drained
-    }
-
-    /// Bounded timeout fallback for broken/absent UART hardware when `THRE`
-    /// never asserts: force-submit up to `limit` bytes so callers retain
-    /// forward progress.
-    fn drain_unconditional_up_to(&mut self, limit: usize) -> usize {
-        let count = self.len.min(limit);
-        for _ in 0..count {
-            if let Some(byte) = self.pop_byte() {
-                unsafe { serial_outb(SERIAL_PORT, byte) };
-            }
-        }
-        self.sync_pending_and_seq(count);
-        count
     }
 
     /// Drain all queued bytes for panic (IF already masked permanently),
@@ -747,15 +891,165 @@ pub fn enable_serial_tx_irq() {
     SERIAL_TX_IRQ_READY.store(true, Ordering::Release);
 }
 
+/// Acquire `SERIAL_OWNER_CPU` while the caller already holds `SERIAL_UART_OWNER`
+/// with IRQs masked.
+///
+/// Strict lock order: `SERIAL_UART_OWNER` -> `SERIAL_OWNER_CPU`. Callers that
+/// hold `SERIAL_OWNER_CPU` without `SERIAL_UART_OWNER` execute only bounded
+/// pure-RAM operations (never UART I/O and never acquiring `SERIAL_UART_OWNER`),
+/// except `claim_serial_for_panic`, which sets `PANIC_CLAIM_STARTED` first.
+#[inline]
+fn acquire_ring_lock_under_uart(owner: usize) -> bool {
+    loop {
+        if PANIC_CLAIM_STARTED.load(Ordering::Acquire) {
+            return false;
+        }
+        match SERIAL_OWNER_CPU.compare_exchange_weak(
+            NO_SERIAL_OWNER,
+            owner,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(current) if current == owner => return false,
+            Err(_) => core::hint::spin_loop(),
+        }
+    }
+}
+
+/// Non-blocking acquisition of `SERIAL_OWNER_CPU` for IRQ4 and timer-kick
+/// contexts that must never spin with IRQs masked.
+#[inline]
+fn try_acquire_ring_lock(owner: usize) -> bool {
+    SERIAL_OWNER_CPU
+        .compare_exchange(NO_SERIAL_OWNER, owner, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Acquire `SERIAL_UART_OWNER` with IRQs masked, returning `SerialHold::Reentered`
+/// if the calling context already owns it (e.g. NMI/exception on the same CPU).
+fn acquire_uart_lock() -> (usize, bool, SerialHold) {
+    let mut irqs_enabled = irq_save_disable();
+    let owner = console_owner_token();
+    loop {
+        let current = SERIAL_UART_OWNER.load(Ordering::Relaxed);
+        if current == owner {
+            return (owner, irqs_enabled, SerialHold::Reentered);
+        }
+        if current == NO_SERIAL_OWNER
+            && SERIAL_UART_OWNER
+                .compare_exchange_weak(NO_SERIAL_OWNER, owner, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            return (owner, irqs_enabled, SerialHold::Locked);
+        }
+        irq_restore(irqs_enabled);
+        core::hint::spin_loop();
+        irqs_enabled = irq_save_disable();
+    }
+}
+
+/// Drain up to `limit` oldest bytes from `SERIAL_TX_RING` to COM1 while the
+/// caller holds `SERIAL_UART_OWNER` (with IRQs masked) and does NOT hold
+/// `SERIAL_OWNER_CPU`.
+///
+/// Acquires `SERIAL_OWNER_CPU` only for a sub-microsecond 16-byte RAM copy per
+/// FIFO batch and releases it before `serial_outb()`, so concurrent producers
+/// never block on UART port I/O.
+fn drain_ring_under_uart_blocking(owner: usize, limit: usize, force_on_not_ready: bool) -> usize {
+    let mut drained = 0usize;
+    let mut batch_buf = [0u8; SERIAL_TX_FIFO_DEPTH];
+
+    while drained < limit {
+        let ready = unsafe { serial_tx_ready() };
+        if !ready && (!force_on_not_ready || drained > 0) {
+            break;
+        }
+        if !acquire_ring_lock_under_uart(owner) {
+            break;
+        }
+        let max_take = SERIAL_TX_FIFO_DEPTH.min(limit - drained);
+        // SAFETY: `SERIAL_OWNER_CPU` is exclusively held with IRQs masked.
+        let batch_len =
+            unsafe { (&mut *SERIAL_TX_RING.0.get()).pop_batch(&mut batch_buf, max_take) };
+        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+
+        if batch_len == 0 {
+            break;
+        }
+        for &byte in &batch_buf[..batch_len] {
+            unsafe { serial_outb(SERIAL_PORT, byte) };
+        }
+        drained += batch_len;
+        if !ready {
+            // Bounded timeout fallback submits at most one FIFO batch per hold.
+            break;
+        }
+    }
+    drained
+}
+
+/// Arm COM1 TX-empty IRQ (`THRI`) after an async ring push observed
+/// `!tx_irq_armed && !tx_irq_deferred`.
+///
+/// Called AFTER releasing `SERIAL_OWNER_CPU` to preserve the strict lock order
+/// `SERIAL_UART_OWNER` -> `SERIAL_OWNER_CPU`. Non-blocking on `SERIAL_UART_OWNER`:
+/// if another CPU currently holds `SERIAL_UART_OWNER` (e.g. IRQ4 or flush), that
+/// holder will inspect `ring.len` under `SERIAL_OWNER_CPU` before releasing
+/// `SERIAL_UART_OWNER` (releasing `SERIAL_UART_OWNER` before `SERIAL_OWNER_CPU`).
+fn arm_serial_tx_irq_if_needed() {
+    let irqs_enabled = irq_save_disable();
+    let owner = console_owner_token();
+    if SERIAL_UART_OWNER
+        .compare_exchange(NO_SERIAL_OWNER, owner, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another CPU (or re-entered same CPU) holds `SERIAL_UART_OWNER`.
+        // Belt-and-suspenders: if TX IRQ is still unarmed and not deferred,
+        // flag the timer backstop in case the holder was unable to re-arm.
+        if SERIAL_TX_PENDING.load(Ordering::Acquire) > 0
+            && !SERIAL_TX_IRQ_ARMED.load(Ordering::Acquire)
+            && !SERIAL_TX_IRQ_DEFERRED.load(Ordering::Acquire)
+            && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
+        {
+            SERIAL_TX_MISSED_LOCK.store(true, Ordering::Release);
+        }
+        irq_restore(irqs_enabled);
+        return;
+    }
+
+    if acquire_ring_lock_under_uart(owner) {
+        // SAFETY: `SERIAL_UART_OWNER` and `SERIAL_OWNER_CPU` are both exclusively held.
+        let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+        ring.apply_pending_yield_deferral();
+        if SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
+            && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
+            && !ring.tx_irq_armed
+            && !ring.tx_irq_deferred
+            && ring.len > 0
+        {
+            ring.tx_irq_armed = true;
+            SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
+            unsafe { serial_set_tx_irq(true) };
+        }
+        SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+    } else {
+        SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+    }
+    irq_restore(irqs_enabled);
+}
+
 /// Drain up to `SERIAL_TX_IRQ_MAX_BURST` bytes from the TX ring in IRQ4 context.
 ///
 /// Called by `serial_interrupt_handler` (BSP, IRQs already masked by the
-/// interrupt gate). Uses a non-blocking lock acquisition so IRQ4 never spins
-/// with IF=0 under AP contention; if contended, flags `SERIAL_TX_MISSED_LOCK`
-/// for immediate timer-tick recovery. When `yield_to_lapic` is set or
-/// `SERIAL_TX_MAX_CONSECUTIVE_BURSTS` consecutive full bursts have run while
-/// bytes remain queued, enters deliberate deferral (`tx_irq_deferred = true`)
-/// and disarms `THRI` so AP producers cannot defeat the LAPIC service window.
+/// interrupt gate). Uses non-blocking lock acquisition on both
+/// `SERIAL_UART_OWNER` and `SERIAL_OWNER_CPU` so IRQ4 never spins with IF=0
+/// under AP contention, and releases `SERIAL_OWNER_CPU` before each 16-byte
+/// `serial_outb()` batch so AP writers in `serial_emit()` never wait on UART
+/// port I/O. At completion, releases `SERIAL_UART_OWNER` before
+/// `SERIAL_OWNER_CPU` so any producer that pushes after IRQ4's empty check sees
+/// `SERIAL_UART_OWNER` free to arm `THRI`.
 pub fn serial_tx_irq_drain(yield_to_lapic: bool) {
     if PANIC_CLAIM_STARTED.load(Ordering::Acquire) {
         unsafe { serial_set_tx_irq(false) };
@@ -763,12 +1057,10 @@ pub fn serial_tx_irq_drain(yield_to_lapic: bool) {
     }
 
     let owner = console_owner_token();
-    if SERIAL_OWNER_CPU
+    if SERIAL_UART_OWNER
         .compare_exchange(NO_SERIAL_OWNER, owner, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        // Another CPU holds `SERIAL_OWNER_CPU` (or same-CPU panic claim): do
-        // not spin with IF=0. Flag the BSP timer tick to re-pulse IER cleanly.
         if SERIAL_TX_PENDING.load(Ordering::Acquire) > 0
             && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
         {
@@ -779,57 +1071,149 @@ pub fn serial_tx_irq_drain(yield_to_lapic: bool) {
     SERIAL_TX_MISSED_LOCK.store(false, Ordering::Relaxed);
 
     let start = read_tsc();
-    let drained = {
+    let mut drained = 0usize;
+    let mut ring_contended = false;
+    let mut finalized = false;
+    let mut batch_buf = [0u8; SERIAL_TX_FIFO_DEPTH];
+
+    while drained < SERIAL_TX_IRQ_MAX_BURST {
+        if !unsafe { serial_tx_ready() } {
+            break;
+        }
+        if !try_acquire_ring_lock(owner) {
+            ring_contended = true;
+            break;
+        }
+        if PANIC_CLAIM_STARTED.load(Ordering::Acquire) {
+            unsafe { serial_set_tx_irq(false) };
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+            return;
+        }
         // SAFETY: `SERIAL_OWNER_CPU` is exclusively held with IRQs masked.
         let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
-        let drained = ring.drain_ready_up_to(SERIAL_TX_IRQ_MAX_BURST);
-        if ring.len == 0 {
-            if yield_to_lapic {
-                // Honor an explicit LAPIC yield even when the ring just emptied
-                // so an AP producer cannot immediately re-arm PIC ExtINT before
-                // the BSP returns from IRQ4 and services LAPIC vectors.
-                ring.tx_irq_armed = false;
-                ring.tx_irq_deferred = true;
-                ring.defer_quiet_ticks = 1;
-                ring.consecutive_bursts = 0;
-                SERIAL_TX_IRQ_ARMED.store(false, Ordering::Release);
-                SERIAL_TX_IRQ_DEFERRED.store(true, Ordering::Release);
-                unsafe { serial_set_tx_irq(false) };
-            } else if ring.tx_irq_armed {
-                ring.disarm_tx_irq_keep_deferral();
-            } else {
-                ring.consecutive_bursts = 0;
-            }
-        } else {
-            if drained >= SERIAL_TX_IRQ_MAX_BURST {
-                ring.consecutive_bursts = ring.consecutive_bursts.saturating_add(1);
-            } else {
-                ring.consecutive_bursts = 0;
-            }
-            // Honor explicit LAPIC yield regardless of burst size, or enforce
-            // deferral after `SERIAL_TX_MAX_CONSECUTIVE_BURSTS` full bursts.
-            let must_defer =
-                yield_to_lapic || ring.consecutive_bursts >= SERIAL_TX_MAX_CONSECUTIVE_BURSTS;
-            if must_defer {
-                ring.tx_irq_armed = false;
-                ring.tx_irq_deferred = true;
-                ring.defer_quiet_ticks = 1;
-                ring.consecutive_bursts = 0;
-                SERIAL_TX_IRQ_ARMED.store(false, Ordering::Release);
-                SERIAL_TX_IRQ_DEFERRED.store(true, Ordering::Release);
-                unsafe { serial_set_tx_irq(false) };
-            }
+        let max_take = SERIAL_TX_FIFO_DEPTH.min(SERIAL_TX_IRQ_MAX_BURST - drained);
+        let batch_len = ring.pop_batch(&mut batch_buf, max_take);
+        if batch_len == 0 {
+            // Ring is already empty; finalize while we already hold both locks.
+            finalize_irq_drain_locked(ring, drained, yield_to_lapic, start);
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+            finalized = true;
+            break;
         }
-        drained
-    };
-    let held = read_tsc().wrapping_sub(start);
+        // Release `SERIAL_OWNER_CPU` BEFORE `serial_outb()` so AP producers can
+        // push into the RAM ring concurrently while COM1 port I/O runs.
+        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+
+        for &byte in &batch_buf[..batch_len] {
+            unsafe { serial_outb(SERIAL_PORT, byte) };
+        }
+        drained += batch_len;
+    }
+
+    if finalized {
+        return;
+    }
+
+    if !ring_contended && try_acquire_ring_lock(owner) {
+        if PANIC_CLAIM_STARTED.load(Ordering::Acquire) {
+            unsafe { serial_set_tx_irq(false) };
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+            return;
+        }
+        // SAFETY: `SERIAL_UART_OWNER` and `SERIAL_OWNER_CPU` are exclusively held.
+        let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+        finalize_irq_drain_locked(ring, drained, yield_to_lapic, start);
+        // Release `SERIAL_UART_OWNER` BEFORE `SERIAL_OWNER_CPU` so any producer
+        // acquiring `SERIAL_OWNER_CPU` after our empty check is guaranteed to
+        // observe `SERIAL_UART_OWNER` released when arming `THRI`.
+        SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+        return;
+    }
+
+    // `SERIAL_OWNER_CPU` was briefly held by another CPU; do not spin in IRQ4.
+    if yield_to_lapic {
+        // Preserve the mandatory LAPIC quiet cooldown across contention:
+        // disarm hardware THRI now and latch `SERIAL_TX_YIELD_DEFER_PENDING` so
+        // concurrent producers cannot re-arm THRI and the next BSP timer tick
+        // enforces the quiet interval before re-enabling TX interrupts.
+        SERIAL_TX_IRQ_ARMED.store(false, Ordering::Release);
+        SERIAL_TX_IRQ_DEFERRED.store(true, Ordering::Release);
+        SERIAL_TX_YIELD_DEFER_PENDING.store(true, Ordering::Release);
+        unsafe { serial_set_tx_irq(false) };
+    } else if SERIAL_TX_PENDING.load(Ordering::Acquire) > 0
+        && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
+    {
+        SERIAL_TX_MISSED_LOCK.store(true, Ordering::Release);
+    }
+    SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+}
+
+/// Finalize `THRI` / LAPIC deferral state and `TD-SERIAL-1` stats at the end
+/// of `serial_tx_irq_drain()`. Caller must hold both `SERIAL_UART_OWNER` and
+/// `SERIAL_OWNER_CPU` with IRQs masked.
+fn finalize_irq_drain_locked(
+    ring: &mut SerialTxRing,
+    drained: usize,
+    yield_to_lapic: bool,
+    start: u64,
+) {
+    ring.apply_pending_yield_deferral();
+    if ring.len == 0 {
+        if yield_to_lapic {
+            // Honor an explicit LAPIC yield even when the ring just emptied
+            // so an AP producer cannot immediately re-arm PIC ExtINT before
+            // the BSP returns from IRQ4 and services LAPIC vectors.
+            ring.tx_irq_armed = false;
+            ring.tx_irq_deferred = true;
+            ring.defer_quiet_ticks = 1;
+            ring.consecutive_bursts = 0;
+            SERIAL_TX_IRQ_ARMED.store(false, Ordering::Release);
+            SERIAL_TX_IRQ_DEFERRED.store(true, Ordering::Release);
+            unsafe { serial_set_tx_irq(false) };
+        } else if ring.tx_irq_armed {
+            ring.disarm_tx_irq_keep_deferral();
+        } else {
+            ring.consecutive_bursts = 0;
+        }
+    } else {
+        if drained >= SERIAL_TX_IRQ_MAX_BURST {
+            ring.consecutive_bursts = ring.consecutive_bursts.saturating_add(1);
+        } else {
+            ring.consecutive_bursts = 0;
+        }
+        // Honor explicit LAPIC yield regardless of burst size, or enforce
+        // deferral after `SERIAL_TX_MAX_CONSECUTIVE_BURSTS` full bursts.
+        let must_defer =
+            yield_to_lapic || ring.consecutive_bursts >= SERIAL_TX_MAX_CONSECUTIVE_BURSTS;
+        if must_defer {
+            ring.tx_irq_armed = false;
+            ring.tx_irq_deferred = true;
+            ring.defer_quiet_ticks = 1;
+            ring.consecutive_bursts = 0;
+            SERIAL_TX_IRQ_ARMED.store(false, Ordering::Release);
+            SERIAL_TX_IRQ_DEFERRED.store(true, Ordering::Release);
+            unsafe { serial_set_tx_irq(false) };
+        } else if !ring.tx_irq_armed
+            && !ring.tx_irq_deferred
+            && SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
+        {
+            // An AP pushed new bytes while IRQ4 held `SERIAL_UART_OWNER` (or
+            // IRQ4 entered via RX while TX was idle): arm THRI now.
+            ring.tx_irq_armed = true;
+            SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
+            unsafe { serial_set_tx_irq(true) };
+        }
+    }
     if drained > 0 {
+        let held = read_tsc().wrapping_sub(start);
         // Bytes were already counted in `SERIAL_HOLD_BYTES` when enqueued;
         // still account for this IRQ-masked hold in max/total/bucket stats.
         record_serial_hold(held, drained, false);
     }
-
-    SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
 }
 
 /// BSP timer-tick deferral release & edge-triggered PIC IRQ4 recovery backstop.
@@ -872,34 +1256,40 @@ pub fn serial_tx_kick_if_pending() {
     }
 
     let owner = console_owner_token();
-    if SERIAL_OWNER_CPU
+    if SERIAL_UART_OWNER
         .compare_exchange(NO_SERIAL_OWNER, owner, Ordering::Acquire, Ordering::Relaxed)
         .is_ok()
     {
-        // SAFETY: `SERIAL_OWNER_CPU` is exclusively held with IRQs masked.
-        let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
-        SERIAL_TX_MISSED_LOCK.store(false, Ordering::Relaxed);
-        if ring.tx_irq_deferred && ring.defer_quiet_ticks > 0 {
-            // Preserve the quiet tick interval even when `ring.len == 0` so an
-            // AP write right after an empty-ring yield cannot defeat cooldown.
-            ring.defer_quiet_ticks -= 1;
-        } else if ring.len == 0 {
-            if ring.tx_irq_armed || ring.tx_irq_deferred {
-                ring.disarm_tx_irq_clear_deferral();
+        if try_acquire_ring_lock(owner) {
+            // SAFETY: `SERIAL_UART_OWNER` and `SERIAL_OWNER_CPU` are exclusively held.
+            let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+            ring.apply_pending_yield_deferral();
+            SERIAL_TX_MISSED_LOCK.store(false, Ordering::Relaxed);
+            if ring.tx_irq_deferred && ring.defer_quiet_ticks > 0 {
+                // Preserve the quiet tick interval even when `ring.len == 0` so an
+                // AP write right after an empty-ring yield cannot defeat cooldown.
+                ring.defer_quiet_ticks -= 1;
+            } else if ring.len == 0 {
+                if ring.tx_irq_armed || ring.tx_irq_deferred {
+                    ring.disarm_tx_irq_clear_deferral();
+                }
+            } else {
+                ring.tx_irq_deferred = false;
+                ring.defer_quiet_ticks = 0;
+                ring.tx_irq_armed = true;
+                SERIAL_TX_IRQ_DEFERRED.store(false, Ordering::Release);
+                SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
+                // Pulse IER 0x00 -> 0x03 so pending RX data cannot mask the rising
+                // edge on the edge-triggered 8259 PIC (RX FIFO data is preserved).
+                unsafe { serial_pulse_all_irqs_for_tx() };
+                SERIAL_TX_LAST_TICK_PENDING.store(true, Ordering::Relaxed);
+                SERIAL_TX_LAST_TICK_SEQ.store(seq, Ordering::Relaxed);
             }
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
         } else {
-            ring.tx_irq_deferred = false;
-            ring.defer_quiet_ticks = 0;
-            ring.tx_irq_armed = true;
-            SERIAL_TX_IRQ_DEFERRED.store(false, Ordering::Release);
-            SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
-            // Pulse IER 0x00 -> 0x03 so pending RX data cannot mask the rising
-            // edge on the edge-triggered 8259 PIC (RX FIFO data is preserved).
-            unsafe { serial_pulse_all_irqs_for_tx() };
-            SERIAL_TX_LAST_TICK_PENDING.store(true, Ordering::Relaxed);
-            SERIAL_TX_LAST_TICK_SEQ.store(seq, Ordering::Relaxed);
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
         }
-        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
     }
 }
 
@@ -916,14 +1306,17 @@ fn flush_serial_impl(stop_async: bool) {
     loop {
         let mut done = false;
         let mut made_progress = false;
-        let hold = with_serial(|_, locked| {
-            if !locked {
-                done = true;
-                return;
-            }
-            let start = read_tsc();
-            // SAFETY: `SERIAL_OWNER_CPU` is exclusively held with IRQs masked.
+        let (owner, irqs_enabled, hold) = acquire_uart_lock();
+        if hold == SerialHold::Reentered {
+            irq_restore(irqs_enabled);
+            break;
+        }
+        let start = read_tsc();
+
+        let chunk_limit = if acquire_ring_lock_under_uart(owner) {
+            // SAFETY: `SERIAL_UART_OWNER` and `SERIAL_OWNER_CPU` are exclusively held.
             let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+            ring.apply_pending_yield_deferral();
             if stop_async && SERIAL_TX_IRQ_READY.swap(false, Ordering::AcqRel) {
                 ring.disarm_tx_irq_clear_deferral();
             }
@@ -938,20 +1331,41 @@ fn flush_serial_impl(stop_async: bool) {
                     } else if ring.tx_irq_armed {
                         ring.disarm_tx_irq_keep_deferral();
                     }
+                } else if !stop_async
+                    && !ring.tx_irq_armed
+                    && !ring.tx_irq_deferred
+                    && SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
+                {
+                    ring.tx_irq_armed = true;
+                    SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
+                    unsafe { serial_set_tx_irq(true) };
                 }
-                done = true;
-                return;
+                SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+                irq_restore(irqs_enabled);
+                break;
             }
-            let chunk_limit = remaining_to_target.min(SERIAL_CHUNK);
-            let mut drained = ring.drain_ready_up_to(chunk_limit);
-            if drained == 0 && ready_wait_spins >= BACKPRESSURE_TX_READY_SPINS {
-                drained = ring.drain_unconditional_up_to(chunk_limit);
-            }
+            SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+            remaining_to_target.min(SERIAL_CHUNK)
+        } else {
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            irq_restore(irqs_enabled);
+            break;
+        };
+
+        let force = ready_wait_spins >= BACKPRESSURE_TX_READY_SPINS;
+        let drained = drain_ring_under_uart_blocking(owner, chunk_limit, force);
+
+        if acquire_ring_lock_under_uart(owner) {
+            // SAFETY: `SERIAL_UART_OWNER` and `SERIAL_OWNER_CPU` are exclusively held.
+            let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+            ring.apply_pending_yield_deferral();
             if drained > 0 {
                 made_progress = true;
                 let held = read_tsc().wrapping_sub(start);
                 record_serial_hold(held, drained, false);
             }
+            let target = target_watermark.unwrap_or(ring.enqueued_total);
             if watermark_remaining(target, ring.drained_total) == 0 || ring.len == 0 {
                 if ring.len == 0 {
                     if stop_async {
@@ -961,11 +1375,26 @@ fn flush_serial_impl(stop_async: bool) {
                     } else if ring.tx_irq_armed {
                         ring.disarm_tx_irq_keep_deferral();
                     }
+                } else if !stop_async
+                    && !ring.tx_irq_armed
+                    && !ring.tx_irq_deferred
+                    && SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
+                {
+                    ring.tx_irq_armed = true;
+                    SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
+                    unsafe { serial_set_tx_irq(true) };
                 }
                 done = true;
             }
-        });
-        if hold == SerialHold::Reentered || done {
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+        } else {
+            SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            done = true;
+        }
+        irq_restore(irqs_enabled);
+
+        if done {
             break;
         }
         if made_progress {
@@ -993,6 +1422,7 @@ fn flush_serial_impl(stop_async: bool) {
 /// enqueue watermark ensures concurrent writers on other CPUs cannot prevent
 /// PID 1 retirement from completing.
 pub fn flush_serial_sync() {
+    crate::framebuffer::flush_now();
     flush_serial_impl(false);
 }
 
@@ -1003,6 +1433,7 @@ pub fn flush_serial_sync() {
 /// for `LSR_TEMT` so the final byte leaves the shift register before power-off
 /// or reset.
 pub fn flush_serial_for_shutdown() {
+    crate::framebuffer::flush_now();
     flush_serial_impl(true);
 }
 
@@ -1071,9 +1502,6 @@ enum SerialHold {
 /// for good ([`claim_serial_for_panic`]).
 fn with_serial(write: impl FnOnce(usize, bool)) -> SerialHold {
     let mut irqs_enabled = irq_save_disable();
-    // Once per call: a kernel thread does not migrate inside a print (kernel
-    // mode is not preemptible), and the lookup is an LAPIC MMIO read that the
-    // waiters below must not repeat while a holder needs the port.
     let owner = console_owner_token();
     loop {
         let current = SERIAL_OWNER_CPU.load(Ordering::Relaxed);
@@ -1092,7 +1520,6 @@ fn with_serial(write: impl FnOnce(usize, bool)) -> SerialHold {
             irq_restore(irqs_enabled);
             return SerialHold::Locked;
         }
-        // Wait with the caller's IRQ state, then mask again before retrying.
         irq_restore(irqs_enabled);
         core::hint::spin_loop();
         irqs_enabled = irq_save_disable();
@@ -1104,105 +1531,338 @@ fn with_serial(write: impl FnOnce(usize, bool)) -> SerialHold {
 /// has no newline, and gates match whole lines).
 ///
 /// Once IRQ4 TX is enabled (`SERIAL_TX_IRQ_READY`), chunks are copied into the
-/// 16 KiB TX ring buffer under `SERIAL_OWNER_CPU` and drained asynchronously
-/// by `serial_interrupt_handler`, keeping both `cli` hold time and caller
-/// blocking latency near zero. If the ring fills, the oldest queued bytes are
-/// drained synchronously in FIFO order (never dropped). Before IRQ4 is armed
-/// or during panic, bytes go directly to `SERIAL_PORT` synchronously.
+/// 16 KiB TX ring buffer under `SERIAL_OWNER_CPU` alone (sub-microsecond RAM
+/// copy, never waiting on IRQ4's `outb` port I/O) and drained asynchronously
+/// by `serial_interrupt_handler`. If the ring fills, the oldest queued bytes are
+/// drained synchronously in FIFO order under `SERIAL_UART_OWNER` -> `SERIAL_OWNER_CPU`
+/// (never dropped). Before IRQ4 is armed or during panic, bytes go directly to
+/// `SERIAL_PORT` synchronously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackpressureAbort {
+    /// Same CPU already owns `SERIAL_UART_OWNER`, `SERIAL_OWNER_CPU`, or an
+    /// active backpressure ticket (NMI/exception re-entry): emit raw bytes.
+    Reentered,
+    /// A panic claim superseded normal serial output while waiting.
+    PanicClaimed,
+}
+
+/// Strict FIFO ticket guard for writers blocked in async TX ring backpressure.
+///
+/// Only the waiter whose `ticket == BACKPRESSURE_SERVING_TICKET` drains and
+/// enqueues into `SERIAL_TX_RING`; all other async producers observe
+/// `backpressure_queue_active()` and queue behind it in strict FIFO order.
+/// Waiting happens with no locks held and caller IRQs restored. `Drop`
+/// unconditionally advances `BACKPRESSURE_SERVING_TICKET` when this guard owns
+/// the active turn and clears the per-CPU re-entrancy bit.
+struct BackpressureWaiterGuard {
+    owner: usize,
+    ticket: u64,
+    has_turn: bool,
+    owner_entered: bool,
+}
+
+impl BackpressureWaiterGuard {
+    fn new() -> Self {
+        Self {
+            owner: NO_SERIAL_OWNER,
+            ticket: 0,
+            has_turn: false,
+            owner_entered: false,
+        }
+    }
+
+    fn acquire_turn(&mut self, owner: usize) -> Result<(), BackpressureAbort> {
+        if self.has_turn {
+            return Ok(());
+        }
+        if SERIAL_UART_OWNER.load(Ordering::Relaxed) == owner
+            || SERIAL_OWNER_CPU.load(Ordering::Relaxed) == owner
+        {
+            return Err(BackpressureAbort::Reentered);
+        }
+        if !self.owner_entered {
+            if !try_enter_backpressure_owner(owner) {
+                return Err(BackpressureAbort::Reentered);
+            }
+            self.owner = owner;
+            self.owner_entered = true;
+        }
+        if self.ticket == 0 {
+            self.ticket = BACKPRESSURE_NEXT_TICKET.fetch_add(1, Ordering::SeqCst);
+        }
+        while BACKPRESSURE_SERVING_TICKET.load(Ordering::SeqCst) != self.ticket {
+            if PANIC_CLAIM_STARTED.load(Ordering::Acquire) {
+                return Err(BackpressureAbort::PanicClaimed);
+            }
+            core::hint::spin_loop();
+        }
+        self.has_turn = true;
+        Ok(())
+    }
+}
+
+impl Drop for BackpressureWaiterGuard {
+    fn drop(&mut self) {
+        if self.has_turn {
+            let next = self.ticket.wrapping_add(1);
+            BACKPRESSURE_SERVING_TICKET.store(next, Ordering::SeqCst);
+            self.has_turn = false;
+        }
+        if self.owner_entered {
+            leave_backpressure_owner(self.owner);
+            self.owner_entered = false;
+        }
+    }
+}
+
 fn serial_emit(stream: SerialStream, chunk: &[u8]) {
     let mut ready_wait_spins = 0usize;
     let mut sync_sent = 0usize;
+    let mut bp_guard = BackpressureWaiterGuard::new();
     loop {
-        let mut retry_after_unlock = false;
-        let mut made_progress = false;
-        let _ = with_serial(|owner, locked| {
-            if !locked {
-                for &byte in &chunk[sync_sent..] {
-                    unsafe { serial_outb(SERIAL_PORT, byte) };
+        // Fast path: acquire only the pure-RAM ring lock (`SERIAL_OWNER_CPU`)
+        // unless this caller already owns the active FIFO backpressure turn.
+        if !bp_guard.has_turn {
+            let mut need_uart_path = false;
+            let mut entering_backpressure = false;
+            let mut need_arm_tx_irq = false;
+            let mut async_pushed = false;
+            let mut caller_owner = NO_SERIAL_OWNER;
+            let _ = with_serial(|owner, locked| {
+                caller_owner = owner;
+                if !locked {
+                    for &byte in &chunk[sync_sent..] {
+                        unsafe { serial_outb(SERIAL_PORT, byte) };
+                    }
+                    return;
                 }
-                return;
-            }
-            let start = read_tsc();
-            let id = stream.id(owner);
-            let open = SERIAL_OPEN_LINE.load(Ordering::Relaxed);
-            // SAFETY: `SERIAL_OWNER_CPU` is exclusively held with IRQs masked.
-            let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
-
-            if SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
-                && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
-                && sync_sent == 0
-            {
-                let need_newline = open != NO_OPEN_LINE && open != id;
-                let needed = chunk.len() + usize::from(need_newline);
-                if ring.free_space() < needed {
-                    let overflow = needed - ring.free_space();
-                    let limit = overflow.min(SERIAL_CHUNK);
-                    let mut drained = ring.drain_ready_up_to(limit);
-                    if drained == 0 && ready_wait_spins >= BACKPRESSURE_TX_READY_SPINS {
-                        drained = ring.drain_unconditional_up_to(limit);
-                    }
-                    if drained > 0 {
-                        made_progress = true;
-                    }
-                    if ring.free_space() < needed {
-                        // Release `SERIAL_OWNER_CPU` and restore caller IRQs
-                        // before retrying so we never spin on THRE under `cli`
-                        // and never overrun a busy 16-byte UART FIFO.
-                        if drained > 0 {
-                            let held = read_tsc().wrapping_sub(start);
-                            record_serial_hold(held, drained, false);
+                if SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
+                    && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
+                    && sync_sent == 0
+                {
+                    let start = read_tsc();
+                    let id = stream.id(owner);
+                    let open = SERIAL_OPEN_LINE.load(Ordering::Relaxed);
+                    // SAFETY: `SERIAL_OWNER_CPU` is exclusively held with IRQs masked.
+                    let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+                    ring.apply_pending_yield_deferral();
+                    let need_newline = open != NO_OPEN_LINE && open != id;
+                    let needed = chunk.len() + usize::from(need_newline);
+                    if !backpressure_queue_active() && ring.free_space() >= needed {
+                        if need_newline {
+                            ring.push_byte(b'\n');
                         }
-                        retry_after_unlock = true;
+                        ring.push_slice(chunk);
+                        SERIAL_TX_PENDING.store(ring.len, Ordering::Release);
+                        need_arm_tx_irq =
+                            !ring.tx_irq_armed && !ring.tx_irq_deferred && ring.len > 0;
+                        let next_open = match chunk.last() {
+                            Some(b'\n') => NO_OPEN_LINE,
+                            Some(_) => id,
+                            None => open,
+                        };
+                        SERIAL_OPEN_LINE.store(next_open, Ordering::Relaxed);
+                        let held = read_tsc().wrapping_sub(start);
+                        record_serial_hold(held, chunk.len(), true);
+                        async_pushed = true;
                         return;
                     }
+                    entering_backpressure = true;
                 }
-                if need_newline {
-                    ring.push_byte(b'\n');
+                // Either async ring is full / has an active FIFO backpressure
+                // waiter, or we are in synchronous mode (early boot / shutdown /
+                // panic). Release `SERIAL_OWNER_CPU` first so we preserve strict
+                // lock order (`BACKPRESSURE_SERVING_TICKET` -> `SERIAL_UART_OWNER`
+                // -> `SERIAL_OWNER_CPU`).
+                need_uart_path = true;
+            });
+
+            if async_pushed {
+                if need_arm_tx_irq {
+                    arm_serial_tx_irq_if_needed();
                 }
-                ring.push_slice(chunk);
-                SERIAL_TX_PENDING.store(ring.len, Ordering::Release);
-                if !ring.tx_irq_armed && !ring.tx_irq_deferred && ring.len > 0 {
-                    ring.tx_irq_armed = true;
-                    SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
-                    unsafe { serial_set_tx_irq(true) };
-                }
-                let next_open = match chunk.last() {
-                    Some(b'\n') => NO_OPEN_LINE,
-                    Some(_) => id,
-                    None => open,
-                };
-                SERIAL_OPEN_LINE.store(next_open, Ordering::Relaxed);
-                let held = read_tsc().wrapping_sub(start);
-                record_serial_hold(held, chunk.len(), true);
-                return;
+                break;
+            }
+            if !need_uart_path {
+                // Re-entered on same owner token; raw bytes already written.
+                break;
             }
 
+            if entering_backpressure {
+                match bp_guard.acquire_turn(caller_owner) {
+                    Ok(()) => {}
+                    Err(BackpressureAbort::Reentered) => {
+                        for &byte in &chunk[sync_sent..] {
+                            unsafe { serial_outb(SERIAL_PORT, byte) };
+                        }
+                        break;
+                    }
+                    Err(BackpressureAbort::PanicClaimed) => break,
+                }
+            }
+        }
+
+        // Slow path (FIFO backpressure turn holder or synchronous mode): acquire
+        // `SERIAL_UART_OWNER` first, then take `SERIAL_OWNER_CPU` only for brief
+        // RAM updates.
+        let mut retry_after_unlock = false;
+        let mut made_progress = false;
+        let (owner, irqs_enabled, uart_hold) = acquire_uart_lock();
+        if uart_hold == SerialHold::Reentered {
+            for &byte in &chunk[sync_sent..] {
+                unsafe { serial_outb(SERIAL_PORT, byte) };
+            }
+            irq_restore(irqs_enabled);
+            break;
+        }
+
+        let start = read_tsc();
+        let id = stream.id(owner);
+        let async_mode = SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
+            && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
+            && sync_sent == 0;
+
+        if async_mode {
+            // While this caller holds the active FIFO backpressure turn, no
+            // other writer may push into `SERIAL_TX_RING`; every drained byte
+            // strictly increases available space for `chunk`.
+            let overflow_limit = if acquire_ring_lock_under_uart(owner) {
+                let open = SERIAL_OPEN_LINE.load(Ordering::Relaxed);
+                let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+                ring.apply_pending_yield_deferral();
+                let need_newline = open != NO_OPEN_LINE && open != id;
+                let needed = chunk.len() + usize::from(need_newline);
+                if ring.free_space() >= needed {
+                    if need_newline {
+                        ring.push_byte(b'\n');
+                    }
+                    ring.push_slice(chunk);
+                    SERIAL_TX_PENDING.store(ring.len, Ordering::Release);
+                    if !ring.tx_irq_armed && !ring.tx_irq_deferred && ring.len > 0 {
+                        ring.tx_irq_armed = true;
+                        SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
+                        unsafe { serial_set_tx_irq(true) };
+                    }
+                    let next_open = match chunk.last() {
+                        Some(b'\n') => NO_OPEN_LINE,
+                        Some(_) => id,
+                        None => open,
+                    };
+                    SERIAL_OPEN_LINE.store(next_open, Ordering::Relaxed);
+                    let held = read_tsc().wrapping_sub(start);
+                    record_serial_hold(held, chunk.len(), true);
+                    SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                    SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+                    irq_restore(irqs_enabled);
+                    break;
+                }
+                let overflow = needed - ring.free_space();
+                SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+                overflow.min(SERIAL_CHUNK)
+            } else {
+                SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                irq_restore(irqs_enabled);
+                break;
+            };
+
+            let force = ready_wait_spins >= BACKPRESSURE_TX_READY_SPINS;
+            let drained = drain_ring_under_uart_blocking(owner, overflow_limit, force);
+            if drained > 0 {
+                made_progress = true;
+            }
+
+            if acquire_ring_lock_under_uart(owner) {
+                let open = SERIAL_OPEN_LINE.load(Ordering::Relaxed);
+                let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+                ring.apply_pending_yield_deferral();
+                let need_newline = open != NO_OPEN_LINE && open != id;
+                let needed = chunk.len() + usize::from(need_newline);
+                if SERIAL_TX_IRQ_READY.load(Ordering::Acquire)
+                    && !PANIC_CLAIM_STARTED.load(Ordering::Acquire)
+                    && ring.free_space() >= needed
+                {
+                    if need_newline {
+                        ring.push_byte(b'\n');
+                    }
+                    ring.push_slice(chunk);
+                    SERIAL_TX_PENDING.store(ring.len, Ordering::Release);
+                    if !ring.tx_irq_armed && !ring.tx_irq_deferred && ring.len > 0 {
+                        ring.tx_irq_armed = true;
+                        SERIAL_TX_IRQ_ARMED.store(true, Ordering::Release);
+                        unsafe { serial_set_tx_irq(true) };
+                    }
+                    let next_open = match chunk.last() {
+                        Some(b'\n') => NO_OPEN_LINE,
+                        Some(_) => id,
+                        None => open,
+                    };
+                    SERIAL_OPEN_LINE.store(next_open, Ordering::Relaxed);
+                    let held = read_tsc().wrapping_sub(start);
+                    record_serial_hold(held, chunk.len(), true);
+                } else {
+                    if drained > 0 {
+                        let held = read_tsc().wrapping_sub(start);
+                        record_serial_hold(held, drained, false);
+                    }
+                    retry_after_unlock = true;
+                }
+                SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+            } else {
+                SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+            }
+            irq_restore(irqs_enabled);
+        } else {
             // Synchronous mode (early boot, post-shutdown, or panic fallback):
             // preserve strict FIFO ordering by draining any queued ring bytes
             // first, then pace both the separator (recomputed under every lock
             // acquisition so an intervening stream's open line is always
             // separated) and `chunk` in 16-byte FIFO batches checked against
             // `LSR_THRE`.
-            if ring.len > 0 {
-                let mut drained = ring.drain_ready_up_to(SERIAL_CHUNK);
-                if drained == 0 && ready_wait_spins >= BACKPRESSURE_TX_READY_SPINS {
-                    drained = ring.drain_unconditional_up_to(SERIAL_CHUNK);
-                }
+            if SERIAL_TX_PENDING.load(Ordering::Acquire) > 0 {
+                let force = ready_wait_spins >= BACKPRESSURE_TX_READY_SPINS;
+                let drained = drain_ring_under_uart_blocking(owner, SERIAL_CHUNK, force);
                 if drained > 0 {
                     made_progress = true;
                 }
-                if ring.len > 0 {
-                    if drained > 0 {
-                        let held = read_tsc().wrapping_sub(start);
-                        record_serial_hold(held, drained, false);
+                if acquire_ring_lock_under_uart(owner) {
+                    let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
+                    if ring.len > 0 {
+                        if drained > 0 {
+                            let held = read_tsc().wrapping_sub(start);
+                            record_serial_hold(held, drained, false);
+                        }
+                        SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+                        irq_restore(irqs_enabled);
+                        if made_progress {
+                            ready_wait_spins = 0;
+                        } else {
+                            ready_wait_spins += 1;
+                            core::hint::spin_loop();
+                        }
+                        continue;
                     }
-                    retry_after_unlock = true;
-                    return;
-                }
-                if ring.tx_irq_armed || ring.tx_irq_deferred {
-                    ring.disarm_tx_irq_clear_deferral();
+                    if ring.tx_irq_armed || ring.tx_irq_deferred {
+                        ring.disarm_tx_irq_clear_deferral();
+                    }
+                    SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+                } else {
+                    SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                    irq_restore(irqs_enabled);
+                    break;
                 }
             }
+
+            let open = if acquire_ring_lock_under_uart(owner) {
+                let open = SERIAL_OPEN_LINE.load(Ordering::Relaxed);
+                SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+                open
+            } else {
+                SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                irq_restore(irqs_enabled);
+                break;
+            };
 
             let need_nl = open != NO_OPEN_LINE && open != id;
             let mut newline_left = need_nl;
@@ -1237,34 +1897,41 @@ fn serial_emit(stream: SerialStream, chunk: &[u8]) {
             if total_written > 0 {
                 made_progress = true;
             }
-            if newline_left || sync_sent < chunk.len() {
-                if payload_written > 0 {
-                    let next_open = match chunk[..sync_sent].last() {
+            if acquire_ring_lock_under_uart(owner) {
+                if newline_left || sync_sent < chunk.len() {
+                    if payload_written > 0 {
+                        let next_open = match chunk[..sync_sent].last() {
+                            Some(b'\n') => NO_OPEN_LINE,
+                            Some(_) => id,
+                            None => NO_OPEN_LINE,
+                        };
+                        SERIAL_OPEN_LINE.store(next_open, Ordering::Relaxed);
+                    } else if need_nl && !newline_left {
+                        SERIAL_OPEN_LINE.store(NO_OPEN_LINE, Ordering::Relaxed);
+                    }
+                    if total_written > 0 {
+                        let held = read_tsc().wrapping_sub(start);
+                        record_serial_hold(held, payload_written, payload_written > 0);
+                    }
+                    retry_after_unlock = true;
+                } else {
+                    let next_open = match chunk.last() {
                         Some(b'\n') => NO_OPEN_LINE,
                         Some(_) => id,
-                        None => NO_OPEN_LINE,
+                        None => open,
                     };
                     SERIAL_OPEN_LINE.store(next_open, Ordering::Relaxed);
-                } else if need_nl && !newline_left {
-                    SERIAL_OPEN_LINE.store(NO_OPEN_LINE, Ordering::Relaxed);
-                }
-                if total_written > 0 {
                     let held = read_tsc().wrapping_sub(start);
-                    record_serial_hold(held, payload_written, payload_written > 0);
+                    record_serial_hold(held, payload_written, true);
                 }
-                retry_after_unlock = true;
-                return;
+                SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
+                SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
+            } else {
+                SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::Release);
             }
+            irq_restore(irqs_enabled);
+        }
 
-            let next_open = match chunk.last() {
-                Some(b'\n') => NO_OPEN_LINE,
-                Some(_) => id,
-                None => open,
-            };
-            SERIAL_OPEN_LINE.store(next_open, Ordering::Relaxed);
-            let held = read_tsc().wrapping_sub(start);
-            record_serial_hold(held, payload_written, true);
-        });
         if !retry_after_unlock {
             break;
         }
@@ -1317,8 +1984,35 @@ pub fn claim_serial_for_panic() {
     if PANIC_CLAIM_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    crate::framebuffer::flush_for_panic();
     SERIAL_TX_IRQ_READY.store(false, Ordering::Release);
     let owner = console_owner_token();
+
+    // Acquire outer `SERIAL_UART_OWNER` first (strict lock order), then inner
+    // `SERIAL_OWNER_CPU`, keeping both permanently claimed by this CPU.
+    let mut uart_claimed = false;
+    for _ in 0..PANIC_CLAIM_SPINS {
+        match SERIAL_UART_OWNER.compare_exchange_weak(
+            NO_SERIAL_OWNER,
+            owner,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                uart_claimed = true;
+                break;
+            }
+            Err(current) if current == owner => {
+                uart_claimed = true;
+                break;
+            }
+            Err(_) => core::hint::spin_loop(),
+        }
+    }
+    if !uart_claimed {
+        return;
+    }
+
     for _ in 0..PANIC_CLAIM_SPINS {
         match SERIAL_OWNER_CPU.compare_exchange_weak(
             NO_SERIAL_OWNER,
@@ -1329,7 +2023,8 @@ pub fn claim_serial_for_panic() {
             Ok(_) => {
                 // Flush any queued async bytes with FIFO pacing and disarm THRI
                 // before the panic separator and raw panic/kdump writes.
-                // SAFETY: `SERIAL_OWNER_CPU` is exclusively owned by this CPU.
+                // SAFETY: `SERIAL_UART_OWNER` and `SERIAL_OWNER_CPU` are both
+                // exclusively owned by this CPU.
                 let ring = unsafe { &mut *SERIAL_TX_RING.0.get() };
                 ring.drain_all_panic_bounded();
                 if SERIAL_OPEN_LINE.swap(NO_OPEN_LINE, Ordering::Relaxed) != NO_OPEN_LINE {
@@ -1585,8 +2280,15 @@ mod tests {
     pub(super) static TX_READY_INJECT_OPEN_LINE: AtomicUsize = AtomicUsize::new(NO_OPEN_LINE);
     /// Mock COM1 `LSR` bit 6 (`TEMT`) state for terminal flush tests.
     pub(super) static TX_EMPTY_MOCK: AtomicBool = AtomicBool::new(true);
+    /// Optional one-shot owner injected into `SERIAL_OWNER_CPU` inside
+    /// `serial_outb()` to deterministically simulate ring-lock contention
+    /// arriving after a successful drain batch releases `SERIAL_OWNER_CPU`.
+    pub(super) static OUTB_LOCK_RING_FOR_OWNER: AtomicUsize = AtomicUsize::new(NO_SERIAL_OWNER);
     /// Serializes the tests that use the global lock word and port log.
     static SERIAL_TESTS: Mutex<()> = Mutex::new(());
+    std::thread_local! {
+        pub(super) static BP_IN_WAIT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
 
     impl ChunkSink for Vec<Vec<u8>> {
         fn emit(&mut self, chunk: &[u8]) {
@@ -1656,6 +2358,7 @@ mod tests {
     /// guard that keeps the other lock tests out.
     fn serial_test_state() -> std::sync::MutexGuard<'static, ()> {
         let guard = SERIAL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::SeqCst);
         SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::SeqCst);
         SERIAL_OPEN_LINE.store(NO_OPEN_LINE, Ordering::SeqCst);
         PANIC_CLAIM_STARTED.store(false, Ordering::SeqCst);
@@ -1664,14 +2367,19 @@ mod tests {
         SERIAL_TX_IRQ_ARMED.store(false, Ordering::SeqCst);
         SERIAL_TX_IRQ_DEFERRED.store(false, Ordering::SeqCst);
         SERIAL_TX_MISSED_LOCK.store(false, Ordering::SeqCst);
+        SERIAL_TX_YIELD_DEFER_PENDING.store(false, Ordering::SeqCst);
         SERIAL_TX_DRAIN_SEQ.store(0, Ordering::SeqCst);
         SERIAL_TX_LAST_TICK_PENDING.store(false, Ordering::SeqCst);
         SERIAL_TX_LAST_TICK_SEQ.store(0, Ordering::SeqCst);
+        BACKPRESSURE_NEXT_TICKET.store(1, Ordering::SeqCst);
+        BACKPRESSURE_SERVING_TICKET.store(1, Ordering::SeqCst);
+        BP_IN_WAIT.with(|flag| flag.set(false));
         TX_IRQ_ENABLED.store(false, Ordering::SeqCst);
         IER_FULL_PULSES.store(0, Ordering::SeqCst);
         TX_READY_MOCK.store(true, Ordering::SeqCst);
         TX_READY_INJECT_OPEN_LINE.store(NO_OPEN_LINE, Ordering::SeqCst);
         TX_EMPTY_MOCK.store(true, Ordering::SeqCst);
+        OUTB_LOCK_RING_FOR_OWNER.store(NO_SERIAL_OWNER, Ordering::SeqCst);
         unsafe {
             let ring = &mut *SERIAL_TX_RING.0.get();
             ring.head = 0;
@@ -2192,6 +2900,253 @@ mod tests {
             "interleaved sync retry must recheck SERIAL_OPEN_LINE and separate diag from prompt"
         );
         assert_eq!(SERIAL_OPEN_LINE.load(Ordering::SeqCst), NO_OPEN_LINE);
+    }
+
+    #[test]
+    fn two_lock_serial_async_emit_does_not_block_on_uart_owner() {
+        let _guard = serial_test_state();
+        enable_serial_tx_irq();
+
+        // Simulate another CPU (e.g. BSP IRQ4) holding the outer UART port I/O
+        // lock (`SERIAL_UART_OWNER`) while `SERIAL_OWNER_CPU` (RAM ring lock)
+        // is free. An async producer must enqueue in RAM without spinning on
+        // `SERIAL_UART_OWNER` and must flag `SERIAL_TX_MISSED_LOCK` if THRI
+        // is not yet armed.
+        let other = console_owner_token() + 1;
+        SERIAL_UART_OWNER.store(other, Ordering::SeqCst);
+        serial_emit(SerialStream::Kernel, b"nonblocking\n");
+        assert!(
+            port_log().is_empty(),
+            "async producer must only enqueue into RAM while UART lock is held"
+        );
+        assert_eq!(SERIAL_TX_PENDING.load(Ordering::SeqCst), 12);
+        assert!(
+            SERIAL_TX_MISSED_LOCK.load(Ordering::SeqCst),
+            "contended THRI arm must flag timer backstop when unarmed"
+        );
+        assert_eq!(SERIAL_OWNER_CPU.load(Ordering::SeqCst), NO_SERIAL_OWNER);
+
+        // Once the UART holder finishes, timer kick + IRQ4 drain emit all bytes.
+        SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::SeqCst);
+        serial_tx_kick_if_pending();
+        assert!(TX_IRQ_ENABLED.load(Ordering::SeqCst));
+        serial_tx_irq_drain(false);
+        assert_eq!(port_log(), b"nonblocking\n");
+        assert_eq!(SERIAL_TX_PENDING.load(Ordering::SeqCst), 0);
+        assert!(!TX_IRQ_ENABLED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn two_lock_serial_irq_drain_handles_concurrent_push_and_rearms_cleanly() {
+        let _guard = serial_test_state();
+        enable_serial_tx_irq();
+
+        // Enqueue >1 burst so IRQ4 drains one burst while leaving bytes queued,
+        // and verify both locks are released in clean state.
+        let first = [b'A'; SERIAL_TX_IRQ_MAX_BURST];
+        let second = b"tail\n";
+        serial_emit(SerialStream::Kernel, &first);
+        serial_emit(SerialStream::Kernel, second);
+        assert!(TX_IRQ_ENABLED.load(Ordering::SeqCst));
+
+        // Simulate IRQ4 running while THRI was cleared (e.g. RX-triggered IRQ4
+        // observing bytes pushed during UART hold): finalization must re-arm THRI.
+        unsafe {
+            (*SERIAL_TX_RING.0.get()).tx_irq_armed = false;
+        }
+        SERIAL_TX_IRQ_ARMED.store(false, Ordering::SeqCst);
+        TX_IRQ_ENABLED.store(false, Ordering::SeqCst);
+
+        serial_tx_irq_drain(false);
+        assert_eq!(port_log(), first);
+        assert_eq!(SERIAL_UART_OWNER.load(Ordering::SeqCst), NO_SERIAL_OWNER);
+        assert_eq!(SERIAL_OWNER_CPU.load(Ordering::SeqCst), NO_SERIAL_OWNER);
+        assert!(
+            TX_IRQ_ENABLED.load(Ordering::SeqCst),
+            "IRQ4 finalization must re-arm THRI when bytes remain queued"
+        );
+
+        serial_tx_irq_drain(false);
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(second);
+        assert_eq!(port_log(), expected);
+        assert!(!TX_IRQ_ENABLED.load(Ordering::SeqCst));
+        assert_eq!(SERIAL_TX_PENDING.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn two_lock_serial_backpressure_fifo_prevents_long_writer_starvation() {
+        let _guard = serial_test_state();
+        enable_serial_tx_irq();
+
+        // Fill ring completely so any concurrent writer enters backpressure.
+        let fill = [b'F'; SERIAL_TX_BUF_CAP];
+        serial_emit(SerialStream::Kernel, &fill);
+        assert_eq!(SERIAL_TX_PENDING.load(Ordering::SeqCst), SERIAL_TX_BUF_CAP);
+
+        // Hold FIFO ticket 1 (simulating an active short writer finishing).
+        BACKPRESSURE_NEXT_TICKET.store(2, Ordering::SeqCst);
+        BACKPRESSURE_SERVING_TICKET.store(1, Ordering::SeqCst);
+
+        // Spawn long 256-byte writer first: it must claim ticket 2 and wait.
+        let long_writer = std::thread::spawn(|| {
+            let payload = [b'L'; SERIAL_CHUNK];
+            serial_emit(SerialStream::Kernel, &payload);
+        });
+        while BACKPRESSURE_NEXT_TICKET.load(Ordering::SeqCst) < 3 {
+            std::thread::yield_now();
+        }
+
+        // Spawn a short 16-byte writer second: it must claim ticket 3 behind
+        // the 256-byte writer rather than jumping ahead and starving it.
+        let short_writer = std::thread::spawn(|| {
+            let payload = [b'S'; 16];
+            serial_emit(SerialStream::Kernel, &payload);
+        });
+        while BACKPRESSURE_NEXT_TICKET.load(Ordering::SeqCst) < 4 {
+            std::thread::yield_now();
+        }
+
+        // Hand off ticket 1 -> ticket 2: long writer must complete BEFORE short writer.
+        BACKPRESSURE_SERVING_TICKET.store(2, Ordering::Release);
+        long_writer.join().unwrap();
+        short_writer.join().unwrap();
+
+        assert_eq!(BACKPRESSURE_SERVING_TICKET.load(Ordering::SeqCst), 4);
+        assert_eq!(BACKPRESSURE_NEXT_TICKET.load(Ordering::SeqCst), 4);
+
+        flush_serial_sync();
+        let out = port_log();
+        assert_eq!(out.len(), SERIAL_TX_BUF_CAP + SERIAL_CHUNK + 16);
+        assert_eq!(&out[..SERIAL_TX_BUF_CAP], &fill[..]);
+        assert_eq!(
+            &out[SERIAL_TX_BUF_CAP..SERIAL_TX_BUF_CAP + SERIAL_CHUNK],
+            &[b'L'; SERIAL_CHUNK][..],
+            "older 256-byte waiter must complete ahead of younger short writer"
+        );
+        assert_eq!(&out[SERIAL_TX_BUF_CAP + SERIAL_CHUNK..], &[b'S'; 16][..]);
+    }
+
+    #[test]
+    fn two_lock_serial_backpressure_reentry_while_holding_uart_does_not_deadlock() {
+        let _guard = serial_test_state();
+        enable_serial_tx_irq();
+
+        // Simulate another CPU waiting in FIFO backpressure while THIS CPU
+        // holds `SERIAL_UART_OWNER` (e.g. BSP in IRQ4 hit by an NMI).
+        // Re-entering `serial_emit` on this CPU must NOT join the FIFO queue
+        // behind the waiting CPU (which is waiting on `SERIAL_UART_OWNER`).
+        let me = console_owner_token();
+        SERIAL_UART_OWNER.store(me, Ordering::SeqCst);
+        BACKPRESSURE_NEXT_TICKET.store(2, Ordering::SeqCst);
+        BACKPRESSURE_SERVING_TICKET.store(1, Ordering::SeqCst);
+
+        serial_emit(SerialStream::Kernel, b"nmi-uart\n");
+        assert_eq!(port_log(), b"nmi-uart\n");
+        assert_eq!(
+            BACKPRESSURE_NEXT_TICKET.load(Ordering::SeqCst),
+            2,
+            "re-entrant UART owner must not allocate a backpressure ticket"
+        );
+        assert_eq!(SERIAL_UART_OWNER.load(Ordering::SeqCst), me);
+        SERIAL_UART_OWNER.store(NO_SERIAL_OWNER, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn two_lock_serial_backpressure_queue_active_reads_serving_before_next() {
+        let _guard = serial_test_state();
+
+        // Reproduce the exact concurrent ticket-issue + handoff interleaving
+        // symmetrically: the transition `(serving=1, next=2) -> (serving=2, next=3)`
+        // fires immediately after WHICHEVER read executes first.
+        // - Correct serving-first order observes serving=1 then next=3 -> active=true.
+        // - Incorrect next-first order observes next=2 then serving=2 -> false-empty!
+        let run_interleaving = |probe: fn(&dyn Fn() -> u64, &dyn Fn() -> u64) -> bool| -> bool {
+            let state = core::cell::Cell::new((1u64, 2u64));
+            let transitioned = core::cell::Cell::new(false);
+            let read_serving = || {
+                let s = state.get().0;
+                if !transitioned.replace(true) {
+                    state.set((2, 3));
+                }
+                s
+            };
+            let read_next = || {
+                let n = state.get().1;
+                if !transitioned.replace(true) {
+                    state.set((2, 3));
+                }
+                n
+            };
+            probe(&read_serving, &read_next)
+        };
+
+        assert!(
+            run_interleaving(|rs, rn| backpressure_queue_active_with(rs, rn)),
+            "serving-first order must report active across concurrent issue + handoff"
+        );
+        // Negative control: confirm reversed (next-first) order fails under the
+        // exact same harness so this test would catch a load-order regression.
+        assert!(
+            !run_interleaving(|rs, rn| {
+                let next = rn();
+                let serving = rs();
+                serving != next
+            }),
+            "negative control: reversed next-first order must observe false-empty"
+        );
+
+        // Steady-state empty queue reports false.
+        assert!(!backpressure_queue_active_with(|| 2, || 2));
+    }
+
+    #[test]
+    fn two_lock_serial_irq_drain_preserves_lapic_cooldown_on_finalization_contention() {
+        let _guard = serial_test_state();
+        enable_serial_tx_irq();
+
+        // Enqueue 40 bytes (> 1 FIFO batch) so batch 1 emits 16 bytes and then
+        // `serial_outb()` injects another CPU holding `SERIAL_OWNER_CPU` before
+        // batch 2 / finalization.
+        let payload = [b'Q'; 40];
+        serial_emit(SerialStream::Kernel, &payload);
+        assert!(TX_IRQ_ENABLED.load(Ordering::SeqCst));
+
+        let other = console_owner_token() + 1;
+        OUTB_LOCK_RING_FOR_OWNER.store(other, Ordering::SeqCst);
+        serial_tx_irq_drain(true);
+
+        // Batch 1 (16 bytes) drained, THRI was disarmed, and LAPIC deferral was
+        // latched despite ring-lock contention at finalization.
+        assert_eq!(port_log().len(), SERIAL_TX_FIFO_DEPTH);
+        assert!(!TX_IRQ_ENABLED.load(Ordering::SeqCst));
+        assert!(SERIAL_TX_IRQ_DEFERRED.load(Ordering::SeqCst));
+        assert!(SERIAL_TX_YIELD_DEFER_PENDING.load(Ordering::SeqCst));
+        assert_eq!(SERIAL_UART_OWNER.load(Ordering::SeqCst), NO_SERIAL_OWNER);
+
+        // Release simulated foreign CPU's ring lock.
+        SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::SeqCst);
+
+        // An immediate producer push must absorb the pending deferral and must
+        // NOT re-enable THRI during the quiet window.
+        serial_emit(SerialStream::Kernel, b"more\n");
+        assert!(!TX_IRQ_ENABLED.load(Ordering::SeqCst));
+        assert!(SERIAL_TX_IRQ_DEFERRED.load(Ordering::SeqCst));
+        assert!(!SERIAL_TX_YIELD_DEFER_PENDING.load(Ordering::SeqCst));
+
+        // First BSP timer tick must preserve the quiet interval (THRI stays off);
+        // second BSP timer tick clears deferral and pulses IER to re-arm.
+        serial_tx_kick_if_pending();
+        assert!(
+            !TX_IRQ_ENABLED.load(Ordering::SeqCst),
+            "first tick after contended yield must preserve the LAPIC quiet interval"
+        );
+        serial_tx_kick_if_pending();
+        assert!(TX_IRQ_ENABLED.load(Ordering::SeqCst));
+        assert!(!SERIAL_TX_IRQ_DEFERRED.load(Ordering::SeqCst));
+
+        flush_serial_sync();
+        assert_eq!(port_log().len(), 45);
     }
 }
 
