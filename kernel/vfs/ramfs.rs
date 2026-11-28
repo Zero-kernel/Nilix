@@ -55,7 +55,9 @@ use spin::RwLock;
 
 use crate::topology::{Edge, MutationContext, Retirement};
 use crate::traits::{FileSystem, Inode, PreparedFileHandle};
-use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
+use crate::types::{
+    DirEntry, FileMode, FileType, FsError, FsStat, OpenFlags, SetAttr, Stat, TimeSpec,
+};
 use kernel_core::{current_credentials, FileDescriptor};
 
 /// V-3 fix: Maximum allowed file size in ramfs (bytes)
@@ -304,11 +306,331 @@ struct SymlinkState {
     _heap_charge: HeapCharge,
 }
 
-/// Node kind: file, directory, or symlink.
+/// N2.3: Bounded FIFO (named pipe) ring buffer capacity.
+const FIFO_CAPACITY: usize = 4096;
+
+struct FifoBuffer {
+    buf: Vec<u8>,
+    read_pos: usize,
+    write_pos: usize,
+    len: usize,
+    readers: usize,
+    writers: usize,
+}
+
+/// N2.3: Shared FIFO channel owned by a `NodeKind::Fifo` inode and all open
+/// `FifoEnd` handles referencing it.
+pub(crate) struct FifoChannel {
+    inner: spin::Mutex<FifoBuffer>,
+    /// Lifetime charge for the ring buffer + `FifoChannel` Arc.
+    _heap_charge: HeapCharge,
+}
+
+impl FifoChannel {
+    fn try_new() -> Result<Arc<Self>, FsError> {
+        let arc_bytes = heap_no_space(arc_charge_bytes::<Self>())?;
+        let est_buf = string_buffer_charge(FIFO_CAPACITY)?;
+        let mut reservation = heap_no_space(try_reserve_heap(
+            HeapClass::RamFs,
+            checked_charge_add(arc_bytes, est_buf)?,
+        ))?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(FIFO_CAPACITY)
+            .map_err(|_| FsError::NoSpace)?;
+        buf.resize(FIFO_CAPACITY, 0);
+        let actual_buf = string_buffer_charge(buf.capacity())?;
+        heap_no_space(reservation.resize(checked_charge_add(arc_bytes, actual_buf)?))?;
+        let charge = heap_no_space(reservation.commit())?;
+        Arc::try_new(Self {
+            inner: spin::Mutex::new(FifoBuffer {
+                buf,
+                read_pos: 0,
+                write_pos: 0,
+                len: 0,
+                readers: 0,
+                writers: 0,
+            }),
+            _heap_charge: charge,
+        })
+        .map_err(|_| FsError::NoSpace)
+    }
+
+    fn poll_status_read_inner(&self) -> kernel_core::poll::PollStatus {
+        let g = self.inner.lock();
+        kernel_core::poll::PollStatus {
+            readable: g.len > 0,
+            writable: false,
+            hup: g.writers == 0,
+            err: false,
+            rdhup: false,
+        }
+    }
+
+    fn poll_status_write_inner(&self) -> kernel_core::poll::PollStatus {
+        let g = self.inner.lock();
+        let cap = g.buf.len();
+        kernel_core::poll::PollStatus {
+            readable: false,
+            writable: g.readers > 0 && g.len < cap,
+            hup: false,
+            err: g.readers == 0,
+            rdhup: false,
+        }
+    }
+
+    fn poll_status_rdwr_inner(&self) -> kernel_core::poll::PollStatus {
+        let g = self.inner.lock();
+        let cap = g.buf.len();
+        kernel_core::poll::PollStatus {
+            readable: g.len > 0,
+            writable: g.readers > 0 && g.len < cap,
+            hup: g.writers == 0,
+            err: g.readers == 0,
+            rdhup: false,
+        }
+    }
+}
+
+/// N2.3: Open endpoint guard for a named FIFO. Cloning increments active
+/// reader/writer counts; dropping decrements them.
+pub(crate) struct FifoEnd {
+    channel: Arc<FifoChannel>,
+    is_reader: bool,
+    is_writer: bool,
+}
+
+impl Clone for FifoEnd {
+    fn clone(&self) -> Self {
+        {
+            let mut g = self.channel.inner.lock();
+            if self.is_reader {
+                g.readers = g.readers.saturating_add(1);
+            }
+            if self.is_writer {
+                g.writers = g.writers.saturating_add(1);
+            }
+        }
+        Self {
+            channel: Arc::clone(&self.channel),
+            is_reader: self.is_reader,
+            is_writer: self.is_writer,
+        }
+    }
+}
+
+impl Drop for FifoEnd {
+    fn drop(&mut self) {
+        let mut g = self.channel.inner.lock();
+        if self.is_reader {
+            g.readers = g.readers.saturating_sub(1);
+        }
+        if self.is_writer {
+            g.writers = g.writers.saturating_sub(1);
+        }
+    }
+}
+
+#[inline]
+fn fifo_should_interrupt() -> bool {
+    if let Some(pid) = kernel_core::current_pid() {
+        kernel_core::process::wait_should_abort(pid)
+            || kernel_core::signal::has_deliverable_signal(pid)
+    } else {
+        false
+    }
+}
+
+impl FifoEnd {
+    fn open(channel: Arc<FifoChannel>, flags: OpenFlags) -> Result<Self, FsError> {
+        let is_reader = flags.is_readable();
+        let is_writer = flags.is_writable();
+        let nonblock = flags.is_nonblock();
+        {
+            let mut g = channel.inner.lock();
+            // POSIX: O_WRONLY | O_NONBLOCK with no readers fails ENXIO.
+            if !is_reader && is_writer && nonblock && g.readers == 0 {
+                return Err(FsError::NoDevice);
+            }
+            if is_reader {
+                g.readers = g.readers.saturating_add(1);
+            }
+            if is_writer {
+                g.writers = g.writers.saturating_add(1);
+            }
+        }
+        let end = Self {
+            channel: Arc::clone(&channel),
+            is_reader,
+            is_writer,
+        };
+        if !nonblock {
+            if is_reader && !is_writer {
+                loop {
+                    if end.channel.inner.lock().writers > 0 {
+                        break;
+                    }
+                    if fifo_should_interrupt() {
+                        return Err(FsError::Interrupted);
+                    }
+                    kernel_core::scheduler_hook::force_reschedule();
+                }
+            } else if is_writer && !is_reader {
+                loop {
+                    if end.channel.inner.lock().readers > 0 {
+                        break;
+                    }
+                    if fifo_should_interrupt() {
+                        return Err(FsError::Interrupted);
+                    }
+                    kernel_core::scheduler_hook::force_reschedule();
+                }
+            }
+        }
+        Ok(end)
+    }
+
+    pub(crate) fn read_with_commit(
+        &self,
+        buf: &mut [u8],
+        nonblock: bool,
+        commit: &mut dyn FnMut(&[u8]) -> Result<(), FsError>,
+    ) -> Result<usize, FsError> {
+        if !self.is_reader {
+            return Err(FsError::BadFd);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let mut g = self.channel.inner.lock();
+            if g.len > 0 {
+                let cap = g.buf.len();
+                let n = buf.len().min(g.len);
+                let first = n.min(cap - g.read_pos);
+                buf[..first].copy_from_slice(&g.buf[g.read_pos..g.read_pos + first]);
+                if n > first {
+                    buf[first..n].copy_from_slice(&g.buf[..n - first]);
+                }
+                // Release lock before usercopy commit; re-acquire to consume only
+                // if copyout succeeds, or consume atomically? FIFO has single-consumer
+                // peek-and-commit semantics under lock-free usercopy: check copyout first.
+                // Note: copyout cannot recurse into this FIFO lock.
+                drop(g);
+                commit(&buf[..n])?;
+                let mut g2 = self.channel.inner.lock();
+                let consumed = n.min(g2.len);
+                let cap2 = g2.buf.len();
+                g2.read_pos = (g2.read_pos + consumed) % cap2;
+                g2.len -= consumed;
+                return Ok(n);
+            }
+            if g.writers == 0 {
+                return Ok(0); // EOF
+            }
+            drop(g);
+            if nonblock {
+                return Err(FsError::Again);
+            }
+            if fifo_should_interrupt() {
+                return Err(FsError::Interrupted);
+            }
+            kernel_core::scheduler_hook::force_reschedule();
+        }
+    }
+
+    pub(crate) fn write(&self, data: &[u8], nonblock: bool) -> Result<usize, FsError> {
+        if !self.is_writer {
+            return Err(FsError::BadFd);
+        }
+        loop {
+            let mut g = self.channel.inner.lock();
+            if g.readers == 0 {
+                drop(g);
+                if let Some(pid) = kernel_core::current_pid() {
+                    let _ = kernel_core::signal::send_signal_kernel(
+                        pid,
+                        kernel_core::signal::Signal::SIGPIPE,
+                    );
+                }
+                return Err(FsError::Pipe);
+            }
+            if data.is_empty() {
+                return Ok(0);
+            }
+            let cap = g.buf.len();
+            let space = cap.saturating_sub(g.len);
+            if space > 0 {
+                let n = data.len().min(space);
+                let write_pos = g.write_pos;
+                let first = n.min(cap - write_pos);
+                g.buf[write_pos..write_pos + first].copy_from_slice(&data[..first]);
+                if n > first {
+                    g.buf[..n - first].copy_from_slice(&data[first..n]);
+                }
+                g.write_pos = (write_pos + n) % cap;
+                g.len += n;
+                return Ok(n);
+            }
+            drop(g);
+            if nonblock {
+                return Err(FsError::Again);
+            }
+            if fifo_should_interrupt() {
+                return Err(FsError::Interrupted);
+            }
+            kernel_core::scheduler_hook::force_reschedule();
+        }
+    }
+
+    pub(crate) fn poll_arm(&self) -> kernel_core::poll::PollArm {
+        unsafe fn probe_read(ptr: *const ()) -> kernel_core::poll::PollStatus {
+            let ch = unsafe { &*(ptr as *const FifoChannel) };
+            ch.poll_status_read_inner()
+        }
+        unsafe fn probe_write(ptr: *const ()) -> kernel_core::poll::PollStatus {
+            let ch = unsafe { &*(ptr as *const FifoChannel) };
+            ch.poll_status_write_inner()
+        }
+        unsafe fn probe_rdwr(ptr: *const ()) -> kernel_core::poll::PollStatus {
+            let ch = unsafe { &*(ptr as *const FifoChannel) };
+            ch.poll_status_rdwr_inner()
+        }
+        unsafe fn drop_ch(ptr: *const ()) {
+            unsafe {
+                drop(Arc::from_raw(ptr as *const FifoChannel));
+            }
+        }
+        let raw = Arc::into_raw(Arc::clone(&self.channel)) as *const ();
+        let (read_fn, write_end): (unsafe fn(*const ()) -> kernel_core::poll::PollStatus, bool) =
+            if self.is_reader && self.is_writer {
+                (probe_rdwr, false)
+            } else if self.is_writer {
+                (probe_read, true)
+            } else {
+                (probe_read, false)
+            };
+        let probe = unsafe {
+            kernel_core::poll::OwnedPollProbe::from_raw_owned(raw, read_fn, probe_write, drop_ch)
+        };
+        kernel_core::poll::PollArm::Dyn { probe, write_end }
+    }
+}
+
+/// Node kind: file, directory, symlink, or FIFO (named pipe).
 enum NodeKind {
-    File { state: RwLock<FileState> },
-    Dir { state: RwLock<DirectoryState> },
-    Symlink { state: RwLock<SymlinkState> },
+    File {
+        state: RwLock<FileState>,
+    },
+    Dir {
+        state: RwLock<DirectoryState>,
+    },
+    Symlink {
+        state: RwLock<SymlinkState>,
+    },
+    Fifo {
+        channel: Arc<FifoChannel>,
+        _heap_charge: HeapCharge,
+    },
 }
 
 #[inline]
@@ -698,6 +1020,39 @@ impl RamFsInode {
             allocation_owner: None,
         })
         .map_err(|_| FsError::NoSpace)?;
+        inode.self_weak.call_once(|| Arc::downgrade(&inode));
+        Ok(inode)
+    }
+
+    /// N2.3: Create a new FIFO (named pipe) inode.
+    pub fn new_fifo(
+        fs_id: u64,
+        ino: u64,
+        perm: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<Self>, FsError> {
+        let mode = FileMode::fifo(perm);
+        let channel = FifoChannel::try_new()?;
+        let arc_bytes = heap_no_space(arc_charge_bytes::<Self>())?;
+        let reservation = heap_no_space(try_reserve_heap(HeapClass::RamFs, arc_bytes))?;
+        let charge = heap_no_space(reservation.commit())?;
+        let inode = Arc::try_new(Self {
+            fs_id,
+            ino,
+            meta: RwLock::new(Meta::new(mode, uid, gid)),
+            kind: NodeKind::Fifo {
+                channel,
+                _heap_charge: charge,
+            },
+            detached: AtomicBool::new(false),
+            parent: RwLock::new(None),
+            self_weak: spin::Once::new(),
+            retirement: None,
+            allocation_owner: None,
+        })
+        .map_err(|_| FsError::NoSpace)?;
+        inode.self_weak.call_once(|| Arc::downgrade(&inode));
         Ok(inode)
     }
 
@@ -748,6 +1103,7 @@ impl RamFsInode {
             allocation_owner: None,
         })
         .map_err(|_| FsError::NoSpace)?;
+        inode.self_weak.call_once(|| Arc::downgrade(&inode));
         // Set symlink size to target path length
         inode.meta.write().size = target_len;
         Ok(inode)
@@ -762,7 +1118,9 @@ impl RamFsInode {
                 .get(name)
                 .map(|edge| edge.target().clone())
                 .ok_or(FsError::NotFound),
-            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
+            NodeKind::File { .. } | NodeKind::Symlink { .. } | NodeKind::Fifo { .. } => {
+                Err(FsError::NotDir)
+            }
         }
     }
 
@@ -839,7 +1197,9 @@ impl RamFsInode {
 
                 Ok(())
             }
-            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
+            NodeKind::File { .. } | NodeKind::Symlink { .. } | NodeKind::Fifo { .. } => {
+                Err(FsError::NotDir)
+            }
         }
     }
 
@@ -847,7 +1207,7 @@ impl RamFsInode {
     fn child_count(&self) -> usize {
         match &self.kind {
             NodeKind::Dir { state } => state.read().entries.len(),
-            NodeKind::File { .. } | NodeKind::Symlink { .. } => 0,
+            NodeKind::File { .. } | NodeKind::Symlink { .. } | NodeKind::Fifo { .. } => 0,
         }
     }
 
@@ -889,7 +1249,7 @@ impl RamFsInode {
     fn dir_entries(&self) -> Option<&RwLock<DirectoryState>> {
         match &self.kind {
             NodeKind::Dir { state } => Some(state),
-            NodeKind::File { .. } | NodeKind::Symlink { .. } => None,
+            NodeKind::File { .. } | NodeKind::Symlink { .. } | NodeKind::Fifo { .. } => None,
         }
     }
 
@@ -1105,7 +1465,7 @@ impl Drop for RamFsInode {
                     quota_release(state.target.len());
                 }
             }
-            NodeKind::Dir { .. } => {}
+            NodeKind::Dir { .. } | NodeKind::Fifo { .. } => {}
         }
     }
 }
@@ -1150,6 +1510,16 @@ impl Inode for RamFsInode {
             }
             let inode: Arc<dyn Inode> = self;
             return Ok(prepared.finalize(inode, flags, false));
+        }
+
+        if let NodeKind::Fifo { channel, .. } = &self.kind {
+            if flags.is_path() {
+                let inode: Arc<dyn Inode> = self;
+                return Ok(prepared.finalize(inode, flags, false));
+            }
+            let end = FifoEnd::open(Arc::clone(channel), flags)?;
+            let inode: Arc<dyn Inode> = self;
+            return Ok(prepared.finalize_fifo(inode, flags, end));
         }
 
         let inode: Arc<dyn Inode> = self;
@@ -1206,10 +1576,11 @@ impl Inode for RamFsInode {
 
                 match entry {
                     Some((name, inode)) => {
-                        let file_type = if inode.is_dir() {
-                            FileType::Directory
-                        } else {
-                            FileType::Regular
+                        let file_type = match &inode.kind {
+                            NodeKind::Dir { .. } => FileType::Directory,
+                            NodeKind::Symlink { .. } => FileType::Symlink,
+                            NodeKind::Fifo { .. } => FileType::Fifo,
+                            NodeKind::File { .. } => FileType::Regular,
                         };
                         Ok(Some((
                             offset + 1,
@@ -1225,7 +1596,9 @@ impl Inode for RamFsInode {
                     None => Ok(None),
                 }
             }
-            NodeKind::File { .. } | NodeKind::Symlink { .. } => Err(FsError::NotDir),
+            NodeKind::File { .. } | NodeKind::Symlink { .. } | NodeKind::Fifo { .. } => {
+                Err(FsError::NotDir)
+            }
         }
     }
 
@@ -1266,6 +1639,7 @@ impl Inode for RamFsInode {
                 Ok(to_read)
             }
             NodeKind::Dir { .. } => Err(FsError::IsDir),
+            NodeKind::Fifo { .. } => Err(FsError::Seek),
         }
     }
 
@@ -1304,6 +1678,7 @@ impl Inode for RamFsInode {
             }
             NodeKind::Dir { .. } => Err(FsError::IsDir),
             NodeKind::Symlink { .. } => Err(FsError::Invalid), // Symlinks are immutable
+            NodeKind::Fifo { .. } => Err(FsError::Seek),
         }
     }
 
@@ -1338,7 +1713,7 @@ impl Inode for RamFsInode {
                 Ok((data_in.len(), required_len as u64))
             }
             NodeKind::Dir { .. } => Err(FsError::IsDir),
-            NodeKind::Symlink { .. } => Err(FsError::Invalid),
+            NodeKind::Symlink { .. } | NodeKind::Fifo { .. } => Err(FsError::Invalid),
         }
     }
 
@@ -1365,8 +1740,32 @@ impl Inode for RamFsInode {
                 Ok(())
             }
             NodeKind::Dir { .. } => Err(FsError::IsDir),
-            NodeKind::Symlink { .. } => Err(FsError::Invalid), // Symlinks are immutable
+            NodeKind::Symlink { .. } | NodeKind::Fifo { .. } => Err(FsError::Invalid),
         }
+    }
+
+    fn setattr(&self, attr: &SetAttr, _context: &MutationContext<'_>) -> Result<(), FsError> {
+        let mut meta = self.meta.write();
+        if let Some(mode) = attr.mode {
+            meta.mode.perm = mode & 0o7777;
+        }
+        if let Some(uid) = attr.uid {
+            meta.uid = uid;
+        }
+        if let Some(gid) = attr.gid {
+            meta.gid = gid;
+        }
+        if attr.clear_setid && !meta.mode.is_dir() {
+            meta.mode.perm &= !0o6000;
+        }
+        if let Some(atime) = attr.atime {
+            meta.atime = atime;
+        }
+        if let Some(mtime) = attr.mtime {
+            meta.mtime = mtime;
+        }
+        meta.ctime = TimeSpec::now();
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1470,6 +1869,54 @@ impl FileSystem for RamFs {
         "ramfs"
     }
 
+    fn statfs(&self) -> Result<FsStat, FsError> {
+        let total_blocks = (MAX_TOTAL_BYTES / 4096) as u64;
+        let used_blocks = (ramfs_bytes_used().div_ceil(4096)) as u64;
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+        Ok(FsStat {
+            f_type: 0x8584_58f6_i64, // RAMFS_MAGIC
+            f_bsize: 4096,
+            f_blocks: total_blocks,
+            f_bfree: free_blocks,
+            f_bavail: free_blocks,
+            f_files: 65536,
+            f_ffree: 65536u64.saturating_sub(self.next_ino.load(Ordering::Relaxed)),
+            f_fsid: [self.fs_id as i32, (self.fs_id >> 32) as i32],
+            f_namelen: 255,
+            f_frsize: 4096,
+            f_flags: 0,
+        })
+    }
+
+    fn link(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        target: &Arc<dyn Inode>,
+        context: &MutationContext<'_>,
+    ) -> Result<(), FsError> {
+        context.defer(&self.retirement)?;
+        let parent = self.downcast_inode(parent)?;
+        let target = self.downcast_inode(target)?;
+        if !parent.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        if target.is_dir() {
+            return Err(FsError::NotPermitted);
+        }
+        let target_arc = target
+            .self_weak
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(FsError::Invalid)?;
+        let _topology_guard = RAMFS_TOPOLOGY_LOCK.lock();
+        parent.ensure_attached_dir()?;
+        parent.add_child(name, target_arc)?;
+        target.inc_nlink();
+        target.meta.write().ctime = TimeSpec::now();
+        Ok(())
+    }
+
     fn root_inode(&self) -> Arc<dyn Inode> {
         self.root.clone()
     }
@@ -1530,6 +1977,8 @@ impl FileSystem for RamFs {
         // Create new inode based on type
         let new_inode = if mode.is_dir() {
             RamFsInode::new_dir(self.fs_id, ino, final_perm, uid, gid, &self.retirement)?
+        } else if mode.is_fifo() {
+            RamFsInode::new_fifo(self.fs_id, ino, final_perm, uid, gid)?
         } else {
             RamFsInode::new_file(self.fs_id, ino, final_perm, uid, gid)?
         };
@@ -2277,6 +2726,162 @@ mod tests {
         drop(root);
         drop(fs);
         assert_eq!(owner.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn ramfs_setattr_chmod_chown_utimens_and_setid_clear() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        let fs = RamFs::try_new().unwrap();
+        let root = fs.root_inode();
+        let guard = crate::topology::write();
+        let ctx = guard.setup(0, 0);
+        let file = fs
+            .create(&root, "attr.txt", FileMode::regular(0o4755), &ctx)
+            .unwrap();
+        assert_eq!(file.stat().unwrap().mode.perm, 0o4755);
+
+        file.setattr(
+            &SetAttr {
+                uid: Some(1000),
+                gid: Some(2000),
+                clear_setid: true,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap();
+        let st = file.stat().unwrap();
+        assert_eq!(st.uid, 1000);
+        assert_eq!(st.gid, 2000);
+        assert_eq!(st.mode.perm, 0o0755);
+
+        file.setattr(
+            &SetAttr {
+                mode: Some(0o640),
+                atime: Some(TimeSpec { sec: 111, nsec: 22 }),
+                mtime: Some(TimeSpec { sec: 333, nsec: 44 }),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap();
+        let st2 = file.stat().unwrap();
+        assert_eq!(st2.mode.perm, 0o640);
+        assert_eq!((st2.atime.sec, st2.atime.nsec), (111, 22));
+        assert_eq!((st2.mtime.sec, st2.mtime.nsec), (333, 44));
+        drop((file, guard, root, fs));
+    }
+
+    #[test]
+    fn ramfs_hard_links_and_statfs_contracts() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        let fs = RamFs::try_new().unwrap();
+        let root = fs.root_inode();
+        let guard = crate::topology::write();
+        let ctx = guard.setup(0, 0);
+        let file = fs
+            .create(&root, "orig", FileMode::regular(0o644), &ctx)
+            .unwrap();
+        file.write_at(0, b"shared").unwrap();
+
+        fs.link(&root, "alias", &file, &ctx).unwrap();
+        let alias = fs.lookup(&root, "alias").unwrap();
+        assert_eq!(alias.ino(), file.ino());
+        assert_eq!(file.stat().unwrap().nlink, 2);
+
+        let sub = fs
+            .create(&root, "dir", FileMode::directory(0o755), &ctx)
+            .unwrap();
+        assert_eq!(
+            fs.link(&root, "dir_alias", &sub, &ctx),
+            Err(FsError::NotPermitted)
+        );
+
+        fs.unlink(&root, "orig", file.ino(), Some(false), &ctx)
+            .unwrap();
+        assert_eq!(alias.stat().unwrap().nlink, 1);
+        let mut buf = [0u8; 6];
+        assert_eq!(alias.read_at(0, &mut buf), Ok(6));
+        assert_eq!(&buf, b"shared");
+
+        let sfs = fs.statfs().unwrap();
+        assert_eq!(sfs.f_type, 0x8584_58f6);
+        assert_eq!(sfs.f_bsize, 4096);
+        assert_eq!(sfs.f_namelen, 255);
+        assert!(sfs.f_blocks > 0);
+        drop((sub, alias, file, guard, root, fs));
+    }
+
+    #[test]
+    fn ramfs_fifo_nonblock_io_eof_epipe_and_poll() {
+        let _serial = HEAP_TEST_LOCK.lock();
+        publish_heap_admission();
+        let fs = RamFs::try_new().unwrap();
+        let root = fs.root_inode();
+        let fifo = {
+            let guard = crate::topology::write();
+            let ctx = guard.setup(0, 0);
+            fs.create(&root, "pipe.fifo", FileMode::fifo(0o666), &ctx)
+                .unwrap()
+        };
+        assert!(fifo.stat().unwrap().mode.is_fifo());
+
+        let prep_w0 = PreparedFileHandle::try_new()
+            .unwrap()
+            .bind_filesystem(fs.clone());
+        assert_eq!(
+            fifo.clone()
+                .open(
+                    OpenFlags::new(OpenFlags::O_WRONLY | OpenFlags::O_NONBLOCK),
+                    prep_w0,
+                )
+                .err(),
+            Some(FsError::NoDevice)
+        );
+
+        let prep_r = PreparedFileHandle::try_new()
+            .unwrap()
+            .bind_filesystem(fs.clone());
+        let rdesc = fifo
+            .clone()
+            .open(
+                OpenFlags::new(OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK),
+                prep_r,
+            )
+            .unwrap();
+        let prep_w = PreparedFileHandle::try_new()
+            .unwrap()
+            .bind_filesystem(fs.clone());
+        let wdesc = fifo
+            .clone()
+            .open(
+                OpenFlags::new(OpenFlags::O_WRONLY | OpenFlags::O_NONBLOCK),
+                prep_w,
+            )
+            .unwrap();
+
+        let rhandle = rdesc
+            .as_any()
+            .downcast_ref::<crate::traits::FileHandle>()
+            .unwrap();
+        let whandle = wdesc
+            .as_any()
+            .downcast_ref::<crate::traits::FileHandle>()
+            .unwrap();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(rhandle.read(&mut buf), Err(FsError::Again));
+        assert_eq!(whandle.write(b"abc123"), Ok(6));
+        assert_eq!(rhandle.read(&mut buf), Ok(6));
+        assert_eq!(&buf[..6], b"abc123");
+
+        drop(wdesc);
+        assert_eq!(rhandle.read(&mut buf), Ok(0));
+
+        drop(rdesc);
+        drop((fifo, root, fs));
     }
 }
 

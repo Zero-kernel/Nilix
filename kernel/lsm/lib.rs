@@ -364,21 +364,6 @@ pub struct FeatureAbsentHook {
 /// documentation must call them dormant (see `SecureBaselinePolicy`).
 pub const FEATURE_ABSENT_HOOKS: &[FeatureAbsentHook] = &[
     FeatureAbsentHook {
-        hook: "hook_file_chmod",
-        syscalls: &[90, 91, 268, 452],
-        reason: "chmod/fchmod are fixed EOPNOTSUPP stubs (R72); no fchmodat/fchmodat2 arm",
-    },
-    FeatureAbsentHook {
-        hook: "hook_file_chown",
-        syscalls: &[92, 93, 94, 260],
-        reason: "chown/fchown/lchown are fixed ENOSYS stubs; no fchownat arm",
-    },
-    FeatureAbsentHook {
-        hook: "hook_file_link",
-        syscalls: &[86, 265],
-        reason: "link is a fixed EPERM stub (R173-09); no linkat arm",
-    },
-    FeatureAbsentHook {
         hook: "hook_file_mmap",
         syscalls: &[],
         reason: "sys_mmap returns EOPNOTSUPP for fd >= 0 before any mapping",

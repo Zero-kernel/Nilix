@@ -155,6 +155,7 @@ N2.5 pgid/sid, controlling terminal ioctls, kill(-pgid), wait4/waitid stop & con
 N2.1 >256 KiB exec image, >1 MiB PT_LOAD segment, and 1024 fd ceiling
 N2.4 set*id, supplementary groups, capget/capset, and privilege drop
 N2.7 /dev/urandom, /dev/tty, /proc/mounts, getrusage, times, sysinfo, priority, and getcpu
+N2.3 dirfd/*at family, fchdir, truncate, setattr/chmod/chown/utimensat, hard links, statx, statfs, and FIFOs
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.

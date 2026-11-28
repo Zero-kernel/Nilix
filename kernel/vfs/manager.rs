@@ -357,6 +357,8 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
         FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
         FsError::Again => SyscallError::EAGAIN,
         FsError::NoDevice => SyscallError::ENXIO,
+        FsError::Interrupted => SyscallError::EINTR,
+        FsError::OpNotSupp => SyscallError::EOPNOTSUPP,
         FsError::CrossDev => SyscallError::EXDEV,
         FsError::SymlinkLoop => SyscallError::ELOOP,
         FsError::NotSupported => SyscallError::ENOSYS,
@@ -403,6 +405,17 @@ fn prepare_syscall_open(
     resolve_flags: ResolveFlags,
     authorization: &kernel_core::process::CredentialAuthorization,
 ) -> Result<kernel_core::syscall::PreparedVfsOpen, SyscallError> {
+    prepare_syscall_open_at(-100, path, flags, mode, resolve_flags, authorization)
+}
+
+fn prepare_syscall_open_at(
+    dirfd: i32,
+    path: &str,
+    flags: u32,
+    mode: u32,
+    resolve_flags: ResolveFlags,
+    authorization: &kernel_core::process::CredentialAuthorization,
+) -> Result<kernel_core::syscall::PreparedVfsOpen, SyscallError> {
     let open_flags = OpenFlags::from_bits(flags);
     let perm = (mode & 0o7777) as u16;
     #[cfg(feature = "open_fault_probe")]
@@ -413,7 +426,8 @@ fn prepare_syscall_open(
     let prepare = PreparedFileHandle::try_new;
 
     let descriptor = VFS
-        .open_with_resolve_using(
+        .open_at_with_resolve_using(
+            dirfd,
             path,
             open_flags,
             perm,
@@ -810,6 +824,109 @@ pub fn register_syscall_callbacks() {
     kernel_core::syscall::register_vfs_symlink_callback(vfs_symlink_callback); // M0-6 SLICE 3
     kernel_core::syscall::register_vfs_readlink_callback(vfs_readlink_callback); // M0-6 SLICE 3
     kernel_core::syscall::register_vfs_stat_nofollow_callback(vfs_stat_nofollow_callback); // M0-6 SLICE 3 (lstat)
+    kernel_core::syscall::register_vfs_extended_callbacks(
+        kernel_core::syscall::VfsExtendedCallbacks {
+            open_at: |dirfd, path, flags, mode, resolve, auth| {
+                prepare_syscall_open_at(
+                    dirfd,
+                    path,
+                    flags,
+                    mode,
+                    ResolveFlags::from_bits(resolve),
+                    auth,
+                )
+            },
+            stat_at: |dirfd, path, follow, empty_path| {
+                let (stat, mnt_id) = VFS
+                    .stat_at(dirfd, path, follow, empty_path)
+                    .map_err(fs_error_to_syscall)?;
+                let vfs_stat = vfs_stat_from(stat)?;
+                Ok((vfs_stat, mnt_id))
+            },
+            create_at: |dirfd, path, raw_mode| {
+                let perm = (raw_mode & 0o7777) as u16;
+                let ftype = raw_mode & 0o170000;
+                let file_mode = match ftype {
+                    0o040000 => FileMode::directory(perm),
+                    0o010000 => FileMode::fifo(perm),
+                    0 | 0o100000 => FileMode::regular(perm),
+                    _ => return Err(SyscallError::EINVAL),
+                };
+                VFS.create_at(dirfd, path, file_mode)
+                    .map(|_| ())
+                    .map_err(fs_error_to_syscall)
+            },
+            unlink_at: |dirfd, path, must_dir| {
+                VFS.unlink_at(dirfd, path, must_dir)
+                    .map_err(fs_error_to_syscall)
+            },
+            rename_at: |olddirfd, old, newdirfd, new, noreplace| {
+                VFS.rename_at(olddirfd, old, newdirfd, new, noreplace)
+                    .map_err(fs_error_to_syscall)
+            },
+            symlink_at: |target, newdirfd, linkpath| {
+                VFS.symlink_at(target, newdirfd, linkpath)
+                    .map_err(fs_error_to_syscall)
+            },
+            readlink_at: |dirfd, path| VFS.readlink_at(dirfd, path).map_err(fs_error_to_syscall),
+            access_at: |dirfd, path, mode, flags| {
+                VFS.access_at(dirfd, path, mode, flags)
+                    .map_err(fs_error_to_syscall)
+            },
+            fchdir: |fd| VFS.fchdir(fd).map_err(fs_error_to_syscall),
+            truncate_path: |path, len| VFS.truncate_path(path, len).map_err(fs_error_to_syscall),
+            chmod_at: |dirfd, path, mode, nofollow| {
+                VFS.chmod_at(dirfd, path, mode, nofollow)
+                    .map_err(fs_error_to_syscall)
+            },
+            fchmod: |fd, mode| VFS.fchmod(fd, mode).map_err(fs_error_to_syscall),
+            chown_at: |dirfd, path, uid, gid, nofollow, empty_path| {
+                VFS.chown_at(dirfd, path, uid, gid, nofollow, empty_path)
+                    .map_err(fs_error_to_syscall)
+            },
+            fchown: |fd, uid, gid| VFS.fchown(fd, uid, gid).map_err(fs_error_to_syscall),
+            utimens_at: |dirfd, path, atime, mtime, nofollow| {
+                VFS.utimens_at(dirfd, path, atime, mtime, nofollow)
+                    .map_err(fs_error_to_syscall)
+            },
+            link_at: |olddirfd, oldpath, newdirfd, newpath, follow, empty_path| {
+                VFS.link_at(olddirfd, oldpath, newdirfd, newpath, follow, empty_path)
+                    .map_err(fs_error_to_syscall)
+            },
+            statfs: |path| {
+                let s = VFS.statfs_path(path).map_err(fs_error_to_syscall)?;
+                Ok(kernel_core::syscall::VfsStatFs {
+                    f_type: s.f_type,
+                    f_bsize: s.f_bsize,
+                    f_blocks: s.f_blocks,
+                    f_bfree: s.f_bfree,
+                    f_bavail: s.f_bavail,
+                    f_files: s.f_files,
+                    f_ffree: s.f_ffree,
+                    f_fsid: s.f_fsid,
+                    f_namelen: s.f_namelen,
+                    f_frsize: s.f_frsize,
+                    f_flags: s.f_flags,
+                })
+            },
+            fstatfs: |fd| {
+                let s = VFS.fstatfs(fd).map_err(fs_error_to_syscall)?;
+                Ok(kernel_core::syscall::VfsStatFs {
+                    f_type: s.f_type,
+                    f_bsize: s.f_bsize,
+                    f_blocks: s.f_blocks,
+                    f_bfree: s.f_bfree,
+                    f_bavail: s.f_bavail,
+                    f_files: s.f_files,
+                    f_ffree: s.f_ffree,
+                    f_fsid: s.f_fsid,
+                    f_namelen: s.f_namelen,
+                    f_frsize: s.f_frsize,
+                    f_flags: s.f_flags,
+                })
+            },
+        },
+    );
 
     // R74-2 FIX: Register mount namespace materialization callback.
     // This enables eager materialization when namespaces are created via
