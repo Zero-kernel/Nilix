@@ -335,10 +335,24 @@ pub const fn reserved_headroom_bytes() -> usize {
     RESERVED_HEADROOM_BYTES
 }
 
-/// Sum of hard floors.
+/// Sum of hard floors (1x compile-time baseline).
 #[inline]
 pub const fn hard_floors_sum_bytes() -> usize {
     HARD_FLOORS_SUM_BYTES
+}
+
+/// N3.1c: Runtime RAM-scaled page-cache metadata budget (`64 KiB * scale`).
+/// Scales linearly with `admission_scale()` so >256 MiB guests can cache
+/// proportionally more file pages while staying <= 1/32 of total runtime heap.
+#[inline]
+pub fn runtime_page_cache_meta_bytes() -> usize {
+    PAGE_CACHE_META_HARD_BYTES * heap_admission::admission_scale()
+}
+
+/// N3.1c: Runtime sum of registered hard floors (including scaled PageCacheMeta).
+#[inline]
+pub fn runtime_hard_floors_sum_bytes() -> usize {
+    HARD_FLOORS_SUM_BYTES + (runtime_page_cache_meta_bytes() - PAGE_CACHE_META_HARD_BYTES)
 }
 
 /// Residual for non-registered general use (compile-time 1x baseline).
@@ -358,7 +372,7 @@ pub fn runtime_general_residual_bytes() -> usize {
 pub fn snapshot() -> HeapBudgetSnapshot {
     HeapBudgetSnapshot {
         heap_total_bytes: crate::memory::runtime_heap_size_bytes(),
-        hard_floors_sum_bytes: HARD_FLOORS_SUM_BYTES,
+        hard_floors_sum_bytes: runtime_hard_floors_sum_bytes(),
         reserved_headroom_bytes: RESERVED_HEADROOM_BYTES,
         transient_peak_bytes: TRANSIENT_PEAK_BYTES,
         general_residual_bytes: heap_admission::runtime_admitted_heap_bytes(),
@@ -391,7 +405,7 @@ pub fn publish_and_assert() {
     let heap = crate::memory::runtime_heap_size_bytes();
     let normal = crate::memory::runtime_normal_heap_size_bytes();
     let admitted = heap_admission::runtime_admitted_heap_bytes();
-    let hard = HARD_FLOORS_SUM_BYTES;
+    let hard = runtime_hard_floors_sum_bytes();
     let head = RESERVED_HEADROOM_BYTES;
     let peak = TRANSIENT_PEAK_BYTES;
 
@@ -525,10 +539,11 @@ pub fn run_heap_budget_self_test() {
     // 5) Residual arithmetic is consistent with the published snapshot shape.
     let runtime_heap = crate::memory::runtime_heap_size_bytes();
     let runtime_normal = crate::memory::runtime_normal_heap_size_bytes();
+    let runtime_hard = runtime_hard_floors_sum_bytes();
     let runtime_admitted = heap_admission::runtime_admitted_heap_bytes();
     let snap = snapshot();
     assert_eq!(snap.heap_total_bytes, runtime_heap);
-    assert_eq!(snap.hard_floors_sum_bytes, HARD_FLOORS_SUM_BYTES);
+    assert_eq!(snap.hard_floors_sum_bytes, runtime_hard);
     assert_eq!(snap.reserved_headroom_bytes, RESERVED_HEADROOM_BYTES);
     assert_eq!(snap.transient_peak_bytes, TRANSIENT_PEAK_BYTES);
     assert_eq!(snap.general_residual_bytes, runtime_admitted);
@@ -539,7 +554,7 @@ pub fn run_heap_budget_self_test() {
         "baseline normal heap partition must be exact"
     );
     assert_eq!(
-        HARD_FLOORS_SUM_BYTES + NORMAL_UNADMITTED_RESERVE_BYTES + runtime_admitted,
+        runtime_hard + NORMAL_UNADMITTED_RESERVE_BYTES + runtime_admitted,
         runtime_normal,
         "runtime normal heap partition must be exact"
     );

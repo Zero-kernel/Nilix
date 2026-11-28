@@ -48,6 +48,10 @@ pub use admitted::{
     RetiredAdmittedDequeCapacity, RetiredAdmittedMapCapacity, RetiredAdmittedSetCapacity,
     RetiredAdmittedVecCapacity,
 };
+pub use buddy_allocator::{
+    compute_low_watermark_pages, low_watermark_pages, low_watermark_reclaim_stats,
+    register_low_watermark_reclaim_hook, LowWatermarkReclaimHook, LowWatermarkReclaimStats,
+};
 pub use capabilities::{
     run_memory_capability_self_test, NumaAllocation, NumaAllocator, NumaError, SlabCache,
     SlabError, SwapEntry, SwapError, SwapSlotTable, ThpError, ThpMapping, MAX_NUMA_NODES,
@@ -69,11 +73,12 @@ pub use heap_budget::{
     budget_bytes, general_residual_bytes, hard_floor_bytes, hard_floors_sum_bytes,
     is_published as heap_budgets_published, publish_and_assert as publish_heap_budgets,
     reserved_headroom_bytes, run_heap_budget_self_test, runtime_general_residual_bytes,
-    snapshot as heap_budget_snapshot, transient_peak_bytes, transient_peak_holders, HeapBudgetId,
-    HeapBudgetSnapshot, TransientPeakGuard, AUDIT_RING_HARD_BYTES, CONNTRACK_HARD_BYTES,
-    EXEC_IMAGE_PEAK_BYTES, EXEC_TRANSACTION_PEAK_BYTES, FUTEX_HARD_BYTES, HARD_FLOORS_SUM_BYTES,
-    HARD_FLOOR_BYTES, HARD_FLOOR_COUNT, HARD_FLOOR_NAMES, PAGE_CACHE_META_HARD_BYTES,
-    RESERVED_HEADROOM_BYTES, TRANSIENT_PEAK_BYTES,
+    runtime_hard_floors_sum_bytes, runtime_page_cache_meta_bytes, snapshot as heap_budget_snapshot,
+    transient_peak_bytes, transient_peak_holders, HeapBudgetId, HeapBudgetSnapshot,
+    TransientPeakGuard, AUDIT_RING_HARD_BYTES, CONNTRACK_HARD_BYTES, EXEC_IMAGE_PEAK_BYTES,
+    EXEC_TRANSACTION_PEAK_BYTES, FUTEX_HARD_BYTES, HARD_FLOORS_SUM_BYTES, HARD_FLOOR_BYTES,
+    HARD_FLOOR_COUNT, HARD_FLOOR_NAMES, PAGE_CACHE_META_HARD_BYTES, RESERVED_HEADROOM_BYTES,
+    TRANSIENT_PEAK_BYTES,
 };
 pub use memory::{
     compute_heap_scale_for_ram, cow_refcount_slot_for_phys, emergency_heap_base,
@@ -92,11 +97,12 @@ pub use oom_killer::{
     OomProcessInfo, OomStats,
 };
 pub use page_cache::{
+    compute_page_cache_max_pages_for_ram, configure_for_ram as configure_page_cache_for_ram,
     find_or_create_page, init as init_page_cache, read_page, reclaim_pages,
-    run_page_cache_policy_self_test, writeback_dirty_pages, writeback_page, GlobalPageCache,
-    InodeId, MemoryPressureHandler, PageCacheEntry, PageCacheStats, PageCacheUnchargeFn, PageIndex,
-    PageState, WritebackStats, PAGE_CACHE, PAGE_CACHE_CGROUP_CHARGE_BYTES, PAGE_CACHE_MAX_PAGES,
-    PAGE_SIZE, PRESSURE_HANDLER,
+    run_page_cache_policy_self_test, runtime_page_cache_max_pages, writeback_dirty_pages,
+    writeback_page, GlobalPageCache, InodeId, MemoryPressureHandler, PageCacheEntry,
+    PageCacheStats, PageCacheUnchargeFn, PageIndex, PageState, WritebackStats, PAGE_CACHE,
+    PAGE_CACHE_CGROUP_CHARGE_BYTES, PAGE_CACHE_MAX_PAGES, PAGE_SIZE, PRESSURE_HANDLER,
 };
 pub use page_table::{
     as_pt_lock_shard, checked_physical_range, direct_map_limit, map_mmio, phys_to_virt,

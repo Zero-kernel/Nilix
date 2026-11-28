@@ -838,7 +838,11 @@ pub fn test_heap_budget_arbiter() {
     );
     assert!(
         (mm::PAGE_CACHE_MAX_PAGES as usize) * 256 <= mm::PAGE_CACHE_META_HARD_BYTES,
-        "page-cache metadata charge must fit arbiter hard floor"
+        "baseline page-cache metadata charge must fit arbiter hard floor"
+    );
+    assert!(
+        (mm::runtime_page_cache_max_pages() as usize) * 256 <= mm::runtime_page_cache_meta_bytes(),
+        "N3.1c runtime page-cache metadata charge must fit runtime page-cache floor"
     );
     assert_eq!(
         mm::budget_bytes(mm::HeapBudgetId::ExecImagePeak),

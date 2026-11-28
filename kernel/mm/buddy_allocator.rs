@@ -2155,6 +2155,13 @@ impl PcpBuddyPool {
             return Err(AllocError::Busy);
         }
         if matches!(refill_result, Err(AllocError::Exhausted)) && run_oom {
+            let reclaimed = invoke_low_watermark_reclaim(LOW_WATERMARK_RECLAIM_BATCH);
+            if reclaimed > 0 {
+                let _ = self.drain_all_pcp(cpu_limit);
+                refill_result = self.refill_batch_from_buddy(cpu, &mut batch);
+            }
+        }
+        if matches!(refill_result, Err(AllocError::Exhausted)) && run_oom {
             oom_killer::on_allocation_failure(1);
             oom_killer::poll_and_handle_oom();
             let _ = self.drain_all_pcp(cpu_limit);
@@ -2163,6 +2170,15 @@ impl PcpBuddyPool {
 
         let (count, zeroed_mask) = refill_result?;
         self.stat_refills.fetch_add(1, Ordering::Relaxed);
+
+        // N3.1c: proactive low-watermark reclaim strictly OUTSIDE buddy locks
+        // on the cold refill path (zero overhead on PCP fast path hits).
+        if run_oom {
+            let wm = LOW_WATERMARK_PAGES.load(Ordering::Relaxed);
+            if wm > 0 && !self.has_at_least_free_pages(wm) {
+                let _ = invoke_low_watermark_reclaim(LOW_WATERMARK_RECLAIM_BATCH);
+            }
+        }
 
         // Invariant S2: scrub every unzeroed frame pulled from buddy before
         // reuse or caching in PCP. Frames drained earlier from PCP already carry
@@ -2571,6 +2587,18 @@ impl PcpBuddyPool {
 
         if !run_oom {
             return Err(AllocError::Exhausted);
+        }
+
+        // N3.1c: direct reclaim of clean page-cache + cached empty slabs before
+        // escalating to OOM kill (runs strictly outside buddy locks).
+        let reclaimed = invoke_low_watermark_reclaim(pages_needed.max(LOW_WATERMARK_RECLAIM_BATCH));
+        if reclaimed > 0 {
+            let _ = self.drain_all_pcp(cpu_limit);
+            match alloc_once() {
+                Ok(frame) => return Ok(frame),
+                Err(AllocError::Exhausted) => {}
+                Err(err) => return Err(err),
+            }
         }
 
         oom_killer::on_allocation_failure(pages_needed);
@@ -3026,6 +3054,113 @@ impl PcpBuddyPool {
     }
 }
 
+/// N3.1c (#67): Low-watermark reclaim callback invoked outside any buddy lock
+/// when free physical pages drop below the RAM-scaled low watermark or before
+/// escalating to OOM. Returns the number of 4 KiB pages freed back to buddy.
+pub type LowWatermarkReclaimHook = fn(usize) -> usize;
+
+/// Reclaim batch target (pages) on proactive low-watermark pressure.
+pub const LOW_WATERMARK_RECLAIM_BATCH: usize = 32;
+
+/// Observability counters for buddy low-watermark reclamation.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct LowWatermarkReclaimStats {
+    pub low_watermark_pages: usize,
+    pub invocations: u64,
+    pub pages_reclaimed: u64,
+}
+
+static LOW_WATERMARK_PAGES: AtomicUsize = AtomicUsize::new(0);
+static LOW_WATERMARK_RECLAIM_HOOK: AtomicUsize = AtomicUsize::new(0);
+static LOW_WATERMARK_RECLAIM_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LOW_WATERMARK_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static LOW_WATERMARK_PAGES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+
+/// Pure RAM -> buddy low-watermark formula: `3.125%` (`total_pages / 32`),
+/// clamped to `[64, 4096]` pages (`256 KiB .. 16 MiB`).
+#[inline]
+pub const fn compute_low_watermark_pages(total_pages: usize) -> usize {
+    if total_pages == 0 {
+        return 0;
+    }
+    let raw = total_pages / 32;
+    if raw < 64 {
+        if total_pages < 64 {
+            total_pages / 4
+        } else {
+            64
+        }
+    } else if raw > 4096 {
+        4096
+    } else {
+        raw
+    }
+}
+
+/// Register the buddy low-watermark reclaim callback (e.g., clean page-cache
+/// eviction + cached empty-slab flush). Lock-free publication.
+pub fn register_low_watermark_reclaim_hook(hook: LowWatermarkReclaimHook) {
+    LOW_WATERMARK_RECLAIM_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Configure the active low watermark from total managed pages.
+pub fn configure_low_watermark(total_pages: usize) -> usize {
+    let wm = compute_low_watermark_pages(total_pages);
+    LOW_WATERMARK_PAGES.store(wm, Ordering::Release);
+    wm
+}
+
+/// Active buddy low watermark in 4 KiB pages.
+#[inline]
+pub fn low_watermark_pages() -> usize {
+    LOW_WATERMARK_PAGES.load(Ordering::Acquire)
+}
+
+/// Snapshot of buddy low-watermark reclaim statistics.
+#[inline]
+pub fn low_watermark_reclaim_stats() -> LowWatermarkReclaimStats {
+    LowWatermarkReclaimStats {
+        low_watermark_pages: LOW_WATERMARK_PAGES.load(Ordering::Acquire),
+        invocations: LOW_WATERMARK_INVOCATIONS.load(Ordering::Relaxed),
+        pages_reclaimed: LOW_WATERMARK_PAGES_RECLAIMED.load(Ordering::Relaxed),
+    }
+}
+
+/// Invoke the registered low-watermark reclaim hook safely outside any buddy
+/// lock. Non-reentrant and skipped in IRQ/soft-progress context so reclaim
+/// cannot deadlock on page-cache or slab locks.
+fn invoke_low_watermark_reclaim(target_pages: usize) -> usize {
+    if target_pages == 0 {
+        return 0;
+    }
+    let hook_addr = LOW_WATERMARK_RECLAIM_HOOK.load(Ordering::Acquire);
+    if hook_addr == 0 {
+        return 0;
+    }
+    #[cfg(not(feature = "host_harness"))]
+    {
+        let cpu = cpu_local::current_cpu();
+        if cpu.in_irq() || cpu.in_soft_progress() {
+            return 0;
+        }
+    }
+    if LOW_WATERMARK_RECLAIM_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return 0;
+    }
+    // SAFETY: `hook_addr` was stored from a valid `LowWatermarkReclaimHook` fn pointer.
+    let hook: LowWatermarkReclaimHook = unsafe { core::mem::transmute(hook_addr) };
+    let freed = hook(target_pages);
+    LOW_WATERMARK_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    if freed > 0 {
+        LOW_WATERMARK_PAGES_RECLAIMED.fetch_add(freed as u64, Ordering::Relaxed);
+    }
+    LOW_WATERMARK_RECLAIM_ACTIVE.store(false, Ordering::Release);
+    freed
+}
+
 /// 全局 Buddy + PCP 物理页分配器实例
 static GLOBAL_BUDDY: PcpBuddyPool = PcpBuddyPool::new();
 
@@ -3094,6 +3229,7 @@ pub fn init_buddy_allocator_zones(
     }
 
     GLOBAL_BUDDY.publish_zones(allocators);
+    let _ = configure_low_watermark(total_pages);
 
     let size = total_pages * PAGE_SIZE;
     klog_always!("Buddy allocator initialized ({} zone(s)):", zone_count);
@@ -3144,6 +3280,7 @@ fn publish_buddy_allocator(allocator: BuddyAllocator) -> Result<(), BuddyInitErr
     let reserved_pages = allocator.reserved_pages;
     let free_pages = allocator.free_pages;
     GLOBAL_BUDDY.publish(allocator);
+    let _ = configure_low_watermark(total_pages);
 
     klog_always!("Buddy allocator initialized:");
     // R132-3 FIX: Use kprintln! (debug-only) to avoid leaking physical memory base
@@ -4281,5 +4418,36 @@ mod tests {
             pool.try_free_order0_with_phys(high_frame, 0, |_, _| 0, |_| {}),
             Ok(())
         );
+    }
+
+    #[test]
+    fn n3_1c_buddy_low_watermark_formula_and_reclaim_hook_nonreentrant() {
+        // Pure watermark formula across tiny, 256M, 2G, 4G, and 64G page counts.
+        assert_eq!(compute_low_watermark_pages(0), 0);
+        assert_eq!(compute_low_watermark_pages(32), 8);
+        assert_eq!(compute_low_watermark_pages(1024), 64);
+        assert_eq!(compute_low_watermark_pages(49_152), 1536); // ~192 MiB -> 6 MiB
+        assert_eq!(compute_low_watermark_pages(512 * 1024), 4096); // 2 GiB -> 16 MiB cap
+        assert_eq!(compute_low_watermark_pages(1024 * 1024), 4096); // 4 GiB -> 16 MiB cap
+
+        static REENTRANT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn reentrant_hook(target: usize) -> usize {
+            REENTRANT_CALLS.fetch_add(1, Ordering::AcqRel);
+            // Nested call must be suppressed by the non-reentrancy guard!
+            assert_eq!(invoke_low_watermark_reclaim(target), 0);
+            target
+        }
+
+        let prev_hook = LOW_WATERMARK_RECLAIM_HOOK.load(Ordering::Acquire);
+        REENTRANT_CALLS.store(0, Ordering::Release);
+        register_low_watermark_reclaim_hook(reentrant_hook);
+        let before = low_watermark_reclaim_stats();
+        let freed = invoke_low_watermark_reclaim(16);
+        assert_eq!(freed, 16);
+        assert_eq!(REENTRANT_CALLS.load(Ordering::Acquire), 1);
+        let after = low_watermark_reclaim_stats();
+        assert!(after.invocations >= before.invocations + 1);
+        assert!(after.pages_reclaimed >= before.pages_reclaimed + 16);
+        LOW_WATERMARK_RECLAIM_HOOK.store(prev_hook, Ordering::Release);
     }
 }

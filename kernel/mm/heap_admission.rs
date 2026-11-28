@@ -62,11 +62,17 @@ pub fn admission_scale() -> usize {
 
 /// Runtime-admitted normal-heap byte pool for the discovered physical RAM size.
 /// Equals [`ADMITTED_HEAP_BYTES`] when `admission_scale() == 1`.
+/// Accounts for N3.1c RAM-scaled `PageCacheMeta` reserve (`64 KiB * scale`).
 #[inline]
 pub fn runtime_admitted_heap_bytes() -> usize {
     let scale = admission_scale();
     let normal = HEAP_SIZE_BYTES * scale - EMERGENCY_HEAP_SIZE_BYTES;
-    normal - NORMAL_UNADMITTED_RESERVE_BYTES - REGISTERED_FIXED_RESERVE_BYTES
+    let extra_page_cache_meta =
+        crate::heap_budget::PAGE_CACHE_META_HARD_BYTES * scale.saturating_sub(1);
+    normal
+        - NORMAL_UNADMITTED_RESERVE_BYTES
+        - REGISTERED_FIXED_RESERVE_BYTES
+        - extra_page_cache_meta
 }
 
 /// Configure runtime global and class admission ceilings from the
@@ -505,11 +511,9 @@ fn release_committed_pair(class: HeapClass, bytes: usize) -> Result<(), HeapAdmi
 /// Publish the runtime ledger after the normal and emergency arenas exist.
 pub(crate) fn publish() {
     let normal = crate::memory::runtime_normal_heap_size_bytes();
+    let fixed_reserve = crate::heap_budget::runtime_hard_floors_sum_bytes();
     assert!(
-        REGISTERED_FIXED_RESERVE_BYTES
-            + NORMAL_UNADMITTED_RESERVE_BYTES
-            + runtime_admitted_heap_bytes()
-            <= normal,
+        fixed_reserve + NORMAL_UNADMITTED_RESERVE_BYTES + runtime_admitted_heap_bytes() <= normal,
         "R180 heap admission partition exceeds normal arena"
     );
     PUBLISHED.store(true, Ordering::Release);
@@ -1912,6 +1916,7 @@ mod tests {
                 - EMERGENCY_HEAP_SIZE_BYTES
                 - NORMAL_UNADMITTED_RESERVE_BYTES
                 - REGISTERED_FIXED_RESERVE_BYTES
+                - crate::heap_budget::PAGE_CACHE_META_HARD_BYTES * 15
         );
         // Futex stays fixed at its audited 128 KiB hard floor; other classes scale.
         assert_eq!(

@@ -820,8 +820,19 @@ pub fn init() {
 // Partial KASLR: Heap Base Randomization
 // ============================================================================
 
-/// N3.1b (`HEAP-SCALE`, #67): scale kernel heap admission ceilings from total
-/// managed physical RAM and activate the buddy-backed slab + large-page heap.
+/// N3.1c (#67): Buddy low-watermark reclaim hook — evicts clean LRU page-cache
+/// pages first, then flushes cached empty slab pages if more frames are needed.
+fn buddy_low_watermark_reclaim(target_pages: usize) -> usize {
+    let mut freed = crate::page_cache::reclaim_pages(target_pages);
+    if freed < target_pages {
+        freed = freed.saturating_add(crate::slab::reclaim_empty_slabs());
+    }
+    freed
+}
+
+/// N3.1b + N3.1c (`HEAP-SCALE`, #67): scale kernel heap admission ceilings and
+/// page cache capacity from total managed physical RAM, activate the
+/// buddy-backed slab + large-page heap, and wire buddy low-watermark reclaim.
 fn activate_scaled_slab_heap(total_managed_bytes: u64) {
     let scale = compute_heap_scale_for_ram(total_managed_bytes);
     crate::heap_admission::configure_for_scale(scale);
@@ -829,12 +840,21 @@ fn activate_scaled_slab_heap(total_managed_bytes: u64) {
     let runtime_normal = runtime_normal_heap_size_bytes();
     let runtime_admitted = crate::heap_admission::runtime_admitted_heap_bytes();
     crate::slab::activate(runtime_normal);
+    let pc_max_pages = crate::page_cache::configure_for_ram(total_managed_bytes, scale);
+    crate::buddy_allocator::register_low_watermark_reclaim_hook(buddy_low_watermark_reclaim);
+    let low_wm = crate::buddy_allocator::low_watermark_pages();
     klog_always!(
         "N3.1b: Buddy-backed slab heap active: total={} MiB (scale={}x, normal={} KiB, admitted={} KiB)",
         runtime_total / (1024 * 1024),
         scale,
         runtime_normal / 1024,
         runtime_admitted / 1024
+    );
+    klog_always!(
+        "N3.1c: Page cache max_pages={} ({} MiB), buddy low_watermark={} pages",
+        pc_max_pages,
+        (pc_max_pages * 4) / 1024,
+        low_wm
     );
 }
 

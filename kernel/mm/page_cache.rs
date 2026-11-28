@@ -34,11 +34,55 @@ pub const PAGE_SIZE: usize = 4096;
 const PAGE_CACHE_METADATA_BUDGET_BYTES: usize = hard_floor_bytes(HeapBudgetId::PageCacheMeta);
 const PAGE_CACHE_METADATA_BYTES_PER_PAGE: usize = 256;
 
-/// Heap-arbiter-derived hard ceiling (256 pages at the current 64 KiB floor).
+/// Heap-arbiter-derived 1x baseline hard ceiling (256 pages at the 64 KiB floor).
 /// The historical 16,384-page policy (and the intermediate 512-page HEAP/8 cap)
 /// could over-commit the 1 MiB heap when stacked with other hard floors.
 pub const PAGE_CACHE_MAX_PAGES: u64 =
     (PAGE_CACHE_METADATA_BUDGET_BYTES / PAGE_CACHE_METADATA_BYTES_PER_PAGE) as u64;
+
+/// N3.1c (#67): runtime page-cache page ceiling, scaled from managed physical RAM
+/// and bounded by both 25% of managed RAM and `runtime_page_cache_meta_bytes() / 256`.
+static RUNTIME_PAGE_CACHE_MAX_PAGES: AtomicU64 = AtomicU64::new(PAGE_CACHE_MAX_PAGES);
+
+/// Pure RAM -> page-cache capacity formula (`>= PAGE_CACHE_MAX_PAGES`).
+///
+/// Bounded by the minimum of:
+/// 1. `25%` of managed physical RAM (leaving >= 75% for userspace/slab/kstacks), and
+/// 2. `PAGE_CACHE_META_HARD_BYTES * heap_scale / 256` (so page-cache metadata
+///    never exceeds its registered runtime heap floor).
+#[inline]
+pub const fn compute_page_cache_max_pages_for_ram(managed_bytes: u64, heap_scale: usize) -> u64 {
+    let scale = if heap_scale < 1 { 1 } else { heap_scale };
+    let meta_cap = (PAGE_CACHE_METADATA_BUDGET_BYTES.saturating_mul(scale)
+        / PAGE_CACHE_METADATA_BYTES_PER_PAGE) as u64;
+    let ram_cap = (managed_bytes / 4) / PAGE_SIZE as u64;
+    let bounded = if meta_cap <= ram_cap {
+        meta_cap
+    } else {
+        ram_cap
+    };
+    if bounded < PAGE_CACHE_MAX_PAGES {
+        PAGE_CACHE_MAX_PAGES
+    } else {
+        bounded
+    }
+}
+
+/// Active runtime page-cache maximum page count (equals `PAGE_CACHE_MAX_PAGES`
+/// on `<= 256 MiB` systems and scales up to 32,768 pages / 128 MiB on `>= 16 GiB`).
+#[inline]
+pub fn runtime_page_cache_max_pages() -> u64 {
+    RUNTIME_PAGE_CACHE_MAX_PAGES.load(Ordering::Acquire)
+}
+
+/// Configure the global page cache ceiling for `managed_bytes` and `heap_scale`.
+/// Called once during early MM bring-up right after buddy publication.
+pub fn configure_for_ram(managed_bytes: u64, heap_scale: usize) -> u64 {
+    let cap = compute_page_cache_max_pages_for_ram(managed_bytes, heap_scale);
+    RUNTIME_PAGE_CACHE_MAX_PAGES.store(cap, Ordering::Release);
+    PAGE_CACHE.set_max_pages(cap);
+    cap
+}
 
 /// The origin cgroup owns the physical page plus its conservative metadata
 /// allowance until the final `PageCacheEntry` reference is dropped.
@@ -325,6 +369,10 @@ impl LruList {
         }
     }
 
+    fn set_max_entries(&mut self, max_entries: usize) {
+        self.max_entries = max_entries;
+    }
+
     /// Add a page to the front of the LRU list (most recently used)
     ///
     /// New backing storage is reserved fallibly before mutation. Reusing a
@@ -522,8 +570,8 @@ pub struct GlobalPageCache {
     nr_pages: AtomicU64,
     /// Total number of dirty pages
     nr_dirty: AtomicU64,
-    /// Maximum number of pages to cache
-    max_pages: u64,
+    /// Maximum number of pages to cache (runtime RAM-scaled in N3.1c)
+    max_pages: AtomicU64,
     /// Resident pages plus in-flight admissions. Unlike a total-free heap
     /// probe, this is a real atomic reservation and cannot be oversubscribed by
     /// concurrent readers.
@@ -603,21 +651,35 @@ enum CacheInsertResult {
 impl GlobalPageCache {
     /// Create a new global page cache
     pub fn new(requested_max_pages: u64) -> Self {
-        let max_pages = requested_max_pages.min(PAGE_CACHE_MAX_PAGES);
+        let max_pages = requested_max_pages.min(runtime_page_cache_max_pages());
         Self {
             index: RwLock::new(FallibleOrderedMap::new()),
             lru: Mutex::new(LruList::new(max_pages as usize)),
             nr_pages: AtomicU64::new(0),
             nr_dirty: AtomicU64::new(0),
-            max_pages,
+            max_pages: AtomicU64::new(max_pages),
             allocated_slots: AtomicU64::new(0),
         }
     }
 
+    #[inline]
+    pub fn max_pages(&self) -> u64 {
+        self.max_pages.load(Ordering::Acquire)
+    }
+
+    /// Update the cache ceiling (used once at boot after buddy zones publish).
+    pub fn set_max_pages(&self, new_max_pages: u64) {
+        let capped = new_max_pages.min(runtime_page_cache_max_pages());
+        let mut lru = self.lru.lock();
+        lru.set_max_entries(capped as usize);
+        self.max_pages.store(capped, Ordering::Release);
+    }
+
     fn try_hold_slot(&self) -> bool {
+        let cap = self.max_pages();
         self.allocated_slots
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                if used < self.max_pages {
+                if used < cap {
                     Some(used + 1)
                 } else {
                     None
@@ -700,7 +762,7 @@ impl GlobalPageCache {
             return CacheInsertResult::Existing(existing);
         }
 
-        if cache_index.len() >= self.max_pages as usize {
+        if cache_index.len() >= self.max_pages() as usize {
             drop(cache_index);
             drop(page);
             return CacheInsertResult::OutOfMemory;
@@ -870,6 +932,42 @@ impl GlobalPageCache {
         }
     }
 
+    /// N3.1c (ST-K4 writeback alignment): clear dirty state across all resident
+    /// cache pages of `inode_id` in `[first, last]` after a durable filesystem
+    /// writeback / JBD2 commit barrier completes, making those pages immediately
+    /// eligible for clean LRU reclaim under memory pressure. Allocation-free.
+    pub fn clear_inode_dirty_range(
+        &self,
+        inode_id: InodeId,
+        first: PageIndex,
+        last: PageIndex,
+    ) -> usize {
+        if first > last {
+            return 0;
+        }
+        let mut cleared = 0usize;
+        let mut cursor = first;
+        while let Some(page) = self.next_inode_page(inode_id, cursor, last) {
+            let page_index = page.index;
+            let _io = page.lock_io();
+            if page.dirty.swap(false, Ordering::AcqRel) {
+                self.nr_dirty.fetch_sub(1, Ordering::Relaxed);
+                cleared += 1;
+            }
+            drop(_io);
+            let Some(next) = page_index.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        cleared
+    }
+
+    /// Clear dirty state on all resident cache pages belonging to `inode_id`.
+    pub fn clear_inode_dirty(&self, inode_id: InodeId) -> usize {
+        self.clear_inode_dirty_range(inode_id, 0, u64::MAX)
+    }
+
     /// Try to reclaim pages to free memory
     ///
     /// Returns the number of pages reclaimed.
@@ -968,7 +1066,7 @@ impl GlobalPageCache {
         PageCacheStats {
             nr_pages: self.nr_pages.load(Ordering::Relaxed),
             nr_dirty: self.nr_dirty.load(Ordering::Relaxed),
-            max_pages: self.max_pages,
+            max_pages: self.max_pages(),
             lru_len: self.lru.lock().len() as u64,
             index_capacity,
         }
@@ -976,7 +1074,8 @@ impl GlobalPageCache {
 
     /// Check if cache is under memory pressure
     pub fn under_pressure(&self) -> bool {
-        self.max_pages == 0 || self.nr_pages.load(Ordering::Relaxed) >= self.max_pages * 90 / 100
+        let cap = self.max_pages();
+        cap == 0 || self.nr_pages.load(Ordering::Relaxed) >= cap * 90 / 100
     }
 }
 
@@ -1002,9 +1101,9 @@ pub struct PageCacheStats {
 use lazy_static::lazy_static;
 
 lazy_static! {
-    /// RF178-11 + P2-A: heap-arbiter metadata bound (256 pages under the 64 KiB
-    /// PageCacheMeta hard floor with the 1 MiB heap).
-    pub static ref PAGE_CACHE: GlobalPageCache = GlobalPageCache::new(PAGE_CACHE_MAX_PAGES);
+    /// RF178-11 + P2-A + N3.1c: heap-arbiter & RAM-proportional page cache.
+    pub static ref PAGE_CACHE: GlobalPageCache =
+        GlobalPageCache::new(runtime_page_cache_max_pages());
 }
 
 /// Initialize the page cache
@@ -1074,7 +1173,7 @@ where
         if let Some(page) = cache.find_get_page(inode_id, index) {
             return Some(page);
         }
-        if owner_reclaims >= cache.max_pages {
+        if owner_reclaims >= cache.max_pages() {
             return None;
         }
         if cache.shrink_owner(owner_cgroup_id, 1) == 0 {
@@ -1257,7 +1356,7 @@ where
     let mut pages_to_writeback = Vec::new();
     // No cache instance can contain more than the heap-derived hard cap. Reserve
     // that bounded collection fallibly before taking/cloning any page Arcs.
-    let collect_cap = max_pages.min(PAGE_CACHE_MAX_PAGES as usize);
+    let collect_cap = max_pages.min(runtime_page_cache_max_pages() as usize);
     if pages_to_writeback.try_reserve_exact(collect_cap).is_err() {
         stats.pages_skipped = collect_cap as u64;
         return stats;
@@ -1269,7 +1368,7 @@ where
 
         // Walk the LRU from tail (oldest) to head
         let mut idx = lru.tail;
-        while idx != u64::MAX && pages_to_writeback.len() < max_pages {
+        while idx != u64::MAX && pages_to_writeback.len() < collect_cap {
             if let Some(entry) = &lru.entries[idx as usize].entry {
                 if entry.is_dirty() {
                     pages_to_writeback.push(entry.clone());
@@ -1367,7 +1466,7 @@ pub fn run_page_cache_policy_self_test() {
 
     {
         let capped = GlobalPageCache::new(u64::MAX);
-        assert_eq!(capped.stats().max_pages, PAGE_CACHE_MAX_PAGES);
+        assert_eq!(capped.stats().max_pages, runtime_page_cache_max_pages());
         let structural_bytes = core::mem::size_of::<PageCacheEntry>()
             + 2 * core::mem::size_of::<usize>() // Arc strong/weak header
             + 2 * core::mem::size_of::<((InodeId, PageIndex), Arc<PageCacheEntry>)>()
@@ -1737,3 +1836,53 @@ impl MemoryPressureHandler for PageCachePressureHandler {
 
 /// Global memory pressure handler instance
 pub static PRESSURE_HANDLER: PageCachePressureHandler = PageCachePressureHandler;
+
+#[cfg(all(test, feature = "host_harness"))]
+mod tests {
+    use super::*;
+
+    fn noop_uncharge(_owner: u64, _bytes: u64) {}
+
+    #[test]
+    fn n3_1c_page_cache_ram_scaling_and_dirty_clear_for_writeback() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        // 1) Pure RAM -> page-cache cap formula across 64 MiB .. 64 GiB.
+        assert_eq!(compute_page_cache_max_pages_for_ram(64 * MIB, 1), 256);
+        assert_eq!(compute_page_cache_max_pages_for_ram(192 * MIB, 1), 256);
+        assert_eq!(compute_page_cache_max_pages_for_ram(445 * MIB, 3), 768);
+        assert_eq!(compute_page_cache_max_pages_for_ram(950 * MIB, 7), 1792);
+        assert_eq!(compute_page_cache_max_pages_for_ram(1983 * MIB, 15), 3840);
+        assert_eq!(compute_page_cache_max_pages_for_ram(4031 * MIB, 31), 7936);
+        assert_eq!(compute_page_cache_max_pages_for_ram(16 * GIB, 128), 32_768);
+        // Very small RAM with an artificially high scale still respects 25% RAM cap
+        // (floored at PAGE_CACHE_MAX_PAGES = 256).
+        assert_eq!(compute_page_cache_max_pages_for_ram(8 * MIB, 16), 512);
+
+        // 2) Dirty page marking blocks shrink, and clear_inode_dirty makes
+        //    written-back pages immediately clean & reclaimable (ST-K4 alignment).
+        let cache = GlobalPageCache::new(16);
+        let p0 = find_or_create_page_in(&cache, 77, 0, 1, |_, _| true, noop_uncharge, || Some(100))
+            .expect("insert page 0");
+        let p1 = find_or_create_page_in(&cache, 77, 1, 1, |_, _| true, noop_uncharge, || Some(101))
+            .expect("insert page 1");
+        p0.set_state(PageState::Uptodate);
+        p1.set_state(PageState::Uptodate);
+        cache.mark_dirty(&p0);
+        cache.mark_dirty(&p1);
+        assert_eq!(cache.stats().nr_dirty, 2);
+        drop(p0);
+        drop(p1);
+
+        // Dirty pages must NOT be evicted before durable writeback.
+        assert_eq!(cache.shrink(4), 0);
+        assert_eq!(cache.stats().nr_pages, 2);
+
+        // After ST-K4 writeback clears dirty state, both pages are clean & reclaimable.
+        assert_eq!(cache.clear_inode_dirty(77), 2);
+        assert_eq!(cache.stats().nr_dirty, 0);
+        assert_eq!(cache.shrink(4), 2);
+        assert_eq!(cache.stats().nr_pages, 0);
+    }
+}

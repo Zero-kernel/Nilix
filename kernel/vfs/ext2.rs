@@ -4791,8 +4791,13 @@ impl MetadataBlockCache {
     }
 }
 
-/// Hard cap on buffered dirty 4 KiB pages across a mounted `Ext2Fs` (512 KiB).
+/// Minimum cap on buffered dirty 4 KiB pages across a mounted `Ext2Fs` (512 KiB,
+/// active on <=256 MiB machines). On larger RAM machines N3.1c scales the live
+/// cap proportionally with `runtime_page_cache_max_pages() / 4` up to
+/// `MAX_DIRTY_PAGES_PER_FS_MAX` (4 MiB) so dirty writeback pressure tracks RAM.
 const MAX_DIRTY_PAGES_PER_FS: usize = 128;
+/// Upper ceiling on buffered dirty 4 KiB pages across a mounted `Ext2Fs` (4 MiB).
+const MAX_DIRTY_PAGES_PER_FS_MAX: usize = 1024;
 /// Hard cap on simultaneously pinned dirty inodes per `Ext2Fs`.
 const MAX_DIRTY_INODES_PER_FS: usize = 32;
 
@@ -15682,10 +15687,17 @@ impl Ext2Fs {
             });
     }
 
+    #[inline]
+    fn max_dirty_pages_limit() -> usize {
+        (page_cache::runtime_page_cache_max_pages() as usize / 4)
+            .clamp(MAX_DIRTY_PAGES_PER_FS, MAX_DIRTY_PAGES_PER_FS_MAX)
+    }
+
     fn inc_dirty_pages_total(&self) -> Result<(), FsError> {
+        let limit = Self::max_dirty_pages_limit();
         self.dirty_pages_total
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                if cur < MAX_DIRTY_PAGES_PER_FS {
+                if cur < limit {
                     cur.checked_add(1)
                 } else {
                     None
@@ -17292,10 +17304,11 @@ impl Ext2Inode {
         Ok(bytes_read)
     }
 
-    fn publish_cached_write(&self, cursor: u64, data: &[u8]) {
+    fn publish_cached_write(&self, cursor: u64, data: &[u8], mark_dirty: bool) {
         let inode_id = self.cache_id;
         let mut remaining = data.len();
         let mut cache_cursor = cursor;
+        #[cfg(not(any(test, feature = "host_harness")))]
         let mut data_pos = 0usize;
         while remaining > 0 {
             let page_index = cache_cursor / PAGE_SIZE as u64;
@@ -17308,24 +17321,36 @@ impl Ext2Inode {
                 // committed bytes and leave a stale Uptodate cache page.
                 let _io_lock = page.lock_io();
                 if page.is_uptodate() {
-                    let page_virt = (page.physical_address() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            data[data_pos..].as_ptr(),
-                            page_virt.add(offset_in_page),
-                            chunk,
-                        );
+                    #[cfg(not(any(test, feature = "host_harness")))]
+                    {
+                        let page_virt =
+                            (page.physical_address() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                data[data_pos..].as_ptr(),
+                                page_virt.add(offset_in_page),
+                                chunk,
+                            );
+                        }
                     }
-                    // R188-U24-2 FIX: writes that update a resident cache page
-                    // now enter the dirty/writeback state machine.  The old
-                    // path copied bytes into the page but never marked it,
-                    // making every production writeback scan vacuous.
-                    PAGE_CACHE.mark_dirty(&page);
+                    // N3.1c (ST-K4 writeback alignment): volatile buffered writes
+                    // mark resident cache pages dirty so LRU reclaim never evicts
+                    // unpersisted bytes; durable ordered-data JBD2/flush commits
+                    // clear the dirty bit so committed pages become immediately
+                    // eligible for clean reclaim under buddy low-watermark pressure.
+                    if mark_dirty {
+                        PAGE_CACHE.mark_dirty(&page);
+                    } else {
+                        PAGE_CACHE.clear_dirty(&page);
+                    }
                 }
             }
             remaining -= chunk;
             cache_cursor += chunk as u64;
-            data_pos += chunk;
+            #[cfg(not(any(test, feature = "host_harness")))]
+            {
+                data_pos += chunk;
+            }
         }
     }
 
@@ -17347,16 +17372,20 @@ impl Ext2Inode {
             if !page.is_uptodate() {
                 continue;
             }
-            let page_start = page_index * PAGE_SIZE as u64;
-            let from = start.max(page_start) - page_start;
-            let to = end.min(page_start + PAGE_SIZE as u64) - page_start;
-            let page_virt = (page.physical_address() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
-            // SAFETY: the page is resident and uptodate, `from..to` lies inside its
-            // PAGE_SIZE bytes, and the raw write guard plus the page I/O lock exclude
-            // every reader, loader and writer of these bytes.
-            unsafe {
-                core::ptr::write_bytes(page_virt.add(from as usize), 0, (to - from) as usize);
+            #[cfg(not(any(test, feature = "host_harness")))]
+            {
+                let page_start = page_index * PAGE_SIZE as u64;
+                let from = start.max(page_start) - page_start;
+                let to = end.min(page_start + PAGE_SIZE as u64) - page_start;
+                let page_virt = (page.physical_address() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+                // SAFETY: the page is resident and uptodate, `from..to` lies inside its
+                // PAGE_SIZE bytes, and the raw write guard plus the page I/O lock exclude
+                // every reader, loader and writer of these bytes.
+                unsafe {
+                    core::ptr::write_bytes(page_virt.add(from as usize), 0, (to - from) as usize);
+                }
             }
+            PAGE_CACHE.clear_dirty(&page);
         }
     }
 
@@ -17957,6 +17986,7 @@ impl Ext2Inode {
             drop(_meta);
             drop(raw_guard);
             if !still_dirty {
+                PAGE_CACHE.clear_inode_dirty(self.cache_id);
                 fs.unregister_dirty_inode(self.cache_id);
             }
         } else {
@@ -17965,6 +17995,7 @@ impl Ext2Inode {
             drop(journal_guard);
             drop(_meta);
             drop(raw_guard);
+            PAGE_CACHE.clear_inode_dirty(self.cache_id);
             fs.unregister_dirty_inode(self.cache_id);
         }
         fs.ensure_io_healthy()?;
@@ -18121,7 +18152,7 @@ impl Ext2Inode {
 
         // Apply dirty-page backpressure before taking inode locks to respect
         // lock ordering (`dirty_inodes` is leaf; writeback takes `write_lock`).
-        if fs.dirty_pages_total.load(Ordering::Acquire) >= MAX_DIRTY_PAGES_PER_FS {
+        if fs.dirty_pages_total.load(Ordering::Acquire) >= Ext2Fs::max_dirty_pages_limit() {
             fs.flush_all_dirty_inodes()?;
         }
 
@@ -18345,7 +18376,7 @@ impl Ext2Inode {
                 dirty.ts_dirty = true;
             }
             self.size.store(new_size, Ordering::Release);
-            self.publish_cached_write(cursor, &data[written..written + to_copy]);
+            self.publish_cached_write(cursor, &data[written..written + to_copy], true);
             written += to_copy;
             cursor = chunk_end;
         }
@@ -18573,7 +18604,7 @@ impl Ext2Inode {
                         fs.io_faulted.store(true, Ordering::Release);
                         return fail(error, written);
                     }
-                    self.publish_cached_write(cursor, &data[written..written + to_copy]);
+                    self.publish_cached_write(cursor, &data[written..written + to_copy], false);
                     written += to_copy;
                     cursor += to_copy as u64;
                     continue;
@@ -18637,7 +18668,7 @@ impl Ext2Inode {
                 *raw_guard = next_raw;
                 let logical_size = self.size.load(Ordering::Acquire).max(published_size);
                 self.size.store(logical_size, Ordering::Release);
-                self.publish_cached_write(cursor, &data[written..written + to_copy]);
+                self.publish_cached_write(cursor, &data[written..written + to_copy], false);
                 written += to_copy;
                 cursor += to_copy as u64;
                 if let Some(failure) = transaction_failure {
@@ -18748,7 +18779,7 @@ impl Ext2Inode {
             *raw_guard = plan.new_inode;
             let logical_size = self.size.load(Ordering::Acquire).max(published_size);
             self.size.store(logical_size, Ordering::Release);
-            self.publish_cached_write(cursor, &data[written..written + to_copy]);
+            self.publish_cached_write(cursor, &data[written..written + to_copy], false);
             written += to_copy;
             cursor += to_copy as u64;
 
@@ -20310,5 +20341,86 @@ mod ext2_fastpath_tests {
                 "synchronous 4 KiB DirectFree must durably zero commit_logical + 1"
             );
         }
+    }
+
+    #[test]
+    fn n3_1c_page_cache_dirty_coherence_across_buffered_write_and_sync() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let file = fs.load_inode(FILE_INO).unwrap();
+
+        // Seed a resident Uptodate page for `file` block 0 in the global page cache.
+        let seeded = page_cache::find_or_create_page(
+            file.cache_id,
+            0,
+            0,
+            |_, _| true,
+            |_, _| {},
+            || Some(0x1234),
+        )
+        .expect("seed resident page cache entry");
+        seeded.set_state(page_cache::PageState::Uptodate);
+        let baseline_dirty = PAGE_CACHE.stats().nr_dirty;
+        assert!(!seeded.is_dirty());
+        drop(seeded);
+
+        // 1) Buffered write marks resident cache page dirty (blocking clean reclaim).
+        let payload1 = [0x42u8; BLK];
+        assert_eq!(file.write_buffered_at(0, &payload1), Ok(BLK));
+        let cached = PAGE_CACHE
+            .find_get_page(file.cache_id, 0)
+            .expect("resident page remains cached");
+        assert!(
+            cached.is_dirty(),
+            "buffered write must mark resident cache page dirty until ST-K4 commit"
+        );
+        assert_eq!(PAGE_CACHE.stats().nr_dirty, baseline_dirty + 1);
+        drop(cached);
+
+        // Dirty page cannot be removed/reclaimed while unpersisted.
+        assert!(!PAGE_CACHE.remove_from_cache(file.cache_id, 0));
+
+        // 2) FileSystem::sync() commits via ordered-data JBD2 and clears the dirty
+        //    bit so the committed page becomes immediately reclaimable.
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        let cached = PAGE_CACHE
+            .find_get_page(file.cache_id, 0)
+            .expect("resident page remains cached after sync");
+        assert!(
+            !cached.is_dirty(),
+            "durable ST-K4 sync must clear resident page dirty bit"
+        );
+        assert_eq!(PAGE_CACHE.stats().nr_dirty, baseline_dirty);
+        drop(cached);
+
+        // 3) Synchronous overwrite (metadata-unchanged or JBD2 path) keeps the
+        //    resident page clean after durable flush.
+        let payload2 = [0x7Eu8; BLK];
+        assert_eq!(file.write_at(0, &payload2), Ok(BLK));
+        let cached = PAGE_CACHE
+            .find_get_page(file.cache_id, 0)
+            .expect("resident page remains cached after sync write_at");
+        assert!(
+            !cached.is_dirty(),
+            "durable write_at must leave resident cache page clean"
+        );
+        assert_eq!(PAGE_CACHE.stats().nr_dirty, baseline_dirty);
+        drop(cached);
+
+        // Clean page is now reclaimable/removable from the global page cache.
+        assert!(PAGE_CACHE.remove_from_cache(file.cache_id, 0));
+
+        // 4) Simulated power loss recovers exact durable bytes written in step 3.
+        let snap = dev.durable_snapshot();
+        let rec_dev = Arc::try_new(CoalescingCrashDevice::new(snap)).unwrap();
+        let rec_fs = Ext2Fs::mount(rec_dev).unwrap();
+        let rec_file = rec_fs.load_inode(FILE_INO).unwrap();
+        assert_eq!(rec_file.stat().unwrap().size, BLK as u64);
+        let phys = rec_file.raw.read().block[0];
+        let mut check = [0u8; BLK];
+        assert_eq!(rec_fs.read_block(phys, &mut check), Ok(()));
+        assert_eq!(check, payload2);
     }
 }
