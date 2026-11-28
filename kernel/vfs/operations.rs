@@ -268,6 +268,13 @@ impl Vfs {
                 }) {
                     return Err(FsError::Busy);
                 }
+                // Flush buffered writes while holding the mount topology write
+                // lock and BEFORE removing the mount, so any writeback failure
+                // (e.g. ENOSPC) leaves the filesystem mounted and reachable.
+                match target.mount.fs.sync() {
+                    Ok(()) | Err(FsError::NotSupported) => {}
+                    Err(error) => return Err(error),
+                }
                 view.mounts
                     .remove(&target.mount.id)
                     .ok_or(FsError::NotFound)?

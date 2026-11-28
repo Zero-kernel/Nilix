@@ -371,10 +371,14 @@ impl OpenFlags {
     pub const O_APPEND: u32 = 0o2000;
     /// Non-blocking mode
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// Synchronized data I/O (Linux x86-64 ABI)
+    pub const O_DSYNC: u32 = 0o10000;
     /// Open directory
     pub const O_DIRECTORY: u32 = 0o200000;
     /// Do not follow the final symlink in path
     pub const O_NOFOLLOW: u32 = 0o400000;
+    /// Synchronized file I/O (Linux x86-64 ABI: O_DSYNC | __O_SYNC)
+    pub const O_SYNC: u32 = 0o4010000;
     /// Path-only open (no read/write operations allowed)
     pub const O_PATH: u32 = 0o10000000;
 
@@ -427,6 +431,11 @@ impl OpenFlags {
     /// Check if non-blocking flag set
     pub fn is_nonblock(&self) -> bool {
         (self.0 & Self::O_NONBLOCK) != 0
+    }
+
+    /// Check if synchronous write durability (O_SYNC or O_DSYNC) is requested
+    pub fn is_sync(&self) -> bool {
+        (self.0 & (Self::O_DSYNC | Self::O_SYNC)) != 0
     }
 
     /// Check if exclusive creation is requested (O_EXCL)

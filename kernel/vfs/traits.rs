@@ -267,12 +267,20 @@ pub trait Inode: Send + Sync {
         Ok(count)
     }
 
-    /// Write data at given offset
+    /// Write data at given offset (synchronous / direct inode mutation).
     ///
     /// Default implementation returns NotSupported. Regular files should override.
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
         let _ = (offset, data);
         Err(FsError::NotSupported)
+    }
+
+    /// Buffered POSIX `write`/`pwrite` path for open file descriptions without
+    /// `O_SYNC`/`O_DSYNC`. Filesystems may retain dirty data in memory until
+    /// `fsync`/`sync`, dirty-pressure writeback, or direct mutation; defaults
+    /// to synchronous `write_at`.
+    fn write_buffered_at(&self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        self.write_at(offset, data)
     }
 
     /// Truncate file to given length
@@ -294,6 +302,18 @@ pub trait Inode: Send + Sync {
     fn append_write(&self, data: &[u8]) -> Result<(usize, u64), FsError> {
         let _ = data;
         Err(FsError::NotSupported)
+    }
+
+    /// Buffered POSIX `O_APPEND` write for open file descriptions without
+    /// `O_SYNC`/`O_DSYNC`; defaults to synchronous `append_write`.
+    fn append_write_buffered(&self, data: &[u8]) -> Result<(usize, u64), FsError> {
+        self.append_write(data)
+    }
+
+    /// Flush any in-memory buffered writes belonging to this inode to its
+    /// backing store without issuing a separate filesystem-wide barrier.
+    fn flush_buffered(&self) -> Result<(), FsError> {
+        Ok(())
     }
 
     /// Get as Any for downcasting
@@ -700,6 +720,10 @@ impl FileHandle {
         }
         match self.inode.stat()?.mode.file_type {
             FileType::Regular | FileType::Directory | FileType::Symlink => {
+                // Flush any inode-local buffered writes (including open
+                // unlinked descriptors no longer in the fs dirty registry)
+                // before issuing the filesystem-wide durability barrier.
+                self.inode.flush_buffered()?;
                 self.owner.filesystem().sync()
             }
             // Linux has no fsync for these. Raw block nodes refuse because
@@ -710,9 +734,9 @@ impl FileHandle {
 
     /// ST-K4: sync_file_range admission after argument validation.
     ///
-    /// Ext2 is write-through, so an admitted range is already on the device and
-    /// nothing is flushed. Returns `Ok(false)` for a kind Linux answers with
-    /// ESPIPE.
+    /// Flushes any pending inode-level buffered writes before confirming
+    /// filesystem health without issuing a full `FileSystem::sync()` barrier.
+    /// Returns `Ok(false)` for a kind Linux answers with ESPIPE.
     pub(crate) fn sync_file_range(&self) -> Result<bool, FsError> {
         if self.flags.is_path() {
             return Err(FsError::BadFd);
@@ -720,6 +744,7 @@ impl FileHandle {
         match self.inode.stat()?.mode.file_type {
             FileType::Regular | FileType::Directory | FileType::Symlink | FileType::BlockDevice => {
                 self.owner.filesystem().check_io_health()?;
+                self.inode.flush_buffered()?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -768,19 +793,28 @@ impl FileHandle {
             return Err(FsError::BadFd);
         }
 
+        let sync = flags.is_sync();
         // R178-21 FIX: O_APPEND uses inode-level atomic append primitive
         if flags.is_append() {
             // RF178-17 FIX: Keep this open file description's offset lock across
             // EOF selection, I/O, and final offset publication. Independent
             // handles serialize at the inode; clones serialize here.
             let mut offset = self.offset.lock();
-            let (n, final_offset) = self.inode.append_write(data)?;
+            let (n, final_offset) = if sync {
+                self.inode.append_write(data)?
+            } else {
+                self.inode.append_write_buffered(data)?
+            };
             *offset = final_offset;
             return Ok(n);
         }
 
         let mut offset = self.offset.lock();
-        let n = self.inode.write_at(*offset, data)?;
+        let n = if sync {
+            self.inode.write_at(*offset, data)?
+        } else {
+            self.inode.write_buffered_at(*offset, data)?
+        };
         *offset += n as u64;
         Ok(n)
     }
@@ -794,10 +828,19 @@ impl FileHandle {
         if !self.seekable {
             return Err(FsError::Seek);
         }
+        let sync = flags.is_sync();
         if flags.is_append() {
-            self.inode.append_write(data).map(|(count, _)| count)
-        } else {
+            if sync {
+                self.inode.append_write(data).map(|(count, _)| count)
+            } else {
+                self.inode
+                    .append_write_buffered(data)
+                    .map(|(count, _)| count)
+            }
+        } else if sync {
             self.inode.write_at(offset, data)
+        } else {
+            self.inode.write_buffered_at(offset, data)
         }
     }
 

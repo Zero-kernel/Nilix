@@ -1400,10 +1400,24 @@ impl Ext2Fs {
         }
         *parent_raw = next_parent;
         *child_raw = next_child;
-        child
-            .unlinked
-            .store(next_child.links_count == 0, Ordering::Release);
+        let became_orphan = next_child.links_count == 0;
+        child.unlinked.store(became_orphan, Ordering::Release);
         self.superblock.write().last_orphan = plan.new_head();
+        if became_orphan {
+            self.unregister_dirty_inode(child.ino);
+            // If no open file descriptor still pins this unlinked inode, drop
+            // its buffered dirty pages immediately so final Drop + reap_orphans
+            // do not perform disk writeback/truncation for discarded data.
+            // Open-while-unlinked handles retain their dirty pages until Drop
+            // and advance their pending timestamp to match the unlink ctime.
+            if Arc::strong_count(&child) == 1 {
+                child.discard_dirty_locked(self);
+            } else {
+                child.sync_dirty_ts_after_metadata_change(next_child.ctime);
+            }
+        } else {
+            child.sync_dirty_ts_after_metadata_change(next_child.ctime);
+        }
         match result {
             Ok(()) => Ok(()),
             Err(failure) => Err(failure.error),
@@ -1626,6 +1640,7 @@ impl Ext2Fs {
             if desc.free_inodes_count == 0 {
                 continue;
             }
+            self.read_block(desc.inode_bitmap, scratch.block_mut())?;
             for index in 0..self.inodes_per_group {
                 let ino = (group as u32)
                     .checked_mul(self.inodes_per_group)
@@ -1637,7 +1652,6 @@ impl Ext2Fs {
                 if ino < sb.first_ino || ino == sb.journal_inum {
                     continue;
                 }
-                self.read_block(desc.inode_bitmap, scratch.block_mut())?;
                 if scratch.block()[index as usize / 8] & (1u8 << (index % 8)) != 0 {
                     continue;
                 }
