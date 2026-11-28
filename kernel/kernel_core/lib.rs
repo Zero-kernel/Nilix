@@ -96,6 +96,7 @@ pub mod signal_frame;
 pub mod steal_hint;
 pub mod syscall;
 pub mod time;
+pub mod tty;
 pub mod user_namespace;
 pub mod user_stack;
 pub mod usercopy;

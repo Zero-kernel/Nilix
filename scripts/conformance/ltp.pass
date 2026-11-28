@@ -1,0 +1,37 @@
+# count: 34
+# Count-pinned ltp conformance pass list (N2.2, #66).
+# Sorted lexicographically; any deletion must record a reason in ltp.removed.
+exit01
+fchownat01
+fchownat02
+fcntl01
+fdatasync01
+fdatasync02
+fstatat01
+getresgid01
+getresuid01
+kill09
+linkat01
+listen01
+mkdirat01
+mknodat01
+munmap03
+pipe05
+pipe09
+rename14
+rt_sigaction02
+rt_sigaction03
+rt_sigprocmask02
+sched_yield01
+set_robust_list01
+setpgrp01
+setsid01
+sigaction02
+sigaltstack01
+sigprocmask01
+string01
+symlinkat01
+sysconf01
+sysinfo01
+sysinfo02
+writev05

@@ -1,0 +1,2 @@
+# Conformance pass-list removals for ltp (N2.2, #66).
+# Format: <case_name> | <reason>

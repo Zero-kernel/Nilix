@@ -246,7 +246,7 @@ run_suite cgroup-access 1 0 \
 
 # Includes the C3 aligned TID store and concurrent word tests, the C3
 # work-stealing hint with its model, and P2 wake-affine / placement / voluntary-yield policy tests.
-run_suite kernel-core 254 0 \
+run_suite kernel-core 257 0 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \
@@ -292,7 +292,7 @@ run_suite security-wxorx 6 14 \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- wxorx::tests
 
-run_suite mitigation-mappings 5 254 \
+run_suite mitigation-mappings 5 257 \
     --manifest-path kernel/kernel_core/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness,mitigation_probe \

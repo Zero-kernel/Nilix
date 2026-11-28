@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 LOCKFILE = ROOT / "scripts/conformance/third_party.lock"
 PASSLIST = ROOT / "scripts/conformance/libc-test.pass"
 REMOVED = ROOT / "scripts/conformance/libc-test.removed"
+LTP_PASSLIST = ROOT / "scripts/conformance/ltp.pass"
+LTP_REMOVED = ROOT / "scripts/conformance/ltp.removed"
 FETCH_SH = ROOT / "scripts/conformance/fetch.sh"
 
 
@@ -34,6 +36,8 @@ class ConformanceLockfileTests(unittest.TestCase):
             self.assertNotIn("HEAD", url, "floating HEAD URL is forbidden in third_party.lock")
             entries.append(suite)
         self.assertIn("libc-test", entries)
+        self.assertIn("ltp", entries)
+        self.assertIn("busybox", entries)
         self.assertEqual(len(entries), len(set(entries)), "duplicate suite in third_party.lock")
 
     def test_fetch_rejects_sha256_mismatch_with_exit_2(self):
@@ -66,6 +70,13 @@ class ConformancePasslistTests(unittest.TestCase):
         removed = gate.parse_removed(REMOVED)
         overlap = set(entries) & set(removed)
         self.assertEqual(overlap, set(), f"cases present in both pass and removed: {overlap}")
+
+    def test_checked_in_ltp_passlist_is_valid_and_nonempty(self):
+        entries = gate.parse_passlist(LTP_PASSLIST)
+        self.assertGreater(len(entries), 0, "ltp.pass must record at least one passing case")
+        removed = gate.parse_removed(LTP_REMOVED)
+        overlap = set(entries) & set(removed)
+        self.assertEqual(overlap, set(), f"cases present in both ltp pass and removed: {overlap}")
 
     def test_passlist_rejects_wrong_count_unsorted_and_duplicates(self):
         with tempfile.TemporaryDirectory(prefix="conf-passlist-") as td:

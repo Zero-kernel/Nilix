@@ -473,11 +473,11 @@ pub(super) fn sys_read(
         // keyboard wait and transactional copyout.
         let mut tmp = try_admitted_zeroed_io_buffer(count)?;
         loop {
-            // 先尝试读取
-            let bytes_read =
-                drivers::keyboard_read_with_commit(&mut tmp, |bytes| copy_to_user(buf, bytes))?;
-            if bytes_read > 0 {
-                return Ok(bytes_read);
+            // 先尝试读取（经控制台 TTY 规范/原始行规程）
+            match crate::tty::console_read_with_commit(&mut tmp, |bytes| copy_to_user(buf, bytes))?
+            {
+                crate::tty::ConsoleReadOutcome::Ready(bytes_read) => return Ok(bytes_read),
+                crate::tty::ConsoleReadOutcome::WouldBlock => {}
             }
 
             // 无数据：先入队再检查（避免丢失唤醒）
@@ -509,10 +509,10 @@ pub(super) fn sys_read(
             let _wait_guard = StdinPreparedWaitGuard;
 
             // 二次检查：入队后可能有新数据到达
-            let bytes_read =
-                drivers::keyboard_read_with_commit(&mut tmp, |bytes| copy_to_user(buf, bytes))?;
-            if bytes_read > 0 {
-                return Ok(bytes_read);
+            match crate::tty::console_read_with_commit(&mut tmp, |bytes| copy_to_user(buf, bytes))?
+            {
+                crate::tty::ConsoleReadOutcome::Ready(bytes_read) => return Ok(bytes_read),
+                crate::tty::ConsoleReadOutcome::WouldBlock => {}
             }
 
             // 确实没有数据，完成等待（让出 CPU）
@@ -1017,11 +1017,11 @@ pub(super) fn sys_readv(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallRes
         }
         let mut tmp = try_admitted_zeroed_io_buffer(read_cap)?;
         loop {
-            let bytes_read = drivers::keyboard_read_with_commit(&mut tmp, |bytes| {
+            match crate::tty::console_read_with_commit(&mut tmp, |bytes| {
                 copy_slice_to_iovecs(&iov_array, bytes).map(|_| ())
-            })?;
-            if bytes_read > 0 {
-                return Ok(bytes_read);
+            })? {
+                crate::tty::ConsoleReadOutcome::Ready(bytes_read) => return Ok(bytes_read),
+                crate::tty::ConsoleReadOutcome::WouldBlock => {}
             }
             match stdin_prepare_to_wait() {
                 StdinWaitPrepare::Enqueued => {}
@@ -1039,11 +1039,11 @@ pub(super) fn sys_readv(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallRes
             }
             let _wait_guard = StdinPreparedWaitGuard;
 
-            let bytes_read = drivers::keyboard_read_with_commit(&mut tmp, |bytes| {
+            match crate::tty::console_read_with_commit(&mut tmp, |bytes| {
                 copy_slice_to_iovecs(&iov_array, bytes).map(|_| ())
-            })?;
-            if bytes_read > 0 {
-                return Ok(bytes_read);
+            })? {
+                crate::tty::ConsoleReadOutcome::Ready(bytes_read) => return Ok(bytes_read),
+                crate::tty::ConsoleReadOutcome::WouldBlock => {}
             }
             if stdin_finish_wait() {
                 return Err(SyscallError::EINTR);
@@ -1618,27 +1618,23 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
 
     match cmd {
         TCGETS if console.is_some() => {
-            // Return minimal termios structure for stdin/stdout/stderr
-            // struct termios is 60 bytes on x86_64
+            // Return live console termios structure (60 bytes on x86_64).
             if arg == 0 {
                 return Err(SyscallError::EFAULT);
             }
-            // Zero out termios structure (canonical mode, no special flags)
-            let zero_termios = [0u8; 60];
-            crate::usercopy::copy_to_user_safe(arg as *mut u8, &zero_termios)
+            let termios = crate::tty::get_termios_bytes();
+            crate::usercopy::copy_to_user_safe(arg as *mut u8, &termios)
                 .map_err(|_| SyscallError::EFAULT)?;
             Ok(0)
         }
         TCSETS | TCSETSW | TCSETSF if console.is_some() => {
-            // Accept termios settings but don't actually apply them
-            // (no real terminal to configure)
             if arg == 0 {
                 return Err(SyscallError::EFAULT);
             }
-            // Just verify the buffer is readable
-            let mut termios_buf = [0u8; 60];
+            let mut termios_buf = [0u8; crate::tty::TERMIOS_SIZE];
             crate::usercopy::copy_from_user_safe(&mut termios_buf, arg as *const u8)
                 .map_err(|_| SyscallError::EFAULT)?;
+            crate::tty::set_termios_bytes(&termios_buf, cmd == TCSETSF);
             Ok(0)
         }
         TIOCGWINSZ if console.is_some() => {
@@ -1671,7 +1667,7 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
             if arg == 0 {
                 return Err(SyscallError::EFAULT);
             }
-            let bytes_available: i32 = drivers::keyboard_available() as i32;
+            let bytes_available: i32 = crate::tty::console_bytes_readable() as i32;
             // lint-repr-c-copy: allow (i32 is a primitive, no padding)
             let bytes_slice = unsafe {
                 core::slice::from_raw_parts(&bytes_available as *const i32 as *const u8, 4)
@@ -1703,6 +1699,7 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
                 return Ok(0);
             }
             crate::process::console_tty_attach(sid, pgid, steal, privileged)?;
+            crate::tty::set_fg_pgid(pgid);
             proc_arc.lock().thread_group.set_has_ctty(true);
             Ok(0)
         }
@@ -1718,6 +1715,7 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
             proc_arc.lock().thread_group.set_has_ctty(false);
             if tgid == sid {
                 if let Some(old_fg) = crate::process::console_tty_release_session(sid) {
+                    crate::tty::set_fg_pgid(0);
                     // POSIX: notify former foreground process group with SIGHUP + SIGCONT.
                     let _ = send_signal_to_pgid_kernel(old_fg, crate::signal::Signal::SIGHUP);
                     let _ = send_signal_to_pgid_kernel(old_fg, crate::signal::Signal::SIGCONT);
@@ -1780,6 +1778,7 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
                 return Err(SyscallError::EPERM);
             }
             crate::process::console_tty_set_fg_pgid(sid, has_ctty, target_global_pgid)?;
+            crate::tty::set_fg_pgid(target_global_pgid);
             Ok(0)
         }
         TIOCGSID if console.is_some() => {

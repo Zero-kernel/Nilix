@@ -113,8 +113,8 @@ jobs:
         env:
           CI_JOB_RESULTS: ${{ toJSON(needs) }}
 
-  # N2.2 (#66): diagnostic external conformance suite (musl libc-test).
-  # Placed outside `needs: [lane]` until N2 completes.
+  # N2 (#66): diagnostic external conformance suites (musl libc-test, LTP)
+  # and BusyBox boot gate. Placed outside `needs: [lane]` until promoted.
   conformance:
     name: Extended / ${{ matrix.os }} / conformance (diagnostic)
     runs-on: ${{ matrix.os }}

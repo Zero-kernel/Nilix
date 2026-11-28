@@ -418,9 +418,10 @@ def main() -> int:
             for err in result.errors:
                 print(f"CONFORMANCE-ERROR: {err}", file=sys.stderr)
             return 1
-        write_passlist(args.passlist, args.suite, list(result.passed))
+        filtered = [name for name in result.passed if name not in removed_reasons]
+        write_passlist(args.passlist, args.suite, filtered)
         print(
-            f"CONFORMANCE-PASSLIST UPDATED suite={args.suite} pass={len(result.passed)} "
+            f"CONFORMANCE-PASSLIST UPDATED suite={args.suite} pass={len(filtered)} "
             f"fail={len(result.failed)} timeout={len(result.timed_out)} "
             f"execfail={len(result.exec_failed)} file={args.passlist}"
         )

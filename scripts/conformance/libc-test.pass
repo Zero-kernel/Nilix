@@ -1,5 +1,5 @@
-# count: 111
-# Count-pinned libc-test conformance pass list (N2.2, #66; +functional_socket in N2.8).
+# count: 115
+# Count-pinned libc-test conformance pass list (N2.2, #66).
 # Sorted lexicographically; any deletion must record a reason in libc-test.removed.
 functional_argv
 functional_basename
@@ -55,6 +55,7 @@ functional_time
 functional_tls_init
 functional_udiv
 functional_ungetc
+functional_utime
 functional_wcsstr
 functional_wcstol
 regression_daemon-failure
@@ -63,6 +64,7 @@ regression_dn_expand-ptr-0
 regression_fflush-exit
 regression_fgets-eof
 regression_fgetwc-buffering
+regression_flockfile-list
 regression_fpclassify-invalid-ld80
 regression_ftello-unflushed-append
 regression_getpwnam_r-crash
@@ -104,9 +106,11 @@ regression_scanf-bytes-consumed
 regression_scanf-match-literal-eof
 regression_scanf-nullbyte-char
 regression_setvbuf-unget
+regression_sigaltstack
 regression_sigprocmask-internal
 regression_sigreturn
 regression_sscanf-eof
+regression_statvfs
 regression_strverscmp
 regression_syscall-sign-extend
 regression_uselocale-0

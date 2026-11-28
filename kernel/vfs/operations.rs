@@ -2060,7 +2060,7 @@ impl Vfs {
                 return Err(FsError::PermDenied);
             }
         }
-        let now = crate::types::TimeSpec::now();
+        let now = crate::types::TimeSpec::realtime_now();
         let to_ts = |spec: VfsUtimeSpec| -> Option<crate::types::TimeSpec> {
             match spec {
                 VfsUtimeSpec::Omit => None,

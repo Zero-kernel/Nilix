@@ -48,6 +48,8 @@ trace_phase_probe = []
 iommu_device_probe = ["iommu/device_probe", "arch/iommu_device_probe"]
 # N2.2 (#66): external conformance suite runner (libc-test / LTP).
 conformance_runner = []
+# N2 (#66): BusyBox boot gate init wrapper.
+busybox_gate = ["kernel_core/busybox_gate"]
 
 [dependencies]
 spin = "0.12"
