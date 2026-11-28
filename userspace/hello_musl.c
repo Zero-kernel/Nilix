@@ -48,7 +48,7 @@ static int fd_exec_check(void) {
 
 static int standard_fd_smoke(void) {
     int saved[3] = {-1, -1, -1}, p[2] = {-1, -1}, file = -1;
-    int held[256], held_count = 0, status = -1, result = 1;
+    int held[1024], held_count = 0, status = -1, result = 1;
     const char *stage = "save";
     char bytes[2];
     struct stat st;
@@ -97,12 +97,12 @@ static int standard_fd_smoke(void) {
     puts("MUSL-STANDARD-FD-OK");
 
     stage = "failed O_TRUNC";
-    while (held_count < 256) {
+    while (held_count < 1024) {
         int next = dup(saved[1]);
         if (next < 0) break;
         held[held_count++] = next;
     }
-    if (held_count == 256 || errno != EMFILE) goto done;
+    if (held_count == 1024 || errno != EMFILE) goto done;
     errno = 0;
     int rejected = open("/ksa-fd-file", O_WRONLY | O_TRUNC);
     if (rejected >= 0) { close(rejected); goto done; }

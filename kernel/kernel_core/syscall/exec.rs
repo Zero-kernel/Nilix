@@ -226,7 +226,7 @@ pub(super) enum ExecEntry {
 pub(super) fn begin_exec_handoff(
     process: &crate::process::ProcessArc,
     pid: ProcessId,
-    elf_data: Vec<u8>,
+    elf_data: crate::elf_loader::ExecImage,
     argv_vec: Vec<Vec<u8>>,
     envp_vec: Vec<Vec<u8>>,
     execfn: Vec<u8>,
@@ -462,13 +462,13 @@ pub(super) fn yield_and_halt() {
 /// fail-open VFS file-gate.
 pub(super) fn exec_from_bytes(
     process: crate::process::ProcessArc,
-    elf_data: Vec<u8>,
+    elf_data: crate::elf_loader::ExecImage,
     argv_vec: Vec<Vec<u8>>,
     envp_vec: Vec<Vec<u8>>,
     execfn: Vec<u8>,
     entry: ExecEntry,
 ) -> SyscallResult {
-    use crate::elf_loader::load_elf;
+    use crate::elf_loader::load_elf_image;
     use crate::fork::create_fresh_address_space;
     use crate::process::{
         activate_memory_space, address_space_share_count, current_pid, free_address_space,
@@ -504,7 +504,8 @@ pub(super) fn exec_from_bytes(
     // group drain, so an LSM denial, a name allocation failure or a header
     // pre-flight failure ends no sibling. Segment checks (range, filesz/memsz,
     // stack overlap) run in load_elf, after the drain.
-    let bin_hash = audit::hash_binary_prefix(&elf_data, EXEC_HASH_WINDOW);
+    let bin_hash =
+        audit::hash_binary_prefix(elf_data.prefix_slice(EXEC_HASH_WINDOW), EXEC_HASH_WINDOW);
 
     // GAP-5 exec step 2 (review F4): a handed-over exec was already checked
     // by the exec'ing thread for this image and the group's shared
@@ -525,8 +526,8 @@ pub(super) fn exec_from_bytes(
     let comm_name = crate::process::PreparedProcessName::try_new(exec_comm_name(&execfn))
         .map_err(|_| SyscallError::ENOMEM)?;
 
-    // The loader's pure header and program-header pre-flight (load_elf repeats it).
-    crate::elf_loader::validate_elf_image(&elf_data).map_err(|_| SyscallError::ENOEXEC)?;
+    // The loader's pure header and program-header pre-flight (load_elf_image repeats it).
+    crate::elf_loader::validate_exec_image(&elf_data).map_err(|_| SyscallError::ENOEXEC)?;
 
     // GAP-5 exec step 2: a non-leader hands the exec to its group leader, which
     // runs it under the group's PID (`ExecEntry::Handoff`).
@@ -805,7 +806,7 @@ pub(super) fn exec_from_bytes(
     // 加载 ELF 映像
     // S-7 fix: Let the guard handle rollback on error
     // R149-3 FIX: Pass exec_cgroup_id captured under lock, not re-read.
-    let load_result = load_elf(&elf_data, exec_cgroup_id).map_err(|e| {
+    let load_result = load_elf_image(&elf_data, exec_cgroup_id).map_err(|e| {
         klog!(Error, "exec_from_bytes: ELF load failed: {:?}", e);
         SyscallError::ENOEXEC
     })?;
@@ -1366,7 +1367,7 @@ pub(super) fn utf8_path(b: &[u8]) -> Result<alloc::string::String, SyscallError>
 /// M0-4: read an entire file by path for exec, via the registered VFS callback.
 /// The callback resolves once, enforces +x/DAC/LSM, and bounds the read to
 /// MAX_EXEC_IMAGE_SIZE. MUST be called with NO Process/PT/COW lock held.
-pub(super) fn exec_read_file(path: &str) -> Result<Vec<u8>, SyscallError> {
+pub(super) fn exec_read_file(path: &str) -> Result<crate::elf_loader::ExecImage, SyscallError> {
     if path.is_empty() {
         return Err(SyscallError::ENOENT);
     }
@@ -1532,15 +1533,22 @@ pub(super) fn sys_spawn_image(
         return Err(SyscallError::E2BIG);
     }
     // P2-A: single-holder transient-peak admission — concurrent exec staging
-    // must not stack N * EXEC_IMAGE_PEAK_BYTES on top of full hard floors.
+    // must not stack concurrent large exec transactions.
     let peak = mm::TransientPeakGuard::try_acquire().map_err(|_| SyscallError::ENOMEM)?;
-    // R151-1 FIX: fallible allocation (the global alloc_error_handler panics).
-    let mut elf_data: Vec<u8> = Vec::new();
-    elf_data
-        .try_reserve_exact(image_len)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    elf_data.resize(image_len, 0);
-    copy_from_user(&mut elf_data, image)?;
+    // N2.1: stage directly into frame-backed ExecImage above 64 KiB so images
+    // up to 16 MiB never exhaust the 2 MiB kernel heap.
+    let elf_data = crate::elf_loader::ExecImage::try_from_reader(
+        image_len,
+        MAX_EXEC_IMAGE_SIZE,
+        |off, dst| {
+            // SAFETY: `off + dst.len() <= image_len`; `copy_from_user` validates
+            // the user range before every chunk copy.
+            let src = (image as usize)
+                .checked_add(off)
+                .ok_or(SyscallError::EFAULT)? as *const u8;
+            copy_from_user(dst, src)
+        },
+    )?;
 
     let argv_vec = copy_user_str_array(argv)?;
     let envp_vec = copy_user_str_array(envp)?;
@@ -1638,21 +1646,24 @@ pub(super) fn sys_execve(
 /// which a green boot cannot exercise — is unit-testable with a mock path->bytes map. The
 /// PONR (`exec_from_bytes`) is the SOLE caller's job AFTER this returns, kept out of the loop
 /// so the point of no return stays exactly-once-at-the-leaf.
-pub(super) fn resolve_exec_chain<F: FnMut(&str) -> Result<Vec<u8>, SyscallError>>(
+pub(super) fn resolve_exec_chain<
+    F: FnMut(&str) -> Result<crate::elf_loader::ExecImage, SyscallError>,
+>(
     orig_path: alloc::string::String,
     orig_argv: Vec<Vec<u8>>,
     mut read: F,
-) -> Result<(Vec<u8>, Vec<Vec<u8>>), SyscallError> {
+) -> Result<(crate::elf_loader::ExecImage, Vec<Vec<u8>>), SyscallError> {
     let mut cur_path = orig_path;
     let mut cur_argv = orig_argv;
     let mut depth: usize = 0;
-    let elf_bytes: Vec<u8> = loop {
+    let elf_bytes: crate::elf_loader::ExecImage = loop {
         let bytes = read(&cur_path)?;
-        if bytes.starts_with(b"\x7FELF") {
+        let prefix = bytes.prefix_slice(MAX_SHEBANG_LINE);
+        if prefix.starts_with(b"\x7FELF") {
             break bytes; // ELF leaf
         }
-        if !bytes.starts_with(b"#!") {
-            // Not a shebang and not ELF — let load_elf reject it (ENOEXEC) inside the core,
+        if !prefix.starts_with(b"#!") {
+            // Not a shebang and not ELF — let load_elf_image reject it (ENOEXEC) inside the core,
             // after a single clean entry.
             break bytes;
         }
@@ -1660,7 +1671,7 @@ pub(super) fn resolve_exec_chain<F: FnMut(&str) -> Result<Vec<u8>, SyscallError>
         if depth > MAX_SHEBANG_DEPTH {
             return Err(SyscallError::ELOOP);
         }
-        let (interp, optarg) = parse_shebang_line(&bytes)?;
+        let (interp, optarg) = parse_shebang_line(prefix)?;
         let interp_path = utf8_path(&interp)?;
         if interp_path.is_empty() || interp_path.len() > MAX_EXEC_PATH_LEN {
             return Err(SyscallError::EINVAL);
@@ -1757,24 +1768,26 @@ pub fn run_exec_disambiguation_self_test() {
 
     // --- R172-P6-F5: resolve_exec_chain (the shebang LOOP + ELOOP depth cap, mock-read) ---
     // The loop a green boot cannot exercise; driven by a fixed path->bytes mock (no VFS).
-    let elf = || alloc::vec![0x7Fu8, b'E', b'L', b'F', 0, 0, 0, 0];
+    let elf = || {
+        crate::elf_loader::ExecImage::from_vec(alloc::vec![0x7Fu8, b'E', b'L', b'F', 0, 0, 0, 0])
+    };
     // (i) ELF leaf at hop 0 => bytes returned, argv untouched.
     {
         let argv = alloc::vec![b"prog".to_vec()];
         let (bytes, out) =
             resolve_exec_chain(String::from("/bin/elf"), argv.clone(), |_p| Ok(elf()))
                 .expect("ELF leaf at hop 0");
-        assert!(bytes.starts_with(b"\x7FELF"));
+        assert!(bytes.prefix_slice(8).starts_with(b"\x7FELF"));
         assert_eq!(out, argv, "ELF leaf must leave argv untouched");
     }
     // (ii) 4-deep #! chain terminating in ELF => Ok (depth == MAX_SHEBANG_DEPTH succeeds).
     {
-        let read = |p: &str| -> Result<Vec<u8>, SyscallError> {
+        let read = |p: &str| -> Result<crate::elf_loader::ExecImage, SyscallError> {
             match p {
-                "/s" => Ok(b"#!/i1\n".to_vec()),
-                "/i1" => Ok(b"#!/i2\n".to_vec()),
-                "/i2" => Ok(b"#!/i3\n".to_vec()),
-                "/i3" => Ok(b"#!/elf\n".to_vec()),
+                "/s" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/i1\n".to_vec())),
+                "/i1" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/i2\n".to_vec())),
+                "/i2" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/i3\n".to_vec())),
+                "/i3" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/elf\n".to_vec())),
                 "/elf" => Ok(elf()),
                 _ => Err(SyscallError::ENOENT),
             }
@@ -1786,13 +1799,13 @@ pub fn run_exec_disambiguation_self_test() {
     }
     // (iii) 5-deep #! chain exceeds the cap => ELOOP.
     {
-        let read = |p: &str| -> Result<Vec<u8>, SyscallError> {
+        let read = |p: &str| -> Result<crate::elf_loader::ExecImage, SyscallError> {
             match p {
-                "/s" => Ok(b"#!/i1\n".to_vec()),
-                "/i1" => Ok(b"#!/i2\n".to_vec()),
-                "/i2" => Ok(b"#!/i3\n".to_vec()),
-                "/i3" => Ok(b"#!/i4\n".to_vec()),
-                "/i4" => Ok(b"#!/elf\n".to_vec()),
+                "/s" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/i1\n".to_vec())),
+                "/i1" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/i2\n".to_vec())),
+                "/i2" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/i3\n".to_vec())),
+                "/i3" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/i4\n".to_vec())),
+                "/i4" => Ok(crate::elf_loader::ExecImage::from_vec(b"#!/elf\n".to_vec())),
                 "/elf" => Ok(elf()),
                 _ => Err(SyscallError::ENOENT),
             }
@@ -1805,20 +1818,24 @@ pub fn run_exec_disambiguation_self_test() {
             "5-deep shebang chain must ELOOP (depth > MAX_SHEBANG_DEPTH)"
         );
     }
-    // (iv) a non-ELF, non-#! leaf returns its bytes (load_elf rejects later — must NOT loop).
+    // (iv) a non-ELF, non-#! leaf returns its bytes (load_elf_image rejects later — must NOT loop).
     {
         let (bytes, _argv) =
             resolve_exec_chain(String::from("/data"), alloc::vec![b"d".to_vec()], |_p| {
-                Ok(b"plain data".to_vec())
+                Ok(crate::elf_loader::ExecImage::from_vec(
+                    b"plain data".to_vec(),
+                ))
             })
             .expect("non-ELF non-#! leaf returns bytes");
-        assert_eq!(bytes, b"plain data".to_vec());
+        assert_eq!(bytes.prefix_slice(16), b"plain data");
     }
     // (v) argv reconstruction across one hop: /s (#!/i -a) with argv [s,x] => [/i,-a,/s,x].
     {
-        let read = |p: &str| -> Result<Vec<u8>, SyscallError> {
+        let read = |p: &str| -> Result<crate::elf_loader::ExecImage, SyscallError> {
             match p {
-                "/s" => Ok(b"#!/i -a\n".to_vec()),
+                "/s" => Ok(crate::elf_loader::ExecImage::from_vec(
+                    b"#!/i -a\n".to_vec(),
+                )),
                 "/i" => Ok(elf()),
                 _ => Err(SyscallError::ENOENT),
             }

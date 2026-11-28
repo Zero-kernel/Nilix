@@ -912,6 +912,20 @@ impl Vfs {
             OperationContext::current().map_err(fs_error_to_syscall)?,
         )
     }
+
+    /// N2.1: Read an executable file directly into a page-backed [`kernel_core::ExecImage`]
+    /// so binaries up to 16 MiB bypass the 2 MiB kernel heap.
+    pub fn read_file_for_exec_image(
+        &self,
+        name: &str,
+        max: usize,
+    ) -> Result<kernel_core::ExecImage, SyscallError> {
+        let context = OperationContext::current().map_err(fs_error_to_syscall)?;
+        let mut image = kernel_core::ExecImage::new();
+        self.read_exec_using_sink(name, context, |chunk| image.try_append(chunk, max))?;
+        Ok(image)
+    }
+
     pub fn read_file_for_exec_trusted(
         &self,
         name: &str,
@@ -924,12 +938,41 @@ impl Vfs {
                 .map_err(fs_error_to_syscall)?,
         )
     }
+
     fn read_exec_using(
         &self,
         name: &str,
         max: usize,
         context: OperationContext,
     ) -> Result<Vec<u8>, SyscallError> {
+        let mut result = Vec::new();
+        self.read_exec_using_sink(name, context, |chunk| {
+            if result
+                .len()
+                .checked_add(chunk.len())
+                .filter(|size| *size <= max)
+                .is_none()
+            {
+                return Err(SyscallError::E2BIG);
+            }
+            result
+                .try_reserve(chunk.len())
+                .map_err(|_| SyscallError::ENOMEM)?;
+            result.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn read_exec_using_sink<F>(
+        &self,
+        name: &str,
+        context: OperationContext,
+        mut sink: F,
+    ) -> Result<(), SyscallError>
+    where
+        F: FnMut(&[u8]) -> Result<(), SyscallError>,
+    {
         let path = self
             .lookup_using(name, ResolveFlags::empty(), FinalLink::Follow, &context)
             .map_err(fs_error_to_syscall)?;
@@ -947,7 +990,6 @@ impl Vfs {
             &LsmFileCtx::new(stat.ino, stat.mode.to_raw(), hash_path(name)),
         )
         .map_err(|_| SyscallError::EACCES)?;
-        let mut result = Vec::new();
         let mut offset = 0;
         let mut bytes = [0; 4096];
         loop {
@@ -959,20 +1001,9 @@ impl Vfs {
                 return Err(SyscallError::EIO);
             }
             if count == 0 {
-                return Ok(result);
+                return Ok(());
             }
-            if result
-                .len()
-                .checked_add(count)
-                .filter(|size| *size <= max)
-                .is_none()
-            {
-                return Err(SyscallError::E2BIG);
-            }
-            result
-                .try_reserve(count)
-                .map_err(|_| SyscallError::ENOMEM)?;
-            result.extend_from_slice(&bytes[..count]);
+            sink(&bytes[..count])?;
             offset += count as u64;
         }
     }

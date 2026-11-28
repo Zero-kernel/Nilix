@@ -530,8 +530,8 @@ fn vfs_lseek_callback(
 /// Called by `sys_execve` (via `exec_read_file`) to load an executable's bytes
 /// by path with a single +x/DAC/LSM-gated resolution. Trivial passthrough —
 /// `read_file_for_exec` already returns a `SyscallError`.
-fn vfs_read_file_callback(path: &str, max: usize) -> Result<Vec<u8>, SyscallError> {
-    VFS.read_file_for_exec(path, max)
+fn vfs_read_file_callback(path: &str, max: usize) -> Result<kernel_core::ExecImage, SyscallError> {
+    VFS.read_file_for_exec_image(path, max)
 }
 
 /// M0-4: self-test for the exec-read VFS leg (`read_file_for_exec`) — the new VFS

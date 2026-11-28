@@ -1239,7 +1239,8 @@ pub type VfsStatCallback = fn(&str) -> Result<VfsStat, SyscallError>;
 /// lock — this callback acquires those internally (LSM `from_current`, DAC euid).
 /// Absent (unregistered) => ENOSYS; it never panics.
 /// 参数: (path, max_bytes) -> 文件字节 或错误
-pub type VfsReadFileCallback = fn(&str, usize) -> Result<alloc::vec::Vec<u8>, SyscallError>;
+pub type VfsReadFileCallback =
+    fn(&str, usize) -> Result<crate::elf_loader::ExecImage, SyscallError>;
 
 /// VFS lseek 回调类型
 ///
@@ -1707,16 +1708,13 @@ pub(super) fn is_directory_mode(mode: u32) -> bool {
 /// 内核空间使用高半区（0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF）
 pub(super) const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 
-/// sys_exec 允许的最大 ELF 映像大小（P2-A transient peak = HEAP/4 = 256 KiB）
+/// N2.1: sys_exec / sys_spawn_image maximum executable image size (16 MiB).
 ///
-/// R151-1 FIX: Reduced from 16 MiB because the kernel heap is only 1 MiB
-/// (HEAP_SIZE); a large limit allowed infallible vec! allocation to exhaust the
-/// heap and trigger the alloc_error_handler panic — a deterministic kernel crash
-/// from unprivileged userspace. P2-A further binds this to the heap-budget
-/// arbiter's `ExecImagePeak` slot (HEAP/4) so the peak coexists with retained
-/// hard floors + reserved headroom without over-commit. Concurrent exec paths
-/// must hold `mm::TransientPeakGuard` while the staging buffer is live.
-pub(super) const MAX_EXEC_IMAGE_SIZE: usize = mm::budget_bytes(mm::HeapBudgetId::ExecImagePeak);
+/// Images above `EXEC_IMAGE_HEAP_FAST_BYTES` (64 KiB) are staged in physical
+/// 4 KiB frames (`ExecImage::Paged`), so a full 16 MiB binary consumes only
+/// ~32 KiB of kernel heap for frame metadata while concurrent exec paths remain
+/// serialized by `mm::TransientPeakGuard`.
+pub(super) const MAX_EXEC_IMAGE_SIZE: usize = crate::elf_loader::MAX_EXEC_IMAGE_BYTES;
 
 // M0-4 (exec disambiguation) limits.
 /// First-line scan window for a `#!` shebang (Linux BINPRM_BUF_SIZE-class).
