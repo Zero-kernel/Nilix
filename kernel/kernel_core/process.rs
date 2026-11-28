@@ -2784,6 +2784,10 @@ pub struct ThreadGroup {
     /// G7: process-directed pending signals (one bit per signal), visible to
     /// every member. Members claim a bit into their own set before delivery.
     shared_pending: AtomicU64,
+    /// N2.6a: bounded FIFO queue of process-directed signal payloads (RT signals
+    /// 32..=64 queue multiple instances; standard signals store at most one).
+    /// Leaf lock ordered after PCB lock; IRQ paths use `try_lock()` only.
+    shared_rt_sigqueue: Mutex<crate::signal::RtSigQueue>,
     /// G8: members that have not begun exiting. Each task leaves exactly once
     /// (`Process.group_live`); the task that takes it to zero is the group's
     /// last live member and runs the process-wide exit work (namespace-init
@@ -2821,6 +2825,7 @@ impl ThreadGroup {
             members: AtomicUsize::new(1),
             parent_notified: AtomicBool::new(false),
             shared_pending: AtomicU64::new(0),
+            shared_rt_sigqueue: Mutex::new(crate::signal::RtSigQueue::new()),
             live: AtomicUsize::new(1),
             child_events: AtomicU64::new(0),
             child_waiters: AtomicUsize::new(0),
@@ -2875,6 +2880,82 @@ impl ThreadGroup {
     /// G7: take `bit` out of the group set; true for exactly one caller.
     pub(crate) fn claim_shared(&self, bit: u64) -> bool {
         self.shared_pending.fetch_and(!bit, Ordering::AcqRel) & bit != 0
+    }
+
+    /// N2.6a: enqueue a process-directed signal with optional `SigInfo` payload.
+    /// Real-time signals (`32..=64`) queue FIFO up to `MAX_QUEUED_RT_SIGNALS`;
+    /// standard signals store a single coalesced payload if not already pending.
+    pub(crate) fn queue_shared_info(
+        &self,
+        signal: crate::signal::Signal,
+        info: Option<crate::signal::SigInfo>,
+        fail_on_full: bool,
+    ) -> Result<(), crate::signal::SignalError> {
+        let mut q = self.shared_rt_sigqueue.lock();
+        if let Some(si) = info {
+            if signal.is_realtime() {
+                if q.push(si).is_err() && fail_on_full {
+                    return Err(crate::signal::SignalError::QueueFull);
+                }
+            } else if (self.shared_pending.load(Ordering::Acquire) & signal.bit()) == 0
+                && !q.has_signal(signal)
+            {
+                let _ = q.push(si);
+            }
+        }
+        self.shared_pending.fetch_or(signal.bit(), Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// N2.6a: claim one instance of `signal` (and its oldest queued `SigInfo`,
+    /// if any) from the group set. Keeps the bit set in `shared_pending` if
+    /// additional RT instances remain queued.
+    pub(crate) fn claim_shared_with_info(
+        &self,
+        signal: crate::signal::Signal,
+    ) -> Option<Option<crate::signal::SigInfo>> {
+        let mut q = self.shared_rt_sigqueue.lock();
+        if (self.shared_pending.load(Ordering::Acquire) & signal.bit()) == 0 {
+            return None;
+        }
+        let info = q.pop(signal);
+        if !q.has_signal(signal) {
+            self.shared_pending
+                .fetch_and(!signal.bit(), Ordering::AcqRel);
+        }
+        Some(info)
+    }
+
+    /// N2.6a: IRQ-safe non-blocking variant of [`claim_shared_with_info`].
+    pub(crate) fn try_claim_shared_with_info_irq(
+        &self,
+        signal: crate::signal::Signal,
+    ) -> Option<Option<crate::signal::SigInfo>> {
+        let mut q = self.shared_rt_sigqueue.try_lock()?;
+        if (self.shared_pending.load(Ordering::Acquire) & signal.bit()) == 0 {
+            return None;
+        }
+        let info = q.pop(signal);
+        if !q.has_signal(signal) {
+            self.shared_pending
+                .fetch_and(!signal.bit(), Ordering::AcqRel);
+        }
+        Some(info)
+    }
+
+    /// N2.6a: discard all queued instances of `signal` from the group set.
+    pub(crate) fn discard_shared_signal(&self, signal: crate::signal::Signal) {
+        let mut q = self.shared_rt_sigqueue.lock();
+        q.remove_all(signal);
+        self.shared_pending
+            .fetch_and(!signal.bit(), Ordering::AcqRel);
+    }
+
+    /// N2.6a: return claimed group entries matching `mask` back to the group.
+    pub(crate) fn return_shared_entries(&self, mask: u64, src: &mut crate::signal::RtSigQueue) {
+        let mut q = self.shared_rt_sigqueue.lock();
+        src.drain_mask_into(mask, &mut q);
+        self.shared_pending.fetch_or(mask, Ordering::AcqRel);
     }
 
     /// Tasks of this group currently in PROCESS_TABLE.
@@ -3047,6 +3128,14 @@ pub struct Process {
     /// fork/CLONE_VM (stays `None` via `Process::new`), cleared on exec — exactly like
     /// `saved_blocked`.
     pub poll_restore_blocked: Option<u64>,
+
+    /// N2.6a: per-task alternate signal stack (`sigaltstack(2)`). Inherited on
+    /// `fork`, disabled on `clone(CLONE_VM)` (without `CLONE_VFORK`) and `execve`.
+    pub sigaltstack: crate::signal::SigAltStack,
+
+    /// N2.6a: bounded FIFO queue of per-task / claimed pending signal payloads.
+    /// Born empty; not inherited on fork/clone; preserved across execve.
+    pub rt_sigqueue: crate::signal::RtSigQueue,
 
     /// 进程优先级（静态优先级）
     pub priority: Priority,
@@ -4019,6 +4108,8 @@ impl Process {
                 saved_frame_owner: _,
                 in_signal_handler: _,
                 poll_restore_blocked: _,
+                sigaltstack: _,
+                rt_sigqueue: _,
                 priority: _,
                 dynamic_priority: _,
                 base_dynamic_priority: _,
@@ -4127,6 +4218,9 @@ impl Process {
         addr_of_mut!((*dst).in_signal_handler).write(false);
         // M0-6 poll/select: no pending ppoll/pselect6 sigmask restore at birth.
         addr_of_mut!((*dst).poll_restore_blocked).write(None);
+        // N2.6a: alternate signal stack disabled and RT queue empty at birth.
+        addr_of_mut!((*dst).sigaltstack).write(crate::signal::SigAltStack::disabled());
+        addr_of_mut!((*dst).rt_sigqueue).write(crate::signal::RtSigQueue::new());
         addr_of_mut!((*dst).priority).write(priority);
         addr_of_mut!((*dst).dynamic_priority).write(priority);
         addr_of_mut!((*dst).base_dynamic_priority).write(priority); // E.4 PI: starts same as dynamic_priority
@@ -4961,7 +5055,10 @@ impl Process {
         if self.pending_signals.is_pending(signal) {
             return true;
         }
-        if self.thread_group.claim_shared(signal.bit()) {
+        if let Some(info) = self.thread_group.claim_shared_with_info(signal) {
+            if let Some(si) = info {
+                let _ = self.rt_sigqueue.push(si);
+            }
             self.pending_signals.set(signal);
             self.group_claimed |= signal.bit();
             return true;
@@ -4969,11 +5066,36 @@ impl Process {
         false
     }
 
+    /// N2.6a: IRQ-safe non-blocking variant of [`claim_pending`].
+    pub(crate) fn try_claim_pending_irq(&mut self, signal: crate::signal::Signal) -> bool {
+        if self.pending_signals.is_pending(signal) {
+            return true;
+        }
+        if let Some(info) = self.thread_group.try_claim_shared_with_info_irq(signal) {
+            if let Some(si) = info {
+                let _ = self.rt_sigqueue.push_no_alloc(si);
+            }
+            self.pending_signals.set(signal);
+            self.group_claimed |= signal.bit();
+            return true;
+        }
+        false
+    }
+
+    /// N2.6a: peek the oldest queued `SigInfo` for `signal` in this task's own
+    /// queue (synthesizing default `SI_USER` metadata if none was queued).
+    pub(crate) fn peek_own_siginfo(&self, signal: crate::signal::Signal) -> crate::signal::SigInfo {
+        self.rt_sigqueue
+            .peek(signal)
+            .unwrap_or_else(|| crate::signal::SigInfo::default_for(signal))
+    }
+
     /// GAP-5 G7: drop `signal` from this task's own set and its group's set.
     pub(crate) fn discard_pending(&mut self, signal: crate::signal::Signal) {
+        self.rt_sigqueue.remove_all(signal);
         self.pending_signals.clear(signal);
         self.group_claimed &= !signal.bit();
-        self.thread_group.discard_shared(signal.bit());
+        self.thread_group.discard_shared_signal(signal);
     }
 
     /// GAP-5 G7: the pending set that interrupts this task's waits: its own
@@ -4982,11 +5104,40 @@ impl Process {
         self.pending_signals.bits() | (self.thread_group.shared_pending() & self.shared_chosen)
     }
 
-    /// GAP-5 G7: this task delivered or consumed `signal`; it is no longer
-    /// pending here and no longer a claimed group signal to hand back.
-    pub(crate) fn consume_own_pending(&mut self, signal: crate::signal::Signal) {
-        self.pending_signals.clear(signal);
-        self.group_claimed &= !signal.bit();
+    /// GAP-5 G7 + N2.6a: this task delivered or consumed ONE instance of `signal`.
+    /// Returns its `SigInfo`. If additional queued instances of `signal` remain
+    /// in `rt_sigqueue` (RT signals 32..=64), keeps the pending bit set for the
+    /// next delivery in FIFO order.
+    pub(crate) fn consume_own_pending(
+        &mut self,
+        signal: crate::signal::Signal,
+    ) -> crate::signal::SigInfo {
+        let info = self
+            .rt_sigqueue
+            .pop(signal)
+            .unwrap_or_else(|| crate::signal::SigInfo::default_for(signal));
+        if !self.rt_sigqueue.has_signal(signal) {
+            self.pending_signals.clear(signal);
+            self.group_claimed &= !signal.bit();
+        }
+        info
+    }
+
+    /// N2.6a: atomically dequeue one pending signal matching `mask` (regardless
+    /// of whether it is currently blocked) for `rt_sigtimedwait(2)`.
+    pub(crate) fn take_pending_for_sigwait(
+        &mut self,
+        mask: u64,
+    ) -> Option<(crate::signal::Signal, crate::signal::SigInfo)> {
+        let mut candidates = self.pending_bits() & mask;
+        while let Some(sig) = crate::signal::select_lowest_deliverable(candidates) {
+            candidates &= !sig.bit();
+            if self.claim_pending(sig) {
+                let info = self.consume_own_pending(sig);
+                return Some((sig, info));
+            }
+        }
+        None
     }
 
     /// GAP-5 G7 (review D3, Linux `recalc_sigpending` with
@@ -5026,7 +5177,8 @@ impl Process {
         if back != 0 {
             self.pending_signals
                 .replace_bits(self.pending_signals.bits() & !back);
-            self.thread_group.queue_shared(back);
+            self.thread_group
+                .return_shared_entries(back, &mut self.rt_sigqueue);
         }
         back
     }

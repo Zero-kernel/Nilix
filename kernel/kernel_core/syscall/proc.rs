@@ -1366,6 +1366,9 @@ pub(super) fn sys_clone(
             None
         };
         child.blocked = parent_blocked;
+        // N2.6a: Linux clone(2) disables sigaltstack when CLONE_VM is set
+        // (without CLONE_VFORK), which matches born-clean `SigAltStack::disabled()`.
+        child.sigaltstack = crate::signal::SigAltStack::disabled();
 
         // RF180-1 FIX: publish the snapshotted sandbox state only while holding
         // parent -> child in canonical order and only if the committed seccomp

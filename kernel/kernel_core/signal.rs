@@ -125,6 +125,11 @@ impl Signal {
     pub const SIGTTIN: Signal = Signal(21); // Background read from tty
     pub const SIGTTOU: Signal = Signal(22); // Background write to tty
 
+    /// First real-time signal number (Linux x86_64 `SIGRTMIN`).
+    pub const SIGRTMIN: u8 = 32;
+    /// Last real-time signal number (Linux x86_64 `SIGRTMAX`).
+    pub const SIGRTMAX: u8 = 64;
+
     /// Create signal from raw signal number
     pub fn from_raw(raw: i32) -> Result<Self, SignalError> {
         if raw <= 0 || raw > MAX_SIGNAL as i32 {
@@ -176,6 +181,452 @@ impl Signal {
     #[inline]
     pub fn is_uncatchable(self) -> bool {
         self == Signal::SIGKILL || self == Signal::SIGSTOP
+    }
+
+    /// Check if this is a POSIX real-time queued signal (32..=64).
+    #[inline]
+    pub fn is_realtime(self) -> bool {
+        self.0 >= Self::SIGRTMIN
+    }
+}
+
+// ============================================================================
+// N2.6a: Real-time signal metadata (`SigInfo`), bounded FIFO queue, and
+// alternate signal stack (`SigAltStack`)
+// ============================================================================
+
+/// Linux x86_64 `siginfo_t.si_code` values (`uapi/asm-generic/siginfo.h`).
+pub const SI_USER: i32 = 0;
+pub const SI_QUEUE: i32 = -1;
+pub const SI_TIMER: i32 = -2;
+pub const SI_TKILL: i32 = -6;
+pub const SI_KERNEL: i32 = 0x80;
+
+/// Linux x86_64 `stack_t.ss_flags` values (`uapi/asm-generic/signal.h`).
+pub const SS_ONSTACK: u32 = 1;
+pub const SS_DISABLE: u32 = 2;
+pub const SS_AUTODISARM: u32 = 1 << 31;
+/// Minimum alternate signal stack size (Linux x86_64 `MINSIGSTKSZ`).
+pub const MINSIGSTKSZ: usize = 2048;
+
+/// Bounded per-task and per-group real-time signal queue capacity
+/// (matches POSIX `_POSIX_SIGQUEUE_MAX = 32`, zero heap allocation on delivery).
+pub const MAX_QUEUED_RT_SIGNALS: usize = 32;
+
+/// Compact kernel representation of a signal's `siginfo_t` payload.
+/// `signo == 0` marks an empty slot in [`RtSigQueue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigInfo {
+    pub signo: i32,
+    pub errno: i32,
+    pub code: i32,
+    pub pid: i32,
+    pub uid: u32,
+    pub value: u64,
+}
+
+impl SigInfo {
+    /// Empty sentinel slot.
+    pub const EMPTY: Self = Self {
+        signo: 0,
+        errno: 0,
+        code: 0,
+        pid: 0,
+        uid: 0,
+        value: 0,
+    };
+
+    /// Minimal `SI_USER` metadata for a signal with no explicitly queued payload.
+    #[inline]
+    pub const fn default_for(signal: Signal) -> Self {
+        Self {
+            signo: signal.0 as i32,
+            errno: 0,
+            code: SI_USER,
+            pid: 0,
+            uid: 0,
+            value: 0,
+        }
+    }
+
+    /// Minimal `SI_USER` metadata for a raw signal number.
+    #[inline]
+    pub const fn default_for_raw(signum: u32) -> Self {
+        Self {
+            signo: signum as i32,
+            errno: 0,
+            code: SI_USER,
+            pid: 0,
+            uid: 0,
+            value: 0,
+        }
+    }
+
+    /// Construct metadata for a `kill`/`tkill`/`tgkill` or kernel-originated signal.
+    #[inline]
+    pub const fn from_sender(signal: Signal, code: i32, pid: i32, uid: u32) -> Self {
+        Self {
+            signo: signal.0 as i32,
+            errno: 0,
+            code,
+            pid,
+            uid,
+            value: 0,
+        }
+    }
+
+    /// Serialize into a 128-byte Linux x86_64 `siginfo_t` wire buffer.
+    /// Zero-fills the entire buffer so no kernel stack residue can leak.
+    pub fn write_wire_bytes(&self, out: &mut [u8; 128]) {
+        out.fill(0);
+        out[0..4].copy_from_slice(&self.signo.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.errno.to_ne_bytes());
+        out[8..12].copy_from_slice(&self.code.to_ne_bytes());
+        // Bytes 12..16: 4-byte alignment pad before `_sifields` on x86_64.
+        out[16..20].copy_from_slice(&self.pid.to_ne_bytes());
+        out[20..24].copy_from_slice(&self.uid.to_ne_bytes());
+        out[24..32].copy_from_slice(&self.value.to_ne_bytes());
+    }
+
+    /// Parse a user-supplied 128-byte `siginfo_t` wire buffer for
+    /// `rt_sigqueueinfo` / `rt_tgsigqueueinfo`, overriding `si_signo` with `sig`.
+    pub fn from_wire_bytes(sig: i32, bytes: &[u8; 128]) -> Self {
+        let rd_i32 =
+            |o: usize| i32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let rd_u32 =
+            |o: usize| u32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let rd_u64 = |o: usize| {
+            u64::from_ne_bytes([
+                bytes[o],
+                bytes[o + 1],
+                bytes[o + 2],
+                bytes[o + 3],
+                bytes[o + 4],
+                bytes[o + 5],
+                bytes[o + 6],
+                bytes[o + 7],
+            ])
+        };
+        Self {
+            signo: sig,
+            errno: rd_i32(4),
+            code: rd_i32(8),
+            pid: rd_i32(16),
+            uid: rd_u32(20),
+            value: rd_u64(24),
+        }
+    }
+}
+
+const RT_SIGQUEUE_OVERFLOW_CAP: usize = MAX_QUEUED_RT_SIGNALS - 1;
+
+/// Lazy overflow storage for queued signals beyond the 1 inline slot.
+/// Allocated fallibly via `Box::try_new` only when a process actually queues
+/// 2..=32 simultaneous signals, keeping `Process` and `ThreadGroup` compact.
+#[derive(Debug, Clone)]
+struct RtSigQueueOverflow {
+    entries: [SigInfo; RT_SIGQUEUE_OVERFLOW_CAP],
+    len: usize,
+}
+
+impl RtSigQueueOverflow {
+    const fn new() -> Self {
+        Self {
+            entries: [SigInfo::EMPTY; RT_SIGQUEUE_OVERFLOW_CAP],
+            len: 0,
+        }
+    }
+}
+
+/// Compact bounded FIFO queue of pending signal payloads (40 bytes inline).
+///
+/// Stores the first pending payload inline (zero heap allocation for normal
+/// single-signal delivery and IRQ claims) and lazily allocates a bounded
+/// fallible overflow slab (`Box::try_new`) only when 2..=[`MAX_QUEUED_RT_SIGNALS`]
+/// signals are simultaneously queued.
+#[derive(Debug)]
+pub struct RtSigQueue {
+    first: SigInfo,
+    overflow: Option<alloc::boxed::Box<RtSigQueueOverflow>>,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<RtSigQueue>() <= 48,
+    "RtSigQueue must stay compact inside Process/ThreadGroup to preserve PCB heap admission budgets"
+);
+
+impl RtSigQueue {
+    pub const fn new() -> Self {
+        Self {
+            first: SigInfo::EMPTY,
+            overflow: None,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        if self.first.signo == 0 {
+            0
+        } else {
+            1 + self.overflow.as_ref().map_or(0, |o| o.len)
+        }
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.first.signo == 0
+    }
+
+    /// Append `info` in FIFO order. Returns `Err(())` if the bounded queue is
+    /// full or if fallible overflow allocation fails (OOM).
+    pub fn push(&mut self, info: SigInfo) -> Result<(), ()> {
+        if self.first.signo == 0 {
+            self.first = info;
+            return Ok(());
+        }
+        if self.overflow.is_none() {
+            let slab = alloc::boxed::Box::try_new(RtSigQueueOverflow::new()).map_err(|_| ())?;
+            self.overflow = Some(slab);
+        }
+        let ov = self.overflow.as_mut().unwrap();
+        if ov.len >= RT_SIGQUEUE_OVERFLOW_CAP {
+            return Err(());
+        }
+        ov.entries[ov.len] = info;
+        ov.len += 1;
+        Ok(())
+    }
+
+    /// Append `info` in FIFO order without allocating (IRQ-safe: uses the inline
+    /// slot or an already-allocated overflow slab, returning `Err(())` otherwise).
+    pub fn push_no_alloc(&mut self, info: SigInfo) -> Result<(), ()> {
+        if self.first.signo == 0 {
+            self.first = info;
+            return Ok(());
+        }
+        let Some(ov) = self.overflow.as_mut() else {
+            return Err(());
+        };
+        if ov.len >= RT_SIGQUEUE_OVERFLOW_CAP {
+            return Err(());
+        }
+        ov.entries[ov.len] = info;
+        ov.len += 1;
+        Ok(())
+    }
+
+    /// Return the oldest queued payload for `signal` without removing it.
+    pub fn peek(&self, signal: Signal) -> Option<SigInfo> {
+        let target = signal.as_i32();
+        if self.first.signo == 0 {
+            return None;
+        }
+        if self.first.signo == target {
+            return Some(self.first);
+        }
+        self.overflow
+            .as_ref()?
+            .entries
+            .iter()
+            .take(self.overflow.as_ref()?.len)
+            .copied()
+            .find(|e| e.signo == target)
+    }
+
+    /// Remove and return the oldest queued payload for `signal`, preserving FIFO
+    /// order of all remaining entries.
+    pub fn pop(&mut self, signal: Signal) -> Option<SigInfo> {
+        let target = signal.as_i32();
+        if self.first.signo == 0 {
+            return None;
+        }
+        if self.first.signo == target {
+            let item = self.first;
+            if let Some(ov) = self.overflow.as_mut() {
+                if ov.len > 0 {
+                    self.first = ov.entries[0];
+                    let mut i = 0usize;
+                    while i + 1 < ov.len {
+                        ov.entries[i] = ov.entries[i + 1];
+                        i += 1;
+                    }
+                    ov.len -= 1;
+                    ov.entries[ov.len] = SigInfo::EMPTY;
+                    return Some(item);
+                }
+            }
+            self.first = SigInfo::EMPTY;
+            return Some(item);
+        }
+        let ov = self.overflow.as_mut()?;
+        let pos = ov.entries[..ov.len]
+            .iter()
+            .position(|e| e.signo == target)?;
+        let item = ov.entries[pos];
+        let mut i = pos;
+        while i + 1 < ov.len {
+            ov.entries[i] = ov.entries[i + 1];
+            i += 1;
+        }
+        ov.len -= 1;
+        ov.entries[ov.len] = SigInfo::EMPTY;
+        Some(item)
+    }
+
+    /// True if at least one entry for `signal` remains queued.
+    pub fn has_signal(&self, signal: Signal) -> bool {
+        let target = signal.as_i32();
+        if self.first.signo == 0 {
+            return false;
+        }
+        if self.first.signo == target {
+            return true;
+        }
+        self.overflow
+            .as_ref()
+            .is_some_and(|ov| ov.entries[..ov.len].iter().any(|e| e.signo == target))
+    }
+
+    /// Remove all queued entries for `signal`.
+    pub fn remove_all(&mut self, signal: Signal) {
+        let target = signal.as_i32();
+        if self.first.signo == 0 {
+            return;
+        }
+        if let Some(ov) = self.overflow.as_mut() {
+            let mut write = 0usize;
+            for read in 0..ov.len {
+                if ov.entries[read].signo != target {
+                    ov.entries[write] = ov.entries[read];
+                    write += 1;
+                }
+            }
+            for i in write..ov.len {
+                ov.entries[i] = SigInfo::EMPTY;
+            }
+            ov.len = write;
+        }
+        if self.first.signo == target {
+            if let Some(ov) = self.overflow.as_mut() {
+                if ov.len > 0 {
+                    self.first = ov.entries[0];
+                    let mut i = 0usize;
+                    while i + 1 < ov.len {
+                        ov.entries[i] = ov.entries[i + 1];
+                        i += 1;
+                    }
+                    ov.len -= 1;
+                    ov.entries[ov.len] = SigInfo::EMPTY;
+                } else {
+                    self.first = SigInfo::EMPTY;
+                }
+            } else {
+                self.first = SigInfo::EMPTY;
+            }
+        }
+        if self.overflow.as_ref().is_some_and(|ov| ov.len == 0) {
+            self.overflow = None;
+        }
+    }
+
+    /// Move every entry whose signal bit is set in `mask` into `dst` (best-effort
+    /// if `dst` is full, preserving bitmap visibility via returned mask).
+    pub fn drain_mask_into(&mut self, mask: u64, dst: &mut RtSigQueue) {
+        if mask == 0 || self.first.signo == 0 {
+            return;
+        }
+        let matches_mask =
+            |entry: SigInfo| Signal::from_raw(entry.signo).is_ok_and(|s| (mask & s.bit()) != 0);
+        let first_matched = matches_mask(self.first);
+        if first_matched {
+            let _ = dst.push(self.first);
+            self.first = SigInfo::EMPTY;
+        }
+        if let Some(ov) = self.overflow.as_mut() {
+            let mut write = 0usize;
+            for read in 0..ov.len {
+                let entry = ov.entries[read];
+                if matches_mask(entry) {
+                    let _ = dst.push(entry);
+                } else if self.first.signo == 0 {
+                    self.first = entry;
+                } else {
+                    ov.entries[write] = entry;
+                    write += 1;
+                }
+            }
+            for i in write..ov.len {
+                ov.entries[i] = SigInfo::EMPTY;
+            }
+            ov.len = write;
+        }
+        if self.overflow.as_ref().is_some_and(|ov| ov.len == 0) {
+            self.overflow = None;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.first = SigInfo::EMPTY;
+        self.overflow = None;
+    }
+}
+
+impl Default for RtSigQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-task alternate signal stack configuration (`sigaltstack(2)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigAltStack {
+    pub sp: u64,
+    pub size: u64,
+    /// `SS_DISABLE` when disabled, `0` (or `SS_AUTODISARM`) when enabled.
+    pub flags: u32,
+}
+
+impl SigAltStack {
+    pub const fn disabled() -> Self {
+        Self {
+            sp: 0,
+            size: 0,
+            flags: SS_DISABLE,
+        }
+    }
+
+    #[inline]
+    pub const fn is_enabled(self) -> bool {
+        (self.flags & SS_DISABLE) == 0 && self.size >= MINSIGSTKSZ as u64 && self.sp != 0
+    }
+
+    /// True if `rsp` currently lies inside the active alternate signal stack.
+    /// Matches Linux `on_sig_stack(sp)`: `sp > ss_sp && sp - ss_sp <= ss_size`.
+    #[inline]
+    pub const fn on_stack(self, rsp: u64) -> bool {
+        self.is_enabled() && rsp > self.sp && rsp.saturating_sub(self.sp) <= self.size
+    }
+
+    /// Exclusive top VA of the alternate signal stack (`sp + size`).
+    #[inline]
+    pub const fn top(self) -> Option<u64> {
+        if self.is_enabled() {
+            self.sp.checked_add(self.size)
+        } else {
+            None
+        }
+    }
+
+    /// Format `(ss_sp, ss_flags, ss_size)` for `old_ss` or `ucontext.uc_stack`.
+    #[inline]
+    pub const fn as_stack_t_fields(self, current_rsp: u64) -> (u64, u32, u64) {
+        if !self.is_enabled() {
+            (0, SS_DISABLE, 0)
+        } else if self.on_stack(current_rsp) {
+            (self.sp, SS_ONSTACK, self.size)
+        } else {
+            (self.sp, 0, self.size)
+        }
     }
 }
 
@@ -882,6 +1333,8 @@ pub enum SignalError {
     PermissionDenied,
     /// A credential writer has closed reader admission; caller may retry.
     CredentialBusy,
+    /// Bounded real-time signal queue is full (`EAGAIN`).
+    QueueFull,
 }
 
 impl From<SignalError> for SyscallError {
@@ -891,6 +1344,7 @@ impl From<SignalError> for SyscallError {
             SignalError::NoSuchProcess => SyscallError::ESRCH,
             SignalError::PermissionDenied => SyscallError::EPERM,
             SignalError::CredentialBusy => SyscallError::EAGAIN,
+            SignalError::QueueFull => SyscallError::EAGAIN,
         }
     }
 }
@@ -944,7 +1398,17 @@ pub fn default_action(signal: Signal) -> SignalAction {
 pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
     // GAP-5 slice 4 G7: kill() is process-directed; a thread group picks the
     // member that will take it. Single-task processes are unaffected.
-    send_process_signal(pid, signal, true)
+    send_process_signal(pid, signal, true, None, false)
+}
+
+/// N2.6a: process-directed `rt_sigqueueinfo(2)` with explicit `SigInfo` payload.
+/// Fails with `SignalError::QueueFull` (`EAGAIN`) if the bounded RT queue is full.
+pub fn send_signal_queueinfo(
+    pid: ProcessId,
+    signal: Signal,
+    info: SigInfo,
+) -> Result<SignalAction, SignalError> {
+    send_process_signal(pid, signal, true, Some(info), true)
 }
 
 /// GAP-5 G7 (review D3): the member is chosen without its lock, so it can
@@ -954,12 +1418,21 @@ fn send_process_signal(
     pid: ProcessId,
     signal: Signal,
     enforce_permissions: bool,
+    info: Option<SigInfo>,
+    fail_on_queue_full: bool,
 ) -> Result<SignalAction, SignalError> {
     const ATTEMPTS: usize = 4;
     let mut last = Err(SignalError::NoSuchProcess);
     for _ in 0..ATTEMPTS {
         let target = process::select_process_directed_target(pid, signal.bit());
-        last = send_signal_inner(target, signal, enforce_permissions, SignalScope::Process);
+        last = send_signal_inner(
+            target,
+            signal,
+            enforce_permissions,
+            SignalScope::Process,
+            info,
+            fail_on_queue_full,
+        );
         if last != Err(SignalError::NoSuchProcess) || target == pid {
             return last;
         }
@@ -971,7 +1444,17 @@ fn send_process_signal(
 /// `tid`, with the same POSIX permission checks as `send_signal`. Fatal and
 /// job-control defaults still act on the whole group.
 pub fn send_signal_thread(tid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
-    send_signal_inner(tid, signal, true, SignalScope::Thread)
+    send_signal_inner(tid, signal, true, SignalScope::Thread, None, false)
+}
+
+/// N2.6a: thread-directed `rt_tgsigqueueinfo(2)` with explicit `SigInfo` payload.
+/// Fails with `SignalError::QueueFull` (`EAGAIN`) if the bounded RT queue is full.
+pub fn send_signal_tgsigqueueinfo(
+    tid: ProcessId,
+    signal: Signal,
+    info: SigInfo,
+) -> Result<SignalAction, SignalError> {
+    send_signal_inner(tid, signal, true, SignalScope::Thread, Some(info), true)
 }
 
 /// R115-2 FIX: Kernel-authoritative signal delivery — bypasses POSIX permission checks.
@@ -983,7 +1466,7 @@ pub fn send_signal_thread(tid: ProcessId, signal: Signal) -> Result<SignalAction
 ///
 /// MUST NOT be exposed to user-facing syscalls.
 pub fn send_signal_kernel(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
-    send_process_signal(pid, signal, false)
+    send_process_signal(pid, signal, false, None, false)
 }
 
 /// GAP-5 G7: where a generated signal is queued.
@@ -1139,6 +1622,8 @@ fn send_signal_inner(
     signal: Signal,
     enforce_permissions: bool,
     scope: SignalScope,
+    explicit_info: Option<SigInfo>,
+    fail_on_queue_full: bool,
 ) -> Result<SignalAction, SignalError> {
     // 注意：我们需要调用调度器的 resume_stopped，它在 sched crate 中
     // 由于循环依赖的限制，我们通过回调机制实现
@@ -1147,6 +1632,10 @@ fn send_signal_inner(
     // This prevents TOCTOU where PID is reused between permission check and signal delivery.
     // Previously, we fetched the process twice: once for permission check, once for signal.
     let process_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
+
+    // Synthesize `SigInfo` when the caller did not supply an explicit one (e.g.
+    // `kill`, `tkill`, `tgkill`, or kernel-originated signal).
+    let mut synthesized_sender: Option<(i32, u32)> = None;
 
     // 【安全修复 Z-9】POSIX 权限检查（深度防御）
     // 使用 UID/EUID 而非仅父子关系
@@ -1161,6 +1650,14 @@ fn send_signal_inner(
         // signal authority.  Kernel-internal callers use `send_signal_kernel`
         // and intentionally bypass this branch.
         let sender_pid = require_signal_sender_pid(process::current_pid())?;
+        if explicit_info.is_none() {
+            if let Some(sender_arc) = process::get_process(sender_pid) {
+                let s = sender_arc.lock();
+                let uid = s.try_credentials_read().map_or(0, |c| c.uid);
+                let visible_pid = s.ns_tgid.max(s.tgid);
+                synthesized_sender = Some((visible_pid as i32, uid));
+            }
+        }
         let has_dac_permission = user_signal_dac_allowed(&process_arc)?;
         let mut namespace_init_supervisor = false;
         // GAP-5 (review D1): init is a process; name the target's and the
@@ -1258,16 +1755,46 @@ fn send_signal_inner(
         }
 
         // Queue the signal (always — delivery/clear decisions follow).
-        // GAP-5 G7: process-directed signals go to the group's shared set, so
-        // they survive the exit of the member chosen to be woken.
+        // GAP-5 G7 + N2.6a: process-directed signals go to the group's shared
+        // set/queue, so they survive the exit of the member chosen to be woken.
+        let siginfo = match explicit_info {
+            Some(mut si) => {
+                si.signo = signal.as_i32();
+                Some(si)
+            }
+            None => {
+                if enforce_permissions {
+                    let (spid, suid) = synthesized_sender.unwrap_or((0, 0));
+                    let code = match scope {
+                        SignalScope::Process => SI_USER,
+                        SignalScope::Thread => SI_TKILL,
+                    };
+                    Some(SigInfo::from_sender(signal, code, spid, suid))
+                } else {
+                    Some(SigInfo::from_sender(signal, SI_KERNEL, 0, 0))
+                }
+            }
+        };
         match scope {
             SignalScope::Process => {
-                proc.thread_group.queue_shared(signal.bit());
+                proc.thread_group
+                    .queue_shared_info(signal, siginfo, fail_on_queue_full)?;
                 // This member was chosen for it: its waits now abort for it
                 // (unless it cannot take it; see the retarget below).
                 proc.shared_chosen |= signal.bit();
             }
             SignalScope::Thread => {
+                if let Some(si) = siginfo {
+                    if signal.is_realtime() {
+                        if proc.rt_sigqueue.push(si).is_err() && fail_on_queue_full {
+                            return Err(SignalError::QueueFull);
+                        }
+                    } else if !proc.pending_signals.is_pending(signal)
+                        && !proc.rt_sigqueue.has_signal(signal)
+                    {
+                        let _ = proc.rt_sigqueue.push(si);
+                    }
+                }
                 proc.pending_signals.set(signal);
                 // A thread-directed instance is this task's own, not a
                 // claimed group signal to hand back.

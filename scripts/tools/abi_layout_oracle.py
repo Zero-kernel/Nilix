@@ -409,6 +409,14 @@ STRUCT_REFS = {
         fields=[("handler", 0, 8), ("flags", 8, 8), ("restorer", 16, 8),
                 ("mask", 24, 8)], size=32,
     ),
+    "StackT": dict(
+        src="syscall_abi", layer=LINUX_UAPI,
+        cite="uapi/asm-generic/signal.h stack_t (x86-64, 24B)",
+        fields=[("ss_sp", 0, 8), ("ss_flags", 8, 4), ("_pad", 12, 4),
+                ("ss_size", 16, 8)], size=24,
+        c_type="stack_t", c_include="signal.h",
+        c_fields=[("ss_sp", 0), ("ss_flags", 8), ("ss_size", 16)],
+    ),
     "VfsStat": dict(
         # D2-ABI-STAT-LAYOUT RESOLVED (2026-07-24): converted from the former
         # 112-byte private layout to the Linux x86-64 struct stat wire layout.
@@ -563,6 +571,7 @@ def emit_c(reference):
     lines.append("#include <dirent.h>")
     lines.append("#include <sys/stat.h>")
     lines.append("#include <sys/utsname.h>")
+    lines.append("#include <signal.h>")
     lines.append("#if defined(__has_include)")
     lines.append("#  if __has_include(<linux/openat2.h>)")
     lines.append("#    include <linux/openat2.h>")

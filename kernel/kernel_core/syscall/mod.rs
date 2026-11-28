@@ -696,6 +696,20 @@ pub fn syscall_dispatcher(
                 arg3 as usize,
             ),
             Sc::RtSigreturn => sys_rt_sigreturn(),
+            // N2.6a: Extended POSIX/Linux RT signal syscalls + alternate signal stack.
+            Sc::RtSigpending => sys_rt_sigpending(arg0 as *mut u8, arg1 as usize),
+            Sc::RtSigtimedwait => sys_rt_sigtimedwait(
+                arg0 as *const u8,
+                arg1 as *mut u8,
+                arg2 as *const u8,
+                arg3 as usize,
+            ),
+            Sc::RtSigqueueinfo => sys_rt_sigqueueinfo(arg0 as i32, arg1 as i32, arg2 as *const u8),
+            Sc::RtSigsuspend => sys_rt_sigsuspend(arg0 as *const u8, arg1 as usize),
+            Sc::Sigaltstack => sys_sigaltstack(arg0 as *const u8, arg1 as *mut u8),
+            Sc::RtTgsigqueueinfo => {
+                sys_rt_tgsigqueueinfo(arg0 as i32, arg1 as i32, arg2 as i32, arg3 as *const u8)
+            }
             // F.1: Namespace unshare
             Sc::Unshare => sys_unshare(arg0 as u64),
             // F.1: setns for mount namespace
@@ -1032,7 +1046,11 @@ fn finish_syscall(
         audit_syscall_exit(syscall_num, args, timestamp, lsm_ctx, &result);
     }
     let voluntary_yield = dispatched && syscall_num == 24 && result.is_ok();
-    finish_syscall_tail(result, voluntary_yield, entry_proc)
+    let restart_nr = (dispatched
+        && matches!(result, Err(SyscallError::EINTR))
+        && is_restartable_syscall(syscall_num, args))
+    .then_some(syscall_num);
+    finish_syscall_tail(result, voluntary_yield, restart_nr, entry_proc)
 }
 
 /// Audit record and LSM exit hook for a dispatched call.
@@ -1088,6 +1106,7 @@ fn audit_syscall_exit(
 fn finish_syscall_tail(
     mut result: SyscallResult,
     mut voluntary_yield: bool,
+    restart_nr: Option<u64>,
     entry_proc: Option<ProcessArc>,
 ) -> i64 {
     // Compute the syscall's return value (→ RAX). Captured here because signal
@@ -1150,10 +1169,10 @@ fn finish_syscall_tail(
                             let handoff_proc = handoff_arc.lock();
                             maybe_deliver_signal_phase1(pid, &handoff_arc, handoff_proc)
                         };
-                        finish_signal_tail_step(pid, ret_val, handoff_arc, step);
+                        finish_signal_tail_step(pid, ret_val, None, handoff_arc, step);
                     }
                 }
-                other => finish_signal_tail_step(pid, ret_val, proc_arc, other),
+                other => finish_signal_tail_step(pid, ret_val, restart_nr, proc_arc, other),
             }
         }
     } else {

@@ -768,6 +768,8 @@ fn fork_prepare_child_state(
     // are preserved even before any custom signal handler is installed.
     child.sigactions.copy_from(&parent.sigactions);
     child.blocked = parent.blocked;
+    // N2.6a: POSIX/Linux fork(2) inherits the parent's alternate signal stack.
+    child.sigaltstack = parent.sigaltstack;
 
     // 克隆能力表（尊重 CLOFORK 标志）
     //
