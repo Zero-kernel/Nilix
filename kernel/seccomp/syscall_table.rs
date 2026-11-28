@@ -331,6 +331,10 @@ define_syscall_table! {
         (95,  SYS_UMASK,              Umask,             "umask",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (96,  SYS_GETTIMEOFDAY,       Gettimeofday,      "gettimeofday",       strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (97,  SYS_GETRLIMIT,          Getrlimit,         "getrlimit",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_RLIMIT),        reason: ""),
+        // System info, resource usage & process times (N2.7)
+        (98,  SYS_GETRUSAGE,          Getrusage,         "getrusage",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
+        (99,  SYS_SYSINFO,            Sysinfo,           "sysinfo",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (100, SYS_TIMES,              Times,             "times",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         // Credentials & capabilities (N2.4)
         (102, SYS_GETUID,             Getuid,            "getuid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (104, SYS_GETGID,             Getgid,            "getgid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
@@ -364,6 +368,9 @@ define_syscall_table! {
         (129, SYS_RT_SIGQUEUEINFO,    RtSigqueueinfo,    "rt_sigqueueinfo",    strict: false, drop_proc: true,  status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (130, SYS_RT_SIGSUSPEND,      RtSigsuspend,      "rt_sigsuspend",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (131, SYS_SIGALTSTACK,        Sigaltstack,       "sigaltstack",        strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        // Process scheduling priority (N2.7)
+        (140, SYS_GETPRIORITY,        Getpriority,       "getpriority",        strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (141, SYS_SETPRIORITY,        Setpriority,       "setpriority",        strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         // Root/prctl/arch/rlimit/sync
         (155, SYS_PIVOT_ROOT,         PivotRoot,         "pivot_root",         strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (157, SYS_PRCTL,              Prctl,             "prctl",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
@@ -407,6 +414,7 @@ define_syscall_table! {
         (297, SYS_RT_TGSIGQUEUEINFO,  RtTgsigqueueinfo,  "rt_tgsigqueueinfo",  strict: false, drop_proc: true,  status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (302, SYS_PRLIMIT64,          Prlimit64,         "prlimit64",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_RLIMIT),        reason: ""),
         (308, SYS_SETNS,              Setns,             "setns",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (309, SYS_GETCPU,             Getcpu,            "getcpu",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (316, SYS_RENAMEAT2,          Renameat2,         "renameat2",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::PrivateNeverPledged,       reason: ""),
         (317, SYS_SECCOMP,            Seccomp,           "seccomp",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (318, SYS_GETRANDOM,          Getrandom,         "getrandom",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_TIME),          reason: ""),

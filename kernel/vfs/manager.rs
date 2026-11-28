@@ -356,6 +356,7 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
         FsError::NameTooLong => SyscallError::ENAMETOOLONG,
         FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
         FsError::Again => SyscallError::EAGAIN,
+        FsError::NoDevice => SyscallError::ENXIO,
         FsError::CrossDev => SyscallError::EXDEV,
         FsError::SymlinkLoop => SyscallError::ELOOP,
         FsError::NotSupported => SyscallError::ENOSYS,

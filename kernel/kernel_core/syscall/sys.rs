@@ -555,6 +555,628 @@ pub(super) fn sys_uname(buf: *mut UtsName) -> SyscallResult {
 }
 
 // ============================================================================
+// N2.7: Resource Usage, System Info, Process Times, Priority & CPU Query
+// ============================================================================
+
+/// Linux x86_64 `RUSAGE_*` selectors for `getrusage(2)`.
+pub(super) const RUSAGE_SELF: i32 = 0;
+pub(super) const RUSAGE_CHILDREN: i32 = -1;
+pub(super) const RUSAGE_THREAD: i32 = 1;
+
+/// Linux x86_64 `PRIO_*` selectors for `getpriority(2)` / `setpriority(2)`.
+pub(super) const PRIO_PROCESS: i32 = 0;
+pub(super) const PRIO_PGRP: i32 = 1;
+pub(super) const PRIO_USER: i32 = 2;
+
+/// POSIX `CAP_SYS_NICE` capability bit (Linux `include/uapi/linux/capability.h`).
+const POSIX_CAP_SYS_NICE_BIT: u64 = 1u64 << 23;
+
+/// Linux x86_64 `struct rusage` (144 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Rusage {
+    pub ru_utime_sec: i64,
+    pub ru_utime_usec: i64,
+    pub ru_stime_sec: i64,
+    pub ru_stime_usec: i64,
+    pub ru_maxrss: i64,
+    pub ru_ixrss: i64,
+    pub ru_idrss: i64,
+    pub ru_isrss: i64,
+    pub ru_minflt: i64,
+    pub ru_majflt: i64,
+    pub ru_nswap: i64,
+    pub ru_inblock: i64,
+    pub ru_oublock: i64,
+    pub ru_msgsnd: i64,
+    pub ru_msgrcv: i64,
+    pub ru_nsignals: i64,
+    pub ru_nvcsw: i64,
+    pub ru_nivcsw: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<Rusage>() == 144);
+const _: () = assert!(core::mem::offset_of!(Rusage, ru_stime_sec) == 16);
+const _: () = assert!(core::mem::offset_of!(Rusage, ru_maxrss) == 32);
+const _: () = assert!(core::mem::offset_of!(Rusage, ru_minflt) == 64);
+const _: () = assert!(core::mem::offset_of!(Rusage, ru_majflt) == 72);
+const _: () = assert!(core::mem::offset_of!(Rusage, ru_nvcsw) == 128);
+const _: () = assert!(core::mem::offset_of!(Rusage, ru_nivcsw) == 136);
+
+impl Rusage {
+    fn to_le_bytes(self) -> [u8; 144] {
+        let mut out = [0u8; 144];
+        let fields = [
+            self.ru_utime_sec,
+            self.ru_utime_usec,
+            self.ru_stime_sec,
+            self.ru_stime_usec,
+            self.ru_maxrss,
+            self.ru_ixrss,
+            self.ru_idrss,
+            self.ru_isrss,
+            self.ru_minflt,
+            self.ru_majflt,
+            self.ru_nswap,
+            self.ru_inblock,
+            self.ru_oublock,
+            self.ru_msgsnd,
+            self.ru_msgrcv,
+            self.ru_nsignals,
+            self.ru_nvcsw,
+            self.ru_nivcsw,
+        ];
+        for (i, val) in fields.iter().enumerate() {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Linux x86_64 `struct tms` (32 bytes) for `times(2)`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Tms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<Tms>() == 32);
+const _: () = assert!(core::mem::offset_of!(Tms, tms_stime) == 8);
+const _: () = assert!(core::mem::offset_of!(Tms, tms_cutime) == 16);
+const _: () = assert!(core::mem::offset_of!(Tms, tms_cstime) == 24);
+
+impl Tms {
+    fn to_le_bytes(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[0..8].copy_from_slice(&self.tms_utime.to_le_bytes());
+        out[8..16].copy_from_slice(&self.tms_stime.to_le_bytes());
+        out[16..24].copy_from_slice(&self.tms_cutime.to_le_bytes());
+        out[24..32].copy_from_slice(&self.tms_cstime.to_le_bytes());
+        out
+    }
+}
+
+/// Linux x86_64 `struct sysinfo` (112 bytes) for `sysinfo(2)`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SysInfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub _pad2: u32,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+    pub _pad3: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<SysInfo>() == 112);
+const _: () = assert!(core::mem::offset_of!(SysInfo, uptime) == 0);
+const _: () = assert!(core::mem::offset_of!(SysInfo, loads) == 8);
+const _: () = assert!(core::mem::offset_of!(SysInfo, totalram) == 32);
+const _: () = assert!(core::mem::offset_of!(SysInfo, freeram) == 40);
+const _: () = assert!(core::mem::offset_of!(SysInfo, sharedram) == 48);
+const _: () = assert!(core::mem::offset_of!(SysInfo, bufferram) == 56);
+const _: () = assert!(core::mem::offset_of!(SysInfo, totalswap) == 64);
+const _: () = assert!(core::mem::offset_of!(SysInfo, freeswap) == 72);
+const _: () = assert!(core::mem::offset_of!(SysInfo, procs) == 80);
+const _: () = assert!(core::mem::offset_of!(SysInfo, totalhigh) == 88);
+const _: () = assert!(core::mem::offset_of!(SysInfo, freehigh) == 96);
+const _: () = assert!(core::mem::offset_of!(SysInfo, mem_unit) == 104);
+
+impl SysInfo {
+    fn to_le_bytes(self) -> [u8; 112] {
+        let mut out = [0u8; 112];
+        out[0..8].copy_from_slice(&self.uptime.to_le_bytes());
+        out[8..16].copy_from_slice(&self.loads[0].to_le_bytes());
+        out[16..24].copy_from_slice(&self.loads[1].to_le_bytes());
+        out[24..32].copy_from_slice(&self.loads[2].to_le_bytes());
+        out[32..40].copy_from_slice(&self.totalram.to_le_bytes());
+        out[40..48].copy_from_slice(&self.freeram.to_le_bytes());
+        out[48..56].copy_from_slice(&self.sharedram.to_le_bytes());
+        out[56..64].copy_from_slice(&self.bufferram.to_le_bytes());
+        out[64..72].copy_from_slice(&self.totalswap.to_le_bytes());
+        out[72..80].copy_from_slice(&self.freeswap.to_le_bytes());
+        out[80..82].copy_from_slice(&self.procs.to_le_bytes());
+        // Bytes 82..88 are pad (zero).
+        out[88..96].copy_from_slice(&self.totalhigh.to_le_bytes());
+        out[96..104].copy_from_slice(&self.freehigh.to_le_bytes());
+        out[104..108].copy_from_slice(&self.mem_unit.to_le_bytes());
+        // Bytes 108..112 are trailing alignment padding (zero).
+        out
+    }
+}
+
+/// Convert kernel ticks (1 tick = 1 ms, matching `AUXV_CLK_TCK = 1000`) to
+/// `(tv_sec, tv_usec)`.
+#[inline]
+pub(super) const fn ticks_to_timeval(ticks: u64) -> (i64, i64) {
+    let sec = (ticks / 1000) as i64;
+    let usec = ((ticks % 1000) * 1000) as i64;
+    (sec, usec)
+}
+
+/// Clamp a Linux nice value to `[-20, 19]`.
+#[inline]
+pub(super) const fn clamp_nice(prio: i32) -> i32 {
+    if prio < -20 {
+        -20
+    } else if prio > 19 {
+        19
+    } else {
+        prio
+    }
+}
+
+/// Convert a nice value `[-20, 19]` to Linux `getpriority(2)` raw return value
+/// (`20 - nice`, in `[1, 40]`) so negative nice values never collide with `-errno`.
+#[inline]
+pub(super) const fn nice_to_getpriority(nice: i32) -> usize {
+    (20 - clamp_nice(nice)) as usize
+}
+
+/// Convert a nice value `[-20, 19]` to Zero-OS static scheduler priority (`[100, 139]`).
+#[inline]
+pub(super) const fn nice_to_sched_priority(nice: i32) -> crate::process::Priority {
+    (120 + clamp_nice(nice)) as crate::process::Priority
+}
+
+/// Pure permission check for `setpriority(2)` on one target process.
+///
+/// Mirrors Linux `set_one_prio` (`kernel/sys.c`):
+/// - Non-privileged callers must match target's host real or effective UID (`EPERM`).
+/// - Lowering nice (raising priority) requires privilege (`CAP_SYS_NICE` / host root), else `EACCES`.
+#[inline]
+pub(super) fn check_setpriority_permission(
+    caller_host_euid: u32,
+    privileged: bool,
+    target_host_uid: Option<u32>,
+    target_host_euid: Option<u32>,
+    current_nice: i32,
+    new_nice: i32,
+) -> Result<(), SyscallError> {
+    if !privileged {
+        let owns_target =
+            target_host_uid == Some(caller_host_euid) || target_host_euid == Some(caller_host_euid);
+        if !owns_target {
+            return Err(SyscallError::EPERM);
+        }
+        if new_nice < clamp_nice(current_nice) {
+            return Err(SyscallError::EACCES);
+        }
+    }
+    Ok(())
+}
+
+/// Sum `cpu_time` across all live tasks belonging to `tgid` (using canonical
+/// `PROCESS_TABLE -> PCB` lock order).
+fn thread_group_cpu_ticks(tgid: ProcessId) -> u64 {
+    let table = crate::process::PROCESS_TABLE.lock();
+    let mut total = 0u64;
+    for slot in table.iter() {
+        if let Some(proc_arc) = slot {
+            let p = proc_arc.lock();
+            if p.tgid == tgid {
+                total = total.saturating_add(p.cpu_time);
+            }
+        }
+    }
+    total
+}
+
+/// `getrusage(who, usage)` (Linux x86_64 syscall 98).
+pub(super) fn sys_getrusage(who: i32, usage_ptr: *mut u8) -> SyscallResult {
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return Err(SyscallError::EINVAL);
+    }
+    if usage_ptr.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let (tgid, self_ticks, maxrss_kb) = {
+        let p = proc_arc.lock();
+        let charged_bytes = crate::process::compute_cgroup_charged_bytes(&p);
+        (p.tgid, p.cpu_time, (charged_bytes / 1024) as i64)
+    };
+
+    let mut rusage = Rusage::default();
+    match who {
+        RUSAGE_SELF => {
+            let total_ticks = thread_group_cpu_ticks(tgid);
+            let (sec, usec) = ticks_to_timeval(total_ticks);
+            rusage.ru_utime_sec = sec;
+            rusage.ru_utime_usec = usec;
+            rusage.ru_maxrss = maxrss_kb;
+        }
+        RUSAGE_THREAD => {
+            let (sec, usec) = ticks_to_timeval(self_ticks);
+            rusage.ru_utime_sec = sec;
+            rusage.ru_utime_usec = usec;
+            rusage.ru_maxrss = maxrss_kb;
+        }
+        RUSAGE_CHILDREN => {
+            // Waited-for children accounting is zeroed when no child stats are accumulated.
+        }
+        _ => unreachable!(),
+    }
+
+    let bytes = rusage.to_le_bytes();
+    crate::usercopy::copy_to_user_safe(usage_ptr, &bytes).map_err(|_| SyscallError::EFAULT)?;
+    Ok(0)
+}
+
+/// Build a `SysInfo` snapshot (respecting cgroup memory virtualization as in `/proc/meminfo`).
+fn build_sysinfo() -> SysInfo {
+    let uptime_secs = (crate::time::get_ticks() / 1000) as i64;
+    let proc_stats = crate::process::get_process_stats();
+    let procs = proc_stats.total.min(u16::MAX as usize) as u16;
+
+    // R140-8 parity: if the caller is inside a non-root cgroup with a finite
+    // memory.max limit, expose cgroup-scoped RAM totals rather than host RAM.
+    if let Some(cgroup_id) = crate::process::current_cgroup_id() {
+        if cgroup_id != 0 {
+            if let Some(cgroup) = crate::cgroup::lookup_cgroup(cgroup_id) {
+                let limits = cgroup.limits();
+                if let Some(memory_max) = limits.memory_max {
+                    if memory_max != u64::MAX {
+                        let snap = cgroup.get_stats();
+                        let freeram = memory_max.saturating_sub(snap.memory_current);
+                        return SysInfo {
+                            uptime: uptime_secs,
+                            loads: [0, 0, 0],
+                            totalram: memory_max,
+                            freeram,
+                            sharedram: 0,
+                            bufferram: 0,
+                            totalswap: 0,
+                            freeswap: 0,
+                            procs,
+                            pad: 0,
+                            _pad2: 0,
+                            totalhigh: 0,
+                            freehigh: 0,
+                            mem_unit: 1,
+                            _pad3: 0,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    let mem_stats = mm::memory::FrameAllocator::new().stats();
+    let cache_stats = mm::page_cache::PAGE_CACHE.stats();
+    let totalram = (mem_stats.total_physical_pages as u64).saturating_mul(4096);
+    let freeram = (mem_stats.free_physical_pages as u64).saturating_mul(4096);
+    let bufferram = cache_stats.nr_pages.saturating_mul(4096);
+
+    SysInfo {
+        uptime: uptime_secs,
+        loads: [0, 0, 0],
+        totalram,
+        freeram,
+        sharedram: 0,
+        bufferram,
+        totalswap: 0,
+        freeswap: 0,
+        procs,
+        pad: 0,
+        _pad2: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _pad3: 0,
+    }
+}
+
+/// `sysinfo(info)` (Linux x86_64 syscall 99).
+pub(super) fn sys_sysinfo(info_ptr: *mut u8) -> SyscallResult {
+    if info_ptr.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let info = build_sysinfo();
+    let bytes = info.to_le_bytes();
+    crate::usercopy::copy_to_user_safe(info_ptr, &bytes).map_err(|_| SyscallError::EFAULT)?;
+    Ok(0)
+}
+
+/// `times(buf)` (Linux x86_64 syscall 100).
+///
+/// Returns monotonic clock ticks since boot (at `AT_CLKTCK = 1000` Hz).
+/// Linux permits `buf == NULL` to query the monotonic tick count without writing `tms`.
+pub(super) fn sys_times(buf_ptr: *mut u8) -> SyscallResult {
+    let now_ticks = crate::time::get_ticks();
+    if !buf_ptr.is_null() {
+        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+        let tgid = proc_arc.lock().tgid;
+        let group_ticks = thread_group_cpu_ticks(tgid);
+        let tms = Tms {
+            tms_utime: group_ticks as i64,
+            tms_stime: 0,
+            tms_cutime: 0,
+            tms_cstime: 0,
+        };
+        let bytes = tms.to_le_bytes();
+        crate::usercopy::copy_to_user_safe(buf_ptr, &bytes).map_err(|_| SyscallError::EFAULT)?;
+    }
+    Ok(now_ticks as usize)
+}
+
+/// Resolve caller context needed for `getpriority` / `setpriority` without
+/// holding any PCB lock across `PROCESS_TABLE`.
+struct PriorityCallerContext {
+    caller_pid: ProcessId,
+    caller_pgid: ProcessId,
+    caller_host_euid: u32,
+    privileged: bool,
+    caller_pid_ns: Option<crate::PidNamespaceArc>,
+    caller_user_ns: alloc::sync::Arc<crate::user_namespace::UserNamespace>,
+}
+
+fn capture_priority_caller_context() -> Result<PriorityCallerContext, SyscallError> {
+    let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let caller_arc = get_process(caller_pid).ok_or(SyscallError::ESRCH)?;
+    let (caller_pgid, caller_pid_ns, caller_user_ns, creds_arc) = {
+        let p = caller_arc.lock();
+        (
+            p.thread_group.pgid(),
+            crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+            p.user_ns.clone(),
+            p.shared_credentials(),
+        )
+    };
+    let (ns_euid, cap_effective) = {
+        let creds = creds_arc.try_read().ok_or(SyscallError::EAGAIN)?;
+        (creds.euid, creds.cap_effective)
+    };
+    let caller_host_euid = caller_user_ns
+        .map_uid_from_ns(ns_euid)
+        .ok_or(SyscallError::EPERM)?;
+    let privileged = crate::current_is_host_root()
+        || (cap_effective & POSIX_CAP_SYS_NICE_BIT) != 0
+        || current_has_cap_rights(cap::CapRights::ADMIN);
+
+    Ok(PriorityCallerContext {
+        caller_pid,
+        caller_pgid,
+        caller_host_euid,
+        privileged,
+        caller_pid_ns,
+        caller_user_ns,
+    })
+}
+
+/// Target selector resolved once for `getpriority` / `setpriority`.
+enum PriorityTarget {
+    Process(ProcessId),
+    PgrpGlobal(ProcessId),
+    PgrpNs(ProcessId),
+    HostUid(u32),
+}
+
+fn resolve_priority_target(
+    ctx: &PriorityCallerContext,
+    which: i32,
+    who: u32,
+) -> Result<PriorityTarget, SyscallError> {
+    match which {
+        PRIO_PROCESS => {
+            if who == 0 {
+                Ok(PriorityTarget::Process(ctx.caller_pid))
+            } else {
+                let global_pid = match &ctx.caller_pid_ns {
+                    Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(ns, who as usize)
+                        .ok_or(SyscallError::ESRCH)?,
+                    None => who as ProcessId,
+                };
+                Ok(PriorityTarget::Process(global_pid))
+            }
+        }
+        PRIO_PGRP => {
+            if who == 0 {
+                Ok(PriorityTarget::PgrpGlobal(ctx.caller_pgid))
+            } else if let Some(ns) = &ctx.caller_pid_ns {
+                if let Some(global_pgid) =
+                    crate::pid_namespace::resolve_pid_in_namespace(ns, who as usize)
+                {
+                    Ok(PriorityTarget::PgrpGlobal(global_pgid))
+                } else {
+                    Ok(PriorityTarget::PgrpNs(who as ProcessId))
+                }
+            } else {
+                Ok(PriorityTarget::PgrpGlobal(who as ProcessId))
+            }
+        }
+        PRIO_USER => {
+            let host_uid = if who == 0 {
+                ctx.caller_host_euid
+            } else {
+                ctx.caller_user_ns
+                    .map_uid_from_ns(who)
+                    .ok_or(SyscallError::ESRCH)?
+            };
+            Ok(PriorityTarget::HostUid(host_uid))
+        }
+        _ => Err(SyscallError::EINVAL),
+    }
+}
+
+fn process_matches_priority_target(
+    proc: &crate::process::Process,
+    ctx: &PriorityCallerContext,
+    target: &PriorityTarget,
+) -> bool {
+    // Enforce PID namespace visibility for every target scan.
+    if let Some(ns) = &ctx.caller_pid_ns {
+        if !crate::pid_namespace::is_visible_in_namespace(ns, &proc.pid_ns_chain) {
+            return false;
+        }
+    }
+    match target {
+        PriorityTarget::Process(global_pid) => proc.pid == *global_pid,
+        PriorityTarget::PgrpGlobal(global_pgid) => proc.thread_group.pgid() == *global_pgid,
+        PriorityTarget::PgrpNs(ns_pgid) => match &ctx.caller_pid_ns {
+            Some(ns) => ns.lookup_ns_pid(proc.thread_group.pgid()) == Some(*ns_pgid),
+            None => proc.thread_group.pgid() == *ns_pgid,
+        },
+        PriorityTarget::HostUid(target_host_uid) => {
+            let creds = proc.shared_credentials();
+            let Some(c) = creds.try_read() else {
+                return false;
+            };
+            proc.user_ns.map_uid_from_ns(c.uid) == Some(*target_host_uid)
+        }
+    }
+}
+
+/// `getpriority(which, who)` (Linux x86_64 syscall 140).
+///
+/// Returns `20 - nice` (`1..=40`) of the highest-priority (lowest nice) matching process.
+pub(super) fn sys_getpriority(which: i32, who: u32) -> SyscallResult {
+    if !matches!(which, PRIO_PROCESS | PRIO_PGRP | PRIO_USER) {
+        return Err(SyscallError::EINVAL);
+    }
+    let ctx = capture_priority_caller_context()?;
+    let target = resolve_priority_target(&ctx, which, who)?;
+
+    let table = crate::process::PROCESS_TABLE.lock();
+    let mut best_nice: Option<i32> = None;
+    for slot in table.iter() {
+        let Some(proc_arc) = slot else {
+            continue;
+        };
+        let p = proc_arc.lock();
+        if process_matches_priority_target(&p, &ctx, &target) {
+            let n = clamp_nice(p.nice);
+            best_nice = Some(match best_nice {
+                Some(prev) => prev.min(n),
+                None => n,
+            });
+        }
+    }
+
+    match best_nice {
+        Some(nice) => Ok(nice_to_getpriority(nice)),
+        None => Err(SyscallError::ESRCH),
+    }
+}
+
+/// `setpriority(which, who, prio)` (Linux x86_64 syscall 141).
+pub(super) fn sys_setpriority(which: i32, who: u32, prio: i32) -> SyscallResult {
+    if !matches!(which, PRIO_PROCESS | PRIO_PGRP | PRIO_USER) {
+        return Err(SyscallError::EINVAL);
+    }
+    let new_nice = clamp_nice(prio);
+    let ctx = capture_priority_caller_context()?;
+    let target = resolve_priority_target(&ctx, which, who)?;
+
+    let table = crate::process::PROCESS_TABLE.lock();
+
+    // Pass 1: validate existence and permissions across all matching targets
+    // before mutating any task (canonical PROCESS_TABLE -> PCB order, zero alloc).
+    let mut matched = 0usize;
+    for slot in table.iter() {
+        let Some(proc_arc) = slot else {
+            continue;
+        };
+        let p = proc_arc.lock();
+        if !process_matches_priority_target(&p, &ctx, &target) {
+            continue;
+        }
+        matched += 1;
+        let (t_uid, t_euid) = {
+            let creds = p.shared_credentials();
+            let c = creds.try_read().ok_or(SyscallError::EAGAIN)?;
+            (
+                p.user_ns.map_uid_from_ns(c.uid),
+                p.user_ns.map_uid_from_ns(c.euid),
+            )
+        };
+        check_setpriority_permission(
+            ctx.caller_host_euid,
+            ctx.privileged,
+            t_uid,
+            t_euid,
+            p.nice,
+            new_nice,
+        )?;
+    }
+    if matched == 0 {
+        return Err(SyscallError::ESRCH);
+    }
+
+    // Pass 2: apply new nice value and recompute scheduler priority.
+    let sched_prio = nice_to_sched_priority(new_nice);
+    for slot in table.iter() {
+        let Some(proc_arc) = slot else {
+            continue;
+        };
+        let mut p = proc_arc.lock();
+        if !process_matches_priority_target(&p, &ctx, &target) {
+            continue;
+        }
+        p.nice = new_nice;
+        p.priority = sched_prio;
+        p.base_dynamic_priority = sched_prio;
+        p.recompute_effective_priority();
+    }
+
+    Ok(0)
+}
+
+/// `getcpu(cpu, node, tcache)` (Linux x86_64 syscall 309).
+///
+/// Writes the current logical CPU ID to `*cpu` (if non-NULL) and NUMA node `0`
+/// to `*node` (if non-NULL). `tcache` is deprecated and ignored per Linux ABI.
+pub(super) fn sys_getcpu(cpu_ptr: *mut u32, node_ptr: *mut u32, _tcache: usize) -> SyscallResult {
+    let cpu_id = cpu_local::current_cpu_id() as u32;
+    let node_id = 0u32;
+
+    if !cpu_ptr.is_null() {
+        crate::usercopy::copy_to_user_safe(cpu_ptr as *mut u8, &cpu_id.to_le_bytes())
+            .map_err(|_| SyscallError::EFAULT)?;
+    }
+    if !node_ptr.is_null() {
+        crate::usercopy::copy_to_user_safe(node_ptr as *mut u8, &node_id.to_le_bytes())
+            .map_err(|_| SyscallError::EFAULT)?;
+    }
+    Ok(0)
+}
+
+// ============================================================================
 // G.3 Compliance Syscalls
 // ============================================================================
 
@@ -1293,5 +1915,160 @@ mod r187_kcov_authorization_tests {
         assert!(!kcov_access_allowed(false, true));
         assert!(kcov_access_allowed(true, false));
         assert!(kcov_access_allowed(true, true));
+    }
+}
+
+#[cfg(test)]
+mod n2_7_sysinfo_rusage_priority_tests {
+    use super::*;
+
+    #[test]
+    fn n2_7_abi_struct_layouts_match_linux_x86_64() {
+        assert_eq!(core::mem::size_of::<Rusage>(), 144);
+        assert_eq!(core::mem::size_of::<Tms>(), 32);
+        assert_eq!(core::mem::size_of::<SysInfo>(), 112);
+
+        let ru = Rusage {
+            ru_utime_sec: 12,
+            ru_utime_usec: 345_000,
+            ru_maxrss: 4096,
+            ru_nvcsw: 7,
+            ru_nivcsw: 9,
+            ..Rusage::default()
+        };
+        let ru_bytes = ru.to_le_bytes();
+        assert_eq!(i64::from_le_bytes(ru_bytes[0..8].try_into().unwrap()), 12);
+        assert_eq!(
+            i64::from_le_bytes(ru_bytes[8..16].try_into().unwrap()),
+            345_000
+        );
+        assert_eq!(
+            i64::from_le_bytes(ru_bytes[32..40].try_into().unwrap()),
+            4096
+        );
+        assert_eq!(
+            i64::from_le_bytes(ru_bytes[128..136].try_into().unwrap()),
+            7
+        );
+        assert_eq!(
+            i64::from_le_bytes(ru_bytes[136..144].try_into().unwrap()),
+            9
+        );
+
+        let tms = Tms {
+            tms_utime: 111,
+            tms_stime: 222,
+            tms_cutime: 333,
+            tms_cstime: 444,
+        };
+        let tms_bytes = tms.to_le_bytes();
+        assert_eq!(i64::from_le_bytes(tms_bytes[0..8].try_into().unwrap()), 111);
+        assert_eq!(
+            i64::from_le_bytes(tms_bytes[8..16].try_into().unwrap()),
+            222
+        );
+        assert_eq!(
+            i64::from_le_bytes(tms_bytes[16..24].try_into().unwrap()),
+            333
+        );
+        assert_eq!(
+            i64::from_le_bytes(tms_bytes[24..32].try_into().unwrap()),
+            444
+        );
+
+        let info = SysInfo {
+            uptime: 42,
+            totalram: 64 * 1024 * 1024,
+            freeram: 32 * 1024 * 1024,
+            procs: 5,
+            mem_unit: 1,
+            ..SysInfo::default()
+        };
+        let info_bytes = info.to_le_bytes();
+        assert_eq!(i64::from_le_bytes(info_bytes[0..8].try_into().unwrap()), 42);
+        assert_eq!(
+            u64::from_le_bytes(info_bytes[32..40].try_into().unwrap()),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            u64::from_le_bytes(info_bytes[40..48].try_into().unwrap()),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            u16::from_le_bytes(info_bytes[80..82].try_into().unwrap()),
+            5
+        );
+        assert_eq!(
+            u32::from_le_bytes(info_bytes[104..108].try_into().unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn n2_7_nice_priority_conversion_and_clamping() {
+        assert_eq!(clamp_nice(-99), -20);
+        assert_eq!(clamp_nice(-20), -20);
+        assert_eq!(clamp_nice(0), 0);
+        assert_eq!(clamp_nice(19), 19);
+        assert_eq!(clamp_nice(99), 19);
+
+        assert_eq!(nice_to_getpriority(-20), 40);
+        assert_eq!(nice_to_getpriority(0), 20);
+        assert_eq!(nice_to_getpriority(19), 1);
+
+        assert_eq!(nice_to_sched_priority(-20), 100);
+        assert_eq!(nice_to_sched_priority(0), 120);
+        assert_eq!(nice_to_sched_priority(19), 139);
+    }
+
+    #[test]
+    fn n2_7_setpriority_permission_rules() {
+        // Unprivileged caller raising own nice (lowering priority) is allowed.
+        assert_eq!(
+            check_setpriority_permission(1000, false, Some(1000), Some(1000), 0, 5),
+            Ok(())
+        );
+        // Unprivileged caller lowering own nice (raising priority) fails EACCES.
+        assert_eq!(
+            check_setpriority_permission(1000, false, Some(1000), Some(1000), 5, 4),
+            Err(SyscallError::EACCES)
+        );
+        // Unprivileged caller targeting another UID fails EPERM even when raising nice.
+        assert_eq!(
+            check_setpriority_permission(1000, false, Some(2000), Some(2000), 0, 10),
+            Err(SyscallError::EPERM)
+        );
+        // Privileged caller (root / CAP_SYS_NICE) can lower nice on any UID.
+        assert_eq!(
+            check_setpriority_permission(0, true, Some(2000), Some(2000), 10, -20),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn n2_7_ticks_to_timeval_conversion() {
+        assert_eq!(ticks_to_timeval(0), (0, 0));
+        assert_eq!(ticks_to_timeval(1), (0, 1_000));
+        assert_eq!(ticks_to_timeval(999), (0, 999_000));
+        assert_eq!(ticks_to_timeval(1000), (1, 0));
+        assert_eq!(ticks_to_timeval(2507), (2, 507_000));
+    }
+
+    #[test]
+    fn n2_7_invalid_selectors_and_null_pointers_rejected() {
+        assert_eq!(
+            sys_getrusage(42, 0x1000 as *mut u8),
+            Err(SyscallError::EINVAL)
+        );
+        assert_eq!(
+            sys_getrusage(RUSAGE_SELF, core::ptr::null_mut()),
+            Err(SyscallError::EFAULT)
+        );
+        assert_eq!(
+            sys_sysinfo(core::ptr::null_mut()),
+            Err(SyscallError::EFAULT)
+        );
+        assert_eq!(sys_getpriority(99, 0), Err(SyscallError::EINVAL));
+        assert_eq!(sys_setpriority(99, 0, 0), Err(SyscallError::EINVAL));
     }
 }

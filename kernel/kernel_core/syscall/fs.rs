@@ -411,6 +411,25 @@ pub(super) fn lookup_console_file_with(
         .copied())
 }
 
+/// N2.7: Recognize both stdio `ConsoleFile` descriptors and VFS `/dev/console`
+/// or `/dev/tty` handles for terminal `ioctl` handling. Returns `Some(readable)`.
+fn lookup_tty_ioctl_target(fd: i32) -> Result<Option<bool>, SyscallError> {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = process.lock();
+    let descriptor = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+    if let Some(console) = descriptor
+        .as_any()
+        .downcast_ref::<crate::process::ConsoleFile>()
+    {
+        return Ok(Some(console.readable));
+    }
+    if let crate::poll::PollArm::Console { readable, .. } = descriptor.poll_arm() {
+        return Ok(Some(readable));
+    }
+    Ok(None)
+}
+
 pub(super) fn sys_read(
     fd: i32,
     buf: *mut u8,
@@ -1579,7 +1598,7 @@ pub(super) fn sys_close(fd: i32, entry_proc: Option<&ProcessArc>) -> SyscallResu
 /// # Returns
 /// 当前始终返回 ENOTTY（不是终端设备）
 pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
-    let console = lookup_console_file(fd)?;
+    let console = lookup_tty_ioctl_target(fd)?;
 
     // M0-6 SLICE 5+: Basic termios support for stdin/stdout/stderr
     // Common ioctl commands for terminal control
@@ -1646,7 +1665,7 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
                 .map_err(|_| SyscallError::EFAULT)?;
             Ok(0)
         }
-        FIONREAD if console.is_some_and(|console| console.readable) => {
+        FIONREAD if console.is_some_and(|readable| readable) => {
             // M0-6 poll/select: report the real count of buffered stdin bytes
             // (non-consuming keyboard probe), consistent with poll(fd0, POLLIN).
             if arg == 0 {

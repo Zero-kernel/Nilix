@@ -1025,6 +1025,30 @@ impl Vfs {
         result
     }
 
+    /// N2.7: Render active mounts in the caller's mount namespace and root view
+    /// for `/proc/mounts`.
+    pub(crate) fn render_mounts(&self) -> Result<mm::AdmittedString, FsError> {
+        let context = OperationContext::current()?;
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let _topology = topology::read();
+        context.revalidate()?;
+        let result = path::render_mounts(&context, &table.view.read());
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_mounts_in_namespace(
+        &self,
+        ns: &Arc<MountNamespace>,
+    ) -> Result<mm::AdmittedString, FsError> {
+        let context = self.trusted_context(ns)?;
+        let table = self.ensure_namespace_table(&context.namespace)?;
+        let _topology = topology::read();
+        context.revalidate()?;
+        let result = path::render_mounts(&context, &table.view.read());
+        result
+    }
+
     /// Preserve Zero-OS access()'s effective-ID contract. Resolve, test the raw
     /// host inode owner and mediate the requested mask under one credential span.
     pub fn access(&self, name: &str, mode: i32) -> Result<(), FsError> {

@@ -530,6 +530,74 @@ pub(crate) fn render_cwd(context: &OperationContext, view: &MountView) -> Result
     Err(FsError::NameTooLong)
 }
 
+/// N2.7: Format active mounts visible under the caller's process root in Linux
+/// `/proc/mounts` format: `<source> <target> <fstype> rw 0 0\n`.
+pub(crate) fn render_mounts(
+    context: &OperationContext,
+    view: &MountView,
+) -> Result<mm::AdmittedString, FsError> {
+    use core::fmt::Write;
+    let root = handle_path(&context.fs.root, view)?;
+    let mut entries: AdmittedVec<(String, &'static str)> = AdmittedVec::new(HeapClass::Procfs);
+    entries
+        .try_reserve(view.mounts.len())
+        .map_err(|_| FsError::NoMem)?;
+
+    for (_, mount) in view.mounts.iter() {
+        let mut cur = mount.root(view.epoch);
+        let mut rendered = String::new();
+        let mut reached_root = false;
+        for _ in 0..MAX_ANCESTORS {
+            if cur.same(&root) {
+                if rendered.is_empty() {
+                    rendered.try_reserve_exact(1).map_err(|_| FsError::NoMem)?;
+                    rendered.push('/');
+                }
+                reached_root = true;
+                break;
+            }
+            let up_res = parent(&cur, &root, view, true, false);
+            let Ok(Some((up, name, _))) = up_res else {
+                break;
+            };
+            if !name.is_empty() {
+                let length = rendered
+                    .len()
+                    .checked_add(name.len() + 1)
+                    .ok_or(FsError::NameTooLong)?;
+                if length > 4096 {
+                    return Err(FsError::NameTooLong);
+                }
+                let mut next = String::new();
+                next.try_reserve_exact(length).map_err(|_| FsError::NoMem)?;
+                next.push('/');
+                next.push_str(&name);
+                next.push_str(&rendered);
+                rendered = next;
+            }
+            if up.same(&cur) {
+                break;
+            }
+            cur = up;
+        }
+        if reached_root {
+            entries
+                .try_push((rendered, mount.fs.fs_type()))
+                .map_err(|_| FsError::NoMem)?;
+        }
+    }
+
+    // Deterministic order: "/" first, then lexicographical mountpoint path.
+    entries.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
+    let mut out = mm::AdmittedString::new(HeapClass::Procfs);
+    for (target, fs_type) in entries.iter() {
+        write!(&mut out, "{} {} {} rw 0 0\n", fs_type, target, fs_type)
+            .map_err(|_| FsError::NoMem)?;
+    }
+    Ok(out)
+}
+
 pub(crate) fn resolve(
     context: &OperationContext,
     view: &MountView,

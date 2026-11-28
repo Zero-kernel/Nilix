@@ -903,7 +903,9 @@ impl FileHandle {
 
 impl FileOps for FileHandle {
     fn poll_arm(&self) -> kernel_core::poll::PollArm {
-        if self.inode.as_any().is::<crate::devfs::ConsoleDevInode>() {
+        if self.inode.as_any().is::<crate::devfs::ConsoleDevInode>()
+            || self.inode.as_any().is::<crate::devfs::TtyDevInode>()
+        {
             let flags = self.flags();
             kernel_core::poll::PollArm::Console {
                 readable: flags.is_readable(),
