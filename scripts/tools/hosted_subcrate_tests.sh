@@ -252,8 +252,8 @@ run_suite kernel-core 221 0 \
     --features host_harness \
     --lib --locked
 
-# Includes SMP AP trampoline GDT/CR4/CR3 sanitizer invariants, x2APIC helpers, and syscall frame layout tests.
-run_suite arch 8 0 \
+# Includes SMP AP trampoline GDT/CR4/CR3/page-separation invariants, x2APIC helpers, and syscall frame layout tests.
+run_suite arch 9 0 \
     --manifest-path kernel/arch/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
@@ -280,11 +280,17 @@ run_suite iommu 67 0 \
     --features mm/host_harness \
     --lib --locked
 
-run_suite mitigation-status 3 13 \
+run_suite mitigation-status 3 17 \
     --manifest-path kernel/security/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness,cpu_local/host_harness \
     --lib --locked -- spectre::status_tests
+
+run_suite security-wxorx 6 14 \
+    --manifest-path kernel/security/Cargo.toml \
+    --target x86_64-unknown-linux-gnu \
+    --features mm/host_harness,cpu_local/host_harness \
+    --lib --locked -- wxorx::tests
 
 run_suite mitigation-mappings 5 221 \
     --manifest-path kernel/kernel_core/Cargo.toml \

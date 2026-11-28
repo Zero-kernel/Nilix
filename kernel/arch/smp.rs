@@ -55,8 +55,15 @@ pub fn register_ap_security_init(callback: fn() -> bool) {
 // Constants
 // ============================================================================
 
-/// Physical address where trampoline is copied (must be < 1MB, page-aligned)
+/// Physical address where immutable AP trampoline code + GDT is copied
+/// (must be < 1MB, page-aligned). Never writable while executable (U55-6).
 const TRAMPOLINE_PHYS: u64 = 0x8000;
+
+/// U55-6: Separate low-memory 4 KiB page for per-AP mutable `ApTrampolineData`.
+/// Keeping data on its own non-executable page lets `TRAMPOLINE_PHYS` (`0x8000`)
+/// transition once (`RW+NX` write -> `PML4[511]` RO+NX -> `PML4[0]` R-X ->
+/// `PML4[0]` RO+NX) with zero writable alias during AP bring-up.
+const TRAMPOLINE_DATA_PHYS: u64 = 0x9000;
 
 /// SIPI vector = physical page number of trampoline
 const TRAMPOLINE_VECTOR: u8 = (TRAMPOLINE_PHYS / 0x1000) as u8;
@@ -223,19 +230,18 @@ pub struct ApTrampolineData {
 // 3. Enables long mode and paging
 // 4. Jumps to 64-bit code and calls the Rust entry point
 //
-// The trampoline uses a fixed layout with ApTrampolineData at offset 0x100.
+// The trampoline places immutable code + GDT at TRAMPOLINE_PHYS (0x8000) and
+// per-AP ApTrampolineData on the separate non-executable page TRAMPOLINE_DATA_PHYS (0x9000).
 
-/// Offset where ApTrampolineData is stored within the trampoline
-const TRAMPOLINE_DATA_OFFSET: usize = 0x100;
-
-/// Size of the complete trampoline including data
-const TRAMPOLINE_SIZE: usize = 0x200;
+/// Size of the immutable trampoline code + GDT image copied to TRAMPOLINE_PHYS
+const TRAMPOLINE_SIZE: usize = 0x100;
 
 /// R67-2 FIX: Offset of claim_flag_addr within ApTrampolineData (byte 48)
 const CLAIM_FLAG_ADDR_OFFSET: u8 = 48;
 
-/// Generate the AP trampoline binary.
-/// Returns a fixed-size array that can be copied to low memory.
+/// Generate the immutable AP trampoline binary (code + GDT only).
+/// Returns a fixed-size array that can be copied to `TRAMPOLINE_PHYS` (0x8000)
+/// BEFORE that page is transitioned to R-X.
 ///
 /// Layout:
 /// - 0x00-0x3F: 16-bit real mode code
@@ -245,7 +251,8 @@ const CLAIM_FLAG_ADDR_OFFSET: u8 = 48;
 /// - 0x70-0x8F: GDT (4 entries * 8 bytes = 32 bytes)
 /// - 0x90-0xBF: 32-bit continuation code (CR4, CR3, EFER, enable paging)
 /// - 0xC0-0xFF: 64-bit long mode entry
-/// - 0x100-0x137: ApTrampolineData structure (56 bytes, includes R67-2 claim_flag_addr)
+///
+/// `ApTrampolineData` lives separately at `TRAMPOLINE_DATA_PHYS` (0x9000).
 fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     let mut code = [0u8; TRAMPOLINE_SIZE];
     let mut i = 0;
@@ -275,10 +282,10 @@ fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     code[i + 1] = 0xD0;
     i += 2;
 
-    // Set up stack: mov sp, 0x8FF0
+    // Set up stack on the data page: mov sp, 0x9FF0
     code[i] = 0xBC;
     i += 1;
-    let sp_addr = (TRAMPOLINE_PHYS as u16) + 0xFF0;
+    let sp_addr = (TRAMPOLINE_DATA_PHYS as u16) + 0xFF0;
     code[i] = (sp_addr & 0xFF) as u8;
     i += 1;
     code[i] = ((sp_addr >> 8) & 0xFF) as u8;
@@ -356,8 +363,8 @@ fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     code[i + 1] = 0xE8;
     i += 2; // mov gs, ax
 
-    // Load EDI with data structure address
-    let data_addr = TRAMPOLINE_PHYS as u32 + TRAMPOLINE_DATA_OFFSET as u32;
+    // Load EDI with data structure address (on separate non-executable page 0x9000)
+    let data_addr = TRAMPOLINE_DATA_PHYS as u32;
     code[i] = 0xBF;
     i += 1; // mov edi, imm32
     code[i] = (data_addr & 0xFF) as u8;
@@ -571,8 +578,8 @@ fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     }
 
     // ============ 64-bit Long Mode Entry (offset 0xC0) ============
-    // Load RBX with data structure address (identity mapped)
-    let data_virt = TRAMPOLINE_PHYS + TRAMPOLINE_DATA_OFFSET as u64;
+    // Load RBX with data structure address (identity mapped, RO+NX page 0x9000)
+    let data_virt = TRAMPOLINE_DATA_PHYS;
     code[i] = 0x48;
     code[i + 1] = 0xBB;
     i += 2; // mov rbx, imm64
@@ -693,113 +700,82 @@ static RSDP_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 // Trampoline Page Permissions
 // ============================================================================
 
-/// Make the trampoline page executable by clearing NX on the identity-mapped region.
+/// Make the trampoline code page (`TRAMPOLINE_PHYS`, 0x8000) strictly R-X in
+/// `PML4[0]` while stripping write permission from its high-half alias in
+/// `PML4[511]` (`U55-6`: zero live writable alias during AP bring-up).
 ///
-/// Security hardening sets NX on identity-mapped memory, but the AP trampoline
-/// must be executable for APs to boot.
-///
-/// # L-5 Compatibility
-///
-/// After L-5 fix, the first 2MB may be split into 4KB pages. In this case:
-/// - PD[0] is a PT pointer (not a huge page)
-/// - The trampoline PTE at 0x8000 should already have NX cleared by memory_hardening
-/// - We still clear NX on the PD entry to ensure the hierarchy allows execution
-/// - Then we also clear NX on the specific trampoline PTE if needed
-///
-/// # Safety
-///
-/// This temporarily makes the trampoline page executable.
-/// The trampoline should only run briefly during AP bring-up.
+/// Must be called AFTER copying the immutable trampoline code + GDT to
+/// `PHYSICAL_MEMORY_OFFSET + TRAMPOLINE_PHYS`. Fails closed if either `PD[0]`
+/// is still a 2 MiB huge page (the bootloader pre-splits `PD[0]` in both
+/// `PML4[0]` and `PML4[511]` to 4 KiB leaves).
 fn make_trampoline_executable() {
     // R142-5 FIX: Acquire PT_LOCK for consistency with the kernel's documented
-    // contract that all page table mutations must be serialized. While this is
-    // boot-only (no concurrent PT modifications possible), the lock acquisition
-    // makes the invariant explicitly enforced rather than implicitly assumed.
+    // contract that all page table mutations must be serialized.
     mm::page_table::with_pt_lock(|| unsafe {
         use mm::page_table::recursive_pt;
 
-        // Identity map is in PML4[0]/PDPT[0]; PD[0] covers 0x0-0x200000 (first 2MB)
-        // The trampoline at 0x8000 falls within this range
+        let trampoline_pt_idx = (TRAMPOLINE_PHYS / 0x1000) as usize; // 0x8000 / 4096 = 8
+
+        // Step 1 (U55-6): Strip WRITABLE (keep NO_EXECUTE) on the high-half
+        // direct-map alias (PML4[511]/PDPT[510]/PD[0] PTE[8]) BEFORE granting
+        // execute on PML4[0], and flush TLB so no stale writable mapping exists.
+        let hi_pd = recursive_pd(511, 510);
+        let hi_pd_entry = &hi_pd[0];
+        if hi_pd_entry.is_unused() || hi_pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            panic!(
+                "U55-6: high-half PD[0] missing or 2 MiB huge; refusing writable alias on SMP trampoline"
+            );
+        }
+        let hi_pt = recursive_pt(511, 510, 0);
+        let hi_pte = &mut hi_pt[trampoline_pt_idx];
+        if !hi_pte.is_unused() {
+            let mut hi_flags = hi_pte.flags();
+            hi_flags.remove(PageTableFlags::WRITABLE);
+            hi_flags.insert(PageTableFlags::NO_EXECUTE);
+            hi_pte.set_addr(hi_pte.addr(), hi_flags);
+        }
+        mm::tlb_shootdown::flush_all_local();
+
+        // Step 2: Grant R-X (`!WRITABLE`, `!NO_EXECUTE`) ONLY on the single
+        // 4 KiB trampoline PTE in PML4[0]/PDPT[0]/PD[0].
         let pd = recursive_pd(0, 0);
         let pd_entry = &mut pd[0];
-
-        if pd_entry.is_unused() {
-            klog!(
-                Warn,
-                "[SMP] WARNING: missing identity mapping for trampoline region"
+        if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            panic!(
+                "U55-6: low-identity PD[0] missing or 2 MiB huge; refusing 2 MiB executable trampoline"
             );
-            return;
         }
 
         let pd_flags = pd_entry.flags();
         let pd_addr = pd_entry.addr();
-        let is_huge = pd_flags.contains(PageTableFlags::HUGE_PAGE);
-
-        klog!(
-            Info,
-            "[SMP] PD[0] addr=0x{:x} flags={:?} (huge={})",
-            pd_addr.as_u64(),
-            pd_flags,
-            is_huge
-        );
-
-        if is_huge {
-            // 2MB huge page: clear NX on the entire region
-            if pd_flags.contains(PageTableFlags::NO_EXECUTE) {
-                let mut new_flags = pd_flags;
-                new_flags.remove(PageTableFlags::NO_EXECUTE);
-                pd_entry.set_addr(pd_addr, new_flags);
-                // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
-                mm::tlb_shootdown::flush_all_local();
-                klog_always!("[SMP] Trampoline (2MB huge) made executable");
-            } else {
-                klog_always!("[SMP] Trampoline (2MB huge) already executable");
-            }
-        } else {
-            // L-5 FIX: PD[0] is a PT pointer, need to handle 4KB pages
-            // First, ensure PD entry allows execution (clear NX if set)
-            if pd_flags.contains(PageTableFlags::NO_EXECUTE) {
-                let mut new_flags = pd_flags;
-                new_flags.remove(PageTableFlags::NO_EXECUTE);
-                pd_entry.set_addr(pd_addr, new_flags);
-                klog_always!("[SMP] PD[0] NX cleared");
-            }
-
-            // Now clear NX on the specific trampoline PTE (0x8000 / 0x1000 = index 8)
-            let pt = recursive_pt(0, 0, 0);
-            let trampoline_pt_idx = (TRAMPOLINE_PHYS / 0x1000) as usize; // 0x8000 / 4096 = 8
-            let pt_entry = &mut pt[trampoline_pt_idx];
-
-            if !pt_entry.is_unused() {
-                let pt_flags = pt_entry.flags();
-                if pt_flags.contains(PageTableFlags::NO_EXECUTE) {
-                    let mut new_flags = pt_flags;
-                    new_flags.remove(PageTableFlags::NO_EXECUTE);
-                    pt_entry.set_addr(pt_entry.addr(), new_flags);
-                    klog_always!("[SMP] Trampoline PTE[{}] NX cleared", trampoline_pt_idx);
-                } else {
-                    klog_always!(
-                        "[SMP] Trampoline PTE[{}] already executable",
-                        trampoline_pt_idx
-                    );
-                }
-            }
-
-            // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
-            mm::tlb_shootdown::flush_all_local();
-            klog_always!("[SMP] Trampoline (4KB page) made executable");
+        if pd_flags.contains(PageTableFlags::NO_EXECUTE) {
+            let mut new_flags = pd_flags;
+            new_flags.remove(PageTableFlags::NO_EXECUTE);
+            pd_entry.set_addr(pd_addr, new_flags);
         }
+
+        let pt = recursive_pt(0, 0, 0);
+        let pt_entry = &mut pt[trampoline_pt_idx];
+        if pt_entry.is_unused() {
+            panic!("U55-6: missing low-identity PTE for SMP trampoline");
+        }
+        let mut new_flags = pt_entry.flags();
+        new_flags.remove(PageTableFlags::WRITABLE);
+        new_flags.remove(PageTableFlags::NO_EXECUTE);
+        pt_entry.set_addr(pt_entry.addr(), new_flags);
+
+        // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
+        mm::tlb_shootdown::flush_all_local();
+        klog_always!(
+            "[SMP] Trampoline (4KB page) transitioned RW+NX -> R-X (high-half alias RO+NX)"
+        );
     });
 }
 
 /// Restore NX bit on the trampoline page after SMP bring-up is complete.
 ///
-/// This re-enables W^X protection for the trampoline region after all APs have
-/// booted. The trampoline code is no longer needed at this point.
-///
-/// # L-5 Compatibility
-///
-/// Handles both 2MB huge pages and 4KB pages (after L-5 split).
+/// Re-enables RO+NX on `PML4[0]` `0x8000` (its high-half alias in `PML4[511]`
+/// also remains RO+NX).
 fn make_trampoline_nonexecutable() {
     // R142-5 FIX: Acquire PT_LOCK for consistency (see make_trampoline_executable).
     mm::page_table::with_pt_lock(|| unsafe {
@@ -817,26 +793,21 @@ fn make_trampoline_nonexecutable() {
         let is_huge = pd_flags.contains(PageTableFlags::HUGE_PAGE);
 
         if is_huge {
-            // 2MB huge page: restore NX on the entire region
             if !pd_flags.contains(PageTableFlags::NO_EXECUTE) {
                 let mut new_flags = pd_flags;
                 new_flags.insert(PageTableFlags::NO_EXECUTE);
                 pd_entry.set_addr(pd_addr, new_flags);
             }
         } else {
-            // L-5 FIX: PD[0] is a PT pointer, need to handle 4KB pages
-            // Restore NX on the specific trampoline PTE
             let pt = recursive_pt(0, 0, 0);
             let trampoline_pt_idx = (TRAMPOLINE_PHYS / 0x1000) as usize;
             let pt_entry = &mut pt[trampoline_pt_idx];
 
             if !pt_entry.is_unused() {
-                let pt_flags = pt_entry.flags();
-                if !pt_flags.contains(PageTableFlags::NO_EXECUTE) {
-                    let mut new_flags = pt_flags;
-                    new_flags.insert(PageTableFlags::NO_EXECUTE);
-                    pt_entry.set_addr(pt_entry.addr(), new_flags);
-                }
+                let mut new_flags = pt_entry.flags();
+                new_flags.remove(PageTableFlags::WRITABLE);
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
+                pt_entry.set_addr(pt_entry.addr(), new_flags);
             }
         }
 
@@ -943,16 +914,15 @@ pub fn start_aps() -> usize {
 
     klog_always!("[SMP] Found {} AP(s), starting...", ap_lapic_ids.len());
 
-    // Ensure the identity-mapped trampoline region is executable
-    // (Security hardening sets NX on identity-mapped memory)
-    make_trampoline_executable();
-
-    // Generate and copy trampoline to low memory
+    // U55-6: Copy immutable trampoline code + GDT while 0x8000 is RW+NX in
+    // PML4[511] and RO+NX in PML4[0], THEN transition 0x8000 to R-X in PML4[0]
+    // with RO+NX on its PML4[511] alias (zero writable/executable overlap).
     let trampoline = generate_trampoline();
     let trampoline_virt = (PHYSICAL_MEMORY_OFFSET + TRAMPOLINE_PHYS) as *mut u8;
     unsafe {
         ptr::copy_nonoverlapping(trampoline.as_ptr(), trampoline_virt, TRAMPOLINE_SIZE);
     }
+    make_trampoline_executable();
 
     // Read BSP's page table and CPU feature state
     let cr3_phys = read_cr3();
@@ -985,9 +955,8 @@ pub fn start_aps() -> usize {
         // Allocate per-AP stack
         let stack_top = alloc_ap_stack();
 
-        // Fill in trampoline data
-        let data_ptr = (PHYSICAL_MEMORY_OFFSET + TRAMPOLINE_PHYS + TRAMPOLINE_DATA_OFFSET as u64)
-            as *mut ApTrampolineData;
+        // Fill in trampoline data on the separate non-executable data page (0x9000)
+        let data_ptr = (PHYSICAL_MEMORY_OFFSET + TRAMPOLINE_DATA_PHYS) as *mut ApTrampolineData;
         unsafe {
             (*data_ptr).pml4_phys = trampoline_cr3;
             (*data_ptr).stack_top = stack_top;
@@ -2268,5 +2237,21 @@ mod topology_tests {
             super::trampoline_safe_cr3(0x0000_0000_0e03_5000),
             0x0000_0000_0e03_5000
         );
+    }
+
+    #[test]
+    fn trampoline_code_and_data_pages_are_disjoint() {
+        assert_ne!(
+            super::TRAMPOLINE_PHYS / 0x1000,
+            super::TRAMPOLINE_DATA_PHYS / 0x1000,
+            "U55-6: AP trampoline code and mutable data must occupy separate 4 KiB pages"
+        );
+        assert!(super::TRAMPOLINE_SIZE <= 0x1000);
+        let code = super::generate_trampoline();
+        // 64-bit long-mode entry at 0xC0 begins with `mov rbx, TRAMPOLINE_DATA_PHYS` (48 BB <u64>).
+        assert_eq!(code[0xC0], 0x48);
+        assert_eq!(code[0xC1], 0xBB);
+        let data_virt = u64::from_le_bytes(code[0xC2..0xCA].try_into().unwrap());
+        assert_eq!(data_virt, super::TRAMPOLINE_DATA_PHYS);
     }
 }
