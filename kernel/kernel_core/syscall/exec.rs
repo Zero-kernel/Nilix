@@ -2,6 +2,51 @@
 
 use super::*;
 
+/// N2.4: Post-exec effective/saved UID/GID transition computed before stack build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExecSetidTransition {
+    pub(super) new_euid: u32,
+    pub(super) new_egid: u32,
+}
+
+/// N2.4: Pure POSIX/Linux setuid/setgid exec transition policy.
+///
+/// Honors `no_new_privs` (suppresses all S_ISUID/S_ISGID elevation), computes
+/// post-exec `StackCreds` (setting `AT_SECURE = 1` whenever effective IDs change
+/// or differ from real IDs), and returns `Some(ExecSetidTransition)` whenever
+/// the exec must mutate the process's `SharedCredentials` at commit time.
+pub(super) fn compute_exec_setid_transition(
+    uid: u32,
+    euid: u32,
+    gid: u32,
+    egid: u32,
+    mapped_setuid: Option<u32>,
+    mapped_setgid: Option<u32>,
+    no_new_privs: bool,
+) -> (crate::user_stack::StackCreds, Option<ExecSetidTransition>) {
+    let new_euid = if no_new_privs {
+        euid
+    } else {
+        mapped_setuid.unwrap_or(euid)
+    };
+    let new_egid = if no_new_privs {
+        egid
+    } else {
+        mapped_setgid.unwrap_or(egid)
+    };
+    let changed = new_euid != euid || new_egid != egid;
+    let at_secure = changed || new_euid != uid || new_egid != gid;
+    let stack_creds = crate::user_stack::StackCreds {
+        uid,
+        euid: new_euid,
+        gid,
+        egid: new_egid,
+        at_secure,
+    };
+    let transition = changed.then_some(ExecSetidTransition { new_euid, new_egid });
+    (stack_creds, transition)
+}
+
 /// Keeps a thread group closed to new threads from the exec drain until
 /// `exec_from_bytes` returns, on success and on every rollback.
 pub(super) struct ExecDrainGuard(Arc<crate::process::ThreadGroup>);
@@ -806,6 +851,11 @@ pub(super) fn exec_from_bytes(
     // 加载 ELF 映像
     // S-7 fix: Let the guard handle rollback on error
     // R149-3 FIX: Pass exec_cgroup_id captured under lock, not re-read.
+    // N2.4: Capture any S_ISUID / S_ISGID host IDs carried by the leaf ELF
+    // before dropping `elf_data` (scripts have already been resolved to the
+    // leaf ELF interpreter, so `#!` scripts never carry setuid/setgid bits).
+    let exec_setid = elf_data.setid();
+
     let load_result = load_elf_image(&elf_data, exec_cgroup_id).map_err(|e| {
         klog!(Error, "exec_from_bytes: ELF load failed: {:?}", e);
         SyscallError::ENOEXEC
@@ -844,21 +894,38 @@ pub(super) fn exec_from_bytes(
     // the builder call.
     // =========================================================================
 
-    // Snapshot credentials for the identity auxv entries (AT_UID/EUID/GID/EGID/
-    // SECURE) under a scoped lock released before the builder runs.
-    let stack_creds = {
+    // N2.4: Resolve any setuid/setgid transition (honoring `no_new_privs` and
+    // user-namespace ID mapping) and snapshot post-exec credentials for
+    // AT_UID/EUID/GID/EGID/SECURE under a scoped lock released before stack build.
+    let (stack_creds, pending_exec_creds) = {
         let proc = process.lock();
         let creds = proc.try_credentials_read().ok_or(SyscallError::EAGAIN)?;
-        crate::user_stack::StackCreds {
-            uid: creds.uid,
-            euid: creds.euid,
-            gid: creds.gid,
-            egid: creds.egid,
-            // AT_SECURE reflects an exec-time privilege delta. No setuid/setgid-exec
-            // path is wired yet, so this is 0 in practice; (euid!=uid)||(egid!=gid)
-            // is the forward-compatible, over-conservative (=SAFE) seam.
-            at_secure: (creds.euid != creds.uid) || (creds.egid != creds.gid),
-        }
+        let no_new_privs = proc.seccomp_state.no_new_privs;
+        let mapped_suid = if no_new_privs {
+            None
+        } else {
+            exec_setid
+                .setuid
+                .and_then(|host_uid| proc.user_ns.map_uid_to_ns(host_uid))
+        };
+        let mapped_sgid = if no_new_privs {
+            None
+        } else {
+            exec_setid
+                .setgid
+                .and_then(|host_gid| proc.user_ns.map_gid_to_ns(host_gid))
+        };
+        let (sc, transition) = compute_exec_setid_transition(
+            creds.uid,
+            creds.euid,
+            creds.gid,
+            creds.egid,
+            mapped_suid,
+            mapped_sgid,
+            no_new_privs,
+        );
+        let creds_arc = transition.map(|t| (proc.shared_credentials(), t));
+        (sc, creds_arc)
     };
 
     // M0-4: AT_EXECFN is the caller-supplied `execfn` (the ORIGINAL execve
@@ -1231,6 +1298,30 @@ pub(super) fn exec_from_bytes(
             exec_tgid,
         )
     };
+
+    // N2.4: Commit post-exec saved/effective setuid/setgid credentials outside
+    // the Process lock (past the point of no return, so failed execs never
+    // leak escalated credentials).
+    if let Some((creds_arc, transition)) = pending_exec_creds {
+        let _ = creds_arc.mutate(|creds| {
+            let old_uid = creds.uid;
+            let old_euid = creds.euid;
+            let old_suid = creds.suid;
+            creds.euid = transition.new_euid;
+            creds.suid = transition.new_euid;
+            creds.fsuid = transition.new_euid;
+            creds.egid = transition.new_egid;
+            creds.sgid = transition.new_egid;
+            creds.fsgid = transition.new_egid;
+            if transition.new_euid == 0 {
+                creds.cap_permitted = crate::process::CAP_VALID_MASK;
+                creds.cap_effective = crate::process::CAP_VALID_MASK;
+            } else {
+                creds.apply_uid_cap_transition(old_uid, old_euid, old_suid);
+            }
+            Ok(crate::process::CredentialMutation::Changed(()))
+        });
+    }
 
     // N2.6b: POSIX execve(2) deletes POSIX timer_create timers while preserving
     // ITIMER_REAL / alarm. Run outside the Process lock.

@@ -3852,13 +3852,9 @@ impl Process {
             crate::fs_context::FsContextState::default(),
             0o022,
         ));
-        let credentials = Arc::new(SharedCredentials::new(Credentials {
-            uid: 65534,
-            gid: 65534,
-            euid: 65534,
-            egid: 65534,
-            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        }));
+        let credentials = Arc::new(SharedCredentials::new(Credentials::with_ids(
+            65534, 65534, 65534, 65534,
+        )));
         Self::new_with_allocations(
             pid,
             ppid,
@@ -3977,13 +3973,9 @@ impl Process {
             0o022,
         ))
         .map_err(|_| ProcessCreateError::OutOfMemory)?;
-        let credentials = Arc::try_new(SharedCredentials::new(Credentials {
-            uid: 65534,
-            gid: 65534,
-            euid: 65534,
-            egid: 65534,
-            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        }))
+        let credentials = Arc::try_new(SharedCredentials::new(Credentials::with_ids(
+            65534, 65534, 65534, 65534,
+        )))
         .map_err(|_| ProcessCreateError::OutOfMemory)?;
         let payload_charge = reservation
             .commit()
@@ -6631,13 +6623,8 @@ fn create_process_arc_inner<N: IntoProcessNameSnapshot>(
                 proc.kernel_stack_phys = Some(stack_phys);
                 proc.kernel_stack_rcu = Some(stack_rcu);
                 if ppid == 0 {
-                    proc.credentials.replace_unpublished(Credentials {
-                        uid: 0,
-                        gid: 0,
-                        euid: 0,
-                        egid: 0,
-                        supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-                    });
+                    proc.credentials
+                        .replace_unpublished(Credentials::with_ids(0, 0, 0, 0));
                 }
                 proc.pid_ns_chain = chain;
                 proc.pid_ns_for_children = target_ns;
@@ -6832,13 +6819,8 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
     // R101-1 FIX: Kernel-internal processes (ppid == 0) need explicit root credentials.
     if ppid == 0 {
         let mut proc = process.lock();
-        proc.credentials.replace_unpublished(Credentials {
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
-            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        });
+        proc.credentials
+            .replace_unpublished(Credentials::with_ids(0, 0, 0, 0));
     }
 
     // Assign PID namespace chain using the specified target namespace.
@@ -9255,6 +9237,14 @@ pub fn set_current_pid(pid: Option<ProcessId>) {
 
 // ========== 进程凭证访问 (DAC支持) ==========
 
+/// N2.4: Linux x86_64 POSIX capability bit numbers and validity mask.
+pub const CAP_SETGID: u32 = 6;
+pub const CAP_SETUID: u32 = 7;
+pub const CAP_SETPCAP: u32 = 8;
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_LAST_CAP: u32 = 40;
+pub const CAP_VALID_MASK: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+
 /// 进程凭证结构
 #[derive(Debug)]
 pub struct Credentials {
@@ -9262,7 +9252,115 @@ pub struct Credentials {
     pub gid: u32,
     pub euid: u32,
     pub egid: u32,
+    /// N2.4: Saved set-user-ID and saved set-group-ID.
+    pub suid: u32,
+    pub sgid: u32,
+    /// N2.4: Filesystem UID/GID (`setfsuid`/`setfsgid`).
+    pub fsuid: u32,
+    pub fsgid: u32,
+    /// N2.4: Linux POSIX capability masks (bits `0..=CAP_LAST_CAP`).
+    pub cap_effective: u64,
+    pub cap_permitted: u64,
+    pub cap_inheritable: u64,
     pub supplementary_groups: AdmittedVec<u32>,
+}
+
+impl Credentials {
+    /// Construct credentials with matching real/effective/saved/fs IDs and
+    /// standard Linux root/non-root default capability masks.
+    pub fn with_ids(uid: u32, gid: u32, euid: u32, egid: u32) -> Self {
+        let caps = if euid == 0 { CAP_VALID_MASK } else { 0 };
+        Self {
+            uid,
+            gid,
+            euid,
+            egid,
+            suid: euid,
+            sgid: egid,
+            fsuid: euid,
+            fsgid: egid,
+            cap_effective: caps,
+            cap_permitted: caps,
+            cap_inheritable: 0,
+            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
+        }
+    }
+
+    /// Fallibly clone an existing `Credentials` including supplementary groups
+    /// and N2.4 saved/fs IDs and Linux capability masks.
+    pub fn try_clone_from(src: &Self) -> Result<Self, mm::AdmittedAllocError> {
+        let supplementary_groups =
+            AdmittedVec::try_copy_from_slice(HeapClass::CoreProcess, &src.supplementary_groups)?;
+        Ok(Self {
+            uid: src.uid,
+            gid: src.gid,
+            euid: src.euid,
+            egid: src.egid,
+            suid: src.suid,
+            sgid: src.sgid,
+            fsuid: src.fsuid,
+            fsgid: src.fsgid,
+            cap_effective: src.cap_effective,
+            cap_permitted: src.cap_permitted,
+            cap_inheritable: src.cap_inheritable,
+            supplementary_groups,
+        })
+    }
+
+    /// True if the effective Linux capability bit `cap` is currently raised.
+    #[inline]
+    pub const fn has_cap(&self, cap: u32) -> bool {
+        cap <= CAP_LAST_CAP && (self.cap_effective & (1u64 << cap)) != 0
+    }
+
+    /// Linux `cap_emulate_setxuid`: update capability sets when transitioning
+    /// UIDs across root (0) / non-root boundaries.
+    pub fn apply_uid_cap_transition(&mut self, old_uid: u32, old_euid: u32, old_suid: u32) {
+        let had_root = old_uid == 0 || old_euid == 0 || old_suid == 0;
+        let has_root = self.uid == 0 || self.euid == 0 || self.suid == 0;
+        if had_root && !has_root {
+            self.cap_permitted = 0;
+            self.cap_effective = 0;
+        } else if old_euid == 0 && self.euid != 0 {
+            self.cap_effective = 0;
+        } else if old_euid != 0 && self.euid == 0 {
+            self.cap_effective = self.cap_permitted;
+        }
+    }
+}
+
+/// N2.4: Full copyable snapshot of a process's POSIX IDs and capability sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullCredentialsSnapshot {
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
+    pub fsuid: u32,
+    pub fsgid: u32,
+    pub cap_effective: u64,
+    pub cap_permitted: u64,
+    pub cap_inheritable: u64,
+}
+
+impl FullCredentialsSnapshot {
+    pub fn from_creds(c: &Credentials) -> Self {
+        Self {
+            uid: c.uid,
+            gid: c.gid,
+            euid: c.euid,
+            egid: c.egid,
+            suid: c.suid,
+            sgid: c.sgid,
+            fsuid: c.fsuid,
+            fsgid: c.fsgid,
+            cap_effective: c.cap_effective,
+            cap_permitted: c.cap_permitted,
+            cap_inheritable: c.cap_inheritable,
+        }
+    }
 }
 
 /// R186-18: credentials and their mutation generation share one Arc identity.
@@ -9283,7 +9381,7 @@ pub struct SharedCredentials {
     generation: AtomicU64,
 }
 
-enum CredentialMutation<T> {
+pub(crate) enum CredentialMutation<T> {
     Changed(T),
     Unchanged(T),
 }
@@ -9430,7 +9528,7 @@ impl SharedCredentials {
         body()
     }
 
-    fn mutate<T>(
+    pub(crate) fn mutate<T>(
         &self,
         mutation: impl FnOnce(&mut Credentials) -> Result<CredentialMutation<T>, CredentialsError>,
     ) -> Result<T, CredentialsError> {
@@ -10006,13 +10104,7 @@ mod credential_gate_tests {
     use super::*;
 
     fn test_identity() -> SharedCredentials {
-        SharedCredentials::new(Credentials {
-            uid: 1000,
-            gid: 1000,
-            euid: 1000,
-            egid: 1000,
-            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        })
+        SharedCredentials::new(Credentials::with_ids(1000, 1000, 1000, 1000))
     }
 
     #[test]
@@ -10197,6 +10289,23 @@ pub fn current_subject_snapshot() -> Option<ProcessSubjectSnapshot> {
             egid: creds.egid,
         },
     })
+}
+
+/// 获取当前进程的完整 N2.4 凭证快照（含 suid/sgid/fsuid/fsgid 与 Linux 能力位）。
+pub fn current_full_credentials() -> Option<FullCredentialsSnapshot> {
+    let pid = current_pid()?;
+    let proc_arc = get_process(pid)?;
+    let proc = proc_arc.lock();
+    let creds = proc.credentials.try_read()?;
+    Some(FullCredentialsSnapshot::from_creds(&creds))
+}
+
+/// 获取当前进程的共享凭证 Arc（在无锁环境下执行 `SharedCredentials::mutate`）。
+pub(crate) fn current_shared_credentials() -> Option<Arc<SharedCredentials>> {
+    let pid = current_pid()?;
+    let proc_arc = get_process(pid)?;
+    let proc = proc_arc.lock();
+    Some(Arc::clone(&proc.credentials))
 }
 
 /// 获取当前进程的凭证
@@ -10518,7 +10627,7 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Result<(), Credential
         Arc::clone(&proc.credentials)
     };
     let old = credentials.mutate(|creds| {
-        if creds.euid != 0 {
+        if !creds.has_cap(CAP_SETGID) {
             return Err(CredentialsError::PermissionDenied);
         }
 
@@ -11993,13 +12102,9 @@ mod clone_credential_admission_tests {
     use super::*;
 
     fn identity() -> Arc<SharedCredentials> {
-        Arc::new(SharedCredentials::new(Credentials {
-            uid: 70001,
-            gid: 70002,
-            euid: 70001,
-            egid: 70002,
-            supplementary_groups: AdmittedVec::new(HeapClass::CoreProcess),
-        }))
+        Arc::new(SharedCredentials::new(Credentials::with_ids(
+            70001, 70002, 70001, 70002,
+        )))
     }
 
     fn child() -> ProcessArc {

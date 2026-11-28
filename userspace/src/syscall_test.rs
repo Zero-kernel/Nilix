@@ -385,6 +385,8 @@ pub extern "C" fn _start() -> ! {
     test_n2_5_job_control_sessions_and_wait(&mut results);
     // N2.1: >256 KiB exec image, >1 MiB PT_LOAD segment, and 1024 fd ceiling.
     test_n2_1_exec_segment_and_fd_ceilings(&mut results);
+    // N2.4: set*id, supplementary groups, and capget/capset.
+    test_n2_4_credentials_groups_and_caps(&mut results);
 
     // Print summary
     println("");
@@ -13121,4 +13123,202 @@ fn test_n2_1_exec_segment_and_fd_ceilings(results: &mut TestResult) {
     }
 
     results.pass("N2.1 >256 KiB exec image, >1 MiB PT_LOAD segment, and 1024 fd ceiling");
+}
+
+// ===========================================================================
+// N2.4: Credentials (set*id), Supplementary Groups, and POSIX Capabilities
+// ===========================================================================
+
+const N24_SYS_SETUID: u64 = 105;
+const N24_SYS_SETGID: u64 = 106;
+const N24_SYS_SETREUID: u64 = 113;
+const N24_SYS_SETREGID: u64 = 114;
+const N24_SYS_GETGROUPS: u64 = 115;
+const N24_SYS_SETGROUPS: u64 = 116;
+const N24_SYS_SETRESUID: u64 = 117;
+const N24_SYS_GETRESUID: u64 = 118;
+const N24_SYS_SETRESGID: u64 = 119;
+const N24_SYS_GETRESGID: u64 = 120;
+const N24_SYS_SETFSUID: u64 = 122;
+const N24_SYS_SETFSGID: u64 = 123;
+const N24_SYS_CAPGET: u64 = 125;
+const N24_SYS_CAPSET: u64 = 126;
+
+const N24_CAP_V3: u32 = 0x2008_0522;
+const N24_CAP_SETUID_BIT: u32 = 1 << 7;
+const N24_CAP_SYS_ADMIN_BIT: u32 = 1 << 21;
+const N24_EPERM: i32 = 1;
+
+fn test_n2_4_credentials_groups_and_caps(results: &mut TestResult) {
+    print("Testing N2.4 set*id, supplementary groups, and capget/capset... ");
+
+    // Run inside a forked child so PID 1 keeps its untouched root credentials.
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        results.fail("n2_4: fork failed");
+        return;
+    }
+    if child == 0 {
+        // 1. capget version probe (unknown version + NULL data -> returns 0 and writes V3).
+        let mut hdr = [0xdead_beef_u32, 0u32];
+        let r_probe = unsafe { syscall2(N24_SYS_CAPGET, hdr.as_mut_ptr() as u64, 0) };
+        if is_error(r_probe) || hdr[0] != N24_CAP_V3 {
+            unsafe { userspace::syscall::sys_exit(11) };
+        }
+
+        // 2. capget(V3, pid=0) as root has CAP_SETUID and CAP_SYS_ADMIN.
+        let mut data = [0u32; 6]; // 2 * { eff, perm, inh }
+        let r_cg = unsafe {
+            syscall2(
+                N24_SYS_CAPGET,
+                hdr.as_mut_ptr() as u64,
+                data.as_mut_ptr() as u64,
+            )
+        };
+        if is_error(r_cg)
+            || (data[0] & N24_CAP_SETUID_BIT) == 0
+            || (data[1] & N24_CAP_SETUID_BIT) == 0
+            || (data[0] & N24_CAP_SYS_ADMIN_BIT) == 0
+        {
+            unsafe { userspace::syscall::sys_exit(12) };
+        }
+
+        // 3. setgroups / getgroups (dedup + sort + query size=0).
+        let gids_in = [200u32, 100u32, 200u32];
+        let r_sg = unsafe {
+            syscall2(
+                N24_SYS_SETGROUPS,
+                gids_in.len() as u64,
+                gids_in.as_ptr() as u64,
+            )
+        };
+        let r_gg0 = unsafe { syscall2(N24_SYS_GETGROUPS, 0, 0) };
+        let mut gids_out = [0u32; 4];
+        let r_gg = unsafe { syscall2(N24_SYS_GETGROUPS, 4, gids_out.as_mut_ptr() as u64) };
+        if is_error(r_sg) || r_gg0 != 2 || r_gg != 2 || gids_out[0] != 100 || gids_out[1] != 200 {
+            unsafe { userspace::syscall::sys_exit(13) };
+        }
+
+        // 4. Temporary euid drop via setresuid(-1, 1000, -1) clears effective caps,
+        //    retains permitted caps, and allows regaining euid=0.
+        let unchanged = u32::MAX as u64;
+        if is_error(unsafe { syscall3(N24_SYS_SETRESUID, unchanged, 1000, unchanged) }) {
+            unsafe { userspace::syscall::sys_exit(14) };
+        }
+        let (mut ru, mut eu, mut su) = (99u32, 99u32, 99u32);
+        let r_gru = unsafe {
+            syscall3(
+                N24_SYS_GETRESUID,
+                &mut ru as *mut u32 as u64,
+                &mut eu as *mut u32 as u64,
+                &mut su as *mut u32 as u64,
+            )
+        };
+        let r_cg_drop = unsafe {
+            syscall2(
+                N24_SYS_CAPGET,
+                hdr.as_mut_ptr() as u64,
+                data.as_mut_ptr() as u64,
+            )
+        };
+        if is_error(r_gru)
+            || is_error(r_cg_drop)
+            || (ru, eu, su) != (0, 1000, 0)
+            || data[0] != 0
+            || (data[1] & N24_CAP_SETUID_BIT) == 0
+        {
+            unsafe { userspace::syscall::sys_exit(15) };
+        }
+        if is_error(unsafe { syscall3(N24_SYS_SETRESUID, unchanged, 0, unchanged) }) {
+            unsafe { userspace::syscall::sys_exit(16) };
+        }
+
+        // 5. capset drops CAP_SYS_ADMIN permanently; re-raising returns EPERM.
+        let _ = unsafe {
+            syscall2(
+                N24_SYS_CAPGET,
+                hdr.as_mut_ptr() as u64,
+                data.as_mut_ptr() as u64,
+            )
+        };
+        data[0] &= !N24_CAP_SYS_ADMIN_BIT;
+        data[1] &= !N24_CAP_SYS_ADMIN_BIT;
+        if is_error(unsafe { syscall2(N24_SYS_CAPSET, hdr.as_ptr() as u64, data.as_ptr() as u64) })
+        {
+            unsafe { userspace::syscall::sys_exit(17) };
+        }
+        data[0] |= N24_CAP_SYS_ADMIN_BIT;
+        data[1] |= N24_CAP_SYS_ADMIN_BIT;
+        let r_raise =
+            unsafe { syscall2(N24_SYS_CAPSET, hdr.as_ptr() as u64, data.as_ptr() as u64) };
+        if !is_error(r_raise) || errno(r_raise) != N24_EPERM {
+            unsafe { userspace::syscall::sys_exit(18) };
+        }
+
+        // 6. setregid / getresgid / setfsgid.
+        if is_error(unsafe { syscall2(N24_SYS_SETREGID, 2000, 2000) }) {
+            unsafe { userspace::syscall::sys_exit(19) };
+        }
+        let (mut rg, mut eg, mut sg) = (0u32, 0u32, 0u32);
+        let r_grg = unsafe {
+            syscall3(
+                N24_SYS_GETRESGID,
+                &mut rg as *mut u32 as u64,
+                &mut eg as *mut u32 as u64,
+                &mut sg as *mut u32 as u64,
+            )
+        };
+        let prev_fsg = unsafe { syscall1(N24_SYS_SETFSGID, unchanged) };
+        if is_error(r_grg) || (rg, eg, sg) != (2000, 2000, 2000) || prev_fsg != 2000 {
+            unsafe { userspace::syscall::sys_exit(20) };
+        }
+
+        // 7. Permanent setuid(1000) drops all capabilities; setuid(0), setreuid(0,0),
+        //    setresgid(0,0,0), setgid(0), setgroups all fail EPERM; setfsuid(0) is no-op.
+        if is_error(unsafe { syscall1(N24_SYS_SETUID, 1000) }) {
+            unsafe { userspace::syscall::sys_exit(21) };
+        }
+        let r_su0 = unsafe { syscall1(N24_SYS_SETUID, 0) };
+        let r_sru0 = unsafe { syscall2(N24_SYS_SETREUID, 0, 0) };
+        let r_sg0 = unsafe { syscall1(N24_SYS_SETGID, 0) };
+        let r_srg0 = unsafe { syscall3(N24_SYS_SETRESGID, 0, 0, 0) };
+        let r_sgrp = unsafe { syscall2(N24_SYS_SETGROUPS, 0, 0) };
+        let prev_fsu1 = unsafe { syscall1(N24_SYS_SETFSUID, 0) };
+        let prev_fsu2 = unsafe { syscall1(N24_SYS_SETFSUID, unchanged) };
+        let _ = unsafe {
+            syscall2(
+                N24_SYS_CAPGET,
+                hdr.as_mut_ptr() as u64,
+                data.as_mut_ptr() as u64,
+            )
+        };
+        if !is_error(r_su0)
+            || errno(r_su0) != N24_EPERM
+            || !is_error(r_sru0)
+            || errno(r_sru0) != N24_EPERM
+            || !is_error(r_sg0)
+            || errno(r_sg0) != N24_EPERM
+            || !is_error(r_srg0)
+            || errno(r_srg0) != N24_EPERM
+            || !is_error(r_sgrp)
+            || errno(r_sgrp) != N24_EPERM
+            || prev_fsu1 != 1000
+            || prev_fsu2 != 1000
+            || data[0] != 0
+            || data[1] != 0
+        {
+            unsafe { userspace::syscall::sys_exit(22) };
+        }
+
+        unsafe { userspace::syscall::sys_exit(0) };
+    }
+
+    let mut status: i32 = -1;
+    let r_wait = unsafe { syscall4(N25_SYS_WAIT4, child, &mut status as *mut i32 as u64, 0, 0) };
+    if r_wait != child || status != 0 {
+        results.fail("n2_4: set*id / groups / capget / capset child failed");
+        return;
+    }
+
+    results.pass("N2.4 set*id, supplementary groups, capget/capset, and privilege drop");
 }

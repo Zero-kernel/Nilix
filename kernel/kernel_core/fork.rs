@@ -344,18 +344,8 @@ fn prepare_fork_identity_or_cleanup(
             parent_creds.euid,
             parent_creds.egid,
         );
-        let supplementary_groups = mm::AdmittedVec::try_copy_from_slice(
-            HeapClass::CoreProcess,
-            &parent_creds.supplementary_groups,
-        )
-        .map_err(|_| ForkError::MemoryAllocationFailed)?;
-        let child_credentials = crate::process::Credentials {
-            uid: parent_creds.uid,
-            gid: parent_creds.gid,
-            euid: parent_creds.euid,
-            egid: parent_creds.egid,
-            supplementary_groups,
-        };
+        let child_credentials = crate::process::Credentials::try_clone_from(&parent_creds)
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
         let child_ctx = lsm::ProcessCtx::new(
             child_pid,
             child_pid,

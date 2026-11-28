@@ -21,9 +21,9 @@ mod lsm_hook_census_tests {
     use std::path::{Path, PathBuf};
 
     /// Upper bound on dormant hook families. Lower it whenever a family is
-    /// wired; never raise it to admit a new unwired hook. 14 since N2.8
-    /// wired `hook_net_setsockopt` (setsockopt/getsockopt).
-    const MAX_FEATURE_ABSENT: usize = 14;
+    /// wired; never raise it to admit a new unwired hook. 11 since N2.4
+    /// wired `hook_task_setuid`, `hook_task_setresuid`, and `hook_task_setgroups`.
+    const MAX_FEATURE_ABSENT: usize = 11;
 
     fn kernel_root() -> PathBuf {
         for candidate in [".", "kernel"] {

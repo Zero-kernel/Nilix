@@ -110,13 +110,16 @@ struct MappedRange {
     page_count: usize,
 }
 
-/// N2.1: Executable image buffer backing `execve(59)` and `spawn_image(517)`.
-///
-/// Images up to `EXEC_IMAGE_HEAP_FAST_BYTES` (64 KiB) use a regular heap `Vec<u8>`.
-/// Larger images up to `MAX_EXEC_IMAGE_BYTES` (16 MiB) are backed by individual
-/// 4 KiB physical frames (`Paged`), consuming only 8 bytes of kernel heap per
-/// 4 KiB page and requiring zero contiguous physical memory.
-pub enum ExecImage {
+/// N2.4: Optional setuid/setgid bits captured from the executable's inode at
+/// `execve(59)` resolution time (host UID/GID; mapped into the caller's user
+/// namespace and gated on `!no_new_privs` before commit).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecSetid {
+    pub setuid: Option<u32>,
+    pub setgid: Option<u32>,
+}
+
+enum ExecImageStorage {
     Heap(Vec<u8>),
     Paged {
         frames: Vec<PhysFrame<Size4KiB>>,
@@ -124,17 +127,30 @@ pub enum ExecImage {
     },
 }
 
+/// N2.1 + N2.4: Executable image buffer backing `execve(59)` and `spawn_image(517)`.
+///
+/// Images up to `EXEC_IMAGE_HEAP_FAST_BYTES` (64 KiB) use a regular heap `Vec<u8>`.
+/// Larger images up to `MAX_EXEC_IMAGE_BYTES` (16 MiB) are backed by individual
+/// 4 KiB physical frames (`Paged`), consuming only 8 bytes of kernel heap per
+/// 4 KiB page and requiring zero contiguous physical memory.
+pub struct ExecImage {
+    storage: ExecImageStorage,
+    setid: ExecSetid,
+}
+
 impl core::fmt::Debug for ExecImage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Heap(v) => f
+        match &self.storage {
+            ExecImageStorage::Heap(v) => f
                 .debug_struct("ExecImage::Heap")
                 .field("len", &v.len())
+                .field("setid", &self.setid)
                 .finish(),
-            Self::Paged { frames, len } => f
+            ExecImageStorage::Paged { frames, len } => f
                 .debug_struct("ExecImage::Paged")
                 .field("len", len)
                 .field("frames", &frames.len())
+                .field("setid", &self.setid)
                 .finish(),
         }
     }
@@ -150,21 +166,45 @@ impl ExecImage {
     /// Create an empty executable image buffer.
     #[inline]
     pub const fn new() -> Self {
-        Self::Heap(Vec::new())
+        Self {
+            storage: ExecImageStorage::Heap(Vec::new()),
+            setid: ExecSetid {
+                setuid: None,
+                setgid: None,
+            },
+        }
     }
 
     /// Wrap an existing heap byte vector as an `ExecImage`.
     #[inline]
     pub const fn from_vec(bytes: Vec<u8>) -> Self {
-        Self::Heap(bytes)
+        Self {
+            storage: ExecImageStorage::Heap(bytes),
+            setid: ExecSetid {
+                setuid: None,
+                setgid: None,
+            },
+        }
+    }
+
+    /// Return any setuid/setgid host IDs carried by the backing file inode.
+    #[inline]
+    pub const fn setid(&self) -> ExecSetid {
+        self.setid
+    }
+
+    /// Attach setuid/setgid host IDs captured from the resolved file inode.
+    #[inline]
+    pub fn set_setid(&mut self, setid: ExecSetid) {
+        self.setid = setid;
     }
 
     /// Total byte length of the image.
     #[inline]
     pub fn len(&self) -> usize {
-        match self {
-            Self::Heap(v) => v.len(),
-            Self::Paged { len, .. } => *len,
+        match &self.storage {
+            ExecImageStorage::Heap(v) => v.len(),
+            ExecImageStorage::Paged { len, .. } => *len,
         }
     }
 
@@ -177,7 +217,7 @@ impl ExecImage {
     /// True if backed by physical 4 KiB frames instead of the kernel heap.
     #[inline]
     pub fn is_paged(&self) -> bool {
-        matches!(self, Self::Paged { .. })
+        matches!(self.storage, ExecImageStorage::Paged { .. })
     }
 
     /// Zero-copy slice of up to `min(max_len, PAGE_SIZE, self.len())` leading bytes.
@@ -189,9 +229,9 @@ impl ExecImage {
         if want == 0 {
             return &[];
         }
-        match self {
-            Self::Heap(v) => &v[..want],
-            Self::Paged { frames, .. } => {
+        match &self.storage {
+            ExecImageStorage::Heap(v) => &v[..want],
+            ExecImageStorage::Paged { frames, .. } => {
                 let first = frames[0];
                 // SAFETY: frame 0 is owned by `self` for the lifetime of `&self`
                 // and mapped through the direct physical map.
@@ -216,12 +256,12 @@ impl ExecImage {
         if dst.is_empty() {
             return Ok(());
         }
-        match self {
-            Self::Heap(v) => {
+        match &self.storage {
+            ExecImageStorage::Heap(v) => {
                 dst.copy_from_slice(&v[offset..end]);
                 Ok(())
             }
-            Self::Paged { frames, .. } => {
+            ExecImageStorage::Paged { frames, .. } => {
                 let mut pos = offset;
                 let mut written = 0usize;
                 while written < dst.len() {
@@ -260,21 +300,23 @@ impl ExecImage {
 
         #[cfg(any(test, feature = "host_harness"))]
         {
-            match self {
-                Self::Heap(v) => {
+            match &mut self.storage {
+                ExecImageStorage::Heap(v) => {
                     v.try_reserve(chunk.len())
                         .map_err(|_| SyscallError::ENOMEM)?;
                     v.extend_from_slice(chunk);
                     Ok(())
                 }
-                Self::Paged { .. } => Err(SyscallError::ENOMEM),
+                ExecImageStorage::Paged { .. } => Err(SyscallError::ENOMEM),
             }
         }
 
         #[cfg(not(any(test, feature = "host_harness")))]
         {
-            if matches!(self, Self::Heap(_)) && new_len <= EXEC_IMAGE_HEAP_FAST_BYTES {
-                if let Self::Heap(v) = self {
+            if matches!(self.storage, ExecImageStorage::Heap(_))
+                && new_len <= EXEC_IMAGE_HEAP_FAST_BYTES
+            {
+                if let ExecImageStorage::Heap(v) = &mut self.storage {
                     v.try_reserve(chunk.len())
                         .map_err(|_| SyscallError::ENOMEM)?;
                     v.extend_from_slice(chunk);
@@ -282,10 +324,13 @@ impl ExecImage {
                 }
             }
 
-            if let Self::Heap(v) = self {
-                let mut paged = Self::Paged {
-                    frames: Vec::new(),
-                    len: 0,
+            if let ExecImageStorage::Heap(v) = &mut self.storage {
+                let mut paged = Self {
+                    storage: ExecImageStorage::Paged {
+                        frames: Vec::new(),
+                        len: 0,
+                    },
+                    setid: self.setid,
                 };
                 if !v.is_empty() {
                     paged.append_to_paged(v)?;
@@ -318,15 +363,18 @@ impl ExecImage {
         #[cfg(not(any(test, feature = "host_harness")))]
         if len > EXEC_IMAGE_HEAP_FAST_BYTES {
             let needed_frames = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-            let mut img = Self::Paged {
-                frames: Vec::new(),
-                len: 0,
+            let mut img = Self {
+                storage: ExecImageStorage::Paged {
+                    frames: Vec::new(),
+                    len: 0,
+                },
+                setid: ExecSetid::default(),
             };
             img.reserve_paged_frames(needed_frames)?;
-            if let Self::Paged {
+            if let ExecImageStorage::Paged {
                 ref frames,
                 len: ref mut img_len,
-            } = img
+            } = img.storage
             {
                 for (page_idx, frame) in frames.iter().enumerate() {
                     let off = page_idx * PAGE_SIZE;
@@ -350,12 +398,12 @@ impl ExecImage {
             .map_err(|_| SyscallError::ENOMEM)?;
         buf.resize(len, 0);
         fill_chunk(0, &mut buf)?;
-        Ok(Self::Heap(buf))
+        Ok(Self::from_vec(buf))
     }
 
     #[cfg(not(any(test, feature = "host_harness")))]
     fn reserve_paged_frames(&mut self, needed_frames: usize) -> Result<(), SyscallError> {
-        let Self::Paged { frames, .. } = self else {
+        let ExecImageStorage::Paged { frames, .. } = &mut self.storage else {
             return Err(SyscallError::EINVAL);
         };
         if frames.len() >= needed_frames {
@@ -384,7 +432,7 @@ impl ExecImage {
             .ok_or(SyscallError::E2BIG)?;
         let needed_frames = (new_len + PAGE_SIZE - 1) / PAGE_SIZE;
         self.reserve_paged_frames(needed_frames)?;
-        if let Self::Paged { frames, len } = self {
+        if let ExecImageStorage::Paged { frames, len } = &mut self.storage {
             let mut pos = *len;
             let mut written = 0usize;
             while written < chunk.len() {
@@ -410,7 +458,7 @@ impl ExecImage {
 
 impl Drop for ExecImage {
     fn drop(&mut self) {
-        if let Self::Paged { frames, .. } = self {
+        if let ExecImageStorage::Paged { frames, .. } = &mut self.storage {
             #[cfg(not(any(test, feature = "host_harness")))]
             if !frames.is_empty() {
                 mm::buddy_allocator::free_physical_pages_batch(frames);
