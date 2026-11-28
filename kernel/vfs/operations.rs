@@ -268,6 +268,13 @@ impl Vfs {
                 }) {
                     return Err(FsError::Busy);
                 }
+                // Flush buffered writes while holding the mount topology write
+                // lock and BEFORE removing the mount, so any writeback failure
+                // (e.g. ENOSPC) leaves the filesystem mounted and reachable.
+                match target.mount.fs.sync() {
+                    Ok(()) | Err(FsError::NotSupported) => {}
+                    Err(error) => return Err(error),
+                }
                 view.mounts
                     .remove(&target.mount.id)
                     .ok_or(FsError::NotFound)?
@@ -1326,6 +1333,42 @@ impl Vfs {
             }
         }
         drop(view);
+        Ok(filesystems)
+    }
+
+    /// Snapshot every distinct filesystem currently mounted in any live mount
+    /// namespace. Used during clean init/system shutdown so buffered writeback
+    /// caches are flushed to durable media before the guest halts.
+    pub(crate) fn all_mounted_filesystems(
+        &self,
+    ) -> Result<mm::AdmittedVec<Arc<dyn FileSystem>>, FsError> {
+        let mut tables = mm::AdmittedVec::new(mm::HeapClass::Vfs);
+        {
+            let registry = self.mount_tables.read();
+            tables
+                .try_reserve_exact(registry.len())
+                .map_err(|_| FsError::NoMem)?;
+            for table in registry.values() {
+                tables
+                    .push_reserved(table.clone())
+                    .map_err(|_| FsError::NoMem)?;
+            }
+        }
+        let mut filesystems = mm::AdmittedVec::new(mm::HeapClass::Vfs);
+        for table in tables.iter() {
+            let view = table.view.read();
+            for mount in view.mounts.values() {
+                let seen = filesystems
+                    .iter()
+                    .any(|fs: &Arc<dyn FileSystem>| fs.fs_id() == mount.fs.fs_id());
+                if !seen {
+                    filesystems.try_reserve(1).map_err(|_| FsError::NoMem)?;
+                    filesystems
+                        .push_reserved(mount.fs.clone())
+                        .map_err(|_| FsError::NoMem)?;
+                }
+            }
+        }
         Ok(filesystems)
     }
 

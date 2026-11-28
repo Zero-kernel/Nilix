@@ -1447,6 +1447,8 @@ lazy_static::lazy_static! {
     pub(super) static ref VFS_TRUNCATE_CALLBACK: spin::Mutex<Option<VfsTruncateCallback>> = spin::Mutex::new(None);
     /// ST-K4 durability callbacks
     pub(super) static ref VFS_DURABILITY_CALLBACKS: spin::Mutex<Option<VfsDurabilityCallbacks>> = spin::Mutex::new(None);
+    /// Shutdown sync callback invoked when PID 1 exits cleanly
+    pub(super) static ref VFS_SHUTDOWN_SYNC_CALLBACK: spin::Mutex<Option<fn()>> = spin::Mutex::new(None);
     /// VFS positioned read callback (pread64)
     pub(super) static ref VFS_PREAD_CALLBACK: spin::Mutex<Option<VfsPreadCallback>> = spin::Mutex::new(None);
     /// VFS positioned write callback (pwrite64)
@@ -1548,6 +1550,20 @@ pub fn register_vfs_durability_callbacks(
         sync,
         sync_file_range,
     });
+}
+
+/// Register the VFS shutdown sync hook invoked before PID 1 emits `CI-EXIT`.
+pub fn register_vfs_shutdown_sync_callback(cb: fn()) {
+    *VFS_SHUTDOWN_SYNC_CALLBACK.lock() = Some(cb);
+}
+
+/// Best-effort flush of all mounted filesystems before PID 1 exits.
+/// Copies the callback out of the registry lock before performing device I/O.
+pub fn invoke_vfs_shutdown_sync() {
+    let cb = *VFS_SHUTDOWN_SYNC_CALLBACK.lock();
+    if let Some(sync_fn) = cb {
+        sync_fn();
+    }
 }
 
 /// 注册 VFS positioned read 回调 (pread64)

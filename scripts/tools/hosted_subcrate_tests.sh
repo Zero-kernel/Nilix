@@ -231,7 +231,7 @@ run_suite ipc-robust-futex 31 17 \
     --features mm/host_harness \
     --lib --locked -- robust_ futex_parity_ futex_pi_ pipe_close_
 
-run_suite vfs 87 0 \
+run_suite vfs 95 0 \
     --manifest-path kernel/vfs/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features host_harness \

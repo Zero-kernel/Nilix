@@ -535,6 +535,29 @@ pub trait BlockDevice: Send + Sync {
         Err(BlockError::NotSupported)
     }
 
+    /// Synchronously submit multiple independent write requests that may
+    /// complete in any order before a subsequent flush barrier.
+    ///
+    /// Returning `Err(BlockError::NoMem)` guarantees that ZERO requests in the
+    /// batch were submitted to the device; if a later request hits `NoMem`
+    /// after an earlier request already ran, it is converted to `BlockError::Io`.
+    ///
+    /// Defaults to sequential `write_sync` calls so devices without batch
+    /// pipelining preserve exact semantics.
+    fn write_batch_sync(&self, writes: &[(u64, &[u8])]) -> Result<(), BlockError> {
+        for (idx, &(sector, buf)) in writes.iter().enumerate() {
+            let written = match self.write_sync(sector, buf) {
+                Ok(written) => written,
+                Err(BlockError::NoMem) if idx > 0 => return Err(BlockError::Io),
+                Err(e) => return Err(e),
+            };
+            if written != buf.len() {
+                return Err(BlockError::Io);
+            }
+        }
+        Ok(())
+    }
+
     /// Flush the device write cache.
     fn flush(&self) -> Result<(), BlockError> {
         Err(BlockError::NotSupported)
@@ -543,6 +566,16 @@ pub trait BlockDevice: Send + Sync {
     /// The persistence guarantee behind `flush`. Unknown devices fail closed.
     fn durability(&self) -> DurabilityGuarantee {
         DurabilityGuarantee::Unsupported
+    }
+
+    /// Whether this device benefits from coalescing contiguous multi-block
+    /// writes into one `write_sync` call and exposes a single-owner stable
+    /// block store suitable for write-through metadata read caching.
+    ///
+    /// Defaults to `false` so fault-injection and synthetic test doubles retain
+    /// exact per-block read/write boundaries.
+    fn supports_coalesced_write(&self) -> bool {
+        false
     }
 
     /// Quiesce a newly probed device whose publication transaction failed.

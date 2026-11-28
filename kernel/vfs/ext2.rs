@@ -593,6 +593,10 @@ pub fn run_ext2_mutation_scratch_self_test() {
             io_faulted: AtomicBool::new(false),
             mapping_bytes: AtomicUsize::new(0),
             self_ref: Mutex::new(None),
+            meta_cache: Mutex::new(MetadataBlockCache::new()),
+            meta_cache_enabled: AtomicBool::new(false),
+            dirty_pages_total: AtomicUsize::new(0),
+            dirty_inodes: Mutex::new(Vec::new()),
         })
         .expect("trace ext2 filesystem");
         let mut raw = Ext2InodeRaw::default();
@@ -645,8 +649,9 @@ pub fn run_ext2_mutation_scratch_self_test() {
             start: 0,
             uuid: [0xA5; 16],
             feature_incompat: 0,
-            superblock_image: Vec::new(),
-            tx_images: Vec::new(),
+            superblock_image: Ext2BlockBuf::empty(),
+            tx_images: Ext2BlockBuf::empty(),
+            checkpoint_buf: Ext2BlockBuf::empty(),
         };
         let entry = JournalOverlayEntry {
             home: 3,
@@ -4588,6 +4593,375 @@ struct GroupDescWriteTarget {
     offset: usize,
 }
 
+/// 4 KiB page backing used by the post-mount write-through metadata cache and
+/// bounded buffered-writeback cache. On bare-metal it draws directly from the
+/// physical frame buddy allocator (zero 1 MiB kernel-heap pressure); under
+/// hosted unit tests it uses a fallibly reserved 4 KiB buffer.
+struct Ext2PageFrame {
+    #[cfg(not(any(test, feature = "host_harness")))]
+    frame: mm::PhysFrame,
+    #[cfg(any(test, feature = "host_harness"))]
+    buf: Vec<u8>,
+}
+
+impl Ext2PageFrame {
+    fn try_new() -> Result<Self, FsError> {
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            let frame = buddy_allocator::alloc_physical_pages(1).ok_or(FsError::NoMem)?;
+            let ptr = (frame.start_address().as_u64() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+            // SAFETY: freshly allocated exclusive 4 KiB physical frame mapped
+            // in the kernel direct-map window.
+            unsafe {
+                core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
+            }
+            Ok(Self { frame })
+        }
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(PAGE_SIZE)
+                .map_err(|_| FsError::NoMem)?;
+            // lint-fallible: PREALLOCATED(exact try_reserve_exact on previous line)
+            buf.resize(PAGE_SIZE, 0u8);
+            Ok(Self { buf })
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            let ptr = (self.frame.start_address().as_u64() + PHYSICAL_MEMORY_OFFSET) as *const u8;
+            // SAFETY: exclusive ownership of this 4 KiB physical frame.
+            unsafe { core::slice::from_raw_parts(ptr, PAGE_SIZE) }
+        }
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            &self.buf
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            let ptr = (self.frame.start_address().as_u64() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+            // SAFETY: exclusive mutable ownership of this 4 KiB physical frame.
+            unsafe { core::slice::from_raw_parts_mut(ptr, PAGE_SIZE) }
+        }
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            &mut self.buf
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "host_harness")))]
+impl Drop for Ext2PageFrame {
+    fn drop(&mut self) {
+        buddy_allocator::free_physical_pages(self.frame, 1);
+    }
+}
+
+const META_CACHE_SETS: usize = 16;
+const META_CACHE_WAYS: usize = 2;
+const META_CACHE_SLOTS: usize = META_CACHE_SETS * META_CACHE_WAYS;
+
+struct MetaCacheSlot {
+    valid: bool,
+    block_no: u32,
+    frame: Option<Ext2PageFrame>,
+}
+
+impl MetaCacheSlot {
+    const fn empty() -> Self {
+        Self {
+            valid: false,
+            block_no: 0,
+            frame: None,
+        }
+    }
+}
+
+/// Bounded 32-slot (16-set x 2-way) write-through metadata read cache.
+///
+/// Activated strictly after `Ext2Fs::mount()` completes on 4 KiB devices that
+/// advertise `supports_coalesced_write()`. Every physical write updates cached
+/// slots in place (never evicting hot metadata for data/journal traffic) and
+/// any I/O error invalidates the entire cache fail-closed.
+struct MetadataBlockCache {
+    slots: [MetaCacheSlot; META_CACHE_SLOTS],
+    next_way: [u8; META_CACHE_SETS],
+}
+
+impl MetadataBlockCache {
+    const fn new() -> Self {
+        Self {
+            slots: [const { MetaCacheSlot::empty() }; META_CACHE_SLOTS],
+            next_way: [0; META_CACHE_SETS],
+        }
+    }
+
+    fn lookup(&self, block_no: u32, out: &mut [u8]) -> bool {
+        if out.len() < PAGE_SIZE {
+            return false;
+        }
+        let set = (block_no as usize) & (META_CACHE_SETS - 1);
+        let base = set * META_CACHE_WAYS;
+        for way in 0..META_CACHE_WAYS {
+            let slot = &self.slots[base + way];
+            if slot.valid && slot.block_no == block_no {
+                if let Some(frame) = slot.frame.as_ref() {
+                    out[..PAGE_SIZE].copy_from_slice(frame.as_slice());
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn store(&mut self, block_no: u32, data: &[u8]) {
+        if data.len() < PAGE_SIZE {
+            return;
+        }
+        let set = (block_no as usize) & (META_CACHE_SETS - 1);
+        let base = set * META_CACHE_WAYS;
+        let mut target_way = None;
+        for way in 0..META_CACHE_WAYS {
+            let slot = &self.slots[base + way];
+            if slot.valid && slot.block_no == block_no {
+                target_way = Some(way);
+                break;
+            }
+            if !slot.valid && target_way.is_none() {
+                target_way = Some(way);
+            }
+        }
+        let way = match target_way {
+            Some(way) => way,
+            None => {
+                let w = (self.next_way[set] as usize) & (META_CACHE_WAYS - 1);
+                self.next_way[set] = self.next_way[set].wrapping_add(1);
+                w
+            }
+        };
+        let slot = &mut self.slots[base + way];
+        if slot.frame.is_none() {
+            match Ext2PageFrame::try_new() {
+                Ok(frame) => slot.frame = Some(frame),
+                Err(_) => return,
+            }
+        }
+        if let Some(frame) = slot.frame.as_mut() {
+            frame.as_mut_slice().copy_from_slice(&data[..PAGE_SIZE]);
+            slot.block_no = block_no;
+            slot.valid = true;
+        }
+    }
+
+    fn update_if_present(&mut self, block_no: u32, data: &[u8]) {
+        if data.len() < PAGE_SIZE {
+            return;
+        }
+        let set = (block_no as usize) & (META_CACHE_SETS - 1);
+        let base = set * META_CACHE_WAYS;
+        for way in 0..META_CACHE_WAYS {
+            let slot = &mut self.slots[base + way];
+            if slot.valid && slot.block_no == block_no {
+                if let Some(frame) = slot.frame.as_mut() {
+                    frame.as_mut_slice().copy_from_slice(&data[..PAGE_SIZE]);
+                } else {
+                    slot.valid = false;
+                }
+                return;
+            }
+        }
+    }
+
+    fn invalidate_all(&mut self) {
+        for slot in &mut self.slots {
+            slot.valid = false;
+        }
+    }
+}
+
+/// Hard cap on buffered dirty 4 KiB pages across a mounted `Ext2Fs` (512 KiB).
+const MAX_DIRTY_PAGES_PER_FS: usize = 128;
+/// Hard cap on simultaneously pinned dirty inodes per `Ext2Fs`.
+const MAX_DIRTY_INODES_PER_FS: usize = 32;
+
+struct Ext2DirtyPage {
+    block_index: u32,
+    frame: Ext2PageFrame,
+}
+
+/// Per-inode POSIX buffered-write state flushed via ordered-data JBD2 on
+/// `fsync()`/`sync()`, dirty-pressure writeback, or direct synchronous writes.
+struct Ext2DirtyState {
+    /// Sorted by `block_index` ascending. Each entry holds the complete
+    /// authoritative 4 KiB block contents for `block_index`.
+    pages: Vec<Ext2DirtyPage>,
+    /// Logical file size covering buffered writes when `size_dirty` is true.
+    logical_size: u64,
+    size_dirty: bool,
+    /// Pending POSIX `mtime`/`ctime` (always equal per JBD2 recovery grammar)
+    /// when `ts_dirty` is true.
+    ts: u32,
+    ts_dirty: bool,
+}
+
+impl Ext2DirtyState {
+    const fn new() -> Self {
+        Self {
+            pages: Vec::new(),
+            logical_size: 0,
+            size_dirty: false,
+            ts: 0,
+            ts_dirty: false,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.pages.is_empty() && !self.size_dirty && !self.ts_dirty
+    }
+
+    #[inline]
+    fn find_page(&self, block_index: u32) -> Option<&Ext2DirtyPage> {
+        self.pages
+            .binary_search_by_key(&block_index, |p| p.block_index)
+            .ok()
+            .map(|idx| &self.pages[idx])
+    }
+}
+
+/// Contiguous physical-page-backed staging buffer for JBD2 journal metadata.
+/// Uses zero bytes of the 1 MiB kernel heap on bare-metal (keeping boot
+/// unledgered heap footprint well below the D1-RES budget) and falls back to a
+/// fallibly reserved `Vec<u8>` under hosted unit tests.
+struct Ext2BlockBuf {
+    #[cfg(not(any(test, feature = "host_harness")))]
+    frame: Option<mm::PhysFrame>,
+    #[cfg(not(any(test, feature = "host_harness")))]
+    pages: usize,
+    #[cfg(not(any(test, feature = "host_harness")))]
+    len: usize,
+    #[cfg(any(test, feature = "host_harness"))]
+    buf: Vec<u8>,
+}
+
+impl Ext2BlockBuf {
+    const fn empty() -> Self {
+        Self {
+            #[cfg(not(any(test, feature = "host_harness")))]
+            frame: None,
+            #[cfg(not(any(test, feature = "host_harness")))]
+            pages: 0,
+            #[cfg(not(any(test, feature = "host_harness")))]
+            len: 0,
+            #[cfg(any(test, feature = "host_harness"))]
+            buf: Vec::new(),
+        }
+    }
+
+    fn try_new_zeroed(len: usize) -> Result<Self, FsError> {
+        if len == 0 {
+            return Ok(Self::empty());
+        }
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            let pages = len.div_ceil(PAGE_SIZE);
+            let frame = buddy_allocator::alloc_physical_pages(pages).ok_or(FsError::NoMem)?;
+            let ptr = (frame.start_address().as_u64() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+            // SAFETY: freshly allocated exclusive contiguous `pages * PAGE_SIZE`
+            // physical buffer mapped in the kernel direct-map window (`len <= pages * PAGE_SIZE`).
+            unsafe {
+                core::ptr::write_bytes(ptr, 0, len);
+            }
+            Ok(Self {
+                frame: Some(frame),
+                pages,
+                len,
+            })
+        }
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(len).map_err(|_| FsError::NoMem)?;
+            // lint-fallible: PREALLOCATED(exact try_reserve_exact on previous line)
+            buf.resize(len, 0u8);
+            Ok(Self { buf })
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            self.len
+        }
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            self.buf.len()
+        }
+    }
+}
+
+impl core::ops::Deref for Ext2BlockBuf {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            match self.frame {
+                Some(frame) if self.len > 0 => {
+                    let ptr =
+                        (frame.start_address().as_u64() + PHYSICAL_MEMORY_OFFSET) as *const u8;
+                    // SAFETY: exclusive ownership of `self.len` bytes in `frame..frame+pages`.
+                    unsafe { core::slice::from_raw_parts(ptr, self.len) }
+                }
+                _ => &[],
+            }
+        }
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            &self.buf
+        }
+    }
+}
+
+impl core::ops::DerefMut for Ext2BlockBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            match self.frame {
+                Some(frame) if self.len > 0 => {
+                    let ptr = (frame.start_address().as_u64() + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+                    // SAFETY: exclusive mutable ownership of `self.len` bytes in `frame..frame+pages`.
+                    unsafe { core::slice::from_raw_parts_mut(ptr, self.len) }
+                }
+                _ => &mut [],
+            }
+        }
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            &mut self.buf
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "host_harness")))]
+impl Drop for Ext2BlockBuf {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            buddy_allocator::free_physical_pages(frame, self.pages);
+        }
+    }
+}
+
 struct Ext2Journal {
     /// Logical journal block -> physical filesystem block.
     blocks: Vec<u32>,
@@ -4608,11 +4982,14 @@ struct Ext2Journal {
     /// Cached logical block 0 (JBD2 superblock) so `write_journal_state`
     /// updates `sequence`/`start` in memory instead of re-reading block 0
     /// twice per transaction.
-    superblock_image: Vec<u8>,
-    /// Pre-allocated staging buffer for up to `JOURNAL_MAX_METADATA_BLOCKS`
-    /// post-images inside `commit_metadata_transaction_inner`, so Pass 1 builds
-    /// each metadata image once and Passes 2/3 reuse it without re-reading disk.
-    tx_images: Vec<u8>,
+    superblock_image: Ext2BlockBuf,
+    /// Pre-allocated staging buffer for `[s_start | descriptor | metadata_0..k]`
+    /// (`JOURNAL_MAX_METADATA_BLOCKS + 2` blocks) so Pass 1 builds each metadata
+    /// image once and coalesced pre-commit writes submit J[0..2+k] in one I/O.
+    tx_images: Ext2BlockBuf,
+    /// Pre-allocated staging buffer for coalescing contiguous home-block
+    /// checkpoint runs on devices with `supports_coalesced_write()`.
+    checkpoint_buf: Ext2BlockBuf,
 }
 
 impl Ext2Journal {
@@ -4630,8 +5007,9 @@ impl Ext2Journal {
             start: 0,
             uuid: [0; 16],
             feature_incompat: 0,
-            superblock_image: Vec::new(),
-            tx_images: Vec::new(),
+            superblock_image: Ext2BlockBuf::empty(),
+            tx_images: Ext2BlockBuf::empty(),
+            checkpoint_buf: Ext2BlockBuf::empty(),
         }
     }
 
@@ -5556,6 +5934,10 @@ pub fn run_ext2_inode_cache_self_test() {
         io_faulted: AtomicBool::new(false),
         mapping_bytes: AtomicUsize::new(0),
         self_ref: Mutex::new(None),
+        meta_cache: Mutex::new(MetadataBlockCache::new()),
+        meta_cache_enabled: AtomicBool::new(false),
+        dirty_pages_total: AtomicUsize::new(0),
+        dirty_inodes: Mutex::new(Vec::new()),
     })
     .expect("synthetic ext2 filesystem");
 
@@ -7494,6 +7876,14 @@ pub struct Ext2Fs {
     /// from the proved post-image rather than applying a second delta.
     mapping_bytes: AtomicUsize,
     self_ref: Mutex<Option<Weak<Ext2Fs>>>,
+    /// Post-mount write-through metadata block cache (4 KiB coalescing devices).
+    meta_cache: Mutex<MetadataBlockCache>,
+    meta_cache_enabled: AtomicBool,
+    /// Total buffered dirty 4 KiB pages currently held across all inodes.
+    dirty_pages_total: AtomicUsize,
+    /// Leaf-locked strong pins for linked inodes carrying buffered dirty writes,
+    /// preserving close()+open() read coherence until sync/writeback/unlink.
+    dirty_inodes: Mutex<Vec<Arc<Ext2Inode>>>,
 }
 
 impl Ext2Fs {
@@ -7575,6 +7965,10 @@ impl Ext2Fs {
             io_faulted: AtomicBool::new(false),
             mapping_bytes: AtomicUsize::new(0),
             self_ref: Mutex::new(None),
+            meta_cache: Mutex::new(MetadataBlockCache::new()),
+            meta_cache_enabled: AtomicBool::new(false),
+            dirty_pages_total: AtomicUsize::new(0),
+            dirty_inodes: Mutex::new(Vec::new()),
         })
         .map_err(|_| FsError::NoMem)?;
 
@@ -7591,6 +7985,12 @@ impl Ext2Fs {
         // Load root inode
         let root = fs.load_inode(EXT2_ROOT_INO)?;
         *fs.root.write() = Some(root);
+
+        // Enable post-mount write-through metadata caching only after recovery
+        // and mount validation have completed cleanly.
+        if fs.block_size as usize == PAGE_SIZE && fs.dev.supports_coalesced_write() {
+            fs.meta_cache_enabled.store(true, Ordering::Release);
+        }
 
         Ok(fs)
     }
@@ -8294,19 +8694,20 @@ impl Ext2Fs {
 
         let block_len = self.block_size as usize;
         let tx_images_bytes = block_len
-            .checked_mul(JOURNAL_MAX_METADATA_BLOCKS)
+            .checked_mul(JOURNAL_MAX_METADATA_BLOCKS + 2)
             .ok_or(FsError::Invalid)?;
-        let mut tx_images = Vec::new();
-        tx_images
-            .try_reserve_exact(tx_images_bytes)
-            .map_err(|_| FsError::NoMem)?;
-        tx_images.resize(tx_images_bytes, 0u8);
+        let tx_images = Ext2BlockBuf::try_new_zeroed(tx_images_bytes)?;
 
-        let mut superblock_image = Vec::new();
-        superblock_image
-            .try_reserve_exact(block_len)
-            .map_err(|_| FsError::NoMem)?;
-        superblock_image.resize(block_len, 0u8);
+        let checkpoint_buf = if self.dev.supports_coalesced_write() {
+            let ckpt_bytes = block_len
+                .checked_mul(JOURNAL_MAX_METADATA_BLOCKS)
+                .ok_or(FsError::Invalid)?;
+            Ext2BlockBuf::try_new_zeroed(ckpt_bytes)?
+        } else {
+            Ext2BlockBuf::empty()
+        };
+
+        let superblock_image = Ext2BlockBuf::try_new_zeroed(block_len)?;
 
         Ok(Ext2Journal {
             blocks,
@@ -8320,6 +8721,7 @@ impl Ext2Fs {
             feature_incompat,
             superblock_image,
             tx_images,
+            checkpoint_buf,
         })
     }
 
@@ -11797,6 +12199,11 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
+        let cache_on = self.meta_cache_enabled.load(Ordering::Acquire);
+        if cache_on && self.meta_cache.lock().lookup(block_no, buf) {
+            return Ok(());
+        }
+
         // R106-6 FIX: Use cached, pre-validated sector_size.
         let sector_size = self.sector_size;
         let block_offset = block_no as u64 * self.block_size as u64;
@@ -11805,9 +12212,14 @@ impl Ext2Fs {
         let read = self
             .dev
             .read_sync(start_sector, &mut buf[..self.block_size as usize])
-            .map_err(|_| FsError::Io)?;
+            .map_err(Self::block_error_to_fs_error)?;
         if read != self.block_size as usize {
             return Err(FsError::Io);
+        }
+        if cache_on {
+            self.meta_cache
+                .lock()
+                .store(block_no, &buf[..self.block_size as usize]);
         }
         Ok(())
     }
@@ -11842,13 +12254,138 @@ impl Ext2Fs {
         let sector_size = self.sector_size;
         let block_offset = block_no as u64 * self.block_size as u64;
         let start_sector = block_offset / sector_size;
+        let block_len = self.block_size as usize;
 
-        let written = self
-            .dev
-            .write_sync(start_sector, &data[..self.block_size as usize])
-            .map_err(|_| FsError::Io)?;
-        if written != self.block_size as usize {
+        let written = match self.dev.write_sync(start_sector, &data[..block_len]) {
+            Ok(written) => written,
+            Err(error) => {
+                if self.meta_cache_enabled.load(Ordering::Acquire) {
+                    self.meta_cache.lock().invalidate_all();
+                }
+                return Err(Self::block_error_to_fs_error(error));
+            }
+        };
+        if written != block_len {
+            if self.meta_cache_enabled.load(Ordering::Acquire) {
+                self.meta_cache.lock().invalidate_all();
+            }
             return Err(FsError::Io);
+        }
+        if self.meta_cache_enabled.load(Ordering::Acquire) {
+            self.meta_cache
+                .lock()
+                .update_if_present(block_no, &data[..block_len]);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn block_error_to_fs_error(error: block::BlockError) -> FsError {
+        match error {
+            block::BlockError::NoMem => FsError::NoMem,
+            block::BlockError::ReadOnly => FsError::ReadOnly,
+            block::BlockError::NotSupported => FsError::NotSupported,
+            block::BlockError::Invalid | block::BlockError::TooLarge => FsError::Invalid,
+            _ => FsError::Io,
+        }
+    }
+
+    /// Write one or more contiguous physical blocks in a single `write_sync`
+    /// request, maintaining write-through coherence with `meta_cache`.
+    fn write_contiguous_physical_blocks(
+        &self,
+        start_block: u32,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        let block_len = self.block_size as usize;
+        if data.is_empty() || data.len() % block_len != 0 {
+            return Err(FsError::Invalid);
+        }
+        let block_count = u32::try_from(data.len() / block_len).map_err(|_| FsError::Invalid)?;
+        if start_block
+            .checked_add(block_count)
+            .is_none_or(|end| end > self.blocks_count)
+        {
+            return Err(FsError::Invalid);
+        }
+        if self.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+
+        let sector_size = self.sector_size;
+        let block_offset = start_block as u64 * self.block_size as u64;
+        let start_sector = block_offset / sector_size;
+
+        let written = match self.dev.write_sync(start_sector, data) {
+            Ok(written) => written,
+            Err(error) => {
+                if self.meta_cache_enabled.load(Ordering::Acquire) {
+                    self.meta_cache.lock().invalidate_all();
+                }
+                return Err(Self::block_error_to_fs_error(error));
+            }
+        };
+        if written != data.len() {
+            if self.meta_cache_enabled.load(Ordering::Acquire) {
+                self.meta_cache.lock().invalidate_all();
+            }
+            return Err(FsError::Io);
+        }
+        if self.meta_cache_enabled.load(Ordering::Acquire) {
+            let mut cache = self.meta_cache.lock();
+            for i in 0..block_count {
+                let off = i as usize * block_len;
+                cache.update_if_present(start_block + i, &data[off..off + block_len]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit two independent contiguous physical block writes in a single
+    /// pipelined `write_batch_sync` call, updating `meta_cache` on success and
+    /// invalidating fail-closed on any error.
+    fn write_physical_block_pair(
+        &self,
+        first: (u32, &[u8]),
+        second: (u32, &[u8]),
+    ) -> Result<(), FsError> {
+        let block_len = self.block_size as usize;
+        if self.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let validate = |(start_block, data): (u32, &[u8])| -> Result<(u64, u32), FsError> {
+            if data.is_empty() || data.len() % block_len != 0 {
+                return Err(FsError::Invalid);
+            }
+            let block_count =
+                u32::try_from(data.len() / block_len).map_err(|_| FsError::Invalid)?;
+            if start_block
+                .checked_add(block_count)
+                .is_none_or(|end| end > self.blocks_count)
+            {
+                return Err(FsError::Invalid);
+            }
+            let start_sector = (start_block as u64 * self.block_size as u64) / self.sector_size;
+            Ok((start_sector, block_count))
+        };
+        let (s0, c0) = validate(first)?;
+        let (s1, c1) = validate(second)?;
+        if let Err(error) = self.dev.write_batch_sync(&[(s0, first.1), (s1, second.1)]) {
+            if self.meta_cache_enabled.load(Ordering::Acquire) {
+                self.meta_cache.lock().invalidate_all();
+            }
+            return Err(Self::block_error_to_fs_error(error));
+        }
+        if self.meta_cache_enabled.load(Ordering::Acquire) {
+            let mut cache = self.meta_cache.lock();
+            for i in 0..c0 {
+                let off = i as usize * block_len;
+                cache.update_if_present(first.0 + i, &first.1[off..off + block_len]);
+            }
+            for i in 0..c1 {
+                let off = i as usize * block_len;
+                cache.update_if_present(second.0 + i, &second.1[off..off + block_len]);
+            }
         }
         Ok(())
     }
@@ -13360,6 +13897,16 @@ impl Ext2Fs {
         plan: JournalMetadataPlan<'_>,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), JournalTxFailure> {
+        self.commit_metadata_transaction_with_data(journal, plan, None, scratch)
+    }
+
+    fn commit_metadata_transaction_with_data(
+        &self,
+        journal: &mut Ext2Journal,
+        plan: JournalMetadataPlan<'_>,
+        ordered_data: Option<(u32, &[u8])>,
+        scratch: &mut Ext2MutationScratch,
+    ) -> Result<(), JournalTxFailure> {
         // All callers hold meta_lock through planning, commit and publication.
         // Compute the counter transition before persistence, then publish it
         // exactly once even when a durable commit's checkpoint subsequently fails.
@@ -13380,7 +13927,7 @@ impl Ext2Fs {
                 committed: false,
                 poison: error != FsError::NoSpace,
             })?;
-        let result = self.commit_metadata_transaction_inner(journal, plan, scratch);
+        let result = self.commit_metadata_transaction_inner(journal, plan, ordered_data, scratch);
         if result.is_ok() || result.as_ref().is_err_and(|failure| failure.committed) {
             self.mapping_bytes.store(next, Ordering::Release);
         }
@@ -13391,6 +13938,7 @@ impl Ext2Fs {
         &self,
         journal: &mut Ext2Journal,
         plan: JournalMetadataPlan<'_>,
+        ordered_data: Option<(u32, &[u8])>,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), JournalTxFailure> {
         let metadata_blocks = plan.metadata_blocks();
@@ -13419,7 +13967,7 @@ impl Ext2Fs {
 
         let sequence = journal.next_sequence;
         let block_len = self.block_size as usize;
-        let use_staged_images = journal.tx_images.len() >= metadata_blocks * block_len;
+        let use_staged_images = journal.tx_images.len() >= (metadata_blocks + 2) * block_len;
         let mut escaped = [false; JOURNAL_MAX_METADATA_BLOCKS];
         let mut homes = [0u32; JOURNAL_MAX_METADATA_BLOCKS];
         let mut preimage_hashes = [[0u8; 32]; JOURNAL_MAX_METADATA_BLOCKS];
@@ -13440,110 +13988,306 @@ impl Ext2Fs {
                     poison: false,
                 })?;
             if use_staged_images {
-                let dst = &mut journal.tx_images[index * block_len..(index + 1) * block_len];
+                let dst = &mut journal.tx_images[(2 + index) * block_len..(3 + index) * block_len];
                 dst.copy_from_slice(&scratch.block()[..block_len]);
             }
         }
 
-        // Write journal superblock (start=first), descriptor, and metadata
-        // payload before one single flush barrier prior to the commit block:
-        // crash before that barrier leaves no commit block on media, while any
-        // crash at/after the commit write observes durable start+descriptor+data.
-        if let Err(error) = self.write_journal_state(journal, sequence, journal.first, scratch) {
-            return Err(JournalTxFailure {
-                error,
-                committed: false,
-                poison: true,
+        let coalesce_device = self.dev.supports_coalesced_write();
+        let max_io_bytes =
+            (self.dev.max_sectors_per_bio() as usize).saturating_mul(self.sector_size as usize);
+        let precommit_blocks = metadata_blocks + 2;
+        let precommit_bytes = precommit_blocks.saturating_mul(block_len);
+        let journal_base = journal.physical(0).ok();
+        let can_coalesce_precommit = coalesce_device
+            && use_staged_images
+            && precommit_bytes <= max_io_bytes
+            && journal_base.is_some_and(|base| {
+                (1..precommit_blocks as u32)
+                    .all(|logical| journal.physical(logical).ok() == base.checked_add(logical))
             });
-        }
-        journal.start = journal.first;
 
-        let descriptor = scratch.block_mut();
-        descriptor.fill(0);
-        write_be_u32(descriptor, 0, JBD2_MAGIC).map_err(|error| JournalTxFailure {
-            error,
-            committed: false,
-            poison: true,
-        })?;
-        write_be_u32(descriptor, 4, JBD2_DESCRIPTOR_BLOCK).map_err(|error| JournalTxFailure {
-            error,
-            committed: false,
-            poison: true,
-        })?;
-        write_be_u32(descriptor, 8, sequence).map_err(|error| JournalTxFailure {
-            error,
-            committed: false,
-            poison: true,
-        })?;
-        let mut offset = JBD2_HEADER_BYTES;
-        for index in 0..metadata_blocks {
-            let home = homes[index];
-            let escape = escaped[index];
-            let mut flags = if escape { JBD2_FLAG_ESCAPE } else { 0 };
-            if index != 0 {
-                flags |= JBD2_FLAG_SAME_UUID;
+        let mut transaction_hasher;
+        if can_coalesce_precommit {
+            // Prepare J[0] (s_start = journal.first, sequence) into tx_images[0..block_len].
+            let cached_sb_valid = journal.superblock_image.len() == block_len
+                && read_be_u32(&journal.superblock_image, 0).ok() == Some(JBD2_MAGIC)
+                && read_be_u32(&journal.superblock_image, 4).ok() == Some(JBD2_SUPERBLOCK_V2);
+            if cached_sb_valid {
+                journal.tx_images[..block_len].copy_from_slice(&journal.superblock_image);
+            } else {
+                let sb_phys = journal_base.ok_or(JournalTxFailure {
+                    error: FsError::Invalid,
+                    committed: false,
+                    poison: true,
+                })?;
+                if let Err(error) =
+                    self.read_physical_block(sb_phys, &mut journal.tx_images[..block_len])
+                {
+                    return Err(JournalTxFailure {
+                        error,
+                        committed: false,
+                        poison: error != FsError::NoMem,
+                    });
+                }
             }
-            if index + 1 == metadata_blocks {
-                flags |= JBD2_FLAG_LAST_TAG;
+            {
+                let sb_blk = &mut journal.tx_images[..block_len];
+                if read_be_u32(sb_blk, 0).ok() != Some(JBD2_MAGIC)
+                    || read_be_u32(sb_blk, 4).ok() != Some(JBD2_SUPERBLOCK_V2)
+                    || write_be_u32(sb_blk, JBD2_SUPER_SEQUENCE_OFFSET, sequence).is_err()
+                    || write_be_u32(sb_blk, JBD2_SUPER_START_OFFSET, journal.first).is_err()
+                {
+                    return Err(JournalTxFailure {
+                        error: FsError::Invalid,
+                        committed: false,
+                        poison: true,
+                    });
+                }
+                if journal.superblock_image.len() == block_len {
+                    journal.superblock_image.copy_from_slice(sb_blk);
+                }
             }
-            write_be_u32(descriptor, offset, home).map_err(|error| JournalTxFailure {
-                error,
-                committed: false,
-                poison: true,
-            })?;
-            write_be_u16(descriptor, offset + 4, 0).map_err(|error| JournalTxFailure {
-                error,
-                committed: false,
-                poison: true,
-            })?;
-            write_be_u16(descriptor, offset + 6, flags).map_err(|error| JournalTxFailure {
-                error,
-                committed: false,
-                poison: true,
-            })?;
-            offset += JBD2_TAG_BYTES;
-            if index == 0 {
-                descriptor[offset..offset + 16].copy_from_slice(&journal.uuid);
-                offset += 16;
-            }
-        }
 
-        if let Err(error) = self.write_journal_block(journal, journal.first, descriptor) {
-            return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
-        }
-        let mut transaction_hasher = Self::transaction_hasher(journal, sequence, descriptor);
-        for (index, escape) in escaped[..metadata_blocks].iter().copied().enumerate() {
-            let logical = journal
-                .advance(journal.first, index as u32 + 1)
-                .map_err(|error| JournalTxFailure {
+            // Prepare J[1] (descriptor) into tx_images[block_len..2*block_len].
+            {
+                let descriptor = &mut journal.tx_images[block_len..2 * block_len];
+                descriptor.fill(0);
+                if write_be_u32(descriptor, 0, JBD2_MAGIC).is_err()
+                    || write_be_u32(descriptor, 4, JBD2_DESCRIPTOR_BLOCK).is_err()
+                    || write_be_u32(descriptor, 8, sequence).is_err()
+                {
+                    return Err(JournalTxFailure {
+                        error: FsError::Invalid,
+                        committed: false,
+                        poison: true,
+                    });
+                }
+                let mut offset = JBD2_HEADER_BYTES;
+                for index in 0..metadata_blocks {
+                    let home = homes[index];
+                    let escape = escaped[index];
+                    let mut flags = if escape { JBD2_FLAG_ESCAPE } else { 0 };
+                    if index != 0 {
+                        flags |= JBD2_FLAG_SAME_UUID;
+                    }
+                    if index + 1 == metadata_blocks {
+                        flags |= JBD2_FLAG_LAST_TAG;
+                    }
+                    if write_be_u32(descriptor, offset, home).is_err()
+                        || write_be_u16(descriptor, offset + 4, 0).is_err()
+                        || write_be_u16(descriptor, offset + 6, flags).is_err()
+                    {
+                        return Err(JournalTxFailure {
+                            error: FsError::Invalid,
+                            committed: false,
+                            poison: true,
+                        });
+                    }
+                    offset += JBD2_TAG_BYTES;
+                    if index == 0 {
+                        descriptor[offset..offset + 16].copy_from_slice(&journal.uuid);
+                        offset += 16;
+                    }
+                }
+            }
+
+            // Apply JBD2 escape in place for hashing + journal write, then restore
+            // JBD2_MAGIC afterward so checkpoint writes the exact post-images.
+            for (index, escape) in escaped[..metadata_blocks].iter().copied().enumerate() {
+                if escape {
+                    let start = (2 + index) * block_len;
+                    journal.tx_images[start..start + 4].fill(0);
+                }
+            }
+            transaction_hasher = Self::transaction_hasher(
+                journal,
+                sequence,
+                &journal.tx_images[block_len..2 * block_len],
+            );
+            for index in 0..metadata_blocks {
+                let start = (2 + index) * block_len;
+                transaction_hasher.update(&journal.tx_images[start..start + block_len]);
+            }
+
+            let base = journal_base.ok_or(JournalTxFailure {
+                error: FsError::Invalid,
+                committed: false,
+                poison: true,
+            })?;
+            journal.start = journal.first;
+            let precommit_res = if let Some((data_block, data_bytes)) = ordered_data {
+                self.write_physical_block_pair(
+                    (data_block, data_bytes),
+                    (base, &journal.tx_images[..precommit_bytes]),
+                )
+            } else {
+                self.write_contiguous_physical_blocks(base, &journal.tx_images[..precommit_bytes])
+            };
+            if let Err(error) = precommit_res {
+                for (index, escape) in escaped[..metadata_blocks].iter().copied().enumerate() {
+                    if escape {
+                        let start = (2 + index) * block_len;
+                        journal.tx_images[start..start + 4]
+                            .copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+                    }
+                }
+                if error == FsError::NoMem {
+                    // Allocation failed strictly before VirtIO submission;
+                    // neither `ordered_data` nor journal blocks were touched.
+                    journal.start = 0;
+                    return Err(JournalTxFailure {
+                        error,
+                        committed: false,
+                        poison: false,
+                    });
+                }
+                let mut failure = self.abort_uncommitted_journal(journal, sequence, error, scratch);
+                if ordered_data.is_some() {
+                    failure.poison = true;
+                }
+                return Err(failure);
+            }
+            for (index, escape) in escaped[..metadata_blocks].iter().copied().enumerate() {
+                if escape {
+                    let start = (2 + index) * block_len;
+                    journal.tx_images[start..start + 4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+                }
+            }
+            if let Err(error) = self.flush_device() {
+                let mut failure = self.abort_uncommitted_journal(journal, sequence, error, scratch);
+                if ordered_data.is_some() {
+                    failure.poison = true;
+                }
+                return Err(failure);
+            }
+        } else {
+            if let Some((data_block, data_bytes)) = ordered_data {
+                if let Err(error) = self.write_block(data_block, data_bytes) {
+                    return Err(JournalTxFailure {
+                        error,
+                        committed: false,
+                        poison: error != FsError::NoMem,
+                    });
+                }
+            }
+            // Write journal superblock (start=first), descriptor, and metadata
+            // payload before one single flush barrier prior to the commit block:
+            // crash before that barrier leaves no commit block on media, while any
+            // crash at/after the commit write observes durable start+descriptor+data.
+            if let Err(error) = self.write_journal_state(journal, sequence, journal.first, scratch)
+            {
+                return Err(JournalTxFailure {
+                    error,
+                    committed: false,
+                    poison: true,
+                });
+            }
+            journal.start = journal.first;
+
+            let descriptor = scratch.block_mut();
+            descriptor.fill(0);
+            write_be_u32(descriptor, 0, JBD2_MAGIC).map_err(|error| JournalTxFailure {
+                error,
+                committed: false,
+                poison: true,
+            })?;
+            write_be_u32(descriptor, 4, JBD2_DESCRIPTOR_BLOCK).map_err(|error| {
+                JournalTxFailure {
+                    error,
+                    committed: false,
+                    poison: true,
+                }
+            })?;
+            write_be_u32(descriptor, 8, sequence).map_err(|error| JournalTxFailure {
+                error,
+                committed: false,
+                poison: true,
+            })?;
+            let mut offset = JBD2_HEADER_BYTES;
+            for index in 0..metadata_blocks {
+                let home = homes[index];
+                let escape = escaped[index];
+                let mut flags = if escape { JBD2_FLAG_ESCAPE } else { 0 };
+                if index != 0 {
+                    flags |= JBD2_FLAG_SAME_UUID;
+                }
+                if index + 1 == metadata_blocks {
+                    flags |= JBD2_FLAG_LAST_TAG;
+                }
+                write_be_u32(descriptor, offset, home).map_err(|error| JournalTxFailure {
                     error,
                     committed: false,
                     poison: true,
                 })?;
-            if use_staged_images && !escape {
-                let staged = &journal.tx_images[index * block_len..(index + 1) * block_len];
-                transaction_hasher.update(staged);
-                if let Err(error) = self.write_journal_block(journal, logical, staged) {
-                    return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
-                }
-            } else {
-                if use_staged_images {
-                    let staged = &journal.tx_images[index * block_len..(index + 1) * block_len];
-                    scratch.block_mut()[..block_len].copy_from_slice(staged);
-                } else if let Err(error) = self.build_metadata_image(plan, index, scratch) {
-                    return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
-                }
-                if escape {
-                    scratch.block_mut()[..4].fill(0);
-                }
-                transaction_hasher.update(scratch.block());
-                if let Err(error) = self.write_journal_block(journal, logical, scratch.block()) {
-                    return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
+                write_be_u16(descriptor, offset + 4, 0).map_err(|error| JournalTxFailure {
+                    error,
+                    committed: false,
+                    poison: true,
+                })?;
+                write_be_u16(descriptor, offset + 6, flags).map_err(|error| JournalTxFailure {
+                    error,
+                    committed: false,
+                    poison: true,
+                })?;
+                offset += JBD2_TAG_BYTES;
+                if index == 0 {
+                    descriptor[offset..offset + 16].copy_from_slice(&journal.uuid);
+                    offset += 16;
                 }
             }
-        }
-        if let Err(error) = self.flush_device() {
-            return Err(self.abort_uncommitted_journal(journal, sequence, error, scratch));
+
+            let abort_after_data = |journal: &mut Ext2Journal,
+                                    error: FsError,
+                                    scratch: &mut Ext2MutationScratch|
+             -> JournalTxFailure {
+                let mut failure = self.abort_uncommitted_journal(journal, sequence, error, scratch);
+                if ordered_data.is_some() {
+                    failure.poison = true;
+                }
+                failure
+            };
+            if let Err(error) = self.write_journal_block(journal, journal.first, descriptor) {
+                return Err(abort_after_data(journal, error, scratch));
+            }
+            transaction_hasher = Self::transaction_hasher(journal, sequence, descriptor);
+            for (index, escape) in escaped[..metadata_blocks].iter().copied().enumerate() {
+                let logical =
+                    journal
+                        .advance(journal.first, index as u32 + 1)
+                        .map_err(|error| JournalTxFailure {
+                            error,
+                            committed: false,
+                            poison: true,
+                        })?;
+                if use_staged_images && !escape {
+                    let staged =
+                        &journal.tx_images[(2 + index) * block_len..(3 + index) * block_len];
+                    transaction_hasher.update(staged);
+                    if let Err(error) = self.write_journal_block(journal, logical, staged) {
+                        return Err(abort_after_data(journal, error, scratch));
+                    }
+                } else {
+                    if use_staged_images {
+                        let staged =
+                            &journal.tx_images[(2 + index) * block_len..(3 + index) * block_len];
+                        scratch.block_mut()[..block_len].copy_from_slice(staged);
+                    } else if let Err(error) = self.build_metadata_image(plan, index, scratch) {
+                        return Err(abort_after_data(journal, error, scratch));
+                    }
+                    if escape {
+                        scratch.block_mut()[..4].fill(0);
+                    }
+                    transaction_hasher.update(scratch.block());
+                    if let Err(error) = self.write_journal_block(journal, logical, scratch.block())
+                    {
+                        return Err(abort_after_data(journal, error, scratch));
+                    }
+                }
+            }
+            if let Err(error) = self.flush_device() {
+                return Err(abort_after_data(journal, error, scratch));
+            }
         }
 
         let commit_logical = match journal.advance(journal.first, metadata_blocks as u32 + 1) {
@@ -13603,33 +14347,118 @@ impl Ext2Fs {
             });
         }
 
-        for index in 0..metadata_blocks {
-            if use_staged_images {
-                let staged = &journal.tx_images[index * block_len..(index + 1) * block_len];
-                if let Err(error) = self.write_physical_block(homes[index], staged) {
-                    return Err(JournalTxFailure {
-                        error,
-                        committed: true,
-                        poison: true,
-                    });
+        if coalesce_device
+            && use_staged_images
+            && metadata_blocks > 1
+            && journal.checkpoint_buf.len() >= metadata_blocks * block_len
+        {
+            // Sort (home, index) ascending on stack and coalesce contiguous
+            // physical runs into single multi-block checkpoint writes.
+            let mut order = [(0u32, 0usize); JOURNAL_MAX_METADATA_BLOCKS];
+            for i in 0..metadata_blocks {
+                order[i] = (homes[i], i);
+            }
+            for i in 1..metadata_blocks {
+                let key = order[i];
+                let mut j = i;
+                while j > 0 && order[j - 1].0 > key.0 {
+                    order[j] = order[j - 1];
+                    j -= 1;
                 }
-            } else {
-                let home = match self.build_metadata_image(plan, index, scratch) {
-                    Ok(home) => home,
-                    Err(error) => {
+                order[j] = key;
+            }
+            let mut runs = [(0u32, 0usize, 0usize); JOURNAL_MAX_METADATA_BLOCKS];
+            let mut run_count = 0usize;
+            let mut ckpt_off = 0usize;
+            let mut pos = 0usize;
+            while pos < metadata_blocks {
+                let run_base = order[pos].0;
+                let mut run_len = 1usize;
+                while pos + run_len < metadata_blocks
+                    && order[pos + run_len].0 == run_base.wrapping_add(run_len as u32)
+                    && (run_len + 1).saturating_mul(block_len) <= max_io_bytes
+                {
+                    run_len += 1;
+                }
+                let run_bytes = run_len * block_len;
+                for step in 0..run_len {
+                    let orig = order[pos + step].1;
+                    let src = &journal.tx_images[(2 + orig) * block_len..(3 + orig) * block_len];
+                    let dst = &mut journal.checkpoint_buf
+                        [ckpt_off + step * block_len..ckpt_off + (step + 1) * block_len];
+                    dst.copy_from_slice(src);
+                }
+                runs[run_count] = (run_base, ckpt_off, run_bytes);
+                run_count += 1;
+                ckpt_off += run_bytes;
+                pos += run_len;
+            }
+            let mut idx = 0usize;
+            while idx < run_count {
+                if idx + 1 < run_count {
+                    let (b0, o0, l0) = runs[idx];
+                    let (b1, o1, l1) = runs[idx + 1];
+                    if let Err(error) = self.write_physical_block_pair(
+                        (b0, &journal.checkpoint_buf[o0..o0 + l0]),
+                        (b1, &journal.checkpoint_buf[o1..o1 + l1]),
+                    ) {
                         return Err(JournalTxFailure {
                             error,
                             committed: true,
                             poison: true,
-                        })
+                        });
                     }
-                };
-                if let Err(error) = self.write_physical_block(home, scratch.block()) {
-                    return Err(JournalTxFailure {
-                        error,
-                        committed: true,
-                        poison: true,
-                    });
+                    idx += 2;
+                } else {
+                    let (b0, o0, l0) = runs[idx];
+                    let res = if l0 == block_len {
+                        self.write_physical_block(b0, &journal.checkpoint_buf[o0..o0 + l0])
+                    } else {
+                        self.write_contiguous_physical_blocks(
+                            b0,
+                            &journal.checkpoint_buf[o0..o0 + l0],
+                        )
+                    };
+                    if let Err(error) = res {
+                        return Err(JournalTxFailure {
+                            error,
+                            committed: true,
+                            poison: true,
+                        });
+                    }
+                    idx += 1;
+                }
+            }
+        } else {
+            for index in 0..metadata_blocks {
+                if use_staged_images {
+                    let staged =
+                        &journal.tx_images[(2 + index) * block_len..(3 + index) * block_len];
+                    if let Err(error) = self.write_physical_block(homes[index], staged) {
+                        return Err(JournalTxFailure {
+                            error,
+                            committed: true,
+                            poison: true,
+                        });
+                    }
+                } else {
+                    let home = match self.build_metadata_image(plan, index, scratch) {
+                        Ok(home) => home,
+                        Err(error) => {
+                            return Err(JournalTxFailure {
+                                error,
+                                committed: true,
+                                poison: true,
+                            })
+                        }
+                    };
+                    if let Err(error) = self.write_physical_block(home, scratch.block()) {
+                        return Err(JournalTxFailure {
+                            error,
+                            committed: true,
+                            poison: true,
+                        });
+                    }
                 }
             }
         }
@@ -13649,12 +14478,22 @@ impl Ext2Fs {
                 poison: true,
             });
         }
-        if let Err(error) = self.flush_device() {
-            return Err(JournalTxFailure {
-                error,
-                committed: true,
-                poison: true,
-            });
+        // Homes are already durable on stable media from the checkpoint flush
+        // above. On coalescing devices, deferring the post-clear barrier is
+        // crash-safe: if power fails before `s_start=0` hits media, mount
+        // recovery idempotently replays the already-applied post-images and
+        // clears `s_start=0`; if a later transaction starts first, any partial
+        // pre-commit fails the SHA-256 intent digest and validates the clean
+        // post-checkpoint homes. Non-coalescing/test devices retain the exact
+        // 4th barrier.
+        if !coalesce_device {
+            if let Err(error) = self.flush_device() {
+                return Err(JournalTxFailure {
+                    error,
+                    committed: true,
+                    poison: true,
+                });
+            }
         }
         journal.next_sequence = next_sequence;
         journal.start = 0;
@@ -13688,10 +14527,99 @@ impl Ext2Fs {
             raw: RwLock::new(raw),
             size: AtomicU64::new(size),
             write_lock: Mutex::new(()),
+            dirty: RwLock::new(Ext2DirtyState::new()),
         })
         .map_err(|_| FsError::NoMem)
     }
 
+    #[inline]
+    fn buffered_writeback_enabled(&self) -> bool {
+        self.block_size as usize == PAGE_SIZE && self.dev.supports_coalesced_write()
+    }
+
+    /// Pin a dirty linked inode in the leaf-locked `dirty_inodes` list.
+    /// Returns `Ok(true)` if present/inserted, `Ok(false)` if the list is at
+    /// `MAX_DIRTY_INODES_PER_FS` capacity and needs writeback first.
+    fn register_dirty_inode(&self, inode: &Arc<Ext2Inode>) -> Result<bool, FsError> {
+        let mut dirty = self.dirty_inodes.lock();
+        if dirty.iter().any(|existing| existing.ino == inode.ino) {
+            return Ok(true);
+        }
+        if dirty.len() >= MAX_DIRTY_INODES_PER_FS {
+            return Ok(false);
+        }
+        dirty.try_reserve(1).map_err(|_| FsError::NoMem)?;
+        // lint-fallible: PREALLOCATED(try_reserve(1) on previous line)
+        dirty.push(inode.clone());
+        Ok(true)
+    }
+
+    pub(super) fn unregister_dirty_inode(&self, ino: u32) {
+        let mut dirty = self.dirty_inodes.lock();
+        if let Some(pos) = dirty.iter().position(|existing| existing.ino == ino) {
+            dirty.swap_remove(pos);
+        }
+    }
+
+    fn dec_dirty_pages_total(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let _ = self
+            .dirty_pages_total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(count))
+            });
+    }
+
+    fn inc_dirty_pages_total(&self) -> Result<(), FsError> {
+        self.dirty_pages_total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                if cur < MAX_DIRTY_PAGES_PER_FS {
+                    cur.checked_add(1)
+                } else {
+                    None
+                }
+            })
+            .map(|_| ())
+            .map_err(|_| FsError::Busy)
+    }
+
+    /// Flush all buffered dirty inodes through the ordered-data JBD2 write path.
+    /// Returns `Ok(true)` if at least one JBD2 transaction completed a device
+    /// flush barrier during this call.
+    fn flush_all_dirty_inodes(&self) -> Result<bool, FsError> {
+        let mut snapshot: [Option<Arc<Ext2Inode>>; MAX_DIRTY_INODES_PER_FS] =
+            [const { None }; MAX_DIRTY_INODES_PER_FS];
+        let mut count = 0usize;
+        {
+            let dirty = self.dirty_inodes.lock();
+            for inode in dirty.iter().take(MAX_DIRTY_INODES_PER_FS) {
+                snapshot[count] = Some(inode.clone());
+                count += 1;
+            }
+        }
+        let mut flushed_tx = false;
+        for slot in snapshot.iter_mut().take(count) {
+            if let Some(inode) = slot.take() {
+                if inode.flush_dirty_to_disk_with_fs(self)? {
+                    flushed_tx = true;
+                }
+            }
+        }
+        Ok(flushed_tx)
+    }
+}
+
+impl Drop for Ext2Fs {
+    fn drop(&mut self) {
+        if !self.io_faulted.load(Ordering::Acquire) && !self.dev.is_read_only() {
+            let _ = self.flush_all_dirty_inodes();
+        }
+    }
+}
+
+impl Ext2Fs {
     /// Serialize cache publication with bitmap allocation/free. Orphans remain
     /// reachable through existing handles, but cannot be loaded through a stale
     /// directory entry. The atomic flag avoids taking raw after meta_lock.
@@ -14506,9 +15434,9 @@ impl Ext2Fs {
 }
 
 impl FileSystem for Ext2Fs {
-    /// ST-K4: `Ok` means the mount is healthy and a device barrier that the
-    /// device can stand behind completed after this call began. Writes are
-    /// write-through, so the barrier is all that remains to do.
+    /// ST-K4: `Ok` means the mount is healthy, every buffered dirty write has
+    /// been persisted via ordered-data JBD2 transactions, and a device barrier
+    /// that the device can stand behind completed after this call began.
     fn sync(&self) -> Result<(), FsError> {
         self.ensure_io_healthy()?;
         if self.dev.is_read_only() {
@@ -14517,11 +15445,18 @@ impl FileSystem for Ext2Fs {
         if self.dev.durability() == block::DurabilityGuarantee::Unsupported {
             return Err(FsError::Io);
         }
+        let flushed_tx = self.flush_all_dirty_inodes()?;
         let owner = self.self_ref.lock().as_ref().and_then(Weak::upgrade);
         if let Some(owner) = owner {
             owner.reap_orphans()?;
         }
-        self.flush_with_retry()?;
+        // If `flush_all_dirty_inodes()` already completed one or more JBD2
+        // transactions after this `sync()` entered, their checkpoint
+        // `flush_device()` barrier has already stabilized all written data and
+        // metadata on media. Otherwise issue a standalone ST-K4 barrier.
+        if !flushed_tx {
+            self.flush_with_retry()?;
+        }
         // A concurrent writer may have poisoned the mount during the barrier.
         self.ensure_io_healthy()
     }
@@ -14671,6 +15606,13 @@ impl FileSystem for Ext2Fs {
             return Err(FsError::NotSupported);
         }
         let src_inode = fs.load_inode(source_ino)?;
+        // Ext4 `auto_da_alloc` crash-safety contract: serialize with and flush
+        // any buffered dirty writes on the renamed source file BEFORE committing
+        // the rename transaction so `open(tmp) -> write -> close -> rename`
+        // never exposes a zero-length or partially written target on crash.
+        if src_inode.is_file_inner() {
+            let _ = src_inode.flush_dirty_to_disk_with_fs(&fs)?;
+        }
         let parent_ino = old_parent_ext2.ino;
         let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
         let block_size_us = fs.block_size as usize;
@@ -14898,13 +15840,25 @@ pub struct Ext2Inode {
     size: AtomicU64,
     /// Serialize writes to this inode
     write_lock: Mutex<()>,
+    /// Buffered dirty 4 KiB pages for POSIX non-O_SYNC writeback.
+    /// Lock ordering: always acquired strictly inside `write_lock` or `raw`.
+    dirty: RwLock<Ext2DirtyState>,
 }
 
 impl Drop for Ext2Inode {
     fn drop(&mut self) {
         page_cache::PAGE_CACHE.retire_inode(self.cache_id);
-        if self.unlinked.load(Ordering::Acquire) && self.raw.get_mut().mode != 0 {
-            if let Some(fs) = self.fs.upgrade() {
+        let dropped_pages = {
+            let dirty = self.dirty.get_mut();
+            let count = dirty.pages.len();
+            dirty.pages.clear();
+            dirty.size_dirty = false;
+            dirty.logical_size = 0;
+            count
+        };
+        if let Some(fs) = self.fs.upgrade() {
+            fs.dec_dirty_pages_total(dropped_pages);
+            if self.unlinked.load(Ordering::Acquire) && self.raw.get_mut().mode != 0 {
                 // A busy metadata/orphan lane leaves a durable orphan for the
                 // next sync/mutation. Reentrant drops must never wait on it.
                 let _ = fs.reap_orphans();
@@ -15054,6 +16008,21 @@ impl Ext2Inode {
             let offset_in_page = (file_offset % PAGE_SIZE as u64) as usize;
             let remaining_in_page = PAGE_SIZE - offset_in_page;
             let copy_len = cmp::min(remaining_in_page, to_read - bytes_read);
+
+            // Serve buffered dirty writes directly under the raw read guard so
+            // POSIX read-your-writes coherence holds before fsync/writeback.
+            if block_size == PAGE_SIZE {
+                if let Ok(block_idx) = u32::try_from(page_index) {
+                    let dirty_guard = self.dirty.read();
+                    if let Some(dirty_page) = dirty_guard.find_page(block_idx) {
+                        buf[bytes_read..bytes_read + copy_len].copy_from_slice(
+                            &dirty_page.frame.as_slice()[offset_in_page..offset_in_page + copy_len],
+                        );
+                        bytes_read += copy_len;
+                        continue;
+                    }
+                }
+            }
 
             // RF178-11 FIX: bind each cache miss to the cgroup current for this
             // page's admission. A multi-page read may straddle a concurrent
@@ -15262,6 +16231,58 @@ impl Ext2Inode {
         let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
         let _inode_guard = self.write_lock.lock();
         let mut raw_guard = self.raw.write();
+        let prev_logical = self.size.load(Ordering::Acquire);
+        let mut flushed_tx = false;
+        if !reclaim && !self.dirty.read().is_empty() {
+            if raw_guard.flags & (EXT2_IMMUTABLE_FL | EXT2_APPEND_FL) != 0 {
+                return Err(FsError::PermDenied);
+            }
+            if raw_guard.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
+                return Err(FsError::NotSupported);
+            }
+            let journal_inum = fs.superblock.read().journal_inum;
+            if self.ino == journal_inum {
+                return Err(FsError::PermDenied);
+            }
+            if fs.journal.lock().is_none() {
+                return Err(FsError::ReadOnly);
+            }
+            fs.check_tree_size(&raw_guard, new_size)?;
+            let trunc_now = TimeSpec::now().sec as u32;
+            let on_disk_size =
+                ((raw_guard.size_high_or_dir_acl as u64) << 32) | u64::from(raw_guard.size_lo);
+            if new_size == 0 && on_disk_size == 0 && raw_guard.blocks_lo == 0 {
+                // Purely RAM-buffered file truncated to 0 (e.g. O_TRUNC):
+                // discard buffered pages without touching disk or diverging
+                // `raw_guard` from on-disk bytes. Record the truncate timestamp
+                // in `self.dirty` so `stat()` sees it and a later `fsync()`
+                // commits it via `InodeUpdate`.
+                if prev_logical != 0 {
+                    self.discard_dirty_locked(&fs);
+                    let mut dirty = self.dirty.write();
+                    dirty.ts = trunc_now;
+                    dirty.ts_dirty = true;
+                    self.size.store(0, Ordering::Release);
+                    self.zero_cached_range(0, prev_logical);
+                }
+                return Ok(());
+            }
+            // Flush only buffered pages starting below `new_size` using the
+            // pre-admitted `scratch`. Pages at/beyond `new_size` remain in
+            // `self.dirty` until the corresponding shrink commits, so a
+            // recoverable pre-commit failure (e.g. ENOSPC or NoMem) preserves
+            // all buffered data, page cache contents, and `self.size`.
+            let keep_boundary_full = on_disk_size > new_size;
+            let trunc_ts = (new_size != prev_logical).then_some(trunc_now);
+            drop(raw_guard);
+            flushed_tx = self.flush_dirty_holding_write_lock_with_scratch(
+                &fs,
+                &mut scratch,
+                Some((new_size, keep_boundary_full, trunc_ts)),
+                None,
+            )?;
+            raw_guard = self.raw.write();
+        }
         let _meta = fs.meta_lock.lock();
         fs.ensure_io_healthy()?;
         if reclaim && (raw_guard.links_count != 0 || new_size != 0) {
@@ -15284,7 +16305,11 @@ impl Ext2Inode {
         }
 
         let block_size = fs.block_size as u64;
-        let old_size = self.size.load(Ordering::Acquire);
+        let old_size = if (raw_guard.mode & EXT2_S_IFMT) == EXT2_S_IFREG {
+            ((raw_guard.size_high_or_dir_acl as u64) << 32) | u64::from(raw_guard.size_lo)
+        } else {
+            u64::from(raw_guard.size_lo)
+        };
         fs.check_tree_size(&raw_guard, old_size)?;
         fs.check_tree_size(&raw_guard, new_size)?;
 
@@ -15336,10 +16361,11 @@ impl Ext2Inode {
             return result;
         }
 
-        // Ordered-data rule: clear the kept block's tail first, or a later cache
-        // fill could bring truncated bytes back from disk before a grow zeroes them.
+        // Ordered-data rule: when shrinking into the middle of a kept block,
+        // clear its tail first so a later cache fill cannot bring truncated
+        // bytes back from disk before a grow zeroes them.
         let offset_in_block = (new_size % block_size) as usize;
-        if offset_in_block != 0 {
+        if offset_in_block != 0 && new_size < old_size {
             let file_block = u32::try_from(new_size / block_size).map_err(|_| FsError::Invalid)?;
             let committed_raw = *raw_guard;
             if let Some(physical) =
@@ -15358,6 +16384,7 @@ impl Ext2Inode {
             }
         }
 
+        let mut disk_size = old_size;
         let first_freed = new_size.div_ceil(block_size);
         let mut cursor = TreeCursor::new(first_freed, fs.tree_block_limit(), true);
         while let Some((edge, exiting)) = cursor.next(&fs, &raw_guard, &mut scratch)? {
@@ -15372,7 +16399,7 @@ impl Ext2Inode {
                 }
             }
             let committed_raw = *raw_guard;
-            let current_size = self.size.load(Ordering::Acquire);
+            let current_size = disk_size;
             let step_size = current_size
                 .min(u64::from(edge.logical) * block_size)
                 .max(new_size);
@@ -15418,10 +16445,10 @@ impl Ext2Inode {
                 step_size,
                 result,
             )?;
+            disk_size = step_size;
         }
 
-        let current_size = self.size.load(Ordering::Acquire);
-        if current_size != new_size {
+        if disk_size != new_size {
             let committed_raw = *raw_guard;
             let next_raw = stamped(&committed_raw, new_size);
             let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
@@ -15435,14 +16462,34 @@ impl Ext2Inode {
                 },
                 &mut scratch,
             );
-            self.finish_truncate_step(
-                &fs,
-                &mut raw_guard,
-                next_raw,
-                current_size,
-                new_size,
-                result,
-            )?;
+            self.finish_truncate_step(&fs, &mut raw_guard, next_raw, disk_size, new_size, result)?;
+        } else if prev_logical != new_size && !flushed_tx {
+            // Buffered tail was truncated back to the existing on-disk size
+            // without flushing a prefix: commit the truncate timestamps so
+            // `mtime`/`ctime` advance durably before discarding the tail.
+            let committed_raw = *raw_guard;
+            let next_raw = stamped(&committed_raw, new_size);
+            let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+            let result = fs.commit_metadata_transaction(
+                journal,
+                JournalMetadataPlan::InodeUpdate {
+                    inode_number: self.ino,
+                    inode_target,
+                    old_inode: committed_raw,
+                    new_inode: next_raw,
+                },
+                &mut scratch,
+            );
+            self.finish_truncate_step(&fs, &mut raw_guard, next_raw, disk_size, new_size, result)?;
+        }
+        // Now that the on-disk size has reached `new_size` and every buffered
+        // prefix `< new_size` is durable on disk, discard any deferred boundary
+        // or tail pages and clear cached bytes beyond `new_size`.
+        self.discard_dirty_locked(&fs);
+        fs.unregister_dirty_inode(self.ino);
+        self.size.store(new_size, Ordering::Release);
+        if prev_logical > new_size {
+            self.zero_cached_range(new_size, prev_logical);
         }
         publication.pending = false;
         Ok(())
@@ -15468,6 +16515,7 @@ impl Ext2Inode {
             }
         }
         *raw_guard = next_raw;
+        self.discard_dirty_from_locked(fs, new_size);
         self.size.store(new_size, Ordering::Release);
         let (low, high) = (old_size.min(new_size), old_size.max(new_size));
         self.zero_cached_range(low, high);
@@ -15475,6 +16523,685 @@ impl Ext2Inode {
             Ok(()) => Ok(()),
             Err(failure) => Err(failure.error),
         }
+    }
+
+    pub(super) fn discard_dirty_locked(&self, fs: &Ext2Fs) {
+        let mut dirty = self.dirty.write();
+        let count = dirty.pages.len();
+        dirty.pages.clear();
+        dirty.size_dirty = false;
+        dirty.logical_size = 0;
+        dirty.ts_dirty = false;
+        dirty.ts = 0;
+        drop(dirty);
+        fs.dec_dirty_pages_total(count);
+    }
+
+    pub(super) fn sync_dirty_ts_after_metadata_change(&self, ts: u32) {
+        let mut dirty = self.dirty.write();
+        if dirty.ts_dirty {
+            dirty.ts = ts;
+        }
+    }
+
+    fn discard_dirty_from_locked(&self, fs: &Ext2Fs, min_offset: u64) {
+        let mut dirty = self.dirty.write();
+        if dirty.is_empty() {
+            return;
+        }
+        let before = dirty.pages.len();
+        dirty
+            .pages
+            .retain(|p| u64::from(p.block_index) * (PAGE_SIZE as u64) < min_offset);
+        let removed = before - dirty.pages.len();
+        if dirty.logical_size > min_offset {
+            dirty.logical_size = min_offset;
+        }
+        let now_empty = dirty.pages.is_empty();
+        if now_empty {
+            dirty.size_dirty = false;
+            dirty.logical_size = 0;
+            dirty.ts_dirty = false;
+            dirty.ts = 0;
+        }
+        drop(dirty);
+        fs.dec_dirty_pages_total(removed);
+        if now_empty {
+            fs.unregister_dirty_inode(self.ino);
+        }
+    }
+
+    /// Flush buffered dirty pages for this inode while caller already holds
+    /// `self.write_lock` (and does NOT hold `self.raw` or `fs.meta_lock`),
+    /// reusing a caller-provided `scratch`.
+    ///
+    /// When `truncate_limit` is `Some((limit, keep_boundary_full, ts))`, only
+    /// pages starting below `limit` are flushed and pages at/beyond `limit`
+    /// remain in `self.dirty` until the caller's shrink commits. Recoverable
+    /// pre-commit errors (such as `NoSpace` or `NoMem`) restore unwritten pages
+    /// into `self.dirty` without poisoning the mount. Returns `Ok(true)` if at
+    /// least one JBD2 transaction completed.
+    fn flush_dirty_holding_write_lock_with_scratch(
+        &self,
+        fs: &Ext2Fs,
+        scratch: &mut Ext2MutationScratch,
+        truncate_limit: Option<(u64, bool, Option<u32>)>,
+        mut track_committed: Option<(u64, &mut u64)>,
+    ) -> Result<bool, FsError> {
+        let mut raw_guard = self.raw.write();
+        if self.dirty.read().is_empty() {
+            drop(raw_guard);
+            fs.unregister_dirty_inode(self.ino);
+            fs.ensure_io_healthy()?;
+            return Ok(false);
+        }
+        let _meta = fs.meta_lock.lock();
+        fs.ensure_io_healthy()?;
+        if fs.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+        let inode_target = fs.inode_write_target(self.ino)?;
+        let mut journal_guard = fs.journal.lock();
+        if journal_guard.is_none() {
+            return Err(FsError::ReadOnly);
+        }
+
+        let (mut pages, saved_logical_size, saved_ts, saved_ts_dirty) = {
+            let mut dirty = self.dirty.write();
+            let pages = core::mem::take(&mut dirty.pages);
+            let logical_size = dirty.logical_size;
+            let ts = dirty.ts;
+            let ts_dirty = dirty.ts_dirty;
+            dirty.size_dirty = false;
+            dirty.logical_size = 0;
+            dirty.ts_dirty = false;
+            (pages, logical_size, ts, ts_dirty)
+        };
+        let total_pages = pages.len();
+        let mut flushed_count = 0usize;
+        let mut drain_count = 0usize;
+        let mut flushed_tx = false;
+        let mut flush_err: Option<FsError> = None;
+        let mut recoverable = false;
+        let flush_ts = truncate_limit.and_then(|(_, _, ts)| ts).unwrap_or(saved_ts);
+
+        if pages.is_empty() && saved_ts_dirty && truncate_limit.is_none() {
+            // Pure timestamp update deferred from a RAM-only `truncate(0)`.
+            let committed_raw = *raw_guard;
+            let mut next_raw = committed_raw;
+            next_raw.mtime = flush_ts;
+            next_raw.ctime = flush_ts;
+            let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
+            let tx_res = fs.commit_metadata_transaction(
+                journal,
+                JournalMetadataPlan::InodeUpdate {
+                    inode_number: self.ino,
+                    inode_target,
+                    old_inode: committed_raw,
+                    new_inode: next_raw,
+                },
+                scratch,
+            );
+            match tx_res {
+                Ok(()) => {
+                    *raw_guard = next_raw;
+                    flushed_tx = true;
+                }
+                Err(failure) if failure.committed => {
+                    *raw_guard = next_raw;
+                    flushed_tx = true;
+                    if failure.poison {
+                        fs.io_faulted.store(true, Ordering::Release);
+                    }
+                    flush_err = Some(failure.error);
+                }
+                Err(failure) => {
+                    if !failure.poison
+                        && !fs.io_faulted.load(Ordering::Acquire)
+                        && matches!(
+                            failure.error,
+                            FsError::NoSpace
+                                | FsError::NoMem
+                                | FsError::ReadOnly
+                                | FsError::PermDenied
+                                | FsError::NotSupported
+                        )
+                    {
+                        let mut dirty = self.dirty.write();
+                        dirty.ts = saved_ts;
+                        dirty.ts_dirty = true;
+                        drop(journal_guard);
+                        drop(_meta);
+                        drop(raw_guard);
+                        return Err(failure.error);
+                    }
+                    fs.io_faulted.store(true, Ordering::Release);
+                    flush_err = Some(failure.error);
+                }
+            }
+        }
+
+        for page in &pages {
+            let page_offset = u64::from(page.block_index) * PAGE_SIZE as u64;
+            if page_offset >= saved_logical_size {
+                break;
+            }
+            if let Some((limit, _, _)) = truncate_limit {
+                if page_offset >= limit {
+                    break;
+                }
+            }
+            let full_page_len = cmp::min(PAGE_SIZE, (saved_logical_size - page_offset) as usize);
+            let page_len = match truncate_limit {
+                Some((limit, false, _)) => cmp::min(
+                    PAGE_SIZE,
+                    (saved_logical_size.min(limit) - page_offset) as usize,
+                ),
+                _ => full_page_len,
+            };
+            match self.write_data_locked(
+                fs,
+                &mut raw_guard,
+                &mut journal_guard,
+                inode_target,
+                scratch,
+                page_offset,
+                &page.frame.as_slice()[..page_len],
+                Some(flush_ts),
+            ) {
+                Ok((n, _)) => {
+                    flushed_tx = true;
+                    flushed_count += 1;
+                    // Only drain pages whose full buffered payload was written;
+                    // a partial boundary page stays in `self.dirty` until
+                    // `truncate_mutation_inner` finishes cleanly, so any later
+                    // recoverable error preserves its unwritten tail bytes.
+                    if page_len == full_page_len {
+                        drain_count = flushed_count;
+                    }
+                    if let Some((track_end, committed_end)) = track_committed.as_mut() {
+                        let page_end = page_offset.saturating_add(n as u64);
+                        if page_offset <= **committed_end && page_end > **committed_end {
+                            **committed_end = page_end.min(*track_end);
+                        }
+                    }
+                    if n < page_len {
+                        fs.io_faulted.store(true, Ordering::Release);
+                        flush_err = Some(FsError::Io);
+                        break;
+                    }
+                    if let Err(error) = fs.ensure_io_healthy() {
+                        flush_err = Some(error);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if !fs.io_faulted.load(Ordering::Acquire)
+                        && matches!(
+                            error,
+                            FsError::NoSpace
+                                | FsError::NoMem
+                                | FsError::ReadOnly
+                                | FsError::PermDenied
+                                | FsError::NotSupported
+                        )
+                    {
+                        recoverable = true;
+                    } else {
+                        fs.io_faulted.store(true, Ordering::Release);
+                    }
+                    flush_err = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if let Some(error) = flush_err {
+            if recoverable {
+                pages.drain(0..drain_count);
+                fs.dec_dirty_pages_total(drain_count);
+                let still_dirty = !pages.is_empty();
+                if still_dirty {
+                    let mut dirty = self.dirty.write();
+                    dirty.pages = pages;
+                    dirty.logical_size = saved_logical_size;
+                    dirty.size_dirty = true;
+                    dirty.ts = saved_ts;
+                    dirty.ts_dirty = saved_ts_dirty;
+                }
+                drop(journal_guard);
+                drop(_meta);
+                drop(raw_guard);
+                if !still_dirty {
+                    fs.unregister_dirty_inode(self.ino);
+                }
+                return Err(error);
+            }
+            drop(pages);
+            fs.dec_dirty_pages_total(total_pages);
+            drop(journal_guard);
+            drop(_meta);
+            drop(raw_guard);
+            fs.unregister_dirty_inode(self.ino);
+            return Err(error);
+        }
+
+        if truncate_limit.is_some() {
+            pages.drain(0..drain_count);
+            fs.dec_dirty_pages_total(drain_count);
+            let still_dirty = !pages.is_empty() || (saved_ts_dirty && !flushed_tx);
+            if still_dirty {
+                let mut dirty = self.dirty.write();
+                dirty.size_dirty = !pages.is_empty();
+                dirty.pages = pages;
+                dirty.logical_size = if dirty.size_dirty {
+                    saved_logical_size
+                } else {
+                    0
+                };
+                dirty.ts = saved_ts;
+                dirty.ts_dirty = saved_ts_dirty;
+            }
+            drop(journal_guard);
+            drop(_meta);
+            drop(raw_guard);
+            if !still_dirty {
+                fs.unregister_dirty_inode(self.ino);
+            }
+        } else {
+            drop(pages);
+            fs.dec_dirty_pages_total(total_pages);
+            drop(journal_guard);
+            drop(_meta);
+            drop(raw_guard);
+            fs.unregister_dirty_inode(self.ino);
+        }
+        fs.ensure_io_healthy()?;
+        Ok(flushed_tx)
+    }
+
+    fn flush_dirty_holding_write_lock(&self, fs: &Ext2Fs) -> Result<bool, FsError> {
+        if self.dirty.read().is_empty() {
+            fs.unregister_dirty_inode(self.ino);
+            fs.ensure_io_healthy()?;
+            return Ok(false);
+        }
+        let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
+        self.flush_dirty_holding_write_lock_with_scratch(fs, &mut scratch, None, None)
+    }
+
+    pub(super) fn flush_dirty_to_disk_with_fs(&self, fs: &Ext2Fs) -> Result<bool, FsError> {
+        // Always serialize with `write_lock` before deciding the inode is clean
+        // so a concurrent `fsync()`/`sync()` cannot observe temporarily emptied
+        // `dirty.pages` and return success before active writeback completes.
+        let _inode_guard = self.write_lock.lock();
+        self.flush_dirty_holding_write_lock(fs)
+    }
+
+    fn flush_dirty_to_disk(&self) -> Result<bool, FsError> {
+        let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
+        self.flush_dirty_to_disk_with_fs(&fs)
+    }
+
+    /// Flush this inode's buffered dirty pages and synchronously write
+    /// `remaining` at `cursor` while the caller STILL holds `self.write_lock`
+    /// (and does NOT hold `self.raw` or `fs.meta_lock`).
+    ///
+    /// Keeping `self.write_lock` held across the spill prevents concurrent
+    /// `O_APPEND` writers or truncates from interleaving between the buffered
+    /// prefix (`written`) and `remaining`.
+    fn finish_buffered_write_synchronously(
+        &self,
+        fs: &Ext2Fs,
+        start_offset: u64,
+        written: usize,
+        cursor: u64,
+        remaining: &[u8],
+    ) -> Result<(usize, u64), FsError> {
+        let finish_err = |error: FsError| -> Result<(usize, u64), FsError> {
+            if written == 0 {
+                Err(error)
+            } else {
+                Ok((written, cursor))
+            }
+        };
+        let mut scratch = match Ext2MutationScratch::try_new_admitted(fs.block_size) {
+            Ok(scratch) => scratch,
+            Err(error) => return finish_err(error),
+        };
+        let mut committed_end = start_offset;
+        if let Err(error) = self.flush_dirty_holding_write_lock_with_scratch(
+            fs,
+            &mut scratch,
+            None,
+            Some((cursor, &mut committed_end)),
+        ) {
+            if written > 0 {
+                if !fs.io_faulted.load(Ordering::Acquire) {
+                    return Ok((written, cursor));
+                }
+                let committed_len = committed_end.saturating_sub(start_offset) as usize;
+                if committed_len > 0 {
+                    return Ok((committed_len, committed_end));
+                }
+            }
+            return Err(error);
+        }
+        let mut raw_guard = self.raw.write();
+        let _meta = fs.meta_lock.lock();
+        if let Err(error) = fs.ensure_io_healthy() {
+            return finish_err(error);
+        }
+        let inode_target = match fs.inode_write_target(self.ino) {
+            Ok(target) => target,
+            Err(error) => return finish_err(error),
+        };
+        let mut journal_guard = fs.journal.lock();
+        if journal_guard.is_none() {
+            return finish_err(FsError::ReadOnly);
+        }
+        let preflight_raw = *raw_guard;
+        if let Err(error) = preflight_write_range(
+            cursor,
+            remaining.len(),
+            fs.block_size as u64,
+            |file_block| match fs.map_file_block_with_scratch(
+                &preflight_raw,
+                file_block,
+                &mut scratch,
+            )? {
+                Some(physical) => {
+                    if fs.is_structural_metadata_block(physical)?
+                        || journal_guard
+                            .as_ref()
+                            .is_some_and(|journal| journal.contains_physical(physical))
+                    {
+                        return Err(FsError::Invalid);
+                    }
+                    Ok(true)
+                }
+                None => Ok((file_block as u64) < fs.tree_block_limit()),
+            },
+        ) {
+            return finish_err(error);
+        }
+        match self.write_data_locked(
+            fs,
+            &mut raw_guard,
+            &mut journal_guard,
+            inode_target,
+            &mut scratch,
+            cursor,
+            remaining,
+            None,
+        ) {
+            Ok((rest, final_off)) => Ok((written + rest, final_off)),
+            Err(error) => finish_err(error),
+        }
+    }
+
+    /// Buffered POSIX `write`/`pwrite` for non-`O_SYNC` handles on 4 KiB
+    /// coalescing devices. Copies into bounded physical page frames and defers
+    /// ordered-data JBD2 writeback until `fsync`/`sync`, dirty pressure, or
+    /// direct mutation; discarded without disk I/O if unlinked before flush.
+    fn write_buffered_mutation(
+        &self,
+        mode: Ext2WriteMode,
+        data: &[u8],
+    ) -> Result<(usize, u64), FsError> {
+        if !self.is_file_inner() {
+            return Err(FsError::IsDir);
+        }
+        let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
+        fs.ensure_io_healthy()?;
+        if data.is_empty() {
+            let offset = match mode {
+                Ext2WriteMode::Positioned(offset) => offset,
+                Ext2WriteMode::Append => self.size.load(Ordering::Acquire),
+            };
+            return Ok((0, offset));
+        }
+        if !fs.buffered_writeback_enabled() {
+            return self.write_mutation(mode, data);
+        }
+        if fs.dev.is_read_only() {
+            return Err(FsError::ReadOnly);
+        }
+
+        // Apply dirty-page backpressure before taking inode locks to respect
+        // lock ordering (`dirty_inodes` is leaf; writeback takes `write_lock`).
+        if fs.dirty_pages_total.load(Ordering::Acquire) >= MAX_DIRTY_PAGES_PER_FS {
+            fs.flush_all_dirty_inodes()?;
+        }
+
+        // Acquire `write_lock` and validate/register under it. If the dirty
+        // inode cap forces a drop-and-flush retry, loop so `current_size`,
+        // `O_APPEND` offset, and flags are recomputed atomically on re-entry.
+        let mut retried_inode_cap = false;
+        let (inode_guard, raw_guard, offset) = loop {
+            let inode_guard = self.write_lock.lock();
+            let raw_guard = self.raw.write();
+            fs.ensure_io_healthy()?;
+
+            let current_size = self.size.load(Ordering::Acquire);
+            let offset = match mode {
+                Ext2WriteMode::Positioned(offset) => offset,
+                Ext2WriteMode::Append => current_size,
+            };
+            if (raw_guard.flags & EXT2_IMMUTABLE_FL) != 0 {
+                return Err(FsError::PermDenied);
+            }
+            if raw_guard.flags & EXT2_UNSUPPORTED_WRITE_LAYOUT_FL != 0 {
+                return Err(FsError::NotSupported);
+            }
+            if (raw_guard.flags & EXT2_APPEND_FL) != 0
+                && matches!(mode, Ext2WriteMode::Positioned(_))
+                && offset != current_size
+            {
+                return Err(FsError::PermDenied);
+            }
+            let end_offset = offset
+                .checked_add(data.len() as u64)
+                .ok_or(FsError::Invalid)?;
+            fs.check_tree_size(&raw_guard, end_offset)?;
+            {
+                let journal_inum = fs.superblock.read().journal_inum;
+                if self.ino == journal_inum {
+                    return Err(FsError::PermDenied);
+                }
+                if fs.journal.lock().is_none() {
+                    return Err(FsError::ReadOnly);
+                }
+            }
+
+            // Sparse writes beyond current EOF fall back to the synchronous
+            // ordered-data path so sparse-gap zeroing remains exact.
+            if offset > current_size {
+                drop(raw_guard);
+                let _ = self.flush_dirty_holding_write_lock(&fs)?;
+                drop(inode_guard);
+                return self.write_mutation(mode, data);
+            }
+
+            // Pin canonical Arc in `fs.dirty_inodes` while linked so
+            // close()+open() preserves buffered writes.
+            if !self.unlinked.load(Ordering::Acquire) {
+                if let Some(canonical) = fs.inode_cache.get(self.ino) {
+                    if !fs.register_dirty_inode(&canonical)? {
+                        drop(raw_guard);
+                        drop(inode_guard);
+                        if !retried_inode_cap {
+                            retried_inode_cap = true;
+                            fs.flush_all_dirty_inodes()?;
+                            continue;
+                        }
+                        return self.write_mutation(mode, data);
+                    }
+                }
+            }
+            break (inode_guard, raw_guard, offset);
+        };
+
+        let mut scratch_opt: Option<Ext2MutationScratch> = None;
+        let mut written = 0usize;
+        let mut cursor = offset;
+        let now_sec = TimeSpec::now().sec as u32;
+
+        while written < data.len() {
+            let block_idx = match u32::try_from(cursor / PAGE_SIZE as u64) {
+                Ok(idx) => idx,
+                Err(_) => {
+                    if self.dirty.read().is_empty() {
+                        fs.unregister_dirty_inode(self.ino);
+                    }
+                    return if written == 0 {
+                        Err(FsError::Invalid)
+                    } else {
+                        Ok((written, cursor))
+                    };
+                }
+            };
+            let off_in_page = (cursor % PAGE_SIZE as u64) as usize;
+            let to_copy = cmp::min(PAGE_SIZE - off_in_page, data.len() - written);
+
+            let already_present = {
+                let mut dirty = self.dirty.write();
+                if let Ok(pos) = dirty
+                    .pages
+                    .binary_search_by_key(&block_idx, |p| p.block_index)
+                {
+                    dirty.pages[pos].frame.as_mut_slice()[off_in_page..off_in_page + to_copy]
+                        .copy_from_slice(&data[written..written + to_copy]);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if !already_present {
+                if fs.inc_dirty_pages_total().is_err() {
+                    // Hit global dirty cap mid-write: flush and finish remaining
+                    // bytes synchronously while STILL holding `inode_guard`.
+                    drop(raw_guard);
+                    let result = self.finish_buffered_write_synchronously(
+                        &fs,
+                        offset,
+                        written,
+                        cursor,
+                        &data[written..],
+                    );
+                    drop(inode_guard);
+                    return result;
+                }
+                let mut frame = match Ext2PageFrame::try_new() {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        fs.dec_dirty_pages_total(1);
+                        drop(raw_guard);
+                        let result = self.finish_buffered_write_synchronously(
+                            &fs,
+                            offset,
+                            written,
+                            cursor,
+                            &data[written..],
+                        );
+                        drop(inode_guard);
+                        return result;
+                    }
+                };
+                let rollback_page = |error: FsError| -> Result<(usize, u64), FsError> {
+                    fs.dec_dirty_pages_total(1);
+                    if self.dirty.read().is_empty() {
+                        fs.unregister_dirty_inode(self.ino);
+                    }
+                    if written == 0 {
+                        Err(error)
+                    } else {
+                        Ok((written, cursor))
+                    }
+                };
+                if to_copy != PAGE_SIZE {
+                    let scratch = match scratch_opt.as_mut() {
+                        Some(s) => s,
+                        None => match Ext2MutationScratch::try_new_admitted(fs.block_size) {
+                            Ok(s) => {
+                                scratch_opt = Some(s);
+                                match scratch_opt.as_mut() {
+                                    Some(s) => s,
+                                    None => return rollback_page(FsError::NoMem),
+                                }
+                            }
+                            Err(error) => return rollback_page(error),
+                        },
+                    };
+                    let phys_opt =
+                        match fs.map_file_block_with_scratch(&raw_guard, block_idx, scratch) {
+                            Ok(phys_opt) => phys_opt,
+                            Err(error) => return rollback_page(error),
+                        };
+                    if let Some(phys) = phys_opt {
+                        if let Err(error) = fs.read_block(phys, frame.as_mut_slice()) {
+                            return rollback_page(error);
+                        }
+                    }
+                }
+                frame.as_mut_slice()[off_in_page..off_in_page + to_copy]
+                    .copy_from_slice(&data[written..written + to_copy]);
+
+                let mut dirty = self.dirty.write();
+                match dirty
+                    .pages
+                    .binary_search_by_key(&block_idx, |p| p.block_index)
+                {
+                    Ok(pos) => {
+                        dirty.pages[pos].frame = frame;
+                        drop(dirty);
+                        fs.dec_dirty_pages_total(1);
+                    }
+                    Err(pos) => {
+                        if dirty.pages.try_reserve(1).is_err() {
+                            drop(dirty);
+                            return rollback_page(FsError::NoMem);
+                        }
+                        // lint-fallible: PREALLOCATED(try_reserve(1) on previous branch)
+                        dirty.pages.insert(
+                            pos,
+                            Ext2DirtyPage {
+                                block_index: block_idx,
+                                frame,
+                            },
+                        );
+                    }
+                }
+            }
+
+            let chunk_end = match cursor.checked_add(to_copy as u64) {
+                Some(end) => end,
+                None => {
+                    return if written == 0 {
+                        Err(FsError::Invalid)
+                    } else {
+                        Ok((written, cursor))
+                    };
+                }
+            };
+            let new_size = self.size.load(Ordering::Acquire).max(chunk_end);
+            {
+                let mut dirty = self.dirty.write();
+                dirty.logical_size = dirty.logical_size.max(new_size);
+                dirty.size_dirty = true;
+                dirty.ts = now_sec;
+                dirty.ts_dirty = true;
+            }
+            self.size.store(new_size, Ordering::Release);
+            self.publish_cached_write(cursor, &data[written..written + to_copy]);
+            written += to_copy;
+            cursor = chunk_end;
+        }
+
+        drop(raw_guard);
+        drop(inode_guard);
+        Ok((written, cursor))
     }
 
     /// R180-6 FIX: mapped blocks retain the ordered in-place update path, while
@@ -15509,6 +17236,10 @@ impl Ext2Inode {
         }
         let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
         let _inode_guard = self.write_lock.lock();
+        if !initializing && !self.dirty.read().is_empty() {
+            let _ =
+                self.flush_dirty_holding_write_lock_with_scratch(&fs, &mut scratch, None, None)?;
+        }
         let mut raw_guard = self.raw.write();
         // Different inodes can share one inode-table block.  Retaining the
         // filesystem metadata gate across preflight and every inode RMW avoids
@@ -15600,6 +17331,30 @@ impl Ext2Inode {
         // releasing admission and before the ordinary data/journal loop starts.
         drop(sparse_gap);
 
+        self.write_data_locked(
+            &fs,
+            &mut raw_guard,
+            &mut journal_guard,
+            inode_target,
+            &mut scratch,
+            offset,
+            data,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_data_locked(
+        &self,
+        fs: &Ext2Fs,
+        raw_guard: &mut Ext2InodeRaw,
+        journal_guard: &mut Option<Ext2Journal>,
+        inode_target: InodeWriteTarget,
+        scratch: &mut Ext2MutationScratch,
+        offset: u64,
+        data: &[u8],
+        timestamp_override: Option<u32>,
+    ) -> Result<(usize, u64), FsError> {
         let block_size = fs.block_size as usize;
         let mut written = 0usize;
         let mut cursor = offset;
@@ -15617,39 +17372,53 @@ impl Ext2Inode {
             let to_copy = cmp::min(block_size - offset_in_block, data.len() - written);
             let committed_raw = *raw_guard;
             let phys_block =
-                match fs.map_file_block_with_scratch(&committed_raw, file_block, &mut scratch) {
+                match fs.map_file_block_with_scratch(&committed_raw, file_block, scratch) {
                     Ok(block) => block,
                     Err(error) => return fail(error, written),
                 };
             let chunk_end = cursor.checked_add(to_copy as u64).ok_or(FsError::Invalid)?;
-            let published_size = self.size.load(Ordering::Acquire).max(chunk_end);
+            let on_disk_size = if committed_raw.mode & EXT2_S_IFMT == EXT2_S_IFREG {
+                ((committed_raw.size_high_or_dir_acl as u64) << 32)
+                    | u64::from(committed_raw.size_lo)
+            } else {
+                u64::from(committed_raw.size_lo)
+            };
+            let published_size = on_disk_size.max(chunk_end);
             let mut next_raw = committed_raw;
             next_raw.size_lo = published_size as u32;
             next_raw.size_high_or_dir_acl = (published_size >> 32) as u32;
-            let now = TimeSpec::now();
-            next_raw.mtime = now.sec as u32;
-            next_raw.ctime = now.sec as u32;
+            let ts = timestamp_override.unwrap_or_else(|| TimeSpec::now().sec as u32);
+            next_raw.mtime = ts;
+            next_raw.ctime = ts;
 
             if let Some(phys_block) = phys_block {
-                let block_buf = scratch.block_mut();
-                if to_copy != block_size {
-                    if let Err(error) = fs.read_block(phys_block, block_buf) {
+                let batch_full_block = fs.dev.supports_coalesced_write() && to_copy == block_size;
+                let ordered_data = if batch_full_block {
+                    Some((phys_block, &data[written..written + block_size]))
+                } else {
+                    let block_buf = scratch.block_mut();
+                    if to_copy != block_size {
+                        if let Err(error) = fs.read_block(phys_block, block_buf) {
+                            return fail(error, written);
+                        }
+                    }
+                    block_buf[offset_in_block..offset_in_block + to_copy]
+                        .copy_from_slice(&data[written..written + to_copy]);
+                    if let Err(error) = fs.write_block(phys_block, block_buf) {
+                        if error != FsError::NoMem {
+                            fs.io_faulted.store(true, Ordering::Release);
+                        }
                         return fail(error, written);
                     }
-                }
-                block_buf[offset_in_block..offset_in_block + to_copy]
-                    .copy_from_slice(&data[written..written + to_copy]);
-                if let Err(error) = fs.write_block(phys_block, block_buf) {
-                    fs.io_faulted.store(true, Ordering::Release);
-                    return fail(error, written);
-                }
-                // Ordered-data barrier: `commit_metadata_transaction` flushes
-                // the device after writing `s_start`, descriptor, and metadata
-                // images and strictly before writing the JBD2 commit block, so
-                // `phys_block` is stabilized before any commit can become
-                // durable without a separate pre-transaction flush.
+                    None
+                };
+                // Ordered-data barrier: `commit_metadata_transaction_with_data`
+                // issues any pipelined data write together with `s_start`,
+                // descriptor, and metadata images and flushes strictly before
+                // writing the JBD2 commit block, so `phys_block` is stabilized
+                // before any commit can become durable.
                 let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
-                let transaction_failure = match fs.commit_metadata_transaction(
+                let transaction_failure = match fs.commit_metadata_transaction_with_data(
                     journal,
                     JournalMetadataPlan::InodeUpdate {
                         inode_number: self.ino,
@@ -15657,17 +17426,21 @@ impl Ext2Inode {
                         old_inode: committed_raw,
                         new_inode: next_raw,
                     },
-                    &mut scratch,
+                    ordered_data,
+                    scratch,
                 ) {
                     Ok(()) => None,
                     Err(failure) if failure.committed => Some(failure),
                     Err(failure) => {
-                        // The ordered data write has already been issued. Even
-                        // a cleanly aborted metadata transaction can leave an
-                        // existing-size overwrite visible on disk while the
-                        // page cache still contains old bytes, so continuing
-                        // the mount would be incoherent.
-                        fs.io_faulted.store(true, Ordering::Release);
+                        // If `ordered_data` was already submitted (either in the
+                        // non-pipelined branch above or before a post-submit
+                        // failure), an existing-size overwrite may be visible on
+                        // disk while page cache holds old bytes, so poison the
+                        // mount. A pre-submission allocation failure on the
+                        // pipelined path leaves disk and cache coherent.
+                        if failure.poison || ordered_data.is_none() {
+                            fs.io_faulted.store(true, Ordering::Release);
+                        }
                         return fail(failure.error, written);
                     }
                 };
@@ -15675,7 +17448,8 @@ impl Ext2Inode {
                 debug_assert_eq!(next_raw.blocks_lo, committed_raw.blocks_lo);
 
                 *raw_guard = next_raw;
-                self.size.store(published_size, Ordering::Release);
+                let logical_size = self.size.load(Ordering::Acquire).max(published_size);
+                self.size.store(logical_size, Ordering::Release);
                 self.publish_cached_write(cursor, &data[written..written + to_copy]);
                 written += to_copy;
                 cursor += to_copy as u64;
@@ -15690,7 +17464,7 @@ impl Ext2Inode {
 
             let journal = journal_guard.as_mut().ok_or(FsError::ReadOnly)?;
             if let Err(error) =
-                fs.ensure_tree_path(self, &mut raw_guard, file_block, journal, &mut scratch)
+                fs.ensure_tree_path(self, raw_guard, file_block, journal, scratch, Some(ts))
             {
                 return fail(error, written);
             }
@@ -15701,7 +17475,7 @@ impl Ext2Inode {
                 Ok(path) => path,
                 Err(error) => return fail(error, written),
             };
-            let edge = match fs.tree_edge(&committed_raw, file_block, 0, &[], &[], &mut scratch) {
+            let edge = match fs.tree_edge(&committed_raw, file_block, 0, &[], &[], scratch) {
                 Ok(edge) => edge,
                 Err(error) => return fail(error, written),
             };
@@ -15714,7 +17488,7 @@ impl Ext2Inode {
                 inode_pointer,
                 inode_target,
                 journal,
-                &mut scratch,
+                scratch,
             ) {
                 Ok(plan) => plan,
                 Err(error) => return fail(error, written),
@@ -15745,29 +17519,39 @@ impl Ext2Inode {
             };
 
             // Ordered-data rule: initialize the complete new block before the
-            // metadata transaction runs; `commit_metadata_transaction` issues
-            // its pre-commit `flush_device()` strictly before writing the JBD2
-            // commit block, stabilizing the new data block before any metadata
-            // can make it reachable.
-            let block_buf = scratch.block_mut();
-            block_buf.fill(0);
-            block_buf[offset_in_block..offset_in_block + to_copy]
-                .copy_from_slice(&data[written..written + to_copy]);
-            if let Err(error) = fs.write_block(plan.phys_block, block_buf) {
-                return fail(error, written);
-            }
+            // metadata transaction runs; `commit_metadata_transaction_with_data`
+            // issues its pre-commit `flush_device()` strictly before writing
+            // the JBD2 commit block, stabilizing the new data block before any
+            // metadata can make it reachable.
+            let batch_full_block = fs.dev.supports_coalesced_write() && to_copy == block_size;
+            let ordered_data = if batch_full_block {
+                Some((plan.phys_block, &data[written..written + block_size]))
+            } else {
+                let block_buf = scratch.block_mut();
+                block_buf.fill(0);
+                block_buf[offset_in_block..offset_in_block + to_copy]
+                    .copy_from_slice(&data[written..written + to_copy]);
+                if let Err(error) = fs.write_block(plan.phys_block, block_buf) {
+                    return fail(error, written);
+                }
+                None
+            };
 
-            let transaction_failure =
-                match fs.commit_metadata_transaction(journal, metadata_plan, &mut scratch) {
-                    Ok(()) => None,
-                    Err(failure) if failure.committed => Some(failure),
-                    Err(failure) => {
-                        if failure.poison {
-                            fs.io_faulted.store(true, Ordering::Release);
-                        }
-                        return fail(failure.error, written);
+            let transaction_failure = match fs.commit_metadata_transaction_with_data(
+                journal,
+                metadata_plan,
+                ordered_data,
+                scratch,
+            ) {
+                Ok(()) => None,
+                Err(failure) if failure.committed => Some(failure),
+                Err(failure) => {
+                    if failure.poison {
+                        fs.io_faulted.store(true, Ordering::Release);
                     }
-                };
+                    return fail(failure.error, written);
+                }
+            };
 
             // The commit is durable at this point even when checkpoint or log
             // clearing subsequently failed. Publish exactly the state recovery
@@ -15775,7 +17559,8 @@ impl Ext2Inode {
             fs.superblock.write().free_blocks_count = plan.new_super_free_blocks;
             fs.group_descs.write()[plan.group] = plan.new_group_desc;
             *raw_guard = plan.new_inode;
-            self.size.store(published_size, Ordering::Release);
+            let logical_size = self.size.load(Ordering::Acquire).max(published_size);
+            self.size.store(logical_size, Ordering::Release);
             self.publish_cached_write(cursor, &data[written..written + to_copy]);
             written += to_copy;
             cursor += to_copy as u64;
@@ -15813,7 +17598,17 @@ impl Inode for Ext2Inode {
     fn stat(&self) -> Result<Stat, FsError> {
         let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
         fs.ensure_io_healthy()?;
-        let raw = *self.raw.read();
+        let raw_guard = self.raw.read();
+        let raw = *raw_guard;
+        let (mtime, ctime) = {
+            let dirty = self.dirty.read();
+            if dirty.ts_dirty {
+                (dirty.ts, dirty.ts)
+            } else {
+                (raw.mtime, raw.ctime)
+            }
+        };
+        drop(raw_guard);
         let size = self.size.load(Ordering::Acquire);
         let (uid, gid) = raw.owner_ids(fs.superblock.read().creator_os);
 
@@ -15829,8 +17624,8 @@ impl Inode for Ext2Inode {
             blksize: fs.block_size,
             blocks: raw.blocks_lo as u64,
             atime: TimeSpec::new(raw.atime as i64, 0),
-            mtime: TimeSpec::new(raw.mtime as i64, 0),
-            ctime: TimeSpec::new(raw.ctime as i64, 0),
+            mtime: TimeSpec::new(mtime as i64, 0),
+            ctime: TimeSpec::new(ctime as i64, 0),
         })
     }
 
@@ -16070,8 +17865,22 @@ impl Inode for Ext2Inode {
             .map(|(written, _)| written)
     }
 
+    fn write_buffered_at(&self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        self.write_buffered_mutation(Ext2WriteMode::Positioned(offset), data)
+            .map(|(written, _)| written)
+    }
+
     fn append_write(&self, data: &[u8]) -> Result<(usize, u64), FsError> {
         self.write_mutation(Ext2WriteMode::Append, data)
+    }
+
+    fn append_write_buffered(&self, data: &[u8]) -> Result<(usize, u64), FsError> {
+        self.write_buffered_mutation(Ext2WriteMode::Append, data)
+    }
+
+    fn flush_buffered(&self) -> Result<(), FsError> {
+        let _ = self.flush_dirty_to_disk()?;
+        Ok(())
     }
 
     fn truncate(&self, len: u64) -> Result<(), FsError> {
@@ -16179,6 +17988,10 @@ mod st_k4_barrier_tests {
             io_faulted: AtomicBool::new(false),
             mapping_bytes: AtomicUsize::new(0),
             self_ref: Mutex::new(None),
+            meta_cache: Mutex::new(MetadataBlockCache::new()),
+            meta_cache_enabled: AtomicBool::new(false),
+            dirty_pages_total: AtomicUsize::new(0),
+            dirty_inodes: Mutex::new(Vec::new()),
         })
         .expect("synthetic ext2 filesystem");
         (device, fs)
@@ -16255,5 +18068,687 @@ mod st_k4_barrier_tests {
 
         device.hard_failure.store(false, Ordering::SeqCst);
         assert_eq!(FileSystem::sync(&*fs), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod ext2_fastpath_tests {
+    use super::*;
+    use block::{BlockError, DurabilityGuarantee};
+    use core::sync::atomic::AtomicUsize;
+
+    const BLK: usize = 4096;
+    const TOTAL_BLOCKS: usize = 64;
+    const JOURNAL_INO: u32 = 8;
+    const FILE_INO: u32 = 12;
+    const JOURNAL_FIRST_PHYS: u32 = 6;
+    const JOURNAL_LEN: u32 = 12;
+    const FIRST_FREE_BLOCK: u32 = 18;
+
+    struct CoalescingState {
+        live: Vec<u8>,
+        durable: Vec<u8>,
+    }
+
+    struct CoalescingCrashDevice {
+        state: Mutex<CoalescingState>,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+        batch_writes: AtomicUsize,
+        flushes: AtomicUsize,
+        fail_writes: AtomicBool,
+    }
+
+    impl CoalescingCrashDevice {
+        fn new(image: Vec<u8>) -> Self {
+            Self {
+                state: Mutex::new(CoalescingState {
+                    live: image.clone(),
+                    durable: image,
+                }),
+                reads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+                batch_writes: AtomicUsize::new(0),
+                flushes: AtomicUsize::new(0),
+                fail_writes: AtomicBool::new(false),
+            }
+        }
+
+        fn reset_counters(&self) {
+            self.reads.store(0, Ordering::SeqCst);
+            self.writes.store(0, Ordering::SeqCst);
+            self.batch_writes.store(0, Ordering::SeqCst);
+            self.flushes.store(0, Ordering::SeqCst);
+        }
+
+        fn durable_snapshot(&self) -> Vec<u8> {
+            self.state.lock().durable.clone()
+        }
+    }
+
+    impl BlockDevice for CoalescingCrashDevice {
+        fn name(&self) -> &str {
+            "ext2-coalescing-test"
+        }
+
+        fn sector_size(&self) -> u32 {
+            512
+        }
+
+        fn max_sectors_per_bio(&self) -> u32 {
+            128
+        }
+
+        fn capacity_sectors(&self) -> u64 {
+            (self.state.lock().live.len() / 512) as u64
+        }
+
+        fn submit_bio(&self, _bio: block::Bio) -> Result<(), BlockError> {
+            Err(BlockError::NotSupported)
+        }
+
+        fn read_sync(&self, sector: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+            // lint-fetch-add: allow (test-only counter)
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let start = (sector as usize) * 512;
+            let state = self.state.lock();
+            buf.copy_from_slice(&state.live[start..start + buf.len()]);
+            Ok(buf.len())
+        }
+
+        fn write_sync(&self, sector: u64, buf: &[u8]) -> Result<usize, BlockError> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(BlockError::Io);
+            }
+            // lint-fetch-add: allow (test-only counter)
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let start = (sector as usize) * 512;
+            let mut state = self.state.lock();
+            state.live[start..start + buf.len()].copy_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn write_batch_sync(&self, writes: &[(u64, &[u8])]) -> Result<(), BlockError> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(BlockError::Io);
+            }
+            // lint-fetch-add: allow (test-only counter)
+            self.batch_writes.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock();
+            for &(sector, buf) in writes {
+                let start = (sector as usize) * 512;
+                state.live[start..start + buf.len()].copy_from_slice(buf);
+            }
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<(), BlockError> {
+            // lint-fetch-add: allow (test-only counter)
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock();
+            let CoalescingState { live, durable } = &mut *state;
+            durable.copy_from_slice(live);
+            Ok(())
+        }
+
+        fn durability(&self) -> DurabilityGuarantee {
+            DurabilityGuarantee::FlushBarrier
+        }
+
+        fn supports_coalesced_write(&self) -> bool {
+            true
+        }
+    }
+
+    fn copy_struct<T>(image: &mut [u8], offset: usize, value: &T) {
+        let bytes =
+            unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
+        image[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn synthetic_4k_ext3_image() -> Vec<u8> {
+        let mut image = Vec::new();
+        image
+            .try_reserve_exact(TOTAL_BLOCKS * BLK)
+            .expect("4k ext3 test image");
+        // lint-fallible: PREALLOCATED(test fixture try_reserve_exact above)
+        image.resize(TOTAL_BLOCKS * BLK, 0u8);
+
+        let uuid = [0x42u8; 16];
+        let free_blocks = (TOTAL_BLOCKS as u32) - FIRST_FREE_BLOCK;
+        // Block layout for 4 KiB ext3 (first_data_block = 0):
+        //   0: superblock (at byte 1024)
+        //   1: BGDT
+        //   2: block bitmap
+        //   3: inode bitmap
+        //   4: inode table (32 inodes * 128 B = 4096 B)
+        //   5: root dir data block
+        //   8..20: journal (12 contiguous 4 KiB blocks)
+        //   20..64: free data blocks
+        let mut sb: Ext2Superblock = unsafe { core::mem::zeroed() };
+        sb.inodes_count = 32;
+        sb.blocks_count = TOTAL_BLOCKS as u32;
+        sb.free_blocks_count = free_blocks;
+        sb.free_inodes_count = 32 - 11; // 1..=10 + 12 allocated
+        sb.first_data_block = 0;
+        sb.log_block_size = 2; // 1024 << 2 = 4096
+        sb.log_frag_size = 2;
+        sb.blocks_per_group = TOTAL_BLOCKS as u32;
+        sb.frags_per_group = TOTAL_BLOCKS as u32;
+        sb.inodes_per_group = 32;
+        sb.magic = EXT2_SUPER_MAGIC;
+        sb.state = 1;
+        sb.rev_level = 1;
+        sb.first_ino = 11;
+        sb.inode_size = size_of::<Ext2InodeRaw>() as u16;
+        sb.feature_compat = EXT3_FEATURE_COMPAT_HAS_JOURNAL;
+        sb.feature_incompat = EXT2_FEATURE_INCOMPAT_FILETYPE;
+        sb.feature_ro_compat = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER;
+        sb.uuid = [0x99u8; 16];
+        sb.journal_uuid = uuid;
+        sb.journal_inum = JOURNAL_INO;
+        copy_struct(&mut image, SUPERBLOCK_OFFSET as usize, &sb);
+
+        let gd = Ext2GroupDesc {
+            block_bitmap: 2,
+            inode_bitmap: 3,
+            inode_table: 4,
+            free_blocks_count: free_blocks as u16,
+            free_inodes_count: (32 - 11) as u16,
+            used_dirs_count: 1,
+            ..Ext2GroupDesc::default()
+        };
+        copy_struct(&mut image, BLK, &gd);
+
+        // Mark blocks 0..20 allocated in block bitmap (block 2).
+        for blk in 0..FIRST_FREE_BLOCK {
+            image[2 * BLK + (blk / 8) as usize] |= 1u8 << (blk % 8);
+        }
+        // Mark inodes 1..=10 and 12 allocated in inode bitmap (block 3).
+        for ino in (1..=10u32).chain(core::iter::once(FILE_INO)) {
+            let bit = ino - 1;
+            image[3 * BLK + (bit / 8) as usize] |= 1u8 << (bit % 8);
+        }
+
+        let mut root = Ext2InodeRaw::default();
+        root.mode = EXT2_S_IFDIR | 0o755;
+        root.size_lo = BLK as u32;
+        root.links_count = 2;
+        root.blocks_lo = (BLK / 512) as u32;
+        root.block[0] = 5;
+        copy_struct(&mut image, 4 * BLK + size_of::<Ext2InodeRaw>(), &root);
+
+        let mut file = Ext2InodeRaw::default();
+        file.mode = EXT2_S_IFREG | 0o644;
+        file.links_count = 1;
+        copy_struct(
+            &mut image,
+            4 * BLK + (FILE_INO as usize - 1) * size_of::<Ext2InodeRaw>(),
+            &file,
+        );
+
+        let mut j_inode = Ext2InodeRaw::default();
+        j_inode.mode = EXT2_S_IFREG | 0o600;
+        j_inode.size_lo = JOURNAL_LEN * BLK as u32;
+        j_inode.blocks_lo = JOURNAL_LEN * (BLK / 512) as u32;
+        for logical in 0..JOURNAL_LEN as usize {
+            j_inode.block[logical] = JOURNAL_FIRST_PHYS + logical as u32;
+        }
+        copy_struct(
+            &mut image,
+            4 * BLK + (JOURNAL_INO as usize - 1) * size_of::<Ext2InodeRaw>(),
+            &j_inode,
+        );
+
+        let dir = &mut image[5 * BLK..6 * BLK];
+        for (off, ino, name, kind, len) in [
+            (0usize, 2u32, &b"."[..], EXT2_FT_DIR, 12u16),
+            (12, 2, &b".."[..], EXT2_FT_DIR, 12),
+            (
+                24,
+                FILE_INO,
+                &b"data"[..],
+                EXT2_FT_REG_FILE,
+                (BLK - 24) as u16,
+            ),
+        ] {
+            dir[off..off + 4].copy_from_slice(&ino.to_le_bytes());
+            dir[off + 4..off + 6].copy_from_slice(&len.to_le_bytes());
+            dir[off + 6] = name.len() as u8;
+            dir[off + 7] = kind;
+            dir[off + 8..off + 8 + name.len()].copy_from_slice(name);
+        }
+
+        let jsb =
+            &mut image[JOURNAL_FIRST_PHYS as usize * BLK..(JOURNAL_FIRST_PHYS as usize + 1) * BLK];
+        write_be_u32(jsb, 0, JBD2_MAGIC).unwrap();
+        write_be_u32(jsb, 4, JBD2_SUPERBLOCK_V2).unwrap();
+        write_be_u32(jsb, JBD2_SUPER_BLOCKSIZE_OFFSET, BLK as u32).unwrap();
+        write_be_u32(jsb, JBD2_SUPER_MAXLEN_OFFSET, JOURNAL_LEN).unwrap();
+        write_be_u32(jsb, JBD2_SUPER_FIRST_OFFSET, 1).unwrap();
+        write_be_u32(jsb, JBD2_SUPER_SEQUENCE_OFFSET, 1).unwrap();
+        write_be_u32(jsb, JBD2_SUPER_START_OFFSET, 0).unwrap();
+        write_be_u32(
+            jsb,
+            JBD2_SUPER_FEATURE_INCOMPAT_OFFSET,
+            JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_ZERO_INTENT,
+        )
+        .unwrap();
+        jsb[JBD2_SUPER_UUID_OFFSET..JBD2_SUPER_UUID_OFFSET + 16].copy_from_slice(&uuid);
+        write_be_u32(jsb, JBD2_SUPER_NR_USERS_OFFSET, 1).unwrap();
+
+        image
+    }
+
+    #[test]
+    fn coalesced_journal_and_metadata_cache_preserve_crash_recovery() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        assert!(fs.meta_cache_enabled.load(Ordering::Acquire));
+
+        let file = fs.load_inode(FILE_INO).unwrap();
+        dev.reset_counters();
+
+        // Buffered write stays in memory with zero disk writes/flushes.
+        let p1 = [0xABu8; BLK];
+        assert_eq!(file.write_buffered_at(0, &p1), Ok(BLK));
+        assert_eq!(dev.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(dev.batch_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(dev.flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(file.stat().unwrap().size, BLK as u64);
+
+        // Read-your-writes coherence before sync().
+        let mut rbuf = [0u8; BLK];
+        assert_eq!(file.read_at(0, &mut rbuf), Ok(BLK));
+        assert_eq!(rbuf, p1);
+
+        // fsync()/sync() flushes via pipelined ordered-data JBD2 with 3 flushes.
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        assert!(dev.batch_writes.load(Ordering::SeqCst) >= 1);
+        assert_eq!(dev.flushes.load(Ordering::SeqCst), 3);
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+
+        // Even though the post-clear flush (#4) was deferred, durable media
+        // recovers cleanly to the exact post-image on power loss.
+        let snap1 = dev.durable_snapshot();
+        let rec_dev = Arc::try_new(CoalescingCrashDevice::new(snap1)).unwrap();
+        let rec_fs = Ext2Fs::mount(rec_dev.clone()).unwrap();
+        let rec_file = rec_fs.load_inode(FILE_INO).unwrap();
+        assert_eq!(rec_file.stat().unwrap().size, BLK as u64);
+        let phys1 = rec_file.raw.read().block[0];
+        assert_eq!(phys1, FIRST_FREE_BLOCK);
+        let mut check = [0u8; BLK];
+        assert_eq!(rec_fs.read_block(phys1, &mut check), Ok(()));
+        assert_eq!(check, p1);
+        drop(rec_file);
+        drop(rec_fs);
+        drop(rec_dev);
+
+        // Overwrite existing mapped block: metadata read cache avoids disk reads.
+        dev.reset_counters();
+        let p2 = [0xCDu8; BLK];
+        assert_eq!(file.write_buffered_at(0, &p2), Ok(BLK));
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        assert_eq!(dev.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(dev.batch_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(dev.flushes.load(Ordering::SeqCst), 3);
+
+        let snap2 = dev.durable_snapshot();
+        let rec_dev2 = Arc::try_new(CoalescingCrashDevice::new(snap2)).unwrap();
+        let rec_fs2 = Ext2Fs::mount(rec_dev2).unwrap();
+        let rec_file2 = rec_fs2.load_inode(FILE_INO).unwrap();
+        let phys2 = rec_file2.raw.read().block[0];
+        assert_eq!(phys2, FIRST_FREE_BLOCK);
+        let mut check2 = [0u8; BLK];
+        assert_eq!(rec_fs2.read_block(phys2, &mut check2), Ok(()));
+        assert_eq!(check2, p2);
+    }
+
+    #[test]
+    fn buffered_write_close_open_and_unlink_discard_without_disk_io() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let root = fs.root_inode();
+
+        let created = fs
+            .create(
+                &root,
+                "tmp.bin",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+        let created_ino = created.ino();
+        dev.reset_counters();
+
+        // Buffer 3 pages without syncing, then drop handle (close).
+        for i in 0u64..3 {
+            let page = [0x10u8 + i as u8; BLK];
+            assert_eq!(created.write_buffered_at(i * BLK as u64, &page), Ok(BLK));
+        }
+        assert_eq!(dev.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(dev.batch_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(dev.flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 3);
+        drop(created);
+
+        // Re-opening after close() still sees buffered dirty pages via dirty_inodes pin.
+        let reopened = fs.lookup(&root, "tmp.bin").unwrap();
+        assert_eq!(reopened.stat().unwrap().size, (3 * BLK) as u64);
+        let mut rbuf = [0u8; BLK];
+        assert_eq!(reopened.read_at(2 * BLK as u64, &mut rbuf), Ok(BLK));
+        assert_eq!(rbuf, [0x12u8; BLK]);
+        drop(reopened);
+
+        // Unlinking discards all 3 dirty pages in RAM without allocating/freeing data blocks.
+        dev.reset_counters();
+        fs.unlink(
+            &root,
+            "tmp.bin",
+            created_ino,
+            Some(false),
+            &crate::topology::write().setup(0, 0),
+        )
+        .unwrap();
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+        // Only UNLINK (3 flushes) + INODE_FREE (3 flushes) = 6 flushes (no 3x DirectFree!).
+        assert_eq!(dev.flushes.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn buffered_write_unlink_while_open_preserves_data_until_drop() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let root = fs.root_inode();
+
+        let opened = fs
+            .create(
+                &root,
+                "open.bin",
+                FileMode::regular(0o600),
+                &crate::topology::write().setup(0, 0),
+            )
+            .unwrap();
+        let ino = opened.ino();
+        let payload = [0x5Au8; BLK];
+        assert_eq!(opened.write_buffered_at(0, &payload), Ok(BLK));
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 1);
+
+        // Unlink while handle is still open: dirty data must stay readable!
+        fs.unlink(
+            &root,
+            "open.bin",
+            ino,
+            Some(false),
+            &crate::topology::write().setup(0, 0),
+        )
+        .unwrap();
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 1);
+        let mut rbuf = [0u8; BLK];
+        assert_eq!(opened.read_at(0, &mut rbuf), Ok(BLK));
+        assert_eq!(rbuf, payload);
+
+        // Closing the final handle drops dirty pages cleanly and reaps the orphan.
+        drop(opened);
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn buffered_truncate_zero_and_metadata_cache_error_invalidation() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let file = fs.load_inode(FILE_INO).unwrap();
+        dev.reset_counters();
+
+        assert_eq!(file.write_buffered_at(0, &[0x77u8; BLK]), Ok(BLK));
+        assert_eq!(file.truncate(0), Ok(()));
+        assert_eq!(dev.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(dev.flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(file.stat().unwrap().size, 0);
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+
+        // Verify metadata cache invalidates fail-closed on a write error.
+        let mut blk = [0u8; BLK];
+        assert_eq!(fs.read_physical_block(0, &mut blk), Ok(()));
+        dev.reset_counters();
+        assert_eq!(fs.read_physical_block(0, &mut blk), Ok(()));
+        assert_eq!(dev.reads.load(Ordering::SeqCst), 0);
+
+        dev.fail_writes.store(true, Ordering::SeqCst);
+        assert_eq!(fs.write_physical_block(0, &blk), Err(FsError::Io));
+        dev.fail_writes.store(false, Ordering::SeqCst);
+
+        dev.reset_counters();
+        assert_eq!(fs.read_physical_block(0, &mut blk), Ok(()));
+        assert_eq!(dev.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn buffered_partial_truncate_and_drop_writeback_recover_cleanly() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let file = fs.load_inode(FILE_INO).unwrap();
+
+        // Buffer 8 KiB into an empty file, then truncate to 4 KiB:
+        // must flush only block 0 (4 KiB), reconcile size to 4096, and NEVER
+        // commit an invalid no-op InodeShrink(4096 -> 4096).
+        let p0 = [0x33u8; BLK];
+        let p1 = [0x44u8; BLK];
+        assert_eq!(file.write_buffered_at(0, &p0), Ok(BLK));
+        assert_eq!(file.write_buffered_at(BLK as u64, &p1), Ok(BLK));
+        assert_eq!(file.truncate(BLK as u64), Ok(()));
+        assert_eq!(file.stat().unwrap().size, BLK as u64);
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+
+        // Verify durable snapshot after buffered truncate mounts and recovers cleanly.
+        let snap_trunc = dev.durable_snapshot();
+        let rec_dev = Arc::try_new(CoalescingCrashDevice::new(snap_trunc)).unwrap();
+        let rec_fs = Ext2Fs::mount(rec_dev).unwrap();
+        let rec_file = rec_fs.load_inode(FILE_INO).unwrap();
+        assert_eq!(rec_file.stat().unwrap().size, BLK as u64);
+        let phys = rec_file.raw.read().block[0];
+        assert_eq!(phys, FIRST_FREE_BLOCK);
+        let mut check = [0u8; BLK];
+        assert_eq!(rec_fs.read_block(phys, &mut check), Ok(()));
+        assert_eq!(check, p0);
+        drop(rec_file);
+        drop(rec_fs);
+
+        // Buffer a new overwrite, then drop the filesystem (simulating unmount):
+        // Drop for Ext2Fs must flush buffered writes to durable media.
+        let p2 = [0x99u8; BLK];
+        assert_eq!(file.write_buffered_at(0, &p2), Ok(BLK));
+        drop(file);
+        drop(fs);
+        let snap_unmount = dev.durable_snapshot();
+        let rec_dev2 = Arc::try_new(CoalescingCrashDevice::new(snap_unmount)).unwrap();
+        let rec_fs2 = Ext2Fs::mount(rec_dev2).unwrap();
+        let rec_file2 = rec_fs2.load_inode(FILE_INO).unwrap();
+        let phys2 = rec_file2.raw.read().block[0];
+        let mut check2 = [0u8; BLK];
+        assert_eq!(rec_fs2.read_block(phys2, &mut check2), Ok(()));
+        assert_eq!(check2, p2);
+    }
+
+    #[test]
+    fn buffered_flush_enospc_preserves_dirty_pages_and_mount_health() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let root = fs.root_inode();
+        let topo = crate::topology::write();
+        let creds = topo.setup(0, 0);
+
+        // Exhaust all 46 free data blocks using 4 filler files (12 + 12 + 12 + 10).
+        let mut last_filler = None;
+        for (idx, blocks) in [(0usize, 12usize), (1, 12), (2, 12), (3, 10)] {
+            let name = match idx {
+                0 => "f0",
+                1 => "f1",
+                2 => "f2",
+                _ => "f3",
+            };
+            let f = fs
+                .create(&root, name, FileMode::regular(0o600), &creds)
+                .unwrap();
+            for b in 0..blocks {
+                assert_eq!(
+                    f.write_buffered_at((b * BLK) as u64, &[0x11u8; BLK]),
+                    Ok(BLK)
+                );
+            }
+            assert_eq!(FileSystem::sync(&*fs), Ok(()));
+            last_filler = Some(f);
+        }
+        assert_eq!(fs.superblock.read().free_blocks_count, 0);
+
+        // Buffer 2 pages into FILE_INO on a full filesystem.
+        let file = fs.load_inode(FILE_INO).unwrap();
+        let p0 = [0xA5u8; BLK];
+        let p1 = [0x5Au8; BLK];
+        assert_eq!(file.write_buffered_at(0, &p0), Ok(BLK));
+        assert_eq!(file.write_buffered_at(BLK as u64, &p1), Ok(BLK));
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 2);
+
+        // Sync must return NoSpace WITHOUT poisoning the mount or discarding dirty pages.
+        assert_eq!(FileSystem::sync(&*fs), Err(FsError::NoSpace));
+        assert!(!fs.io_faulted.load(Ordering::Acquire));
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 2);
+        let mut rbuf = [0u8; BLK];
+        assert_eq!(file.read_at(0, &mut rbuf), Ok(BLK));
+        assert_eq!(rbuf, p0);
+        assert_eq!(file.read_at(BLK as u64, &mut rbuf), Ok(BLK));
+        assert_eq!(rbuf, p1);
+
+        // Free space by truncating the last filler file, then retry sync().
+        assert_eq!(last_filler.unwrap().truncate(0), Ok(()));
+        assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+
+        let snap = dev.durable_snapshot();
+        let rec_dev = Arc::try_new(CoalescingCrashDevice::new(snap)).unwrap();
+        let rec_fs = Ext2Fs::mount(rec_dev).unwrap();
+        let rec_file = rec_fs.load_inode(FILE_INO).unwrap();
+        assert_eq!(rec_file.stat().unwrap().size, (2 * BLK) as u64);
+        let b0 = rec_file.raw.read().block[0];
+        let b1 = rec_file.raw.read().block[1];
+        let mut check = [0u8; BLK];
+        assert_eq!(rec_fs.read_block(b0, &mut check), Ok(()));
+        assert_eq!(check, p0);
+        assert_eq!(rec_fs.read_block(b1, &mut check), Ok(()));
+        assert_eq!(check, p1);
+    }
+
+    #[test]
+    fn buffered_truncate_enospc_preserves_size_and_pages_atomically() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let root = fs.root_inode();
+        let topo = crate::topology::write();
+        let creds = topo.setup(0, 0);
+
+        for (idx, blocks) in [(0usize, 12usize), (1, 12), (2, 12), (3, 10)] {
+            let name = match idx {
+                0 => "t0",
+                1 => "t1",
+                2 => "t2",
+                _ => "t3",
+            };
+            let f = fs
+                .create(&root, name, FileMode::regular(0o600), &creds)
+                .unwrap();
+            for b in 0..blocks {
+                assert_eq!(
+                    f.write_buffered_at((b * BLK) as u64, &[0x22u8; BLK]),
+                    Ok(BLK)
+                );
+            }
+            assert_eq!(FileSystem::sync(&*fs), Ok(()));
+        }
+
+        let file = fs.load_inode(FILE_INO).unwrap();
+        let p0 = [0xC1u8; BLK];
+        let p1 = [0xD2u8; BLK];
+        assert_eq!(file.write_buffered_at(0, &p0), Ok(BLK));
+        assert_eq!(file.write_buffered_at(BLK as u64, &p1), Ok(BLK));
+
+        // Partial truncate hits ENOSPC flushing block 0: must NOT drop block 1
+        // or poison the mount, and must keep logical size at 8 KiB.
+        assert_eq!(file.truncate(BLK as u64), Err(FsError::NoSpace));
+        assert!(!fs.io_faulted.load(Ordering::Acquire));
+        assert_eq!(file.stat().unwrap().size, (2 * BLK) as u64);
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 2);
+        let mut rbuf = [0u8; BLK];
+        assert_eq!(file.read_at(0, &mut rbuf), Ok(BLK));
+        assert_eq!(rbuf, p0);
+        assert_eq!(file.read_at(BLK as u64, &mut rbuf), Ok(BLK));
+        assert_eq!(rbuf, p1);
+    }
+
+    #[test]
+    fn buffered_write_close_rename_flushes_before_publish() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let root = fs.root_inode();
+        let topo = crate::topology::write();
+        let creds = topo.setup(0, 0);
+
+        // Simulate `open(tmp) -> write(4096 + 192) -> close -> rename(tmp, final)`
+        // without an explicit fsync(), matching nilix_syz_executor / atomic save.
+        let tmp = fs
+            .create(&root, "result.tmp", FileMode::regular(0o600), &creds)
+            .unwrap();
+        let tmp_ino = tmp.ino();
+        let mut payload = [0u8; BLK + 192];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        assert_eq!(tmp.write_buffered_at(0, &payload), Ok(payload.len()));
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 2);
+        drop(tmp);
+
+        fs.rename(
+            &root,
+            "result.tmp",
+            &root,
+            "result.bin",
+            true,
+            tmp_ino,
+            None,
+            &creds,
+        )
+        .unwrap();
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+
+        // Immediate power loss right after rename() must recover the full file.
+        let snap = dev.durable_snapshot();
+        let rec_dev = Arc::try_new(CoalescingCrashDevice::new(snap)).unwrap();
+        let rec_fs = Ext2Fs::mount(rec_dev).unwrap();
+        let rec_root = rec_fs.root_inode();
+        let rec_file = rec_fs.lookup(&rec_root, "result.bin").unwrap();
+        assert_eq!(rec_file.stat().unwrap().size, payload.len() as u64);
+        let rec_ext2 = rec_file.as_any().downcast_ref::<Ext2Inode>().unwrap();
+        let b0 = rec_ext2.raw.read().block[0];
+        let b1 = rec_ext2.raw.read().block[1];
+        let mut blk = [0u8; BLK];
+        assert_eq!(rec_fs.read_block(b0, &mut blk), Ok(()));
+        assert_eq!(&blk[..], &payload[..BLK]);
+        assert_eq!(rec_fs.read_block(b1, &mut blk), Ok(()));
+        assert_eq!(&blk[..192], &payload[BLK..]);
     }
 }

@@ -609,6 +609,7 @@ impl Ext2Fs {
         logical: u32,
         journal: &mut Ext2Journal,
         scratch: &mut Ext2MutationScratch,
+        timestamp_override: Option<u32>,
     ) -> Result<(), FsError> {
         self.check_tree_allocation_budget(raw, logical, scratch)?;
         let path = self.block_path(logical)?;
@@ -626,7 +627,7 @@ impl Ext2Fs {
             // The commit path rechecks and publishes the same budget delta.
             self.mapping_usage_after(1)?;
             let mut next = *raw;
-            next.mtime = TimeSpec::now().sec as u32;
+            next.mtime = timestamp_override.unwrap_or_else(|| TimeSpec::now().sec as u32);
             next.ctime = next.mtime;
             let block = self.plan_direct_allocation(
                 inode.ino,
@@ -693,7 +694,7 @@ impl Ext2Fs {
             .ok_or(FsError::NoSpace)?;
         self.check_tree_size(raw, u64::from(size))?;
         let logical = raw.size_lo / self.block_size;
-        self.ensure_tree_path(parent, raw, logical, journal, scratch)?;
+        self.ensure_tree_path(parent, raw, logical, journal, scratch, None)?;
         let edge = self.tree_edge(raw, logical, 0, &[], &[], scratch)?;
         if edge.physical != 0 {
             return Err(FsError::Invalid);

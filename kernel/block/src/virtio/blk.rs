@@ -601,21 +601,27 @@ pub struct VirtioBlkDevice {
 }
 
 struct LegacyDmaPool {
-    header: Option<DmaBuffer>,
+    headers: [Option<DmaBuffer>; 2],
     data_4k: Option<DmaBuffer>,
+    /// Reusable 32 KiB (8 x 4 KiB) bounce buffer for coalesced multi-block
+    /// journal/checkpoint writes in Legacy mode (`mm::dma::is_iommu_legacy()`).
+    data_32k: Option<DmaBuffer>,
 }
 
 impl LegacyDmaPool {
     const fn new() -> Self {
         Self {
-            header: None,
+            headers: [None, None],
             data_4k: None,
+            data_32k: None,
         }
     }
 
     fn clear(&mut self) {
-        self.header = None;
+        self.headers[0] = None;
+        self.headers[1] = None;
         self.data_4k = None;
+        self.data_32k = None;
     }
 }
 
@@ -1499,7 +1505,7 @@ impl VirtioBlkDevice {
         Ok(())
     }
 
-    /// Acquire a DMA bounce buffer, reusing a cached Legacy-mode page when
+    /// Acquire a DMA bounce buffer, reusing a cached Legacy-mode buffer when
     /// IOMMU is strictly inactive (`mm::dma::is_iommu_legacy()`). Any IOMMU
     /// probing/active/failed state drops cached buffers and delegates to
     /// on-demand `alloc_dma_buffer()` (R94-13).
@@ -1508,21 +1514,38 @@ impl VirtioBlkDevice {
         size: usize,
         is_header: bool,
     ) -> Result<DmaBuffer, mm::dma::DmaError> {
+        const LARGE_POOL_BYTES: usize = 32 * 1024;
         if mm::dma::is_iommu_legacy() {
-            if size <= 4096 {
+            if is_header && size <= 4096 {
                 let mut pool = self.legacy_dma_pool.lock();
-                let slot = if is_header {
-                    &mut pool.header
-                } else {
-                    &mut pool.data_4k
-                };
-                if let Some(buf) = slot.take() {
+                for slot in &mut pool.headers {
+                    if let Some(buf) = slot.take() {
+                        if !buf.is_iommu_mapped() && buf.size() >= size {
+                            return Ok(buf);
+                        }
+                        drop(buf);
+                    }
+                }
+            } else if !is_header && size <= 4096 {
+                let mut pool = self.legacy_dma_pool.lock();
+                if let Some(buf) = pool.data_4k.take() {
                     if !buf.is_iommu_mapped() && buf.size() >= size {
                         return Ok(buf);
                     }
-                    // Incompatible or IOMMU-mapped: drop immediately.
                     drop(buf);
                 }
+            } else if !is_header && size <= LARGE_POOL_BYTES {
+                let mut pool = self.legacy_dma_pool.lock();
+                if let Some(buf) = pool.data_32k.take() {
+                    if !buf.is_iommu_mapped() && buf.size() >= size {
+                        return Ok(buf);
+                    }
+                    drop(buf);
+                }
+                drop(pool);
+                // Allocate the full 32 KiB pool size so subsequent coalesced
+                // journal/checkpoint writes up to 8 blocks hit the cached slot.
+                return alloc_dma_buffer(LARGE_POOL_BYTES);
             }
         } else {
             self.legacy_dma_pool.lock().clear();
@@ -1530,20 +1553,32 @@ impl VirtioBlkDevice {
         alloc_dma_buffer(size)
     }
 
-    /// Return a cleanly retired Legacy-mode 4 KiB DMA buffer to the single-slot
-    /// pool. IOMMU-mapped buffers or non-4 KiB buffers are always dropped so
+    /// Return a cleanly retired Legacy-mode 4 KiB or 32 KiB DMA buffer to the
+    /// pool. IOMMU-mapped or other-sized buffers are always dropped so
     /// `DmaBuffer::drop()` unmaps and scrubs them immediately (R94-13).
     fn recycle_dma_buffer(&self, buf: DmaBuffer, is_header: bool) {
-        if !buf.is_iommu_mapped() && buf.size() == 4096 && mm::dma::is_iommu_legacy() {
-            let mut pool = self.legacy_dma_pool.lock();
-            let slot = if is_header {
-                &mut pool.header
-            } else {
-                &mut pool.data_4k
-            };
-            if slot.is_none() {
-                *slot = Some(buf);
-                return;
+        const LARGE_POOL_BYTES: usize = 32 * 1024;
+        if !buf.is_iommu_mapped() && mm::dma::is_iommu_legacy() {
+            if is_header && buf.size() == 4096 {
+                let mut pool = self.legacy_dma_pool.lock();
+                for slot in &mut pool.headers {
+                    if slot.is_none() {
+                        *slot = Some(buf);
+                        return;
+                    }
+                }
+            } else if !is_header && buf.size() == 4096 {
+                let mut pool = self.legacy_dma_pool.lock();
+                if pool.data_4k.is_none() {
+                    pool.data_4k = Some(buf);
+                    return;
+                }
+            } else if !is_header && buf.size() == LARGE_POOL_BYTES {
+                let mut pool = self.legacy_dma_pool.lock();
+                if pool.data_32k.is_none() {
+                    pool.data_32k = Some(buf);
+                    return;
+                }
             }
         }
         drop(buf);
@@ -1879,6 +1914,250 @@ impl VirtioBlkDevice {
 
         result
     }
+
+    /// Pipeline two independent synchronous writes in one virtqueue notify
+    /// round-trip (VirtIO 1.2 compliant: both complete before any subsequent
+    /// flush barrier is submitted). Falls back cleanly to sequential writes
+    /// if resource allocation fails before submission.
+    fn do_write_pair(&self, reqs: [(u64, &[u8]); 2]) -> Result<(), BlockError> {
+        if self.device_failed.load(Ordering::Acquire) {
+            return Err(BlockError::Offline);
+        }
+        if self.read_only {
+            return Err(BlockError::ReadOnly);
+        }
+        let mut header_sectors = [0u64; 2];
+        for i in 0..2 {
+            let (sector, buf) = reqs[i];
+            if buf.len() > u32::MAX as usize {
+                return Err(BlockError::Invalid);
+            }
+            header_sectors[i] = self.geometry.virtio_header_sector(sector, buf.len())?;
+        }
+
+        let _lock = self.lock.lock();
+        if self.device_failed.load(Ordering::Acquire) {
+            return Err(BlockError::Offline);
+        }
+        if self.queue.is_fatal() {
+            self.reset_device(&_lock)?;
+        }
+
+        // Acquire two request buffer slots atomically before allocating DMA/descs.
+        let mut buf_indices = [0usize; 2];
+        {
+            let mut buffers = self.req_buffers.lock();
+            let mut found = 0usize;
+            for (idx, b) in buffers.iter().enumerate() {
+                if !b.in_use {
+                    buf_indices[found] = idx;
+                    found += 1;
+                    if found == 2 {
+                        break;
+                    }
+                }
+            }
+            if found < 2 {
+                return Err(BlockError::Busy);
+            }
+            for i in 0..2 {
+                let slot = &mut buffers[buf_indices[i]];
+                slot.in_use = true;
+                slot.header.req_type = blk_types::VIRTIO_BLK_T_OUT;
+                slot.header.reserved = 0;
+                slot.header.sector = header_sectors[i];
+                slot.status = 0xFF;
+            }
+        }
+
+        let header_size = core::mem::size_of::<VirtioBlkReqHeader>();
+        let header_status_dma_size = if header_size + 1 < 32 {
+            32
+        } else {
+            header_size + 1
+        };
+
+        let mut hdr_dmas: [Option<DmaBuffer>; 2] = [None, None];
+        let mut data_dmas: [Option<DmaBuffer>; 2] = [None, None];
+        let mut descs: [[u16; 3]; 2] = [[0; 3]; 2];
+        let mut desc_allocated = [0usize; 2];
+
+        let release_pre_submit =
+            |buf_indices: [usize; 2], descs: [[u16; 3]; 2], desc_allocated: [usize; 2]| {
+                for i in 0..2 {
+                    for k in 0..desc_allocated[i] {
+                        self.queue.free_desc(descs[i][k]);
+                    }
+                }
+                let mut buffers = self.req_buffers.lock();
+                for i in 0..2 {
+                    buffers[buf_indices[i]].in_use = false;
+                }
+            };
+
+        for i in 0..2 {
+            let hdr = match self.acquire_dma_buffer(header_status_dma_size, true) {
+                Ok(b) => b,
+                Err(_) => {
+                    release_pre_submit(buf_indices, descs, desc_allocated);
+                    return Err(BlockError::NoMem);
+                }
+            };
+            let data_buf = reqs[i].1;
+            let data = match self.acquire_dma_buffer(data_buf.len(), false) {
+                Ok(b) => b,
+                Err(_) => {
+                    drop(hdr);
+                    release_pre_submit(buf_indices, descs, desc_allocated);
+                    return Err(BlockError::NoMem);
+                }
+            };
+            for k in 0..3 {
+                match self.queue.alloc_desc() {
+                    Some(d) => {
+                        descs[i][k] = d;
+                        desc_allocated[i] = k + 1;
+                    }
+                    None => {
+                        drop(data);
+                        drop(hdr);
+                        release_pre_submit(buf_indices, descs, desc_allocated);
+                        return Err(BlockError::Busy);
+                    }
+                }
+            }
+            hdr_dmas[i] = Some(hdr);
+            data_dmas[i] = Some(data);
+        }
+
+        // Populate headers, copy payloads, wire descriptor chains, and publish metadata.
+        for i in 0..2 {
+            let hdr_dma = hdr_dmas[i].take().unwrap();
+            let data_dma = data_dmas[i].take().unwrap();
+            let buf = reqs[i].1;
+            let buf_len = buf.len();
+            unsafe {
+                let header = self.req_buffers.lock()[buf_indices[i]].header;
+                core::ptr::write(hdr_dma.virt_ptr() as *mut VirtioBlkReqHeader, header);
+                core::ptr::write(hdr_dma.virt_ptr().add(header_size), 0xFFu8);
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), data_dma.virt_ptr(), buf_len);
+                if buf_len < data_dma.size() {
+                    core::ptr::write_bytes(
+                        data_dma.virt_ptr().add(buf_len),
+                        0,
+                        data_dma.size() - buf_len,
+                    );
+                }
+                let [desc0, desc1, desc2] = descs[i];
+                let d0 = self.queue.desc(desc0);
+                d0.addr = hdr_dma.phys();
+                d0.len = header_size as u32;
+                d0.flags = VRING_DESC_F_NEXT;
+                d0.next = desc1;
+
+                let d1 = self.queue.desc(desc1);
+                d1.addr = data_dma.phys();
+                d1.len = buf_len as u32;
+                d1.flags = VRING_DESC_F_NEXT;
+                d1.next = desc2;
+
+                let d2 = self.queue.desc(desc2);
+                d2.addr = hdr_dma.phys() + header_size as u64;
+                d2.len = 1;
+                d2.flags = VRING_DESC_F_WRITE;
+                d2.next = 0;
+            }
+            let mut buffers = self.req_buffers.lock();
+            buffers[buf_indices[i]].pending = Some(RequestMeta {
+                head: descs[i][0],
+                desc_chain: descs[i],
+                desc_count: 3,
+                header_status_dma: hdr_dma,
+                header_size,
+                kind: RequestKind::Write {
+                    data_dma,
+                    data_len: buf_len,
+                },
+                abandoned: false,
+            });
+        }
+
+        // Push both chains to avail ring and ring doorbell ONCE.
+        unsafe {
+            self.queue.push_avail(descs[0][0]);
+            self.queue.push_avail(descs[1][0]);
+        }
+        mb();
+        self.notify();
+
+        let mut wait = RequestWait::start();
+        let mut completed_count = 0usize;
+        let mut first_err: Option<BlockError> = None;
+
+        while wait_should_continue(completed_count < 2, self.queue.is_fatal(), wait.expired()) {
+            while let Some(used) = self.queue.pop_used() {
+                match self.complete_used_entry(used) {
+                    Some(RequestCompletion::Io(res)) => {
+                        completed_count += 1;
+                        match res {
+                            Ok(CompletedIo::Write(_)) => {}
+                            Ok(_) => {
+                                if first_err.is_none() {
+                                    first_err = Some(BlockError::Io);
+                                }
+                            }
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    Some(RequestCompletion::Flush(_)) => {
+                        klog!(
+                            Error,
+                            "[virtio-blk] unexpected flush completion during batched write wait"
+                        );
+                    }
+                    None => {}
+                }
+            }
+            if completed_count >= 2 {
+                break;
+            }
+            let _ = wait.spend();
+            core::hint::spin_loop();
+        }
+
+        if completed_count < 2 {
+            let mut abandoned_now = 0usize;
+            {
+                let mut buffers = self.req_buffers.lock();
+                for &idx in &buf_indices {
+                    if let Some(meta) = buffers[idx].pending.as_mut() {
+                        if !meta.abandoned {
+                            meta.abandoned = true;
+                            abandoned_now += 1;
+                        }
+                    }
+                }
+            }
+            if abandoned_now > 0 {
+                let _ = TIMEOUT_LEAKED_REQUESTS.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| v.checked_add(abandoned_now),
+                );
+            }
+            let _ = self.reset_device(&_lock);
+            return Err(BlockError::Io);
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 impl BlockDevice for VirtioBlkDevice {
@@ -2065,6 +2344,29 @@ impl BlockDevice for VirtioBlkDevice {
         self.do_request(sector, SyncRequestData::Write(buf))
     }
 
+    fn write_batch_sync(&self, writes: &[(u64, &[u8])]) -> Result<(), BlockError> {
+        if writes.len() == 2 && mm::dma::is_iommu_legacy() {
+            match self.do_write_pair([writes[0], writes[1]]) {
+                Ok(()) => return Ok(()),
+                Err(BlockError::Busy | BlockError::NoMem) => {
+                    // Fall through to sequential single-request path under pressure.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        for (idx, &(sector, buf)) in writes.iter().enumerate() {
+            let written = match self.do_request(sector, SyncRequestData::Write(buf)) {
+                Ok(written) => written,
+                Err(BlockError::NoMem) if idx > 0 => return Err(BlockError::Io),
+                Err(e) => return Err(e),
+            };
+            if written != buf.len() {
+                return Err(BlockError::Io);
+            }
+        }
+        Ok(())
+    }
+
     fn durability(&self) -> crate::DurabilityGuarantee {
         // ST-K4: flush() below returns Ok without the feature. The spec lets a
         // driver deduce write-through then, but legacy devices make that unsafe
@@ -2074,6 +2376,10 @@ impl BlockDevice for VirtioBlkDevice {
         } else {
             crate::DurabilityGuarantee::Unsupported
         }
+    }
+
+    fn supports_coalesced_write(&self) -> bool {
+        true
     }
 
     fn flush(&self) -> Result<(), BlockError> {
