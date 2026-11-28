@@ -751,7 +751,7 @@ lint-fetch-add:
 # H.0.1-3: Expanded scan scope from syscall.rs-only to all boundary files.
 lint-repr-c-copy:
 	@echo "=== Lint: checking for unannotated repr(C) struct copies ==="
-	@FILES="kernel/kernel_core/syscall.rs kernel/kernel_core/usercopy.rs kernel/audit/lib.rs"; \
+	@FILES="kernel/kernel_core/syscall/*.rs kernel/kernel_core/usercopy.rs kernel/audit/lib.rs"; \
 	FAIL=""; \
 	for FILE in $$FILES; do \
 		HITS=$$(grep -n 'from_raw_parts\|copy_nonoverlapping\|mem::transmute' $$FILE \

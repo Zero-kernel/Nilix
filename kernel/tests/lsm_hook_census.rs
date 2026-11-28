@@ -573,20 +573,20 @@ mod lsm_hook_census_tests {
     /// must match exactly once, so a moved, deleted or weakened site fails.
     const SUBJECT_LOOKUP_SITES: &[(&str, &str, &str, &str)] = &[
         (
-            "kernel_core/syscall.rs",
+            "kernel_core/syscall/helpers.rs",
             "fn lsm_current_process_ctx() -> Option<lsm::ProcessCtx> {",
             "",
             "the wrapper; its callers are scanned",
         ),
         (
-            "kernel_core/syscall.rs",
+            "kernel_core/syscall/mod.rs",
             "let lsm_ctx = lsm::",
             "increment_counter(TraceCounter::SyscallExit, 1); \
              return SyscallError::EPERM.as_i64(); } };",
             "syscall entry: the None arm returns EPERM (R184-U01-1)",
         ),
         (
-            "kernel_core/syscall.rs",
+            "kernel_core/syscall/proc.rs",
             "let foreign_target = if Arc::ptr_eq(&t.thread_group, &caller_group) {",
             "let target_ctx = target_ctx?;",
             "get_robust_list target snapshot; propagated after the DAC check (R191-3)",

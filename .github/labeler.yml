@@ -27,7 +27,7 @@
           - "kernel/kernel_core/process.rs"
           - "kernel/kernel_core/fork.rs"
           - "kernel/kernel_core/elf_loader.rs"
-          - "kernel/kernel_core/syscall.rs"
+          - "kernel/kernel_core/syscall/**"
           - "kernel/kernel_core/syscall_macros.rs"
           - "kernel/kernel_core/usercopy.rs"
           - "kernel/kernel_core/user_stack.rs"
