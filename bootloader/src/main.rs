@@ -29,7 +29,16 @@ const KERNEL_VIRT_BASE: u64 = 0xffffffff80000000;
 
 /// R167-C: BootInfo ABI version. MUST match `BOOT_INFO_VERSION` in
 /// `kernel/mm/memory.rs`. Bump on any change to the `BootInfo` layout.
-const BOOT_INFO_VERSION: u64 = 2;
+const BOOT_INFO_VERSION: u64 = 3;
+
+/// N3.1a (#67): Dedicated high-half linear direct map (`PML4[273]`), decoupled
+/// from the 1 GiB kernel image window at `PML4[511]/PDPT[510]`.
+const DIRECT_MAP_PML4_INDEX: usize = 273;
+const DIRECT_MAP_OFFSET: u64 = 0xffff_8880_0000_0000;
+/// Maximum physical address mapped into `PML4[273]` (64 GiB; 1 PML4 + 1 PDPT + <=64 PDs).
+const DIRECT_MAP_MAX_PHYS_CAP: u64 = 64 * 1024 * 1024 * 1024;
+const ONE_GIB: u64 = 1024 * 1024 * 1024;
+const TWO_MIB: u64 = 2 * 1024 * 1024;
 
 /// BootInfo `kaslr_flags`: the exact placement order was produced by a
 /// complete, unbiased RDRAND-backed shuffle. A non-zero relocation slide
@@ -86,25 +95,35 @@ const _: () = assert!(KASLR_SLOT_COUNT <= u16::MAX as usize + 1);
 /// - `0f 0b`:    `ud2`           (unreachable trap)
 const CR3_TRANSITION_STUB: [u8; 8] = [0x0F, 0x22, 0xD8, 0x41, 0xFF, 0xE0, 0x0F, 0x0B];
 
-/// U55-6: Fail-closed verification of the boot page tables before `ExitBootServices`.
+/// U55-6 / N3.1a: Fail-closed verification of the boot page tables before `ExitBootServices`.
 ///
 /// Proves that from the very first instruction after `mov cr3, rax`:
-/// 1. Neither `PML4[0]` (identity map) nor `PML4[511]` (high-half direct map)
-///    contains any leaf that is simultaneously writable and executable (W+X).
+/// 1. Neither `PML4[0]` (identity map), `PML4[273]` (linear direct map), nor
+///    `PML4[511]` (high-half kernel image window) contains any leaf that is
+///    simultaneously writable and executable (W+X).
 /// 2. In `PML4[0]`, the ONLY executable leaf is the single 4 KiB R-X CR3
 ///    transition stub page at `transition_stub_phys`.
-/// 3. No physical frame mapped executable in `PML4[0]` or `PML4[511]` has a
-///    live writable alias in the other hierarchy.
-/// 4. `PML4[510]` (recursive mapping) has `NO_EXECUTE` set.
+/// 3. In `PML4[273]`, `NO_EXECUTE` is set at the PML4 entry and ZERO leaves are
+///    executable.
+/// 4. No physical frame mapped executable in `PML4[0]` or `PML4[511]` has a
+///    live writable alias in any other root hierarchy.
+/// 5. `PML4[510]` (recursive mapping) has `NO_EXECUTE` set.
 unsafe fn verify_boot_page_tables(pml4_frame: u64, transition_stub_phys: u64) {
     use x86_64::structures::paging::{PageTable, PageTableFlags as Flags};
 
     let pml4 = &*(pml4_frame as *const PageTable);
 
-    // 1. Recursive slot must remain non-executable.
+    // 1. Recursive slot and linear direct map slot must remain non-executable.
     let rec = &pml4[510];
     if rec.is_unused() || !rec.flags().contains(Flags::NO_EXECUTE) {
         panic!("U55-6: PML4[510] recursive mapping missing or executable");
+    }
+    let dm = &pml4[DIRECT_MAP_PML4_INDEX];
+    if dm.is_unused()
+        || !dm.flags().contains(Flags::PRESENT)
+        || !dm.flags().contains(Flags::NO_EXECUTE)
+    {
+        panic!("U55-6: PML4[273] linear direct map missing or executable");
     }
 
     let lookup_writable = |root_idx: usize, target_phys: u64| -> bool {
@@ -155,8 +174,9 @@ unsafe fn verify_boot_page_tables(pml4_frame: u64, transition_stub_phys: u64) {
 
     let mut low_exec_leaves = 0usize;
     let mut high_exec_leaves = 0usize;
+    let roots = [0usize, DIRECT_MAP_PML4_INDEX, 511usize];
 
-    for &(root_idx, other_idx) in &[(0usize, 511usize), (511usize, 0usize)] {
+    for &root_idx in &roots {
         let pml4e = &pml4[root_idx];
         if pml4e.is_unused() || !pml4e.flags().contains(Flags::PRESENT) {
             panic!("U55-6: expected PML4[{}] to be present", root_idx);
@@ -218,14 +238,18 @@ unsafe fn verify_boot_page_tables(pml4_frame: u64, transition_stub_phys: u64) {
                                 panic!("U55-6: unexpected executable leaf in PML4[0]");
                             }
                             low_exec_leaves += 1;
-                        } else {
+                        } else if root_idx == 511 {
                             high_exec_leaves += 1;
+                        } else {
+                            panic!("U55-6: unexpected executable leaf in PML4[{}]", root_idx);
                         }
-                        if lookup_writable(other_idx, phys) {
-                            panic!(
-                                "U55-6: live writable alias in PML4[{}] for executable leaf in PML4[{}]",
-                                other_idx, root_idx
-                            );
+                        for &other_idx in &roots {
+                            if other_idx != root_idx && lookup_writable(other_idx, phys) {
+                                panic!(
+                                    "U55-6: live writable alias in PML4[{}] for executable leaf in PML4[{}]",
+                                    other_idx, root_idx
+                                );
+                            }
                         }
                     }
                 }
@@ -762,6 +786,86 @@ pub struct BootInfo {
     /// means the complete candidate order was uniformly randomized; the slide
     /// alone never proves KASLR because deterministic relocation is permitted.
     pub kaslr_flags: u64,
+    /// N3.1a (#67): virtual base of the linear physical direct map (`PML4[273]`).
+    pub direct_map_base: u64,
+    /// N3.1a (#67): exclusive upper physical bound covered by `PML4[273]`
+    /// (1 GiB multiple, `>= 1 GiB`, `<= DIRECT_MAP_MAX_PHYS_CAP`).
+    pub direct_map_limit: u64,
+}
+
+/// N3.1a (#67): inspect the UEFI memory map before page-table construction so
+/// `PML4[273]` maps every write-back RAM and firmware range up to 64 GiB while
+/// leaving pure PCI MMIO holes unmapped.
+fn discover_direct_map_plan(boot_services: &BootServices) -> (u64, Vec<(u64, u64)>) {
+    use uefi::table::boot::MemoryAttribute;
+
+    let mmap = boot_services
+        .memory_map(MemoryType::LOADER_DATA)
+        .expect("N3.1a: failed to query UEFI memory map for direct-map sizing");
+
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut max_end: u64 = ONE_GIB;
+
+    for desc in mmap.entries() {
+        if desc.page_count == 0 {
+            continue;
+        }
+        let is_ram_or_fw = matches!(
+            desc.ty,
+            MemoryType::CONVENTIONAL
+                | MemoryType::LOADER_CODE
+                | MemoryType::LOADER_DATA
+                | MemoryType::BOOT_SERVICES_CODE
+                | MemoryType::BOOT_SERVICES_DATA
+                | MemoryType::RUNTIME_SERVICES_CODE
+                | MemoryType::RUNTIME_SERVICES_DATA
+                | MemoryType::ACPI_RECLAIM
+                | MemoryType::ACPI_NON_VOLATILE
+                | MemoryType::PERSISTENT_MEMORY
+        ) || (desc.ty == MemoryType::RESERVED
+            && desc.att.contains(MemoryAttribute::WRITE_BACK));
+        if !is_ram_or_fw {
+            continue;
+        }
+        let start = desc.phys_start;
+        if start >= DIRECT_MAP_MAX_PHYS_CAP {
+            continue;
+        }
+        let end = start
+            .saturating_add(desc.page_count.saturating_mul(KERNEL_PAGE_SIZE))
+            .min(DIRECT_MAP_MAX_PHYS_CAP);
+        if end <= start {
+            continue;
+        }
+        if end > max_end {
+            max_end = end;
+        }
+        ranges.push((start, end));
+    }
+
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                if e > last.1 {
+                    last.1 = e;
+                }
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+
+    let aligned_limit = ((max_end + ONE_GIB - 1) & !(ONE_GIB - 1))
+        .max(ONE_GIB)
+        .min(DIRECT_MAP_MAX_PHYS_CAP);
+    (aligned_limit, merged)
+}
+
+#[inline]
+fn range_overlaps_any(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+    ranges.iter().any(|&(lo, hi)| lo < end && start < hi)
 }
 
 const KERNEL_PAGE_SIZE: u64 = 4096;
@@ -1263,6 +1367,16 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         boot_info_page as *mut BootInfo
     };
 
+    // N3.1a (#67): size the linear direct map (`PML4[273]`) from UEFI RAM/firmware descriptors.
+    let (direct_map_limit, direct_map_ranges) =
+        discover_direct_map_plan(system_table.boot_services());
+    info!(
+        "N3.1a: Linear direct map PML4[{}] covers 0..{} GiB ({} RAM/firmware spans)",
+        DIRECT_MAP_PML4_INDEX,
+        direct_map_limit / ONE_GIB,
+        direct_map_ranges.len()
+    );
+
     // 构建四级页表结构，将物理内核地址映射到高半区虚拟地址
     let (pml4_frame, entry_point_to_jump, transition_stub_phys) = unsafe {
         // 最早的 VGA 写入 - 在任何其他操作之前
@@ -1445,10 +1559,101 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         (&mut *pdpt_high_ptr)[510]
             .set_addr(PhysAddr::new(pd_frame), Flags::PRESENT | Flags::WRITABLE);
 
-        // PML4的第511项指向高半区PDPT
+        // PML4的第511项指向高半区PDPT（内核镜像 + 0..1 GiB 引导别名）
         (&mut *pml4_ptr)[511].set_addr(
             PhysAddr::new(pdpt_high_frame),
             Flags::PRESENT | Flags::WRITABLE,
+        );
+
+        // N3.1a (#67): Build dedicated linear direct map at PML4[273]
+        // (`0xffff_8880_0000_0000`), mapping 0..direct_map_limit with RW+NX 2 MiB
+        // huge pages for RAM/firmware regions while splitting PD[0], kernel-image
+        // buckets, and the CR3 transition stub to 4 KiB leaves (RO+NX on executable
+        // frames) so U55-6 zero-cross-alias W^X holds across PML4[0], [273], [511].
+        let pdpt_dm_frame = boot_services
+            .allocate_pages(
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                MemoryType::LOADER_DATA,
+                1,
+            )
+            .expect("Failed to allocate direct-map PDPT");
+        let pdpt_dm_ptr = pdpt_dm_frame as *mut PageTable;
+        core::ptr::write_bytes(pdpt_dm_ptr as *mut u8, 0, 4096);
+
+        let num_gb = (direct_map_limit / ONE_GIB) as usize;
+        for gb_idx in 0..num_gb {
+            let gb_start = (gb_idx as u64) * ONE_GIB;
+            let gb_end = gb_start + ONE_GIB;
+            if gb_idx > 0 && !range_overlaps_any(&direct_map_ranges, gb_start, gb_end) {
+                continue;
+            }
+            let pd_dm_frame = boot_services
+                .allocate_pages(
+                    AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                    MemoryType::LOADER_DATA,
+                    1,
+                )
+                .expect("Failed to allocate direct-map PD");
+            let pd_dm_ptr = pd_dm_frame as *mut PageTable;
+            core::ptr::write_bytes(pd_dm_ptr as *mut u8, 0, 4096);
+
+            for i in 0..512usize {
+                let bucket_start = gb_start + (i as u64) * TWO_MIB;
+                let bucket_end = bucket_start + TWO_MIB;
+                if gb_idx > 0 && !range_overlaps_any(&direct_map_ranges, bucket_start, bucket_end) {
+                    continue;
+                }
+                let split_bucket = gb_idx == 0
+                    && (i == 0 || (i >= start_pd_idx && i <= end_pd_idx) || i == stub_pd_idx);
+                if split_bucket {
+                    let pt_dm_frame = boot_services
+                        .allocate_pages(
+                            AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                            MemoryType::LOADER_DATA,
+                            1,
+                        )
+                        .expect("Failed to allocate direct-map W^X PT");
+                    let pt_dm_ptr = pt_dm_frame as *mut PageTable;
+                    core::ptr::write_bytes(pt_dm_ptr as *mut u8, 0, 4096);
+
+                    for page_index in 0..512usize {
+                        let phys_page = bucket_start + (page_index as u64) * KERNEL_PAGE_SIZE;
+                        let flags = if phys_page == transition_stub_phys {
+                            Flags::PRESENT | Flags::NO_EXECUTE
+                        } else if let Some(permissions) = kernel_permissions.get(phys_page) {
+                            if permissions & KERNEL_PAGE_WRITABLE != 0 {
+                                Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
+                            } else {
+                                // Kernel .text / .rodata / gaps: RO+NX (zero writable alias).
+                                Flags::PRESENT | Flags::NO_EXECUTE
+                            }
+                        } else {
+                            Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
+                        };
+                        (&mut *pt_dm_ptr)[page_index].set_addr(PhysAddr::new(phys_page), flags);
+                    }
+
+                    (&mut *pd_dm_ptr)[i].set_addr(
+                        PhysAddr::new(pt_dm_frame),
+                        Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
+                    );
+                } else {
+                    (&mut *pd_dm_ptr)[i].set_addr(
+                        PhysAddr::new(bucket_start),
+                        Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE | Flags::NO_EXECUTE,
+                    );
+                }
+            }
+
+            (&mut *pdpt_dm_ptr)[gb_idx].set_addr(
+                PhysAddr::new(pd_dm_frame),
+                Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
+            );
+        }
+
+        (&mut *pml4_ptr)[DIRECT_MAP_PML4_INDEX].set_addr(
+            PhysAddr::new(pdpt_dm_frame),
+            Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
         );
 
         // 建立恒等映射以防止切换页表时崩溃
@@ -1677,6 +1882,8 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             } else {
                 0
             },
+            direct_map_base: DIRECT_MAP_OFFSET,
+            direct_map_limit,
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);

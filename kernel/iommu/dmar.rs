@@ -30,13 +30,11 @@ use crate::MAX_IOMMU_UNITS;
 /// DMAR table signature ("DMAR").
 const DMAR_SIGNATURE: [u8; 4] = *b"DMAR";
 
-/// R171-G5-01-B FIX: the kernel high-half direct map covers only physical
-/// `[0, 1 GiB)` (mm `HIGH_HALF_MAP_LIMIT`). Any ACPI table physical address whose
-/// `[phys, phys+len)` is not fully inside this window cannot be read through the
-/// direct map and MUST fail CLOSED (`InvalidStructure`), never be silently treated
-/// as "no DMAR" (`NotFound`). Mirrors `vtd.rs` MAX_DIRECT_MAP_PHYS; do NOT use the
-/// (latently-wrong) 4 GiB `smp::MAX_PHYS_MAPPED`.
-const MAX_DIRECT_MAP_PHYS: u64 = 1 << 30;
+/// Physical upper bound reachable through the kernel direct map (`mm::direct_map_limit()`).
+#[inline]
+fn max_direct_map_phys() -> u64 {
+    mm::direct_map_limit()
+}
 
 /// Legacy BIOS RSDP scan window (used only when the bootloader provides no RSDP).
 const RSDP_SEARCH_START: u64 = 0xE_0000;
@@ -542,7 +540,7 @@ fn phys_window(phys: u64, len: usize) -> Option<*const u8> {
         return None;
     }
     let end = phys.checked_add(len as u64)?; // no u64 wrap
-    if end > MAX_DIRECT_MAP_PHYS {
+    if end > max_direct_map_phys() {
         // F9: a table above the 1 GiB direct map (UEFI puts ACPI near the top
         // of low RAM) is copied through the bounded firmware reader; a copy
         // that cannot be made stays `None`, the fail-closed signal.

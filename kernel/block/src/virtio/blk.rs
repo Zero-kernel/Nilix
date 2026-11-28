@@ -191,32 +191,9 @@ fn virt_to_phys_dma(ptr: *const u8, len: usize) -> Result<u64, BlockError> {
         return Err(BlockError::Invalid);
     }
 
-    let virt = ptr as u64;
-
-    // Kernel high-half direct map: 0xffffffff80000000 -> physical 0x0
-    // This covers the first 1GB of physical memory where kernel allocations reside.
-    const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_ffff_8000_0000;
-
-    // Verify the address is in the expected kernel range
-    if virt < PHYSICAL_MEMORY_OFFSET {
-        // Address is not in kernel direct map - this is a programming error
-        // User-space buffers should never reach here
-        return Err(BlockError::Invalid);
-    }
-
-    let phys = virt - PHYSICAL_MEMORY_OFFSET;
-
-    // Overflow check: ensure the entire buffer is within valid physical memory
-    // The direct map covers 0-1GB (0x0 to 0x40000000)
-    let end = phys
-        .checked_add(len as u64 - 1)
-        .ok_or(BlockError::Invalid)?;
-    if end >= 0x4000_0000 {
-        // Beyond direct map coverage - likely an error
-        return Err(BlockError::Invalid);
-    }
-
-    Ok(phys)
+    let virt = x86_64::VirtAddr::try_new(ptr as u64).map_err(|_| BlockError::Invalid)?;
+    let phys = mm::virt_to_phys_direct(virt, len as u64).ok_or(BlockError::Invalid)?;
+    Ok(phys.as_u64())
 }
 
 // ============================================================================

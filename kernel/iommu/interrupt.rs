@@ -62,8 +62,11 @@ use crate::{IommuError, IommuResult};
 /// When set, the destination ID field in IRTEs uses x2APIC format (32-bit).
 const IRTA_EIME: u64 = 1 << 11;
 
-/// Maximum physical address reachable via direct map (1 GB).
-const MAX_DIRECT_MAP_PHYS: u64 = 1 << 30;
+/// Maximum physical address reachable via the kernel direct map.
+#[inline]
+fn max_direct_map_phys() -> u64 {
+    mm::direct_map_limit()
+}
 
 /// Default number of IRTE entries (power of 2).
 /// 256 entries = 4KB, fits in one page.
@@ -382,7 +385,8 @@ impl InterruptRemappingTable {
                 return Err(IommuError::PageTableAllocFailed);
             }
         };
-        if phys >= MAX_DIRECT_MAP_PHYS || phys_end > MAX_DIRECT_MAP_PHYS {
+        let limit = max_direct_map_phys();
+        if phys >= limit || phys_end > limit {
             buddy_allocator::free_physical_pages(frame, pages);
             return Err(IommuError::PageTableAllocFailed);
         }
