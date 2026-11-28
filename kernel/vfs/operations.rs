@@ -268,10 +268,11 @@ impl Vfs {
                 }) {
                     return Err(FsError::Busy);
                 }
-                // Flush buffered writes while holding the mount topology write
-                // lock and BEFORE removing the mount, so any writeback failure
-                // (e.g. ENOSPC) leaves the filesystem mounted and reachable.
-                match target.mount.fs.sync() {
+                // Flush buffered writes and checkpoint any pending delayed
+                // journal epoch while holding the mount topology write lock
+                // and BEFORE removing the mount, so any durability/checkpoint
+                // failure leaves the filesystem mounted and reachable.
+                match target.mount.fs.shutdown_sync() {
                     Ok(()) | Err(FsError::NotSupported) => {}
                     Err(error) => return Err(error),
                 }
@@ -760,10 +761,18 @@ impl Vfs {
         if self.covered_in_any_namespace(&current_victim) {
             return Err(FsError::Busy);
         }
+        // Release the temporary VFS validation pins before invoking the
+        // filesystem so unlinked zero-block files with no open descriptors are
+        // observed as exclusively referenced and eligible for single-tx
+        // `UNLINK_FREE` reclamation. Topology write lock + `victim_ino`
+        // preserve identity binding.
+        let victim_ino = victim.ino();
+        drop(current_victim);
+        drop(victim);
         current
             .mount
             .fs
-            .unlink(&current.inode, &name, victim.ino(), must_dir, &mutation)
+            .unlink(&current.inode, &name, victim_ino, must_dir, &mutation)
     }
     pub fn unlink(&self, name: &str, must_dir: Option<bool>) -> Result<(), FsError> {
         self.unlink_using(name, must_dir, OperationContext::current()?)

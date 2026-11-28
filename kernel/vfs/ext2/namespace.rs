@@ -11,6 +11,10 @@ pub(super) const UNLINK: u8 = 11;
 pub(super) const INODE_FREE: u8 = 12;
 pub(super) const ORPHAN_ALLOC: u8 = 13;
 pub(super) const PUBLISH: u8 = 14;
+/// Single-transaction unlink + inode free for unreferenced, zero-block
+/// non-directory inodes (`links_count == 1`, `blocks_lo == 0`, no open handles),
+/// bypassing the orphan chain and eliminating the separate `INODE_FREE` tx.
+pub(super) const UNLINK_FREE: u8 = 19;
 const CHILD_OFFSET: usize = ZERO_INTENT_FILE_RENAME_END;
 const HEAD_OFFSET: usize = CHILD_OFFSET + size_of::<Ext2InodeRaw>();
 const PREDECESSOR_OFFSET: usize = HEAD_OFFSET + 4;
@@ -24,7 +28,10 @@ const NO_PREVIOUS: u32 = u32::MAX;
 const _: () = assert!(INTENT_END <= 1024);
 
 pub(super) fn is_kind(kind: u8) -> bool {
-    matches!(kind, UNLINK | INODE_FREE | ORPHAN_ALLOC | PUBLISH)
+    matches!(
+        kind,
+        UNLINK | INODE_FREE | ORPHAN_ALLOC | PUBLISH | UNLINK_FREE
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +152,7 @@ impl NamespacePlan {
 
     fn inode_delta(&self) -> i32 {
         match self.intent.kind {
-            INODE_FREE => 1,
+            INODE_FREE | UNLINK_FREE => 1,
             ORPHAN_ALLOC => -1,
             _ => 0,
         }
@@ -185,7 +192,7 @@ impl NamespacePlan {
             Ok(())
         };
         let i = &self.intent;
-        if matches!(i.kind, INODE_FREE | ORPHAN_ALLOC) {
+        if matches!(i.kind, INODE_FREE | ORPHAN_ALLOC | UNLINK_FREE) {
             let group = fs.inode_group_index(i.new_ino).ok_or(FsError::Invalid)?.0;
             add(fs
                 .group_descs
@@ -247,7 +254,8 @@ impl NamespacePlan {
         drop(sb);
         let tail_len = fs.namespace_tail_len()?;
         if x.old_tail[tail_len..].iter().any(|b| *b != 0)
-            || (!matches!(i.kind, ORPHAN_ALLOC | INODE_FREE) && x.old_tail.iter().any(|b| *b != 0))
+            || (!matches!(i.kind, ORPHAN_ALLOC | INODE_FREE | UNLINK_FREE)
+                && x.old_tail.iter().any(|b| *b != 0))
         {
             return Err(FsError::Invalid);
         }
@@ -310,6 +318,7 @@ impl NamespacePlan {
             }
             return Ok(());
         }
+        let removing = matches!(i.kind, UNLINK | UNLINK_FREE);
         fs.check_reclaim_layout(&x.old_child)?;
         if i.parent_ino == 0
             || i.physical == 0
@@ -319,7 +328,7 @@ impl NamespacePlan {
                 & (EXT2_IMMUTABLE_FL
                     | EXT2_INDEX_FL
                     | EXT2_UNSUPPORTED_WRITE_LAYOUT_FL
-                    | if i.kind == UNLINK { EXT2_APPEND_FL } else { 0 })
+                    | if removing { EXT2_APPEND_FL } else { 0 })
                 != 0
             || x.old_child.flags & (EXT2_IMMUTABLE_FL | EXT2_APPEND_FL) != 0
             || fs.is_structural_metadata_block(i.physical)?
@@ -338,49 +347,72 @@ impl NamespacePlan {
             EXT2_S_IFLNK => EXT2_FT_SYMLINK,
             _ => return Err(FsError::Invalid),
         });
-        if x.file_type != expected_type && !(i.kind == UNLINK && x.file_type == 0) {
+        if x.file_type != expected_type && !(removing && x.file_type == 0) {
             return Err(FsError::Invalid);
         }
         let mut child = x.old_child;
         let mut parent = i.old_inode;
-        if i.kind == UNLINK {
-            if child.links_count == 0 || child.dtime != 0 || (dir && child.links_count != 2) {
+        if i.kind == UNLINK_FREE {
+            let inline = is_inline(&child);
+            if dir
+                || child.links_count != 1
+                || child.dtime != 0
+                || child.blocks_lo != 0
+                || (!inline
+                    && (child.size_lo != 0
+                        || child.size_high_or_dir_acl != 0
+                        || child.block.iter().any(|b| *b != 0)))
+                || Ext2Fs::inode_bytes(&self.new_child) != Ext2Fs::inode_bytes(&zero)
+            {
                 return Err(FsError::Invalid);
             }
-            child.links_count = if dir { 0 } else { child.links_count - 1 };
-            child.dtime = if child.links_count == 0 {
-                x.old_head
-            } else {
-                0
-            };
-            if dir {
-                parent.links_count = parent.links_count.checked_sub(1).ok_or(FsError::Invalid)?;
+            parent.mtime = self.new_parent.mtime;
+            parent.ctime = parent.mtime;
+            if Ext2Fs::inode_bytes(&parent) != Ext2Fs::inode_bytes(&self.new_parent) {
+                return Err(FsError::Invalid);
             }
         } else {
-            if child.links_count != 0 || x.old_head != i.new_ino {
-                return Err(FsError::Invalid);
-            }
-            child.links_count = if dir { 2 } else { 1 };
-            child.dtime = 0;
-            if dir {
-                if child.size_lo != fs.block_size
-                    || child.blocks_lo != fs.block_size / 512
-                    || child.block[0] == 0
-                    || child.block[1..].iter().any(|b| *b != 0)
-                {
+            if i.kind == UNLINK {
+                if child.links_count == 0 || child.dtime != 0 || (dir && child.links_count != 2) {
                     return Err(FsError::Invalid);
                 }
-                parent.links_count = parent.links_count.checked_add(1).ok_or(FsError::NoSpace)?;
+                child.links_count = if dir { 0 } else { child.links_count - 1 };
+                child.dtime = if child.links_count == 0 {
+                    x.old_head
+                } else {
+                    0
+                };
+                if dir {
+                    parent.links_count =
+                        parent.links_count.checked_sub(1).ok_or(FsError::Invalid)?;
+                }
+            } else {
+                if child.links_count != 0 || x.old_head != i.new_ino {
+                    return Err(FsError::Invalid);
+                }
+                child.links_count = if dir { 2 } else { 1 };
+                child.dtime = 0;
+                if dir {
+                    if child.size_lo != fs.block_size
+                        || child.blocks_lo != fs.block_size / 512
+                        || child.block[0] == 0
+                        || child.block[1..].iter().any(|b| *b != 0)
+                    {
+                        return Err(FsError::Invalid);
+                    }
+                    parent.links_count =
+                        parent.links_count.checked_add(1).ok_or(FsError::NoSpace)?;
+                }
             }
-        }
-        child.ctime = self.new_child.ctime;
-        parent.mtime = self.new_parent.mtime;
-        parent.ctime = parent.mtime;
-        if child.ctime != parent.ctime
-            || Ext2Fs::inode_bytes(&child) != Ext2Fs::inode_bytes(&self.new_child)
-            || Ext2Fs::inode_bytes(&parent) != Ext2Fs::inode_bytes(&self.new_parent)
-        {
-            return Err(FsError::Invalid);
+            child.ctime = self.new_child.ctime;
+            parent.mtime = self.new_parent.mtime;
+            parent.ctime = parent.mtime;
+            if child.ctime != parent.ctime
+                || Ext2Fs::inode_bytes(&child) != Ext2Fs::inode_bytes(&self.new_child)
+                || Ext2Fs::inode_bytes(&parent) != Ext2Fs::inode_bytes(&self.new_parent)
+            {
+                return Err(FsError::Invalid);
+            }
         }
         let off = i.rename_dir_off as usize;
         let len = usize::from(i.rename_rec_len);
@@ -404,7 +436,7 @@ impl NamespacePlan {
                 || previous_len < 8
                 || previous_len % 4 != 0
                 || previous >= off
-                || (i.kind == UNLINK && previous.checked_add(previous_len) != Some(off))
+                || (removing && previous.checked_add(previous_len) != Some(off))
                 || (i.kind == PUBLISH && previous.checked_add(previous_len) != off.checked_add(len))
             {
                 return Err(FsError::Invalid);
@@ -422,7 +454,8 @@ impl NamespacePlan {
     ) -> Result<(), FsError> {
         let i = &self.intent;
         let x = i.namespace;
-        let directory_home = matches!(i.kind, UNLINK | PUBLISH) && home == i.physical;
+        let removing = matches!(i.kind, UNLINK | UNLINK_FREE);
+        let directory_home = (removing || i.kind == PUBLISH) && home == i.physical;
         if directory_home {
             validate_dir_edit(self, bytes, !forward)?;
         }
@@ -436,7 +469,7 @@ impl NamespacePlan {
                 forward,
             )?;
         }
-        if matches!(i.kind, INODE_FREE | ORPHAN_ALLOC) && home == target.block {
+        if matches!(i.kind, INODE_FREE | ORPHAN_ALLOC | UNLINK_FREE) && home == target.block {
             let tail_len = fs.namespace_tail_len()?;
             change(
                 bytes,
@@ -524,7 +557,7 @@ impl NamespacePlan {
                 )?;
             }
         }
-        if matches!(i.kind, UNLINK | PUBLISH) && home == i.physical {
+        if directory_home {
             let off = i.rename_dir_off as usize;
             let mut present = [0u8; 263];
             let len = 8 + usize::from(i.rename_old_name_len);
@@ -542,10 +575,10 @@ impl NamespacePlan {
                 off,
                 &present[..len],
                 &empty[..len],
-                forward == (i.kind == UNLINK),
+                forward == removing,
             )?;
             if x.previous_offset != NO_PREVIOUS {
-                let next = if i.kind == UNLINK {
+                let next = if removing {
                     x.previous_length.checked_add(i.rename_rec_len)
                 } else {
                     u16::try_from(i.rename_dir_off - x.previous_offset).ok()
@@ -572,7 +605,7 @@ impl NamespacePlan {
         journal: &Ext2Journal,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), FsError> {
-        if matches!(self.intent.kind, INODE_FREE | ORPHAN_ALLOC) {
+        if matches!(self.intent.kind, INODE_FREE | ORPHAN_ALLOC | UNLINK_FREE) {
             let target = fs.inode_write_target(self.intent.new_ino)?;
             fs.read_physical_block(target.block, scratch.block_mut())?;
             let len = fs.namespace_tail_len()?;
@@ -675,7 +708,7 @@ fn validate_dir_edit(plan: &NamespacePlan, bytes: &[u8], post: bool) -> Result<(
             {
                 return Err(FsError::Invalid);
             }
-            if i.kind == UNLINK
+            if matches!(i.kind, UNLINK | UNLINK_FREE)
                 && (previous != x.previous_offset || previous_length != x.previous_length)
             {
                 return Err(FsError::Invalid);
@@ -1109,55 +1142,76 @@ impl Ext2Fs {
             let count = self
                 .inodes_per_group
                 .min(sb.inodes_count.saturating_sub(first));
-            for local in 0..count {
-                if bitmap.block()[local as usize / 8] & (1 << (local % 8)) == 0 {
+            let mut byte_idx = 0usize;
+            while (byte_idx as u32) * 8 < count {
+                let bits = bitmap.block()[byte_idx];
+                if bits == 0 {
+                    byte_idx += 1;
                     continue;
                 }
-                let ino = first + local + 1;
-                let location = self.inode_write_target(ino)?;
-                if last_table != Some(location.block) {
-                    self.read_virtual_block(journal, overlay, images, location.block, &mut table)?;
-                    last_table = Some(location.block);
-                }
-                let raw = inode_from(table.block(), location.start)?;
-                if raw.mode & EXT2_S_IFMT != EXT2_S_IFDIR || raw.links_count == 0 {
-                    continue;
-                }
-                if raw.size_lo % self.block_size != 0 || raw.size_high_or_dir_acl != 0 {
-                    return Err(FsError::Invalid);
-                }
-                let blocks = raw.size_lo / self.block_size;
-                if blocks > MAX_OWNERSHIP_REFERENCES as u32 {
-                    return Err(FsError::NotSupported);
-                }
-                for index in 0..blocks {
-                    let physical = self
-                        .map_tree_block(&raw, index, overlay, images, scratch)?
-                        .ok_or(FsError::Invalid)?;
-                    self.read_virtual_block(journal, overlay, images, physical, scratch)?;
-                    let bytes = scratch.block();
-                    let mut off = 0;
-                    while off < bytes.len() {
-                        let head = bytes.get(off..off + 8).ok_or(FsError::Invalid)?;
-                        let child =
-                            u32::from_le_bytes(head[..4].try_into().map_err(|_| FsError::Invalid)?);
-                        let len = usize::from(u16::from_le_bytes(
-                            head[4..6].try_into().map_err(|_| FsError::Invalid)?,
-                        ));
-                        if len < 8
-                            || len % 4 != 0
-                            || off.checked_add(len).is_none_or(|end| end > bytes.len())
-                            || usize::from(head[6]) + 8 > len
-                            || (self.disk_dirent_type(EXT2_FT_DIR) == 0 && head[7] != 0)
-                        {
-                            return Err(FsError::Invalid);
+                let base_local = (byte_idx as u32) * 8;
+                for bit in 0..8u32 {
+                    let local = base_local + bit;
+                    if local >= count {
+                        break;
+                    }
+                    if bits & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let ino = first + local + 1;
+                    let location = self.inode_write_target(ino)?;
+                    if last_table != Some(location.block) {
+                        self.read_virtual_block(
+                            journal,
+                            overlay,
+                            images,
+                            location.block,
+                            &mut table,
+                        )?;
+                        last_table = Some(location.block);
+                    }
+                    let raw = inode_from(table.block(), location.start)?;
+                    if raw.mode & EXT2_S_IFMT != EXT2_S_IFDIR || raw.links_count == 0 {
+                        continue;
+                    }
+                    if raw.size_lo % self.block_size != 0 || raw.size_high_or_dir_acl != 0 {
+                        return Err(FsError::Invalid);
+                    }
+                    let blocks = raw.size_lo / self.block_size;
+                    if blocks > MAX_OWNERSHIP_REFERENCES as u32 {
+                        return Err(FsError::NotSupported);
+                    }
+                    for index in 0..blocks {
+                        let physical = self
+                            .map_tree_block(&raw, index, overlay, images, scratch)?
+                            .ok_or(FsError::Invalid)?;
+                        self.read_virtual_block(journal, overlay, images, physical, scratch)?;
+                        let bytes = scratch.block();
+                        let mut off = 0;
+                        while off < bytes.len() {
+                            let head = bytes.get(off..off + 8).ok_or(FsError::Invalid)?;
+                            let child = u32::from_le_bytes(
+                                head[..4].try_into().map_err(|_| FsError::Invalid)?,
+                            );
+                            let len = usize::from(u16::from_le_bytes(
+                                head[4..6].try_into().map_err(|_| FsError::Invalid)?,
+                            ));
+                            if len < 8
+                                || len % 4 != 0
+                                || off.checked_add(len).is_none_or(|end| end > bytes.len())
+                                || usize::from(head[6]) + 8 > len
+                                || (self.disk_dirent_type(EXT2_FT_DIR) == 0 && head[7] != 0)
+                            {
+                                return Err(FsError::Invalid);
+                            }
+                            if child == target {
+                                references = references.checked_add(1).ok_or(FsError::Invalid)?;
+                            }
+                            off += len;
                         }
-                        if child == target {
-                            references = references.checked_add(1).ok_or(FsError::Invalid)?;
-                        }
-                        off += len;
                     }
                 }
+                byte_idx += 1;
             }
         }
         if references != u32::from(expected) {
@@ -1325,28 +1379,43 @@ impl Ext2Fs {
             child_raw.links_count,
             &mut scratch,
         )?;
-        let chain = self.read_orphan_chain(journal, &[], &[], &mut scratch)?;
-        if chain.len() == MAX_ORPHANS {
-            return Err(FsError::NoSpace);
+        // Fast path: when removing the final link of an unreferenced, zero-block
+        // non-directory inode (e.g. a newly created / buffered-only file or inline
+        // symlink with no open descriptors), atomically claim it against
+        // concurrent `flush_all_dirty_inodes()` snapshots and emit a single
+        // `UNLINK_FREE` transaction that removes the dirent and frees the inode,
+        // bypassing the orphan chain and eliminating the second `INODE_FREE` tx.
+        let unlink_free_candidate = !directory
+            && child_raw.links_count == 1
+            && child_raw.dtime == 0
+            && child_raw.blocks_lo == 0
+            && (is_inline(&child_raw)
+                || (child_raw.size_lo == 0
+                    && child_raw.size_high_or_dir_acl == 0
+                    && child_raw.block.iter().all(|&b| b == 0)));
+        let use_unlink_free = unlink_free_candidate && self.try_claim_for_unlink_free(&child);
+        if !use_unlink_free {
+            let chain = self.read_orphan_chain(journal, &[], &[], &mut scratch)?;
+            if chain.len() == MAX_ORPHANS {
+                return Err(FsError::NoSpace);
+            }
+            drop(chain);
         }
-        drop(chain);
         let old_head = self.superblock.read().last_orphan;
         let now = TimeSpec::now().sec as u32;
-        let mut next_child = *child_raw;
-        next_child.links_count = if directory {
-            0
+        let next_child = if use_unlink_free {
+            Ext2InodeRaw::default()
         } else {
-            next_child
-                .links_count
-                .checked_sub(1)
-                .ok_or(FsError::Invalid)?
+            let mut next = *child_raw;
+            next.links_count = if directory {
+                0
+            } else {
+                next.links_count.checked_sub(1).ok_or(FsError::Invalid)?
+            };
+            next.dtime = if next.links_count == 0 { old_head } else { 0 };
+            next.ctime = now;
+            next
         };
-        next_child.dtime = if next_child.links_count == 0 {
-            old_head
-        } else {
-            0
-        };
-        next_child.ctime = now;
         let mut next_parent = *parent_raw;
         next_parent.mtime = now;
         next_parent.ctime = now;
@@ -1359,7 +1428,7 @@ impl Ext2Fs {
         let mut old_name = [0u8; 255];
         old_name[..name.len()].copy_from_slice(name.as_bytes());
         let intent = JournalCommitIntent {
-            kind: UNLINK,
+            kind: if use_unlink_free { UNLINK_FREE } else { UNLINK },
             metadata_count: 0,
             inode_number: parent.ino,
             file_block: u32::MAX,
@@ -1384,7 +1453,12 @@ impl Ext2Fs {
             },
         };
         let mut plan = NamespacePlan::new(intent, next_child, next_parent);
-        plan.prepare(self, journal, &mut scratch)?;
+        if let Err(error) = plan.prepare(self, journal, &mut scratch) {
+            if use_unlink_free {
+                self.release_unlink_free_claim(child.cache_id);
+            }
+            return Err(error);
+        }
         let result = self.commit_metadata_transaction(
             journal,
             JournalMetadataPlan::Namespace(&plan),
@@ -1395,28 +1469,40 @@ impl Ext2Fs {
                 self.io_faulted.store(true, Ordering::Release);
             }
             if !failure.committed {
+                if use_unlink_free {
+                    self.release_unlink_free_claim(child.cache_id);
+                }
                 return Err(failure.error);
             }
         }
         *parent_raw = next_parent;
         *child_raw = next_child;
-        let became_orphan = next_child.links_count == 0;
-        child.unlinked.store(became_orphan, Ordering::Release);
-        self.superblock.write().last_orphan = plan.new_head();
-        if became_orphan {
-            self.unregister_dirty_inode(child.ino);
-            // If no open file descriptor still pins this unlinked inode, drop
-            // its buffered dirty pages immediately so final Drop + reap_orphans
-            // do not perform disk writeback/truncation for discarded data.
-            // Open-while-unlinked handles retain their dirty pages until Drop
-            // and advance their pending timestamp to match the unlink ctime.
-            if Arc::strong_count(&child) == 1 {
-                child.discard_dirty_locked(self);
+        if use_unlink_free {
+            child.unlinked.store(true, Ordering::Release);
+            child.size.store(0, Ordering::Release);
+            plan.publish_counts(self)?;
+            self.unregister_dirty_inode(child.cache_id);
+            child.discard_dirty_locked(self);
+            self.inode_cache.entries.write().remove(&child.ino);
+        } else {
+            let became_orphan = next_child.links_count == 0;
+            child.unlinked.store(became_orphan, Ordering::Release);
+            self.superblock.write().last_orphan = plan.new_head();
+            if became_orphan {
+                self.unregister_dirty_inode(child.cache_id);
+                // If no open file descriptor still pins this unlinked inode, drop
+                // its buffered dirty pages immediately so final Drop + reap_orphans
+                // do not perform disk writeback/truncation for discarded data.
+                // Open-while-unlinked handles retain their dirty pages until Drop
+                // and advance their pending timestamp to match the unlink ctime.
+                if Arc::strong_count(&child) == 1 {
+                    child.discard_dirty_locked(self);
+                } else {
+                    child.sync_dirty_ts_after_metadata_change(next_child.ctime);
+                }
             } else {
                 child.sync_dirty_ts_after_metadata_change(next_child.ctime);
             }
-        } else {
-            child.sync_dirty_ts_after_metadata_change(next_child.ctime);
         }
         match result {
             Ok(()) => Ok(()),
@@ -1948,10 +2034,11 @@ impl Ext2Fs {
         intent: &JournalCommitIntent,
         scratch: &mut Ext2MutationScratch,
     ) -> Result<(), FsError> {
-        if !matches!(intent.kind, UNLINK | PUBLISH) {
+        let removing = matches!(intent.kind, UNLINK | UNLINK_FREE);
+        if !removing && intent.kind != PUBLISH {
             return Ok(());
         }
-        if intent.kind == UNLINK {
+        if removing {
             self.validate_namespace_link_count(
                 journal,
                 overlay,
@@ -1971,7 +2058,7 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
         for (images, expected) in [
-            (pre, usize::from(intent.kind == UNLINK)),
+            (pre, usize::from(removing)),
             (post, usize::from(intent.kind == PUBLISH)),
         ] {
             let mut found = 0;
