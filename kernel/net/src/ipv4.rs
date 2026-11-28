@@ -137,6 +137,23 @@ impl Ipv4Addr {
         true
     }
 
+    /// Check if this address is valid as a source address on the loopback (`lo`) path.
+    ///
+    /// External wire packets MUST use [`Self::is_valid_source`] (which rejects
+    /// 127.0.0.0/8 per R44-3 anti-spoofing). Loopback delivery explicitly permits
+    /// 127.0.0.0/8 sources while still rejecting unspecified, broadcast, multicast,
+    /// reserved 0/8, and `.255` addresses.
+    #[inline]
+    pub fn is_valid_loopback_source(&self) -> bool {
+        if self.is_broadcast() || self.is_multicast() || self.is_unspecified() {
+            return false;
+        }
+        if self.0[0] == 0 || self.0[3] == 255 {
+            return false;
+        }
+        true
+    }
+
     /// Get the raw bytes
     #[inline]
     pub fn octets(&self) -> [u8; 4] {
@@ -357,6 +374,22 @@ pub fn calculate_checksum_with_pseudo(pseudo_header: &[u8], data: &[u8]) -> u16 
 /// On success: (header, options_slice, payload_slice)
 /// On failure: Ipv4Error describing the problem
 pub fn parse_ipv4(packet: &[u8]) -> Result<(Ipv4Header, &[u8], &[u8]), Ipv4Error> {
+    parse_ipv4_inner(packet, false)
+}
+
+/// Parse and validate an IPv4 packet arriving on the loopback (`lo`) path.
+///
+/// Identical to [`parse_ipv4`] except 127.0.0.0/8 source addresses are
+/// permitted. External NIC ingress MUST continue to call [`parse_ipv4`] so
+/// R44-3 anti-spoofing remains intact on the wire.
+pub fn parse_ipv4_loopback(packet: &[u8]) -> Result<(Ipv4Header, &[u8], &[u8]), Ipv4Error> {
+    parse_ipv4_inner(packet, true)
+}
+
+fn parse_ipv4_inner(
+    packet: &[u8],
+    allow_loopback_src: bool,
+) -> Result<(Ipv4Header, &[u8], &[u8]), Ipv4Error> {
     // Check minimum length
     if packet.len() < IPV4_HEADER_MIN_LEN {
         return Err(Ipv4Error::Truncated);
@@ -412,7 +445,12 @@ pub fn parse_ipv4(packet: &[u8]) -> Result<(Ipv4Header, &[u8], &[u8]), Ipv4Error
     let dst = Ipv4Addr([packet[16], packet[17], packet[18], packet[19]]);
 
     // Validate source address
-    if !src.is_valid_source() {
+    let valid_src = if allow_loopback_src {
+        src.is_valid_loopback_source()
+    } else {
+        src.is_valid_source()
+    };
+    if !valid_src {
         return Err(Ipv4Error::InvalidSource);
     }
 
@@ -589,5 +627,34 @@ mod tests {
         let csum = compute_checksum(&hdr, 20);
         // With zero checksum field, this gives the correct checksum
         assert_ne!(csum, 0);
+    }
+
+    #[test]
+    fn n2_8_parse_ipv4_loopback_keeps_external_anti_spoofing() {
+        let hdr = build_ipv4_header(
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Proto::Udp,
+            0,
+            64,
+        );
+        // External wire parser MUST still reject 127.0.0.1 source (R44-3).
+        assert_eq!(parse_ipv4(&hdr).unwrap_err(), Ipv4Error::InvalidSource);
+        // Loopback parser explicitly allows 127.0.0.0/8 source.
+        let (parsed, _opts, _payload) = parse_ipv4_loopback(&hdr).expect("loopback parse ok");
+        assert_eq!(parsed.src, Ipv4Addr::LOCALHOST);
+        assert_eq!(parsed.dst, Ipv4Addr::LOCALHOST);
+        // Loopback parser still rejects unspecified/broadcast/multicast sources.
+        let bad = build_ipv4_header(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Proto::Udp,
+            0,
+            64,
+        );
+        assert_eq!(
+            parse_ipv4_loopback(&bad).unwrap_err(),
+            Ipv4Error::InvalidSource
+        );
     }
 }

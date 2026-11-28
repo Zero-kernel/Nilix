@@ -235,11 +235,59 @@ const _: [(); 19] = [(); LINUX_DIRENT64_NAME_OFFSET];
 const SOCK_NONBLOCK: u32 = 0o4000; // O_NONBLOCK
 const SOCK_CLOEXEC: u32 = 0o2000000; // O_CLOEXEC
 
-/// sendto/recvfrom flags we support
+/// sendto/recvfrom/sendmsg/recvmsg flags we support
+const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u32 = 0x40;
+const MSG_NOSIGNAL: u32 = 0x4000;
+
+/// Socket option levels (Linux x86_64 ABI)
+const IPPROTO_IP: i32 = 0;
+const SOL_SOCKET: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+
+/// SOL_SOCKET option names (Linux x86_64 ABI)
+const SO_REUSEADDR: i32 = 2;
+const SO_TYPE: i32 = 3;
+const SO_ERROR: i32 = 4;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+const SO_KEEPALIVE: i32 = 9;
+const SO_RCVTIMEO: i32 = 20;
+const SO_SNDTIMEO: i32 = 21;
+
+/// IPPROTO_TCP option names (Linux x86_64 ABI)
+const TCP_NODELAY: i32 = 1;
+
+/// IPPROTO_IP option names (Linux x86_64 ABI)
+const IP_TTL: i32 = 2;
 
 /// Maximum UDP payload size
 const UDP_MAX_PAYLOAD: usize = 65507;
+
+/// struct msghdr (Linux x86_64 ABI compatible, 56 bytes, explicit padding)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct MsgHdr {
+    msg_name: *mut u8,
+    msg_namelen: u32,
+    _pad0: u32,
+    msg_iov: *const Iovec,
+    msg_iovlen: usize,
+    msg_control: *mut u8,
+    msg_controllen: usize,
+    msg_flags: i32,
+    _pad1: u32,
+}
+
+const _: [(); 56] = [(); core::mem::size_of::<MsgHdr>()];
+const _: [(); 8] = [(); core::mem::align_of::<MsgHdr>()];
+const _: [(); 0] = [(); core::mem::offset_of!(MsgHdr, msg_name)];
+const _: [(); 8] = [(); core::mem::offset_of!(MsgHdr, msg_namelen)];
+const _: [(); 16] = [(); core::mem::offset_of!(MsgHdr, msg_iov)];
+const _: [(); 24] = [(); core::mem::offset_of!(MsgHdr, msg_iovlen)];
+const _: [(); 32] = [(); core::mem::offset_of!(MsgHdr, msg_control)];
+const _: [(); 40] = [(); core::mem::offset_of!(MsgHdr, msg_controllen)];
+const _: [(); 48] = [(); core::mem::offset_of!(MsgHdr, msg_flags)];
 
 /// struct sockaddr_in (Linux x86_64 ABI compatible)
 ///
@@ -2199,6 +2247,7 @@ pub enum SyscallError {
     EDESTADDRREQ = -89,    // 需要目标地址
     EMSGSIZE = -90,        // 消息太长
     EPROTOTYPE = -91,      // 协议类型错误
+    ENOPROTOOPT = -92,     // 协议选项不可用
     EPROTONOSUPPORT = -93, // 协议不支持
     EAFNOSUPPORT = -97,    // 地址族不支持
     EADDRINUSE = -98,      // 地址已被使用
@@ -2509,9 +2558,12 @@ pub type PipeCreateCallback =
 /// R180-L1: the callback owns source commit ordering. It must copy the produced
 /// bytes through `copyout` and advance/dequeue the source only after copyout
 /// succeeds. This closes sibling-unmap races that bounds preflight cannot pin.
-pub type FdReadCopyout = fn(*mut u8, &[u8]) -> Result<(), SyscallError>;
-pub type FdReadCallback =
-    fn(i32, &mut [u8], *mut u8, FdReadCopyout, Option<&ProcessArc>) -> Result<usize, SyscallError>;
+pub type FdReadCallback = fn(
+    i32,
+    &mut [u8],
+    &mut dyn FnMut(&[u8]) -> Result<(), SyscallError>,
+    Option<&ProcessArc>,
+) -> Result<usize, SyscallError>;
 
 /// 文件描述符写入回调类型
 ///
@@ -4863,8 +4915,6 @@ pub fn syscall_dispatcher(
             arg2 as *mut u32,
             arg3 as i32,
         ),
-        49 => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
-        50 => sys_listen(arg0 as i32, arg1 as i32),
         44 => sys_sendto(
             arg0 as i32,
             arg1 as *const u8,
@@ -4881,7 +4931,27 @@ pub fn syscall_dispatcher(
             arg4 as *mut SockAddrIn,
             arg5 as *mut u32,
         ),
+        46 => sys_sendmsg(arg0 as i32, arg1 as *const MsgHdr, arg2 as i32),
+        47 => sys_recvmsg(arg0 as i32, arg1 as *mut MsgHdr, arg2 as i32),
         48 => sys_shutdown(arg0 as i32, arg1 as i32),
+        49 => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
+        50 => sys_listen(arg0 as i32, arg1 as i32),
+        51 => sys_getsockname(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
+        52 => sys_getpeername(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
+        54 => sys_setsockopt(
+            arg0 as i32,
+            arg1 as i32,
+            arg2 as i32,
+            arg3 as *const u8,
+            arg4 as u32,
+        ),
+        55 => sys_getsockopt(
+            arg0 as i32,
+            arg1 as i32,
+            arg2 as i32,
+            arg3 as *mut u8,
+            arg4 as *mut u32,
+        ),
 
         // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504, 513, 516)
         500 => sys_cgroup_create(arg0 as u64, arg1 as u32),
@@ -13871,6 +13941,18 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize, entry_proc: Option<&ProcessArc>
         coverage::trace_pc(1003); // sys_read fd callback path
     }
 
+    // POSIX: read() on a socket fd is equivalent to recv(fd, buf, count, 0).
+    if fd_is_socket(fd, entry_proc) {
+        return sys_recvfrom(
+            fd,
+            buf,
+            count,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+    }
+
     // 获取回调函数指针（无锁原子读取）
     let read_fn = get_fd_read_callback().ok_or(SyscallError::EBADF)?;
 
@@ -13878,7 +13960,12 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize, entry_proc: Option<&ProcessArc>
     // their callback lifetime, which may block. Small transfers (<= 256 B) use
     // stack storage and consume zero heap bytes.
     let mut tmp = IoScratchBuffer::try_zeroed(count)?;
-    let bytes_read = read_fn(fd, tmp.as_mut_slice(), buf, copy_to_user, entry_proc)?;
+    let bytes_read = read_fn(
+        fd,
+        tmp.as_mut_slice(),
+        &mut |bytes| copy_to_user(buf, bytes),
+        entry_proc,
+    )?;
 
     // Z-4 安全修复：将回调返回值 clamp 到请求的大小
     // 防止恶意/错误回调返回超大值导致切片越界 panic
@@ -13952,6 +14039,11 @@ fn sys_write(
         #[cfg(feature = "kcov")]
         {
             coverage::trace_pc(1013); // sys_write fd callback path
+        }
+        // POSIX: write() on a socket fd is equivalent to send(fd, buf, count, 0).
+        if fd_is_socket(fd, entry_proc) {
+            drop(tmp);
+            return sys_sendto(fd, buf, count, 0, core::ptr::null(), 0);
         }
         // 获取回调函数指针（无锁原子读取）
         let write_fn = get_fd_write_callback().ok_or(SyscallError::EBADF)?;
@@ -14186,46 +14278,199 @@ fn sys_writev_console(console: crate::process::ConsoleFile, iovs: &[Iovec]) -> S
     Ok(total_written)
 }
 
-/// Index of the first non-empty iovec — the single segment `sys_readv` services
-/// this call — or `None` if every segment is zero-length. Pure (reads only
-/// `iov_len`), so it is unit-testable without touching user memory.
+/// Check whether `fd` currently refers to a `SocketFile`.
+fn fd_is_socket(fd: i32, entry_proc: Option<&ProcessArc>) -> bool {
+    let process = match entry_proc {
+        Some(proc_arc) => proc_arc.clone(),
+        None => match current_pid().and_then(get_process) {
+            Some(proc_arc) => proc_arc,
+            None => return false,
+        },
+    };
+    let proc = process.lock();
+    proc.get_fd(fd)
+        .and_then(|obj| obj.as_any().downcast_ref::<SocketFile>().map(|_| ()))
+        .is_some()
+}
+
+/// Index of the first non-empty iovec — kept for M0 #2 self-test coverage.
 fn first_nonempty_iovec(iovs: &[Iovec]) -> Option<usize> {
     iovs.iter().position(|e| e.iov_len != 0)
 }
 
+/// Compute the total byte length of an `iovec` slice, rejecting `isize::MAX` overflow
+/// per POSIX/Linux `readv`/`writev`/`sendmsg`/`recvmsg` rules.
+fn iovec_total_len(iovs: &[Iovec]) -> Result<usize, SyscallError> {
+    let mut total: usize = 0;
+    for entry in iovs {
+        total = total
+            .checked_add(entry.iov_len)
+            .ok_or(SyscallError::EINVAL)?;
+        if total > isize::MAX as usize {
+            return Err(SyscallError::EINVAL);
+        }
+    }
+    Ok(total)
+}
+
+/// Validate writable user pointers for all non-empty iovecs up to `max_bytes`.
+fn validate_iovecs_writable(iovs: &[Iovec], max_bytes: usize) -> Result<(), SyscallError> {
+    let mut remaining = max_bytes;
+    for entry in iovs {
+        if remaining == 0 {
+            break;
+        }
+        if entry.iov_len == 0 {
+            continue;
+        }
+        let chunk = core::cmp::min(entry.iov_len, remaining);
+        validate_user_ptr_mut(entry.iov_base as *mut u8, chunk)?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+/// Scatter `data` sequentially across user `iovs` using fault-tolerant `copy_to_user`.
+///
+/// Shared by `sys_readv` and `sys_recvmsg`. Returns the exact number of bytes copied
+/// (`min(data.len(), sum(iov_len))`). If any segment faults, returns `EFAULT` immediately
+/// so transactional readers (pipes, VFS files, sockets) leave their source position
+/// unchanged.
+fn copy_slice_to_iovecs(iovs: &[Iovec], data: &[u8]) -> Result<usize, SyscallError> {
+    let mut offset = 0usize;
+    for entry in iovs {
+        if offset >= data.len() {
+            break;
+        }
+        if entry.iov_len == 0 {
+            continue;
+        }
+        let take = core::cmp::min(entry.iov_len, data.len() - offset);
+        copy_to_user(entry.iov_base as *mut u8, &data[offset..offset + take])?;
+        offset += take;
+    }
+    Ok(offset)
+}
+
+/// Gather all non-empty user `iovs` into a single admitted kernel buffer of class `class`,
+/// enforcing `max_bytes` (returning `too_large_err` when exceeded).
+///
+/// Shared by `sys_sendmsg` (and available to other vectored writers).
+fn gather_iovecs_from_user(
+    iovs: &[Iovec],
+    class: mm::HeapClass,
+    max_bytes: usize,
+    too_large_err: SyscallError,
+) -> Result<AdmittedVec<u8>, SyscallError> {
+    let total = iovec_total_len(iovs)?;
+    if total > max_bytes {
+        return Err(too_large_err);
+    }
+    if total == 0 {
+        return try_admitted_vec(class, 0);
+    }
+    for entry in iovs {
+        if entry.iov_len != 0 {
+            validate_user_ptr(entry.iov_base, entry.iov_len)?;
+        }
+    }
+    let mut buf = try_admitted_zeroed_buffer(class, total)?;
+    let mut offset = 0usize;
+    for entry in iovs {
+        if entry.iov_len == 0 {
+            continue;
+        }
+        let end = offset + entry.iov_len;
+        copy_from_user(&mut buf[offset..end], entry.iov_base)?;
+        offset = end;
+    }
+    Ok(buf)
+}
+
 /// sys_readv - 分散读取到多个缓冲区 (Linux x86_64 syscall 19)
 ///
-/// Shares `sys_writev`'s hardened iovec validation (`copy_iovec_array_from_user`),
-/// then performs EXACTLY ONE underlying `sys_read` into the first non-empty
-/// segment.
+/// N2.8: True multi-iovec scatter read backed by a SINGLE transactional read
+/// operation into a bounded staging buffer (`min(total_len, MAX_RW_SIZE)`), then
+/// scattered across all iovecs via `copy_slice_to_iovecs`.
 ///
-/// Why one read, not a per-segment gather: `readv(2)` is a SINGLE read operation
-/// over the concatenated buffers — it blocks at most until the first byte and
-/// then returns whatever is currently available, *without blocking again*. Our
-/// I/O primitive is per-buffer and `sys_read` blocks on empty blocking sources
-/// (stdin, pipes — `ipc/lib.rs:121` "potentially blocking pipe I/O"). A naive
-/// gather that advanced to the next segment after a full read would issue a
-/// second blocking read and could hang at an exact buffer boundary where Linux
-/// returns (the case Codex flagged). Servicing only the first non-empty segment
-/// is a legal `readv` (a short result is always permitted; callers loop) and is
-/// musl-stdio compatible (its `[user_buf, FILE_buf]` readv tolerates a short
-/// return — it just forgoes read-ahead buffering). A true scatter awaits a
-/// lower-level vectored read (Phase U / later M0).
+/// Because only ONE underlying read executes per `readv`, blocking sources (stdin,
+/// pipes, sockets) never issue a second blocking read at a segment boundary, and
+/// any usercopy fault on a later segment leaves the file offset / pipe queue /
+/// socket queue untouched.
 fn sys_readv(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
     // Shared hardened validation/copy (R97-1 / R24-11 / P1-6 / R158-9).
     let iov_array = copy_iovec_array_from_user(iov, iovcnt)?;
+    let total_len = iovec_total_len(&iov_array)?;
 
-    match first_nonempty_iovec(&iov_array) {
-        Some(i) => {
-            let entry = &iov_array[i];
-            // `iov_base` is the destination here. `sys_read` validates it
-            // writable (validate_user_ptr_mut) and performs the fault-tolerant
-            // usercopy — we never form a Rust `&mut [u8]` from the raw pointer.
-            sys_read(fd, entry.iov_base as *mut u8, entry.iov_len, None)
-        }
-        // Empty vector (iovcnt == 0) or all segments zero-length: read nothing.
-        None => Ok(0),
+    // Validate fd even when total_len == 0? Match existing sys_read/readv:
+    // empty vector or all zero-length segments reads nothing and returns 0.
+    if total_len == 0 {
+        return Ok(0);
     }
+
+    let read_cap = core::cmp::min(total_len, MAX_RW_SIZE);
+    validate_iovecs_writable(&iov_array, read_cap)?;
+
+    let console = lookup_console_file_with(fd, None)?;
+
+    if let Some(console) = console {
+        if !console.readable {
+            return Err(SyscallError::EBADF);
+        }
+        if !crate::process::console_input_allowed() {
+            return Err(SyscallError::EPERM);
+        }
+        let mut tmp = try_admitted_zeroed_io_buffer(read_cap)?;
+        loop {
+            let bytes_read = drivers::keyboard_read_with_commit(&mut tmp, |bytes| {
+                copy_slice_to_iovecs(&iov_array, bytes).map(|_| ())
+            })?;
+            if bytes_read > 0 {
+                return Ok(bytes_read);
+            }
+            match stdin_prepare_to_wait() {
+                StdinWaitPrepare::Enqueued => {}
+                StdinWaitPrepare::NoProcess => return Ok(0),
+                StdinWaitPrepare::RegistryFull => {
+                    yield_with_deferred_work();
+                    continue;
+                }
+            }
+            struct StdinPreparedWaitGuard;
+            impl Drop for StdinPreparedWaitGuard {
+                fn drop(&mut self) {
+                    stdin_cancel_wait();
+                }
+            }
+            let _wait_guard = StdinPreparedWaitGuard;
+
+            let bytes_read = drivers::keyboard_read_with_commit(&mut tmp, |bytes| {
+                copy_slice_to_iovecs(&iov_array, bytes).map(|_| ())
+            })?;
+            if bytes_read > 0 {
+                return Ok(bytes_read);
+            }
+            if stdin_finish_wait() {
+                return Err(SyscallError::EINTR);
+            }
+        }
+    }
+
+    // Socket descriptors scatter via the shared transactional socket recv path.
+    if fd_is_socket(fd, None) {
+        return recv_socket_into_iovecs(fd, &iov_array, read_cap, 0, None, None);
+    }
+
+    let read_fn = get_fd_read_callback().ok_or(SyscallError::EBADF)?;
+    let mut tmp = IoScratchBuffer::try_zeroed(read_cap)?;
+    let bytes_read = read_fn(
+        fd,
+        tmp.as_mut_slice(),
+        &mut |bytes| copy_slice_to_iovecs(&iov_array, bytes).map(|_| ()),
+        None,
+    )?;
+
+    Ok(bytes_read.min(read_cap))
 }
 
 /// sys_open - 打开文件
@@ -23102,6 +23347,9 @@ fn write_sockaddr_in(
     let mut len_bytes = [0u8; 4];
     copy_from_user(&mut len_bytes, user_len as *const u8)?;
     let provided_len = u32::from_ne_bytes(len_bytes);
+    if (provided_len as i32) < 0 {
+        return Err(SyscallError::EINVAL);
+    }
 
     // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,[u8;4],[u8;8]} = 16 bytes)
     let addr_bytes = unsafe {
@@ -24080,12 +24328,9 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
     // Current process context for LSM
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
 
-    // Source IP: use bound value if present, else 0.0.0.0 placeholder
-    // The actual source IP will be determined by routing (future enhancement)
-    let src_ip = socket
-        .local_ip()
-        .map(net::Ipv4Addr)
-        .unwrap_or(net::Ipv4Addr([0, 0, 0, 0]));
+    // Source IP: resolve consistently with the IPv4 TX path (loopback -> 127.0.0.1,
+    // external -> namespace our_ip) when unbound or bound to INADDR_ANY.
+    let src_ip = net::select_source_ip(socket.local_ip(), dst_ip, socket.net_ns_id.0);
 
     // Non-blocking connect uses zero timeout to get EINPROGRESS
     // Blocking connect uses a reasonable timeout to avoid indefinite blocks
@@ -24101,15 +24346,21 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
     // conntrack together with device queue acceptance. Pre-seeding here would
     // leave a ghost SYN on QueueFull and double-account successful sends.
 
-    // Phase 2: Transmit the SYN segment via network device
+    // Phase 2: Transmit the SYN segment via network device (or loopback `lo`)
     // R51-5 FIX: Abort connection if TX fails to prevent TCB/binding leak
-    if let Err(e) = net::transmit_tcp_connect(syn_result, socket.net_ns_id.0) {
+    if let Err(e) = net::transmit_tcp_connect_opts(syn_result, socket.net_ns_id.0, socket.ip_ttl())
+    {
         net::socket_table().abort_tcp_connect(&socket);
         return Err(tx_error_to_syscall(e));
     }
 
-    // Non-blocking connect returns EINPROGRESS after sending SYN
+    // Non-blocking connect: if loopback already completed the 3-way handshake
+    // synchronously, POSIX permits returning 0 immediately; otherwise return
+    // EINPROGRESS (with any synchronous loopback RST recorded in SO_ERROR).
     if nonblock {
+        if matches!(socket.tcp_state(), Some(net::TcpState::Established)) {
+            return Ok(0);
+        }
         return Err(SyscallError::EINPROGRESS);
     }
 
@@ -24194,7 +24445,7 @@ fn sys_sendto(
 ) -> SyscallResult {
     // Check flags
     let flag_bits = flags as u32;
-    if flag_bits & !MSG_DONTWAIT != 0 {
+    if flag_bits & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
         return Err(SyscallError::EINVAL);
     }
 
@@ -24249,27 +24500,7 @@ fn sys_sendto(
         let mut data = try_admitted_zeroed_buffer(mm::HeapClass::SocketPayload, len)?;
         copy_from_user(&mut data, buf)?;
 
-        // Get remote IP for transmission
-        let remote_ip = socket
-            .remote_ip()
-            .map(net::Ipv4Addr)
-            .ok_or(SyscallError::ENOTCONN)?;
-
-        // Send via TCP (segments split at MSS boundary)
-        let (bytes_sent, segments) = net::socket_table()
-            .tcp_send(&socket, &ctx, cap_id, &data)
-            .map_err(socket_error_to_syscall)?;
-
-        // Transmit all TCP segments via network device.
-        // R162-10 FIX: Ignore transmit failures — data is already committed
-        // to the TCP send buffer with snd_nxt advanced. The retransmission
-        // timer will re-send on failure. Returning an error here would cause
-        // the caller to re-send, creating duplicate data in the TCP stream.
-        for segment in segments {
-            let _ = net::transmit_tcp_segment(remote_ip, &segment, socket.net_ns_id.0);
-        }
-
-        return Ok(bytes_sent);
+        return send_tcp_payload(&socket, &ctx, cap_id, &data);
     }
 
     // Non-TCP with dest_addr: must be UDP
@@ -24301,40 +24532,93 @@ fn sys_sendto(
     }
     let dst_ip = net::Ipv4Addr(dest.ip_bytes());
 
-    // R48-REVIEW FIX: Source IP - use actual bound address if available.
-    // If not bound, use INADDR_ANY (0.0.0.0) which send_to_udp will use
-    // when auto-binding to an ephemeral port.
-    let src_ip = socket
+    if len == 0 {
+        return send_udp_payload(&socket, &ctx, cap_id, dst_ip, dst_port, &[]);
+    }
+
+    validate_user_ptr(buf, len)?;
+    // R180-11: include the user-copy staging buffer in the socket-payload
+    // ledger; PendingDatagram takes its own retained charge on publication.
+    let mut data = try_admitted_zeroed_buffer(mm::HeapClass::SocketPayload, len)?;
+    copy_from_user(&mut data, buf)?;
+    send_udp_payload(&socket, &ctx, cap_id, dst_ip, dst_port, &data)
+}
+
+/// Shared TCP payload transmit core for `sys_sendto` and `sys_sendmsg`.
+fn send_tcp_payload(
+    socket: &net::SocketArc,
+    ctx: &lsm::ProcessCtx,
+    cap_id: cap::CapId,
+    data: &[u8],
+) -> SyscallResult {
+    let remote_ip = socket
+        .remote_ip()
+        .map(net::Ipv4Addr)
+        .ok_or(SyscallError::ENOTCONN)?;
+    let local_ip = socket
         .local_ip()
         .map(net::Ipv4Addr)
-        .unwrap_or(net::Ipv4Addr([0, 0, 0, 0]));
+        .filter(|ip| !ip.is_unspecified());
+    let ttl = socket.ip_ttl();
 
-    // Send via socket_table (includes LSM hook_net_send check). A zero-length
-    // UDP send is a real datagram, not a no-op: pass an empty slice so the net
-    // layer emits the mandatory eight-byte UDP header without allocating a
-    // syscall staging buffer or touching the user pointer.
-    let datagram = if len == 0 {
-        net::socket_table()
-            .send_to_udp(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, &[])
-            .map_err(socket_error_to_syscall)?
+    let (bytes_sent, segments) = net::socket_table()
+        .tcp_send(socket, ctx, cap_id, data)
+        .map_err(socket_error_to_syscall)?;
+
+    // R162-10 FIX: Ignore transmit failures — data is already committed
+    // to the TCP send buffer with snd_nxt advanced. The retransmission
+    // timer will re-send on failure.
+    for segment in segments {
+        let _ =
+            net::transmit_tcp_segment_opts(local_ip, remote_ip, &segment, socket.net_ns_id.0, ttl);
+    }
+
+    Ok(bytes_sent)
+}
+
+/// Shared UDP payload transmit core for `sys_sendto` and `sys_sendmsg`.
+fn send_udp_payload(
+    socket: &net::SocketArc,
+    ctx: &lsm::ProcessCtx,
+    cap_id: cap::CapId,
+    dst_ip: net::Ipv4Addr,
+    dst_port: u16,
+    data: &[u8],
+) -> SyscallResult {
+    let src_ip = net::select_source_ip(socket.local_ip(), dst_ip, socket.net_ns_id.0);
+    let datagram = net::socket_table()
+        .send_to_udp(socket, ctx, cap_id, src_ip, dst_ip, dst_port, data)
+        .map_err(socket_error_to_syscall)?;
+
+    net::transmit_udp_datagram_opts(
+        (!src_ip.is_unspecified()).then_some(src_ip),
+        dst_ip,
+        &datagram,
+        socket.net_ns_id.0,
+        socket.ip_ttl(),
+    )
+    .map_err(tx_error_to_syscall)?;
+    net::socket_table().commit_udp_send(socket, data.len());
+
+    Ok(data.len())
+}
+
+/// Resolve the receive timeout from nonblock/MSG_DONTWAIT and `SO_RCVTIMEO`.
+#[inline]
+fn resolve_recv_timeout(
+    socket: &net::SocketState,
+    nonblock: bool,
+    flags: u32,
+) -> (Option<u64>, bool) {
+    if nonblock || (flags & MSG_DONTWAIT != 0) {
+        return (Some(0), false);
+    }
+    let us = socket.rcvtimeo_us();
+    if us > 0 {
+        (Some(us.saturating_mul(1000)), true)
     } else {
-        validate_user_ptr(buf, len)?;
-        // R180-11: include the user-copy staging buffer in the socket-payload
-        // ledger; PendingDatagram takes its own retained charge on publication.
-        let mut data = try_admitted_zeroed_buffer(mm::HeapClass::SocketPayload, len)?;
-        copy_from_user(&mut data, buf)?;
-        net::socket_table()
-            .send_to_udp(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, &data)
-            .map_err(socket_error_to_syscall)?
-    };
-
-    // Transmit the UDP datagram via network device
-    // R162-7-2 FIX: Pass socket's namespace for per-NS egress firewall evaluation.
-    net::transmit_udp_datagram(dst_ip, &datagram, socket.net_ns_id.0)
-        .map_err(tx_error_to_syscall)?;
-    net::socket_table().commit_udp_send(&socket, len);
-
-    Ok(len)
+        (None, false)
+    }
 }
 
 /// sys_recvfrom - Receive data from socket (syscall 45).
@@ -24410,11 +24694,14 @@ fn sys_recvfrom(
     // Get current process context
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
 
-    // Determine timeout (0 for non-blocking, None for blocking)
-    let timeout = if nonblock || (flag_bits & MSG_DONTWAIT != 0) {
-        Some(0)
-    } else {
-        None
+    // Determine timeout (0 for non-blocking, SO_RCVTIMEO if set, else blocking)
+    let (timeout, has_rcvtimeo) = resolve_recv_timeout(&socket, nonblock, flag_bits);
+    let map_recv_err = |error: net::RecvTransactionError<SyscallError>| match error {
+        net::RecvTransactionError::Socket(net::SocketError::Timeout) if has_rcvtimeo => {
+            SyscallError::EAGAIN
+        }
+        net::RecvTransactionError::Socket(error) => socket_error_to_syscall(error),
+        net::RecvTransactionError::Commit(error) => error,
     };
 
     // TCP: recv() semantics when src_addr is NULL (connected socket)
@@ -24426,10 +24713,7 @@ fn sys_recvfrom(
                 }
                 Ok(())
             })
-            .map_err(|error| match error {
-                net::RecvTransactionError::Socket(error) => socket_error_to_syscall(error),
-                net::RecvTransactionError::Commit(error) => error,
-            })?;
+            .map_err(map_recv_err)?;
         return Ok(copied);
     }
 
@@ -24450,10 +24734,526 @@ fn sys_recvfrom(
             }
             Ok(copied)
         })
-        .map_err(|error| match error {
-            net::RecvTransactionError::Socket(error) => socket_error_to_syscall(error),
-            net::RecvTransactionError::Commit(error) => error,
+        .map_err(map_recv_err)
+}
+
+/// Shared vectored socket receive core for `sys_readv` and `sys_recvmsg`.
+///
+/// Returns `(bytes_copied, msg_flags)` where `msg_flags` sets `MSG_TRUNC` when
+/// a UDP datagram was larger than the total iovec capacity.
+fn recv_socket_into_iovecs(
+    fd: i32,
+    iovs: &[Iovec],
+    total_cap: usize,
+    flag_bits: u32,
+    msg_name_out: Option<(*mut u8, u32)>,
+    msg_hdr_user: Option<*mut MsgHdr>,
+) -> SyscallResult {
+    let (cap_id, socket_id, nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    if !entry.rights.allows(cap::CapRights::READ) {
+        return Err(SyscallError::EACCES);
+    }
+
+    let is_tcp = socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp;
+    let is_udp = socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp;
+    if !is_tcp && !is_udp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    if total_cap > MAX_RW_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+
+    if total_cap != 0 {
+        validate_iovecs_writable(iovs, total_cap)?;
+    }
+
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+    let (timeout, has_rcvtimeo) = resolve_recv_timeout(&socket, nonblock, flag_bits);
+    let map_recv_err = |error: net::RecvTransactionError<SyscallError>| match error {
+        net::RecvTransactionError::Socket(net::SocketError::Timeout) if has_rcvtimeo => {
+            SyscallError::EAGAIN
+        }
+        net::RecvTransactionError::Socket(error) => socket_error_to_syscall(error),
+        net::RecvTransactionError::Commit(error) => error,
+    };
+
+    if is_tcp {
+        let copied = net::socket_table()
+            .tcp_recv_with_commit(&socket, &ctx, cap_id, total_cap, timeout, |data| {
+                if !data.is_empty() {
+                    copy_slice_to_iovecs(iovs, data)?;
+                }
+                if let Some(user_msg) = msg_hdr_user {
+                    write_msghdr_out_fields(user_msg, None, 0)?;
+                }
+                Ok(())
+            })
+            .map_err(map_recv_err)?;
+        return Ok(copied);
+    }
+
+    net::socket_table()
+        .recv_from_udp_with_commit(&socket, &ctx, cap_id, timeout, |pkt| {
+            let mut out_namelen: Option<u32> = None;
+            if let Some((name_ptr, name_cap)) = msg_name_out {
+                if !name_ptr.is_null() {
+                    let sockaddr = SockAddrIn::from_addr(pkt.src_ip.0, pkt.src_port);
+                    let mut addr_bytes = [0u8; 16];
+                    addr_bytes[0..2].copy_from_slice(&sockaddr.sin_family.to_ne_bytes());
+                    addr_bytes[2..4].copy_from_slice(&sockaddr.sin_port.to_ne_bytes());
+                    addr_bytes[4..8].copy_from_slice(&sockaddr.sin_addr);
+                    let write_len = core::cmp::min(name_cap as usize, addr_bytes.len());
+                    if write_len > 0 {
+                        validate_user_ptr_mut(name_ptr, write_len)?;
+                        copy_to_user(name_ptr, &addr_bytes[..write_len])?;
+                    }
+                    out_namelen = Some(addr_bytes.len() as u32);
+                }
+            }
+            let payload = pkt.payload();
+            let copied = core::cmp::min(total_cap, payload.len());
+            if copied != 0 {
+                let copy = payload.get(..copied).ok_or(SyscallError::EIO)?;
+                copy_slice_to_iovecs(iovs, copy)?;
+            }
+            let out_flags = if payload.len() > total_cap {
+                MSG_TRUNC as i32
+            } else {
+                0
+            };
+            if let Some(user_msg) = msg_hdr_user {
+                write_msghdr_out_fields(user_msg, out_namelen, out_flags)?;
+            }
+            Ok(copied)
         })
+        .map_err(map_recv_err)
+}
+
+/// Fault-tolerant decode of Linux x86_64 `struct msghdr` (56 bytes) from user space.
+fn read_msghdr_from_user(user_msg: *const MsgHdr) -> Result<MsgHdr, SyscallError> {
+    if user_msg.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    validate_user_ptr(user_msg as *const u8, core::mem::size_of::<MsgHdr>())?;
+    let mut raw = [0u8; 56];
+    copy_from_user(&mut raw, user_msg as *const u8)?;
+    Ok(MsgHdr {
+        msg_name: usize::from_ne_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ]) as *mut u8,
+        msg_namelen: u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]),
+        _pad0: u32::from_ne_bytes([raw[12], raw[13], raw[14], raw[15]]),
+        msg_iov: usize::from_ne_bytes([
+            raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+        ]) as *const Iovec,
+        msg_iovlen: usize::from_ne_bytes([
+            raw[24], raw[25], raw[26], raw[27], raw[28], raw[29], raw[30], raw[31],
+        ]),
+        msg_control: usize::from_ne_bytes([
+            raw[32], raw[33], raw[34], raw[35], raw[36], raw[37], raw[38], raw[39],
+        ]) as *mut u8,
+        msg_controllen: usize::from_ne_bytes([
+            raw[40], raw[41], raw[42], raw[43], raw[44], raw[45], raw[46], raw[47],
+        ]),
+        msg_flags: i32::from_ne_bytes([raw[48], raw[49], raw[50], raw[51]]),
+        _pad1: u32::from_ne_bytes([raw[52], raw[53], raw[54], raw[55]]),
+    })
+}
+
+/// Write `msg_namelen` (when updated), `msg_controllen = 0`, and `msg_flags` back to user `msghdr`.
+fn write_msghdr_out_fields(
+    user_msg: *mut MsgHdr,
+    out_namelen: Option<u32>,
+    out_flags: i32,
+) -> Result<(), SyscallError> {
+    let base = user_msg as usize;
+    if let Some(namelen) = out_namelen {
+        let ptr = base
+            .checked_add(core::mem::offset_of!(MsgHdr, msg_namelen))
+            .ok_or(SyscallError::EFAULT)? as *mut u8;
+        validate_user_ptr_mut(ptr, 4)?;
+        copy_to_user(ptr, &namelen.to_ne_bytes())?;
+    }
+    let ctrl_ptr = base
+        .checked_add(core::mem::offset_of!(MsgHdr, msg_controllen))
+        .ok_or(SyscallError::EFAULT)? as *mut u8;
+    validate_user_ptr_mut(ctrl_ptr, 8)?;
+    copy_to_user(ctrl_ptr, &0usize.to_ne_bytes())?;
+
+    let flags_ptr = base
+        .checked_add(core::mem::offset_of!(MsgHdr, msg_flags))
+        .ok_or(SyscallError::EFAULT)? as *mut u8;
+    validate_user_ptr_mut(flags_ptr, 4)?;
+    copy_to_user(flags_ptr, &out_flags.to_ne_bytes())?;
+    Ok(())
+}
+
+/// sys_sendmsg - Send message on a socket using scatter-gather `msghdr` (syscall 46).
+///
+/// Supports `msg_iov` gather for both TCP and UDP. Returns `EOPNOTSUPP` when
+/// `msg_controllen != 0` (ancillary control messages / SCM_RIGHTS deferred to N4).
+fn sys_sendmsg(fd: i32, msg: *const MsgHdr, flags: i32) -> SyscallResult {
+    let flag_bits = flags as u32;
+    if flag_bits & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    if !entry.rights.allows(cap::CapRights::WRITE) {
+        return Err(SyscallError::EACCES);
+    }
+
+    let is_tcp = socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp;
+    let is_udp = socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp;
+    if !is_tcp && !is_udp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    let hdr = read_msghdr_from_user(msg)?;
+
+    // N2.8: ancillary/control messages are not supported yet.
+    if hdr.msg_controllen != 0 {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    let iov_array = copy_iovec_array_from_user(hdr.msg_iov, hdr.msg_iovlen)?;
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    let has_name = !hdr.msg_name.is_null() && hdr.msg_namelen != 0;
+    if !has_name {
+        if !is_tcp {
+            return Err(SyscallError::EDESTADDRREQ);
+        }
+        let data = gather_iovecs_from_user(
+            &iov_array,
+            mm::HeapClass::SocketPayload,
+            net::tcp::TCP_MAX_SEND_SIZE,
+            SyscallError::EMSGSIZE,
+        )?;
+        if data.is_empty() {
+            let (bytes_sent, segments) = net::socket_table()
+                .tcp_send(&socket, &ctx, cap_id, &[])
+                .map_err(socket_error_to_syscall)?;
+            debug_assert_eq!(bytes_sent, 0);
+            debug_assert!(segments.is_empty());
+            return Ok(0);
+        }
+        return send_tcp_payload(&socket, &ctx, cap_id, &data);
+    }
+
+    if !is_udp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    if socket.local_port().is_none() && !entry.rights.allows(cap::CapRights::BIND) {
+        return Err(SyscallError::EACCES);
+    }
+
+    let dest = read_sockaddr_in(hdr.msg_name as *const SockAddrIn, hdr.msg_namelen)?;
+    if dest.sin_family != AF_INET as u16 {
+        return Err(SyscallError::EAFNOSUPPORT);
+    }
+    let dst_port = dest.port();
+    if dst_port == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let dst_ip = net::Ipv4Addr(dest.ip_bytes());
+
+    let data = gather_iovecs_from_user(
+        &iov_array,
+        mm::HeapClass::SocketPayload,
+        UDP_MAX_PAYLOAD,
+        SyscallError::EMSGSIZE,
+    )?;
+    send_udp_payload(&socket, &ctx, cap_id, dst_ip, dst_port, &data)
+}
+
+/// sys_recvmsg - Receive message from a socket into scatter-gather `msghdr` (syscall 47).
+///
+/// Supports `msg_iov` scatter for both TCP and UDP (sharing iovec helpers with
+/// `sys_readv`). Returns `EOPNOTSUPP` when `msg_controllen != 0`.
+fn sys_recvmsg(fd: i32, msg: *mut MsgHdr, flags: i32) -> SyscallResult {
+    let flag_bits = flags as u32;
+    if flag_bits & !MSG_DONTWAIT != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Validate fd first so bad fds report EBADF/ENOTSOCK before msghdr checks.
+    let (_cap_id, _socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+
+    let hdr = read_msghdr_from_user(msg as *const MsgHdr)?;
+
+    // N2.8: ancillary/control messages are not supported yet.
+    if hdr.msg_controllen != 0 {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+    if (hdr.msg_namelen as i32) < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let iov_array = copy_iovec_array_from_user(hdr.msg_iov, hdr.msg_iovlen)?;
+    let total_cap = iovec_total_len(&iov_array)?;
+    if total_cap > MAX_RW_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let name_out = if hdr.msg_name.is_null() {
+        None
+    } else {
+        Some((hdr.msg_name, hdr.msg_namelen))
+    };
+
+    recv_socket_into_iovecs(fd, &iov_array, total_cap, flag_bits, name_out, Some(msg))
+}
+
+/// sys_getsockname - Get local address bound to a socket (syscall 51).
+fn sys_getsockname(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResult {
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (_entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    if addr.is_null() || addrlen.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let ip = socket.local_ip().unwrap_or([0, 0, 0, 0]);
+    let port = socket.local_port().unwrap_or(0);
+    let out = SockAddrIn::from_addr(ip, port);
+    write_sockaddr_in(&out, addr, addrlen)?;
+    Ok(0)
+}
+
+/// sys_getpeername - Get remote peer address of a connected socket (syscall 52).
+fn sys_getpeername(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResult {
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (_entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    if addr.is_null() || addrlen.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // For TCP sockets, peername is only available once the connection is established
+    // (or in a post-establishment closing state).
+    if socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp {
+        match socket.tcp_state() {
+            Some(
+                net::TcpState::Established
+                | net::TcpState::CloseWait
+                | net::TcpState::FinWait1
+                | net::TcpState::FinWait2
+                | net::TcpState::Closing
+                | net::TcpState::LastAck
+                | net::TcpState::TimeWait,
+            ) => {}
+            _ => return Err(SyscallError::ENOTCONN),
+        }
+    }
+
+    let (rip, rport) = match (socket.remote_ip(), socket.remote_port()) {
+        (Some(ip), Some(port)) if port != 0 => (ip, port),
+        _ => return Err(SyscallError::ENOTCONN),
+    };
+    let out = SockAddrIn::from_addr(rip, rport);
+    write_sockaddr_in(&out, addr, addrlen)?;
+    Ok(0)
+}
+
+/// sys_setsockopt - Set options on a socket (syscall 54).
+///
+/// Mediated by `lsm::hook_net_setsockopt` (N2.8). Supports:
+/// - `SOL_SOCKET`: `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_RCVBUF`, `SO_SNDBUF`,
+///   `SO_RCVTIMEO`, `SO_SNDTIMEO`
+/// - `IPPROTO_TCP`: `TCP_NODELAY` (TCP sockets only)
+/// - `IPPROTO_IP`: `IP_TTL` (1..=255, or -1 to reset to default 64)
+/// Returns `ENOPROTOOPT` for unsupported or read-only (`SO_TYPE`/`SO_ERROR`) options.
+fn sys_setsockopt(
+    fd: i32,
+    level: i32,
+    optname: i32,
+    optval: *const u8,
+    optlen: u32,
+) -> SyscallResult {
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (_entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Mandatory LSM mediation for every setsockopt call.
+    let proc_ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+    let mut net_ctx = net::socket_table().ctx_from_socket(&socket);
+    net_ctx.cap = Some(cap_id);
+    lsm::hook_net_setsockopt(&proc_ctx, &net_ctx, level, optname).map_err(lsm_error_to_syscall)?;
+
+    if (optlen as i32) < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let read_i32_opt = || -> Result<i32, SyscallError> {
+        if optval.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+        if optlen < 4 {
+            return Err(SyscallError::EINVAL);
+        }
+        validate_user_ptr(optval, 4)?;
+        let mut bytes = [0u8; 4];
+        copy_from_user(&mut bytes, optval)?;
+        Ok(i32::from_ne_bytes(bytes))
+    };
+
+    let read_timeval_us = || -> Result<u64, SyscallError> {
+        if optval.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+        if optlen < 16 {
+            return Err(SyscallError::EINVAL);
+        }
+        validate_user_ptr(optval, 16)?;
+        let mut bytes = [0u8; 16];
+        copy_from_user(&mut bytes, optval)?;
+        let tv_sec = i64::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let tv_usec = i64::from_ne_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
+            return Err(SyscallError::EINVAL);
+        }
+        Ok((tv_sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add(tv_usec as u64))
+    };
+
+    match (level, optname) {
+        (SOL_SOCKET, SO_REUSEADDR) => {
+            let val = read_i32_opt()?;
+            socket.set_reuseaddr(val != 0);
+            Ok(0)
+        }
+        (SOL_SOCKET, SO_KEEPALIVE) => {
+            let val = read_i32_opt()?;
+            socket.set_keepalive(val != 0);
+            Ok(0)
+        }
+        (SOL_SOCKET, SO_RCVBUF) => {
+            let val = read_i32_opt()?;
+            let size = if val < 0 { 0u32 } else { val as u32 };
+            socket.set_rcvbuf(size);
+            Ok(0)
+        }
+        (SOL_SOCKET, SO_SNDBUF) => {
+            let val = read_i32_opt()?;
+            let size = if val < 0 { 0u32 } else { val as u32 };
+            socket.set_sndbuf(size);
+            Ok(0)
+        }
+        (SOL_SOCKET, SO_RCVTIMEO) => {
+            let us = read_timeval_us()?;
+            socket.set_rcvtimeo_us(us);
+            Ok(0)
+        }
+        (SOL_SOCKET, SO_SNDTIMEO) => {
+            let us = read_timeval_us()?;
+            socket.set_sndtimeo_us(us);
+            Ok(0)
+        }
+        (IPPROTO_TCP, TCP_NODELAY) => {
+            if socket.ty != net::SocketType::Stream || socket.proto != net::SocketProtocol::Tcp {
+                return Err(SyscallError::ENOPROTOOPT);
+            }
+            let val = read_i32_opt()?;
+            socket.set_nodelay(val != 0);
+            Ok(0)
+        }
+        (IPPROTO_IP, IP_TTL) => {
+            let val = read_i32_opt()?;
+            if val == -1 {
+                socket.set_ip_ttl(net::DEFAULT_IP_TTL);
+            } else if (1..=255).contains(&val) {
+                socket.set_ip_ttl(val as u8);
+            } else {
+                return Err(SyscallError::EINVAL);
+            }
+            Ok(0)
+        }
+        _ => Err(SyscallError::ENOPROTOOPT),
+    }
+}
+
+/// sys_getsockopt - Get options on a socket (syscall 55).
+fn sys_getsockopt(
+    fd: i32,
+    level: i32,
+    optname: i32,
+    optval: *mut u8,
+    optlen: *mut u32,
+) -> SyscallResult {
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (_entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    if optval.is_null() || optlen.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    validate_user_ptr_mut(optlen as *mut u8, 4)?;
+    let mut len_bytes = [0u8; 4];
+    copy_from_user(&mut len_bytes, optlen as *const u8)?;
+    let provided_len = u32::from_ne_bytes(len_bytes);
+    if (provided_len as i32) < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let write_bytes = |data: &[u8]| -> SyscallResult {
+        let write_len = core::cmp::min(provided_len as usize, data.len());
+        if write_len > 0 {
+            validate_user_ptr_mut(optval, write_len)?;
+            copy_to_user(optval, &data[..write_len])?;
+        }
+        let out_len = (write_len as u32).to_ne_bytes();
+        copy_to_user(optlen as *mut u8, &out_len)?;
+        Ok(0)
+    };
+
+    let write_i32 = |v: i32| -> SyscallResult { write_bytes(&v.to_ne_bytes()) };
+
+    match (level, optname) {
+        (SOL_SOCKET, SO_REUSEADDR) => write_i32(i32::from(socket.reuseaddr())),
+        (SOL_SOCKET, SO_KEEPALIVE) => write_i32(i32::from(socket.keepalive())),
+        (SOL_SOCKET, SO_RCVBUF) => write_i32(socket.rcvbuf() as i32),
+        (SOL_SOCKET, SO_SNDBUF) => write_i32(socket.sndbuf() as i32),
+        (SOL_SOCKET, SO_TYPE) => {
+            let raw_ty = match socket.ty {
+                net::SocketType::Stream => 1,
+                net::SocketType::Dgram => 2,
+            };
+            write_i32(raw_ty)
+        }
+        (SOL_SOCKET, SO_ERROR) => write_i32(socket.take_pending_error()),
+        (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => {
+            let us = if optname == SO_RCVTIMEO {
+                socket.rcvtimeo_us()
+            } else {
+                socket.sndtimeo_us()
+            };
+            let tv_sec = (us / 1_000_000) as i64;
+            let tv_usec = (us % 1_000_000) as i64;
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&tv_sec.to_ne_bytes());
+            buf[8..16].copy_from_slice(&tv_usec.to_ne_bytes());
+            write_bytes(&buf)
+        }
+        (IPPROTO_TCP, TCP_NODELAY) => {
+            if socket.ty != net::SocketType::Stream || socket.proto != net::SocketProtocol::Tcp {
+                return Err(SyscallError::ENOPROTOOPT);
+            }
+            write_i32(i32::from(socket.nodelay()))
+        }
+        (IPPROTO_IP, IP_TTL) => write_i32(socket.ip_ttl() as i32),
+        _ => Err(SyscallError::ENOPROTOOPT),
+    }
 }
 
 /// sys_shutdown - Shutdown TCP connection (syscall 48).
@@ -24502,10 +25302,16 @@ fn sys_shutdown(fd: i32, how: i32) -> SyscallResult {
         Ok(Some(fin_segment)) => {
             // Transmit the FIN segment
             if let Some(dst_ip) = socket.remote_ip() {
-                let _ = net::transmit_tcp_segment(
+                let src_ip = socket
+                    .local_ip()
+                    .map(net::Ipv4Addr)
+                    .filter(|ip| !ip.is_unspecified());
+                let _ = net::transmit_tcp_segment_opts(
+                    src_ip,
                     net::Ipv4Addr(dst_ip),
                     &fin_segment,
                     socket.net_ns_id.0,
+                    socket.ip_ttl(),
                 );
             }
             Ok(0)

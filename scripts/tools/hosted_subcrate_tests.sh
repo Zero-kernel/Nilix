@@ -215,8 +215,8 @@ run_suite cap-cloexec 1 12 \
     --features mm/host_harness \
     --lib --locked -- ksa005_
 
-# Includes the C3 port-uncharge drain's sequence gate.
-run_suite net 142 0 \
+# Includes the C3 port-uncharge drain's sequence gate and N2.8 loopback/firewall tests.
+run_suite net 146 0 \
     --manifest-path kernel/net/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \

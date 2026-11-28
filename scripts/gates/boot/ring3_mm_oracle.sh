@@ -148,6 +148,9 @@ context switch RIP/RFLAGS: concurrent threads preserve Ring-3 CS/SS, callee regi
 TLS isolation: concurrent threads preserve distinct FS_BASE and GS_BASE across context switches
 syscall_active isolation: interleaved blocking syscalls on one CPU never leak EBUSY
 FPU IRQ isolation: concurrent SSE XMM0-XMM7 state stays bit-exact across timer preemptions
+N2.8 loopback UDP/TCP echo, getsockname/getpeername, and RST/SO_ERROR
+N2.8 setsockopt/getsockopt round-trip, bounds, and negative checks
+N2.8 sendmsg/recvmsg scatter-gather, MSG_TRUNC, EOPNOTSUPP control, and multi-iovec readv
 LEGS
 
 # 3. No leg reported a failure, and the suite ran to completion.

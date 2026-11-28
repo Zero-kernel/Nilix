@@ -419,11 +419,6 @@ pub const FEATURE_ABSENT_HOOKS: &[FeatureAbsentHook] = &[
         reason: "livepatch SUPPORTED=false; no production KernelOps implementor",
     },
     FeatureAbsentHook {
-        hook: "hook_net_setsockopt",
-        syscalls: &[54, 55],
-        reason: "no setsockopt/getsockopt arms",
-    },
-    FeatureAbsentHook {
         hook: "hook_task_setgroups",
         syscalls: &[116],
         reason: "no setgroups arm",

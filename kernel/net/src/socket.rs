@@ -50,7 +50,9 @@ use alloc::sync::{Arc, Weak};
 use core::alloc::{AllocError, Allocator, Layout};
 use core::arch::asm;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use spin::{Mutex, RwLock};
 
 use cap::{CapId, NamespaceId};
@@ -785,6 +787,15 @@ static GLOBAL_UDP_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Privileged port boundary (ports below this require special permissions).
 const PRIVILEGED_PORT_LIMIT: u16 = 1024;
+
+/// Minimum SO_RCVBUF / SO_SNDBUF value (4 KiB).
+pub const SOCK_BUF_MIN: u32 = 4096;
+/// Default SO_RCVBUF / SO_SNDBUF value (64 KiB).
+pub const SOCK_BUF_DEFAULT: u32 = 65_536;
+/// Maximum SO_RCVBUF / SO_SNDBUF value (256 KiB, matching TCP_MAX_SEND_BUFFER_BYTES).
+pub const SOCK_BUF_MAX: u32 = 262_144;
+/// Default IPv4 TTL for outbound packets (RFC 1700 / Linux default).
+pub const DEFAULT_IP_TTL: u8 = 64;
 
 /// RF178-30 / R180-L2 FIX: Accept a segment when either its first or last
 /// sequence-space position is inside the receive window.  FIN contributes one
@@ -1785,6 +1796,24 @@ pub struct SocketState {
     tcp: Mutex<Option<TcpSocketState>>,
     /// Listen state (only for listening TCP sockets)
     listen: Mutex<Option<TcpListenState>>,
+    /// Socket option: SO_REUSEADDR
+    opt_reuseaddr: AtomicBool,
+    /// Socket option: SO_KEEPALIVE
+    opt_keepalive: AtomicBool,
+    /// Socket option: TCP_NODELAY
+    opt_nodelay: AtomicBool,
+    /// Socket option: SO_RCVBUF (bounded)
+    opt_rcvbuf: AtomicU32,
+    /// Socket option: SO_SNDBUF (bounded)
+    opt_sndbuf: AtomicU32,
+    /// Socket option: IP_TTL (1..=255)
+    opt_ip_ttl: AtomicU8,
+    /// Socket option: SO_ERROR (positive Linux errno, cleared on read)
+    opt_pending_error: AtomicI32,
+    /// Socket option: SO_RCVTIMEO in microseconds (0 = disabled)
+    opt_rcvtimeo_us: AtomicU64,
+    /// Socket option: SO_SNDTIMEO in microseconds (0 = disabled)
+    opt_sndtimeo_us: AtomicU64,
 }
 
 impl core::fmt::Debug for SocketState {
@@ -1836,7 +1865,126 @@ impl SocketState {
             rx_dropped: AtomicU64::new(0),
             tcp: Mutex::new(None),
             listen: Mutex::new(None),
+            opt_reuseaddr: AtomicBool::new(false),
+            opt_keepalive: AtomicBool::new(false),
+            opt_nodelay: AtomicBool::new(false),
+            opt_rcvbuf: AtomicU32::new(SOCK_BUF_DEFAULT),
+            opt_sndbuf: AtomicU32::new(SOCK_BUF_DEFAULT),
+            opt_ip_ttl: AtomicU8::new(DEFAULT_IP_TTL),
+            opt_pending_error: AtomicI32::new(0),
+            opt_rcvtimeo_us: AtomicU64::new(0),
+            opt_sndtimeo_us: AtomicU64::new(0),
         })
+    }
+
+    /// SO_REUSEADDR option.
+    #[inline]
+    pub fn reuseaddr(&self) -> bool {
+        self.opt_reuseaddr.load(Ordering::Relaxed)
+    }
+
+    /// Set SO_REUSEADDR option.
+    #[inline]
+    pub fn set_reuseaddr(&self, enabled: bool) {
+        self.opt_reuseaddr.store(enabled, Ordering::Relaxed);
+    }
+
+    /// SO_KEEPALIVE option.
+    #[inline]
+    pub fn keepalive(&self) -> bool {
+        self.opt_keepalive.load(Ordering::Relaxed)
+    }
+
+    /// Set SO_KEEPALIVE option.
+    #[inline]
+    pub fn set_keepalive(&self, enabled: bool) {
+        self.opt_keepalive.store(enabled, Ordering::Relaxed);
+    }
+
+    /// TCP_NODELAY option.
+    #[inline]
+    pub fn nodelay(&self) -> bool {
+        self.opt_nodelay.load(Ordering::Relaxed)
+    }
+
+    /// Set TCP_NODELAY option.
+    #[inline]
+    pub fn set_nodelay(&self, enabled: bool) {
+        self.opt_nodelay.store(enabled, Ordering::Relaxed);
+    }
+
+    /// SO_RCVBUF option (effective bounded receive buffer size in bytes).
+    #[inline]
+    pub fn rcvbuf(&self) -> u32 {
+        self.opt_rcvbuf.load(Ordering::Relaxed)
+    }
+
+    /// Set SO_RCVBUF option, clamped to `[SOCK_BUF_MIN, SOCK_BUF_MAX]`.
+    #[inline]
+    pub fn set_rcvbuf(&self, size: u32) {
+        self.opt_rcvbuf
+            .store(size.clamp(SOCK_BUF_MIN, SOCK_BUF_MAX), Ordering::Relaxed);
+    }
+
+    /// SO_SNDBUF option (effective bounded send buffer size in bytes).
+    #[inline]
+    pub fn sndbuf(&self) -> u32 {
+        self.opt_sndbuf.load(Ordering::Relaxed)
+    }
+
+    /// Set SO_SNDBUF option, clamped to `[SOCK_BUF_MIN, SOCK_BUF_MAX]`.
+    #[inline]
+    pub fn set_sndbuf(&self, size: u32) {
+        self.opt_sndbuf
+            .store(size.clamp(SOCK_BUF_MIN, SOCK_BUF_MAX), Ordering::Relaxed);
+    }
+
+    /// IP_TTL option (1..=255).
+    #[inline]
+    pub fn ip_ttl(&self) -> u8 {
+        self.opt_ip_ttl.load(Ordering::Relaxed)
+    }
+
+    /// Set IP_TTL option (caller must validate 1..=255).
+    #[inline]
+    pub fn set_ip_ttl(&self, ttl: u8) {
+        self.opt_ip_ttl.store(ttl.max(1), Ordering::Relaxed);
+    }
+
+    /// SO_ERROR: read and atomically clear pending socket error (positive Linux errno).
+    #[inline]
+    pub fn take_pending_error(&self) -> i32 {
+        self.opt_pending_error.swap(0, Ordering::AcqRel)
+    }
+
+    /// Record a pending asynchronous socket error for `getsockopt(SO_ERROR)`.
+    #[inline]
+    pub fn set_pending_error(&self, errno: i32) {
+        self.opt_pending_error.store(errno, Ordering::Release);
+    }
+
+    /// SO_RCVTIMEO in microseconds (0 = no timeout).
+    #[inline]
+    pub fn rcvtimeo_us(&self) -> u64 {
+        self.opt_rcvtimeo_us.load(Ordering::Relaxed)
+    }
+
+    /// Set SO_RCVTIMEO in microseconds (0 = no timeout).
+    #[inline]
+    pub fn set_rcvtimeo_us(&self, us: u64) {
+        self.opt_rcvtimeo_us.store(us, Ordering::Relaxed);
+    }
+
+    /// SO_SNDTIMEO in microseconds (0 = no timeout).
+    #[inline]
+    pub fn sndtimeo_us(&self) -> u64 {
+        self.opt_sndtimeo_us.load(Ordering::Relaxed)
+    }
+
+    /// Set SO_SNDTIMEO in microseconds (0 = no timeout).
+    #[inline]
+    pub fn set_sndtimeo_us(&self, us: u64) {
+        self.opt_sndtimeo_us.store(us, Ordering::Relaxed);
     }
 
     /// Linux O_APPEND/O_NONBLOCK status; access mode remains O_RDWR at the fd.
@@ -6501,7 +6649,11 @@ impl SocketTable {
             Some(p) => (p, false),
             None => (self.alloc_ephemeral_tcp_port(sock.net_ns_id)?, true),
         };
-        let local_ip = sock.local_ip().map(Ipv4Addr).unwrap_or(src_ip);
+        let local_ip = sock
+            .local_ip()
+            .map(Ipv4Addr)
+            .filter(|ip| !ip.is_unspecified())
+            .unwrap_or(src_ip);
 
         // Build the connection key for uniqueness check
         let conn_key =
@@ -7548,6 +7700,32 @@ impl SocketTable {
         data: &[u8],
         now_ticks: u64,
     ) -> bool {
+        self.deliver_udp_for_dst(
+            net_ns_id,
+            Ipv4Addr::UNSPECIFIED,
+            dst_port,
+            src_ip,
+            src_port,
+            data,
+            now_ticks,
+        )
+    }
+
+    /// Deliver an inbound UDP datagram to a bound socket matching `(net_ns_id, dst_ip, dst_port)`.
+    ///
+    /// If the bound socket specified a non-zero local IP, `dst_ip` (when non-zero)
+    /// must match it. Sockets bound to `0.0.0.0` (INADDR_ANY) receive datagrams for
+    /// any local destination IP in their namespace.
+    pub fn deliver_udp_for_dst(
+        &self,
+        net_ns_id: NamespaceId,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        src_ip: Ipv4Addr,
+        src_port: u16,
+        data: &[u8],
+        now_ticks: u64,
+    ) -> bool {
         // R190-14 FIX: never from a hard IRQ (see the lock-chain note above).
         assert!(
             !cpu_local::current_cpu().in_irq(),
@@ -7579,6 +7757,16 @@ impl SocketTable {
         let Some(sock) = target else {
             return false;
         };
+
+        // Respect explicit local IP binding (0.0.0.0 / unbound matches any local dst_ip).
+        if !dst_ip.is_unspecified() {
+            if let Some(bound_ip) = sock.local_ip() {
+                let bound = Ipv4Addr(bound_ip);
+                if !bound.is_unspecified() && bound != dst_ip {
+                    return false;
+                }
+            }
+        }
 
         // R48-3 FIX: Invoke LSM policy check BEFORE allocating/copying
         // attacker-controlled payload. This prevents unauthorized peers from
@@ -8518,6 +8706,13 @@ impl SocketTable {
                     ) {
                         tcp_state.control.state = TcpState::Closed;
                         drop(guard);
+
+                        // N2.8: Record pending async error for getsockopt(SO_ERROR).
+                        if old_state == TcpState::SynSent {
+                            sock.set_pending_error(111); // ECONNREFUSED
+                        } else if old_state == TcpState::Established {
+                            sock.set_pending_error(104); // ECONNRESET
+                        }
 
                         // R164-5 FIX: When RST aborts a SynReceived connection,
                         // remove the PendingSyn entry from the listener's SYN

@@ -358,6 +358,18 @@ STRUCT_REFS = {
         c_type="struct sockaddr_in", c_include="netinet/in.h",
         c_fields=[("sin_family", 0), ("sin_port", 2), ("sin_addr", 4)],
     ),
+    "MsgHdr": dict(
+        src="syscall", layer=LINUX_UAPI, cite="uapi/linux/socket.h struct msghdr (x86-64)",
+        fields=[("msg_name", 0, 8), ("msg_namelen", 8, 4), ("_pad0", 12, 4),
+                ("msg_iov", 16, 8), ("msg_iovlen", 24, 8),
+                ("msg_control", 32, 8), ("msg_controllen", 40, 8),
+                ("msg_flags", 48, 4), ("_pad1", 52, 4)], size=56,
+        c_type="struct msghdr", c_include="sys/socket.h",
+        c_fields=[("msg_name", 0), ("msg_namelen", 8),
+                  ("msg_iov", 16), ("msg_iovlen", 24),
+                  ("msg_control", 32), ("msg_controllen", 40),
+                  ("msg_flags", 48)],
+    ),
     "OpenHow": dict(
         # Linux 5.6+ openat2(2). All-u64 fields defeat the in-tree size assert, so
         # a field REORDER is silent without an offset check -- exactly the drift

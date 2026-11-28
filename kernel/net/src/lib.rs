@@ -131,8 +131,8 @@ pub use icmp::{
     ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST, ICMP_TYPE_TIME_EXCEEDED,
 };
 pub use ipv4::{
-    build_ipv4_header, compute_checksum, parse_ipv4, try_build_ipv4_header, Ipv4Addr, Ipv4Error,
-    Ipv4Header, Ipv4Proto,
+    build_ipv4_header, compute_checksum, parse_ipv4, parse_ipv4_loopback, try_build_ipv4_header,
+    Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
 };
 pub use socket::{
     register_cgroup_port_hooks, register_netns_device_hooks, register_socket_wait_hooks,
@@ -140,16 +140,18 @@ pub use socket::{
     RecvTransactionError, SerializedTcpPacket, SockPollReadiness, SocketArc, SocketArcAllocator,
     SocketDomain, SocketError, SocketLabel, SocketProtocol, SocketState, SocketStats, SocketTable,
     SocketType, SocketWaitHooks, TableStats, TcpConnectResult, WaitOutcome, WaitQueue,
-    WaitQueueArc,
+    WaitQueueArc, DEFAULT_IP_TTL, SOCK_BUF_DEFAULT, SOCK_BUF_MAX, SOCK_BUF_MIN,
 };
 pub use stack::{
     drain_parked_ready, handle_timer_tick, network_config, next_hop, prepare_arp_probe,
     process_frame, quiesce_rx_ingress_background, resolve_dst_mac, rx_ingress_counters,
     rx_ingress_net_stats, rx_ingress_poll, rx_ingress_poll_filtered, rx_ingress_poll_throttled,
-    rx_ingress_pool_stats, transmit_prepared_reply, transmit_tcp_connect, transmit_tcp_segment,
-    transmit_udp_datagram, tx_net_config, DropReason, NetConfigSnapshot, NetStats, NextHop,
-    PreparedReply, PreparedReplyTxError, ProcessResult, RxIngressCounters, RxIngressQuiesceGuard,
-    RxPoolStats, RX_BUF_POOL_SIZE, RX_DEVICE_OUTSTANDING_CAP, RX_INGRESS_POLL_BUDGET,
+    rx_ingress_pool_stats, select_source_ip, transmit_prepared_reply, transmit_tcp_connect,
+    transmit_tcp_connect_opts, transmit_tcp_segment, transmit_tcp_segment_opts,
+    transmit_udp_datagram, transmit_udp_datagram_opts, tx_net_config, DropReason,
+    NetConfigSnapshot, NetStats, NextHop, PreparedReply, PreparedReplyTxError, ProcessResult,
+    RxIngressCounters, RxIngressQuiesceGuard, RxPoolStats, RX_BUF_POOL_SIZE,
+    RX_DEVICE_OUTSTANDING_CAP, RX_INGRESS_POLL_BUDGET,
 };
 pub use tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, compute_tcp_checksum,
