@@ -495,6 +495,113 @@ impl FaultMemoryCharge {
         Ok(receipt)
     }
 
+    /// Capture the cgroup memory-controller chain without blocking or charging
+    /// any bytes up front. Intended for private anonymous demand faults whose
+    /// DATA bytes were already hard-charged at `sys_mmap` time: if `map_page`
+    /// allocates 1..=3 intermediate page-table frames, the caller soft-charges
+    /// only the actual PT delta via [`Self::try_add_soft`], matching `sys_mmap`
+    /// Phase-3's J2-9 forced PT-charge contract without spurious `memory.max`
+    /// OOMs on already-admitted mappings.
+    pub fn try_new_soft_deferred(cgroup_id: CgroupId) -> Result<Self, FaultChargeError> {
+        let registry = CGROUP_REGISTRY
+            .try_read()
+            .ok_or(FaultChargeError::Contended)?;
+        let origin = registry
+            .get(&cgroup_id)
+            .cloned()
+            .ok_or(FaultChargeError::NotFound)?;
+        if origin.deleted.load(Ordering::Acquire) {
+            return Err(FaultChargeError::NotFound);
+        }
+
+        let mut chain: [Option<CgroupArc>; FAULT_CHARGE_CHAIN_CAPACITY] =
+            core::array::from_fn(|_| None);
+        let mut limits = [(None, None); FAULT_CHARGE_CHAIN_CAPACITY];
+        let mut chain_len = 0usize;
+        let mut depth = 0u32;
+        let mut cursor = Some(origin.clone());
+        while let Some(node) = cursor {
+            if node.controllers.contains(CgroupControllers::MEMORY) {
+                if chain_len == FAULT_CHARGE_CHAIN_CAPACITY {
+                    return Err(FaultChargeError::Invalid);
+                }
+                let snapshot = node.limits.try_lock().ok_or(FaultChargeError::Contended)?;
+                limits[chain_len] = (None, snapshot.memory_high);
+                drop(snapshot);
+                chain[chain_len] = Some(node.clone());
+                chain_len += 1;
+            }
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
+            cursor = node.parent();
+        }
+
+        drop(registry);
+        Ok(Self {
+            origin,
+            chain,
+            limits,
+            chain_len,
+            charged_bytes: 0,
+            armed: true,
+        })
+    }
+
+    /// Soft/forced PT-frame charge using the captured hierarchy snapshot.
+    /// Does not reject on `memory.max` (mirrors `charge_memory_forced`),
+    /// while still enforcing checked overflow and updating `mem_pinned`,
+    /// `memory_current`, and `memory.high` events atomically.
+    pub fn try_add_soft(&mut self, bytes: u64) -> Result<(), FaultChargeError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes & 0xfff != 0 {
+            return Err(FaultChargeError::Invalid);
+        }
+        let new_total = self
+            .charged_bytes
+            .checked_add(bytes)
+            .ok_or(FaultChargeError::Overflow)?;
+
+        self.origin
+            .stats
+            .mem_pinned
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                current.checked_add(bytes)
+            })
+            .map_err(|_| FaultChargeError::Overflow)?;
+
+        let mut charged_len = 0usize;
+        for index in 0..self.chain_len {
+            let Some(node) = self.chain[index].as_ref() else {
+                self.rollback_delta(bytes, charged_len);
+                return Err(FaultChargeError::Invariant);
+            };
+            let (_max, high) = self.limits[index];
+            match node.stats.memory_current.fetch_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |current| current.checked_add(bytes),
+            ) {
+                Ok(old) => {
+                    charged_len += 1;
+                    if high.is_some_and(|limit| old.saturating_add(bytes) > limit) {
+                        node.stats.record_memory_high();
+                    }
+                }
+                Err(_) => {
+                    self.rollback_delta(bytes, charged_len);
+                    return Err(FaultChargeError::Overflow);
+                }
+            }
+        }
+
+        self.charged_bytes = new_total;
+        Ok(())
+    }
+
     /// Hard-charge an additional PT-frame delta using the transaction snapshot.
     pub fn try_add(&mut self, bytes: u64) -> Result<(), FaultChargeError> {
         if bytes == 0 {
@@ -7207,5 +7314,77 @@ mod high1_tests {
         );
 
         delete_cgroup(id).expect("HIGH-1 regression cgroup cleanup");
+    }
+
+    #[test]
+    fn fault_memory_charge_soft_deferred_allows_pt_overshoot_and_tracks_pin() {
+        mm::publish_heap_budgets();
+        init();
+        let node = create_cgroup(0, CgroupControllers::MEMORY).expect("create soft-pt test cgroup");
+        let id = node.id();
+        // Set memory.max = 2 pages, memory.high = 1 page, and pre-fill memory.max.
+        {
+            let mut limits = node.limits.lock();
+            limits.memory_max = Some(2 * 0x1000);
+            limits.memory_high = Some(0x1000);
+        }
+        try_charge_memory(id, 2 * 0x1000).expect("fill up to memory.max");
+
+        // Hard fault charge must fail at memory.max. Retry transient Contended
+        // from parallel hosted tests that deliberately hold CGROUP_REGISTRY.write().
+        let hard_res = loop {
+            match FaultMemoryCharge::try_new(id, 0x1000) {
+                Err(FaultChargeError::Contended) => thread::yield_now(),
+                other => break other,
+            }
+        };
+        assert!(matches!(hard_res, Err(FaultChargeError::LimitExceeded)));
+
+        let acquire_soft = || loop {
+            match FaultMemoryCharge::try_new_soft_deferred(id) {
+                Ok(receipt) => return receipt,
+                Err(FaultChargeError::Contended) => thread::yield_now(),
+                Err(err) => panic!("unexpected soft receipt error: {:?}", err),
+            }
+        };
+
+        // Soft deferred fault charge succeeds with 0 upfront bytes, then allows
+        // charging 1 PT page above memory.max while updating memory_current,
+        // mem_pinned, and memory_events_high, and releases cleanly on Drop.
+        {
+            let mut receipt = acquire_soft();
+            assert_eq!(receipt.charged_bytes(), 0);
+            receipt.try_add_soft(0x1000).expect("soft PT charge");
+            assert_eq!(receipt.charged_bytes(), 0x1000);
+            assert_eq!(
+                node.stats.memory_current.load(Ordering::Acquire),
+                3 * 0x1000
+            );
+            assert_eq!(node.stats.mem_pinned.load(Ordering::Acquire), 3 * 0x1000);
+            assert!(node.stats.memory_events_high.load(Ordering::Acquire) >= 1);
+            // Drop without commit must roll back the 1 PT page cleanly.
+        }
+        assert_eq!(
+            node.stats.memory_current.load(Ordering::Acquire),
+            2 * 0x1000
+        );
+        assert_eq!(node.stats.mem_pinned.load(Ordering::Acquire), 2 * 0x1000);
+
+        // Commit retains the charge until explicitly uncharged.
+        {
+            let mut receipt = acquire_soft();
+            receipt.try_add_soft(0x1000).expect("soft PT charge 2");
+            receipt.commit();
+        }
+        assert_eq!(
+            node.stats.memory_current.load(Ordering::Acquire),
+            3 * 0x1000
+        );
+        assert_eq!(node.stats.mem_pinned.load(Ordering::Acquire), 3 * 0x1000);
+
+        uncharge_memory(id, 3 * 0x1000);
+        assert_eq!(node.stats.memory_current.load(Ordering::Acquire), 0);
+        assert_eq!(node.stats.mem_pinned.load(Ordering::Acquire), 0);
+        delete_cgroup(id).expect("delete soft-pt test cgroup");
     }
 }

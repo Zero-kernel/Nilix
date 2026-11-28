@@ -31,6 +31,7 @@ const SYS_MPROTECT: u64 = 10;
 const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_POPULATE: u64 = 0x8000;
 const MREMAP_MAYMOVE: i32 = 0x1;
 const MREMAP_FIXED: i32 = 0x2;
 
@@ -75,6 +76,20 @@ unsafe fn mmap_anon_prot(len: usize, prot: u64, shared: bool) -> i64 {
 /// Read/write anonymous mapping (the common case).
 unsafe fn mmap_anon(len: usize, shared: bool) -> i64 {
     mmap_anon_prot(len, PROT_READ | PROT_WRITE, shared)
+}
+
+/// Eagerly populated private anonymous mapping (`MAP_POPULATE`) for tests that
+/// explicitly exercise `EagerPopulator` bounded holds and rollback.
+unsafe fn mmap_anon_populated(len: usize) -> i64 {
+    syscall6(
+        SYS_MMAP,
+        0,
+        len as u64,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+        (-1i64) as u64,
+        0,
+    ) as i64
 }
 
 /// `mremap(old, old_len, new_len, flags, 0)`. Returns the new base address, or
@@ -729,7 +744,7 @@ unsafe fn populated_and_writable(base: usize, len: usize) -> Result<(), &'static
 unsafe fn bounded_population() -> Result<(), &'static str> {
     let len = R192_RES_2_LEN;
 
-    let base = mmap_anon(len, false);
+    let base = mmap_anon_populated(len);
     if base < 0 {
         return Err("64 MiB mmap");
     }
@@ -758,7 +773,7 @@ unsafe fn bounded_population() -> Result<(), &'static str> {
     }
 
     // An mremap grow populates its 64 MiB tail; the first page keeps its data.
-    let base = mmap_anon(PAGE, false);
+    let base = mmap_anon_populated(PAGE);
     if base < 0 {
         return Err("one-page mmap for the mremap grow");
     }
@@ -793,7 +808,7 @@ unsafe fn bounded_population() -> Result<(), &'static str> {
         return Err("memory.current is not readable");
     };
     let fault_len = R192_RES_2_FAULT_PAGES * PAGE;
-    if err_of(mmap_anon(fault_len, false)) != ENOMEM {
+    if err_of(mmap_anon_populated(fault_len)) != ENOMEM {
         return Err("the injected population failure was not ENOMEM");
     }
     if read_memory_current() != Some(before) {
@@ -802,7 +817,7 @@ unsafe fn bounded_population() -> Result<(), &'static str> {
     // The knob is one-shot: the same request now succeeds and unmaps cleanly.
     // A second knob makes it stage no spare page tables, so each table it
     // needs is allocated between holds (the starvation path).
-    let again = mmap_anon(fault_len, false);
+    let again = mmap_anon_populated(fault_len);
     if again < 0 {
         return Err("the same mmap after the injected failure");
     }
@@ -6135,6 +6150,18 @@ unsafe fn mmap_hint(addr: usize, len: usize, shared: bool) -> i64 {
     ) as i64
 }
 
+unsafe fn mmap_hint_populated(addr: usize, len: usize) -> i64 {
+    syscall6(
+        SYS_MMAP,
+        addr as u64,
+        len as u64,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+        u64::MAX,
+        0,
+    ) as i64
+}
+
 /// Map and first-touch the shared page: its page table (and the PD above it)
 /// go to the shared-fault ledger.
 unsafe fn rollback_shared_page() -> Result<(), &'static str> {
@@ -6174,10 +6201,9 @@ unsafe fn rollback_mmap_cycle() -> Result<(), &'static str> {
     if shared_fault_test(7, ROLLBACK_PAGES as u64, 0) != 0 {
         return Err("mmap: arming the population failure");
     }
-    rollback_failed(mmap_hint(
+    rollback_failed(mmap_hint_populated(
         ROLLBACK_BASE + PAGE,
         ROLLBACK_PAGES * PAGE,
-        false,
     ))?;
     if read_memory_current() != Some(with_shared) {
         return Err("mmap: the failed population changed memory.current");
@@ -6202,7 +6228,7 @@ unsafe fn rollback_mremap_cycle() -> Result<(), &'static str> {
         .checked_sub(base)
         .ok_or("mremap: memory.current decreased after shared fault")?;
     let private = ROLLBACK_BASE + PAGE;
-    if mmap_hint(private, PAGE, false) != private as i64 {
+    if mmap_hint_populated(private, PAGE) != private as i64 {
         return Err("mremap: private page hint unavailable");
     }
     core::ptr::write_volatile(private as *mut u64, WORD);
@@ -6300,7 +6326,7 @@ unsafe fn rollback_concurrent_cycle() -> Result<(), &'static str> {
         let _ = g8_join_thread();
         return Err("concurrent: the sibling did not start on CPU 1");
     }
-    let result = mmap_hint(ROLLBACK_BASE + PAGE, ROLLBACK_PAGES * PAGE, false);
+    let result = mmap_hint_populated(ROLLBACK_BASE + PAGE, ROLLBACK_PAGES * PAGE);
     let joined = g8_join_thread();
     rollback_failed(result)?;
     if !joined || ROLLBACK_STAGE.load(Ordering::Acquire) != 2 {

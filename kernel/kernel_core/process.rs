@@ -1523,6 +1523,12 @@ pub struct MmState {
     /// Non-last CLONE_VM exit must NOT uncharge; last exit uncharges all.
     pub vm_charged_bytes: u64,
 
+    /// Resident physical bytes actually faulted into lazy private-anonymous VMAs
+    /// (`MMAP_REGION_FLAG_LAZY_ANON`). Tracked separately from `vm_charged_bytes`
+    /// so OOM victim selection counts only materialized resident frames rather
+    /// than untouched virtual reservations.
+    pub lazy_anon_resident_bytes: u64,
+
     /// Cgroup memory bytes charged by the ELF loader for PT_LOAD segments
     /// and the initial user stack. Uncharged on last-exit or subsequent exec.
     pub elf_charged_bytes: u64,
@@ -1622,6 +1628,13 @@ pub struct MmState {
     /// or rollback section that replaces the reservation.
     pub mremap_uncharged_reserve_bytes: u64,
 
+    /// Subset of `mremap_uncharged_reserve_bytes` belonging to in-flight lazy
+    /// private-anonymous `mremap` growth/relocation reservations (`PENDING_MAP |
+    /// LAZY_ANON`). Excluded from `oom_resident_pages` subtraction because lazy
+    /// reservations are already omitted from `rss_bytes`, keeping unrelated eager
+    /// VMAs exact during concurrent lazy `mremap` Phase-2 snapshots.
+    pub mremap_lazy_uncharged_reserve_bytes: u64,
+
     /// Transient: bytes charged by sys_exec (ELF loader) not yet reflected
     /// in `elf_charged_bytes`. Non-zero between load_elf() and exec commit.
     pub exec_pending_bytes: u64,
@@ -1704,6 +1717,7 @@ impl MmState {
             brk: 0,
             next_mmap_addr,
             vm_charged_bytes: 0,
+            lazy_anon_resident_bytes: 0,
             elf_charged_bytes: 0,
             pt_charged_bytes: 0,
             // R171-CG1x0 FIX (M2-1 SLICE-0): fresh AS — empty ledger, no inherited
@@ -1716,6 +1730,7 @@ impl MmState {
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
             mremap_uncharged_reserve_bytes: 0,
+            mremap_lazy_uncharged_reserve_bytes: 0,
             exec_pending_bytes: 0,
             brk_in_progress: false,
             brk_grow_resv_lo: 0,
@@ -1813,12 +1828,30 @@ impl MmState {
         &mut self,
         new_region: Option<(usize, usize)>,
     ) -> Result<(), ()> {
-        let mut additional = 0usize;
+        self.reserve_shared_fault_pt_extra(new_region, 0)
+    }
+
+    pub(crate) fn reserve_shared_fault_pt_extra(
+        &mut self,
+        new_region: Option<(usize, usize)>,
+        extra_slots: usize,
+    ) -> Result<(), ()> {
+        let mut additional = extra_slots;
         for (&base, region) in self.shared_regions.iter() {
             let length = region.page_count.checked_mul(0x1000).ok_or(())?;
             additional = additional
                 .checked_add(Self::shared_pt_bound(base, length).ok_or(())?)
                 .ok_or(())?;
+        }
+        for (&base, &entry) in self.mmap_regions.iter() {
+            if entry.is_lazy_anon() && !entry.is_prot_none() && !entry.is_shared() {
+                let length = entry.len();
+                if length > 0 {
+                    additional = additional
+                        .checked_add(Self::shared_pt_bound(base, length).ok_or(())?)
+                        .ok_or(())?;
+                }
+            }
         }
         if let Some((base, length)) = new_region {
             additional = additional
@@ -1874,7 +1907,12 @@ impl MmState {
     }
 
     pub(crate) fn reclaim_empty_shared_fault_pt_capacity(&mut self) {
-        if self.shared_regions.is_empty() {
+        if self.shared_regions.is_empty()
+            && !self
+                .mmap_regions
+                .values()
+                .any(|entry| entry.is_lazy_anon() && !entry.is_prot_none() && !entry.is_shared())
+        {
             self.shared_fault_pt_frames.reclaim_empty_capacity();
         }
     }
@@ -15269,6 +15307,7 @@ fn free_process_resources(
         }
         mm.pt_charged_frames.clear();
         mm.shared_fault_pt_frames.clear();
+        mm.lazy_anon_resident_bytes = 0;
         mm.pt_inherited_bytes = 0;
         mm.pt_ledger_authoritative = true;
     } else if (keep_address_space || mm_shared) && proc.memory_space != 0 {
@@ -16321,6 +16360,10 @@ fn oom_resident_pages(state: &MmState) -> u64 {
                     .map(|region| region.resident_pages())
                     .unwrap_or(0);
                 total.saturating_add(resident.saturating_mul(4096))
+            } else if entry.is_lazy_anon() {
+                // Lazy private-anonymous regions track materialized resident
+                // pages in `state.lazy_anon_resident_bytes` below.
+                total
             } else {
                 total.saturating_add(crate::syscall::mmap_region_len(entry))
             }
@@ -16329,8 +16372,12 @@ fn oom_resident_pages(state: &MmState) -> u64 {
     // brk_start may be unaligned; count the same page interval as sys_brk.
     let ceil_pages = |bytes: usize| (bytes / 4096) as u64 + u64::from(bytes % 4096 != 0);
     let heap_pages = ceil_pages(state.brk).saturating_sub(ceil_pages(state.brk_start));
+    let eager_mremap_uncharged = state
+        .mremap_uncharged_reserve_bytes
+        .saturating_sub(state.mremap_lazy_uncharged_reserve_bytes);
     (rss_bytes as u64)
-        .saturating_sub(state.mremap_uncharged_reserve_bytes)
+        .saturating_sub(eager_mremap_uncharged)
+        .saturating_add(state.lazy_anon_resident_bytes)
         .saturating_add(heap_pages.saturating_mul(4096))
         .saturating_add(state.elf_charged_bytes)
         .saturating_add(state.pt_charged_bytes)
@@ -16369,7 +16416,41 @@ fn audit_20261031_oom_excludes_sparse_and_mremap_reservations() {
         )
         .unwrap();
     state.mremap_uncharged_reserve_bytes = 2 * 4096;
+    state
+        .mmap_regions
+        .try_insert(
+            0x90000000,
+            crate::syscall::MmapEntry::from_len_flags(
+                1024 * 4096,
+                crate::syscall::MMAP_REGION_FLAG_LAZY_ANON
+                    | crate::syscall::MMAP_REGION_FLAG_UNFAULTED,
+            ),
+        )
+        .unwrap();
+    // Untouched lazy private VMA must contribute 0 resident pages to OOM RSS.
     assert_eq!(oom_resident_pages(&state), 1);
+    // In-flight lazy mremap relocation reservation (PENDING_MAP | LAZY_ANON)
+    // must neither inflate RSS nor under-subtract unrelated eager VMAs.
+    state
+        .mmap_regions
+        .try_insert(
+            0xa0000000,
+            crate::syscall::MmapEntry::from_len_flags(
+                1025 * 4096,
+                crate::syscall::MMAP_REGION_FLAG_PENDING_MAP
+                    | crate::syscall::MMAP_REGION_FLAG_LAZY_ANON,
+            ),
+        )
+        .unwrap();
+    state.mremap_uncharged_reserve_bytes += 4096;
+    state.mremap_lazy_uncharged_reserve_bytes += 4096;
+    assert_eq!(oom_resident_pages(&state), 1);
+    state.mmap_regions.remove(&0xa0000000);
+    state.mremap_uncharged_reserve_bytes -= 4096;
+    state.mremap_lazy_uncharged_reserve_bytes -= 4096;
+    state.lazy_anon_resident_bytes = 2 * 4096;
+    assert_eq!(oom_resident_pages(&state), 3);
+    state.lazy_anon_resident_bytes = 0;
     state.brk_start = 0x1000;
     state.brk = 0x11000;
     let small = mm::OomProcessInfo {

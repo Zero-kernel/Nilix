@@ -1001,6 +1001,7 @@ fn fork_prepare_child_state(
             brk: parent_mm.brk,
             next_mmap_addr: parent_mm.next_mmap_addr,
             vm_charged_bytes: parent_mm.vm_charged_bytes,
+            lazy_anon_resident_bytes: parent_mm.lazy_anon_resident_bytes,
             elf_charged_bytes: parent_mm.elf_charged_bytes,
             // J2-9 FIX: inherit the page-table-frame kmem charge. The child
             // builds its OWN page tables (so the value, like elf, is a copy of
@@ -1029,6 +1030,7 @@ fn fork_prepare_child_state(
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
             mremap_uncharged_reserve_bytes: 0,
+            mremap_lazy_uncharged_reserve_bytes: 0,
             exec_pending_bytes: 0,
             // R165-1 FIX: child starts with no brk reservation (fork is
             // rejected above while a brk is in flight).
@@ -2244,6 +2246,242 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
         return SharedFaultResult::Busy;
     };
     result
+}
+
+/// Resolve one demand fault in a lazy private-anonymous mapping (`MAP_PRIVATE |
+/// MAP_ANONYMOUS` created without `MAP_POPULATE`).
+///
+/// Mirrors [`handle_shared_page_fault`]'s strict try-only lock discipline so
+/// `#PF` never blocks or inverts lock ordering (`PROCESS_TABLE -> PCB ->
+/// MmState -> PT_LOCK -> Buddy`). DATA bytes were already hard-charged at
+/// `sys_mmap` time; only newly created intermediate PT/PD/PDPT frames are
+/// soft-charged via [`crate::cgroup::FaultMemoryCharge::try_new_soft_deferred`]
+/// and recorded by frame identity in `mm_state.shared_fault_pt_frames`.
+pub unsafe fn handle_private_anon_page_fault(
+    pid: ProcessId,
+    fault_addr: usize,
+    is_write: bool,
+    is_exec: bool,
+) -> SharedFaultResult {
+    use crate::cgroup::{FaultChargeError, FaultMemoryCharge};
+    use mm::page_table::try_with_current_manager;
+    use x86_64::structures::paging::{Page, PageTableFlags};
+
+    let Some(process_arc) = crate::process::try_get_process(pid) else {
+        return shared_fault_contended(
+            &crate::process::PROCESS_TABLE,
+            SharedFaultLock::ProcessTable,
+        );
+    };
+    let Some(process_arc) = process_arc else {
+        return SharedFaultResult::NotShared;
+    };
+    let Some(proc) = process_arc.try_lock() else {
+        return shared_fault_contended(&process_arc, SharedFaultLock::Pcb);
+    };
+    if proc.pid != pid {
+        return SharedFaultResult::NotShared;
+    }
+    let active_root = x86_64::registers::control::Cr3::read()
+        .0
+        .start_address()
+        .as_u64() as usize;
+    let own_root = proc.memory_space != 0
+        && (active_root == proc.memory_space
+            || (proc.user_memory_space != 0 && active_root == proc.user_memory_space));
+    if !own_root {
+        return SharedFaultResult::NotShared;
+    }
+    let Some(mut mm_state) = proc.mm.try_lock() else {
+        return shared_fault_contended(&proc.mm, SharedFaultLock::MmState);
+    };
+
+    let page_base = fault_addr & !0xfff;
+    let Some((region_base, entry)) = mm_state
+        .mmap_regions
+        .range(..=page_base)
+        .next_back()
+        .map(|(&base, &entry)| (base, entry))
+    else {
+        return SharedFaultResult::NotShared;
+    };
+    let region_len = entry.len();
+    if region_len == 0 || page_base >= region_base.saturating_add(region_len) {
+        return SharedFaultResult::NotShared;
+    }
+    if entry.is_shared() || entry.is_prot_none() || !entry.is_lazy_anon() {
+        return SharedFaultResult::NotShared;
+    }
+    // Serialize first-touch with concurrent fork / munmap / mprotect / mremap.
+    if mm_state.fork_in_progress || entry.has_transient() {
+        return SharedFaultResult::Busy;
+    }
+    // Enforce VMA permissions before materializing any page.
+    if (is_write && !entry.prot_write())
+        || (is_exec && !entry.prot_exec())
+        || (!entry.prot_read() && !entry.prot_write() && !entry.prot_exec())
+    {
+        return SharedFaultResult::NotShared;
+    }
+
+    let virt = VirtAddr::new(page_base as u64);
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if entry.prot_write() {
+        flags.insert(PageTableFlags::WRITABLE);
+    }
+    if !entry.prot_exec() {
+        flags.insert(PageTableFlags::NO_EXECUTE);
+    }
+
+    // A CLONE_VM sibling may have resolved this page while we waited.
+    match try_with_current_manager(VirtAddr::new(0), |manager| {
+        manager.translate_with_flags(virt)
+    }) {
+        None => return SharedFaultResult::Busy,
+        Some(Some((_phys, existing_flags))) => {
+            let present_user =
+                existing_flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE);
+            let write_ok = !is_write
+                || existing_flags.contains(PageTableFlags::WRITABLE)
+                || existing_flags.contains(cow_flag());
+            let exec_ok = !is_exec || !existing_flags.contains(PageTableFlags::NO_EXECUTE);
+            if present_user && write_ok && exec_ok {
+                x86_64::instructions::tlb::flush(virt);
+                return SharedFaultResult::Handled;
+            }
+            return SharedFaultResult::NotShared;
+        }
+        Some(None) => {}
+    }
+
+    // If a CLONE_VM sibling has an in-flight munmap/mprotect/mremap that has
+    // detached page tables not yet reconciled out of `shared_fault_pt_frames`,
+    // temporarily low ledger headroom is retryable rather than fatal.
+    let spare_ledger = mm_state
+        .shared_fault_pt_frames
+        .capacity()
+        .saturating_sub(mm_state.shared_fault_pt_frames.len());
+    if spare_ledger < SHARED_FAULT_PT_PAGES
+        && mm_state
+            .mmap_regions
+            .values()
+            .any(|other| other.has_transient())
+    {
+        return SharedFaultResult::Busy;
+    }
+
+    // Capture cgroup chain non-blockingly OUTSIDE PT_LOCK so any intermediate
+    // PT frames allocated by `map_page` can be soft-charged without blocking.
+    let mut charge = match FaultMemoryCharge::try_new_soft_deferred(proc.cgroup_id) {
+        Ok(receipt) => receipt,
+        Err(FaultChargeError::Contended) => return SharedFaultResult::Busy,
+        Err(
+            FaultChargeError::NotFound | FaultChargeError::Invalid | FaultChargeError::Invariant,
+        ) => {
+            return SharedFaultResult::Fatal(CowFaultFailure::MetadataCorrupt);
+        }
+        Err(FaultChargeError::LimitExceeded | FaultChargeError::Overflow) => {
+            return SharedFaultResult::Fatal(CowFaultFailure::OutOfMemory);
+        }
+    };
+
+    // Clear UNFAULTED BEFORE installing the first PTE while `mm_state` is held,
+    // so any subsequent `sys_munmap` is guaranteed to run the full PT-unmap path.
+    if entry.is_unfaulted() {
+        if let Some(slot) = mm_state.mmap_regions.get_mut(&region_base) {
+            slot.clear_unfaulted();
+        }
+    }
+
+    enum PrivateMapOutcome {
+        Mapped {
+            pt_frames: [Option<PhysFrame<Size4KiB>>; 3],
+            pt_bytes: u64,
+        },
+        Failed {
+            reason: CowFaultFailure,
+            retained_pt_frames: [Option<PhysFrame<Size4KiB>>; 3],
+            retained_pt_bytes: u64,
+        },
+    }
+
+    let mapped = try_with_current_manager(VirtAddr::new(0), |manager| {
+        mm::buddy_allocator::try_with_allocator(|buddy| {
+            let spare = mm_state
+                .shared_fault_pt_frames
+                .capacity()
+                .saturating_sub(mm_state.shared_fault_pt_frames.len());
+            let mut allocator = SharedFaultFrameAllocator::new(buddy, spare);
+            let Some(frame) = allocator.allocate_data_frame() else {
+                return PrivateMapOutcome::Failed {
+                    reason: CowFaultFailure::OutOfMemory,
+                    retained_pt_frames: [None; 3],
+                    retained_pt_bytes: 0,
+                };
+            };
+            // Always zero the freshly allocated frame before publishing to userspace.
+            let direct = mm::phys_to_virt(frame.start_address());
+            core::ptr::write_bytes(direct.as_mut_ptr::<u8>(), 0, 0x1000);
+
+            if manager.translate_addr(virt).is_some() {
+                allocator.deallocate_frame(frame);
+                return PrivateMapOutcome::Failed {
+                    reason: CowFaultFailure::MappingFailed,
+                    retained_pt_frames: [None; 3],
+                    retained_pt_bytes: 0,
+                };
+            }
+            if manager
+                .map_page(Page::containing_address(virt), frame, flags, &mut allocator)
+                .is_err()
+            {
+                let retained_pt_pages = allocator.rollback_pt_tables(manager, virt);
+                allocator.deallocate_frame(frame);
+                return PrivateMapOutcome::Failed {
+                    reason: CowFaultFailure::MappingFailed,
+                    retained_pt_frames: *allocator.tracked_pt_frames(),
+                    retained_pt_bytes: (retained_pt_pages as u64) * SHARED_FAULT_PAGE_SIZE,
+                };
+            }
+
+            PrivateMapOutcome::Mapped {
+                pt_frames: *allocator.tracked_pt_frames(),
+                pt_bytes: allocator.pt_bytes(),
+            }
+        })
+    });
+
+    match mapped {
+        Some(Some(PrivateMapOutcome::Mapped {
+            pt_frames,
+            pt_bytes,
+        })) => {
+            mm_state.lazy_anon_resident_bytes = mm_state
+                .lazy_anon_resident_bytes
+                .saturating_add(SHARED_FAULT_PAGE_SIZE);
+            if pt_bytes > 0 {
+                let _ = charge.try_add_soft(pt_bytes);
+                let committed_pt_bytes = charge.charged_bytes();
+                mm_state.record_shared_fault_pt_charge(&pt_frames, committed_pt_bytes);
+            }
+            charge.commit();
+            SharedFaultResult::Handled
+        }
+        Some(Some(PrivateMapOutcome::Failed {
+            reason,
+            retained_pt_frames,
+            retained_pt_bytes,
+        })) => {
+            if retained_pt_bytes > 0 {
+                let _ = charge.try_add_soft(retained_pt_bytes);
+                let committed_pt_bytes = charge.charged_bytes();
+                mm_state.record_shared_fault_pt_charge(&retained_pt_frames, committed_pt_bytes);
+            }
+            charge.commit();
+            SharedFaultResult::Fatal(reason)
+        }
+        Some(None) | None => SharedFaultResult::Busy,
+    }
 }
 
 /// Shared-anonymous region metadata.  The inner lock is acquired with
