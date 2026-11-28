@@ -331,9 +331,11 @@ define_syscall_table! {
         (95,  SYS_UMASK,              Umask,             "umask",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (96,  SYS_GETTIMEOFDAY,       Gettimeofday,      "gettimeofday",       strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (97,  SYS_GETRLIMIT,          Getrlimit,         "getrlimit",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_RLIMIT),        reason: ""),
-        // Credentials
+        // Credentials & capabilities (N2.4)
         (102, SYS_GETUID,             Getuid,            "getuid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (104, SYS_GETGID,             Getgid,            "getgid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
+        (105, SYS_SETUID,             Setuid,            "setuid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (106, SYS_SETGID,             Setgid,            "setgid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (107, SYS_GETEUID,            Geteuid,           "geteuid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (108, SYS_GETEGID,            Getegid,           "getegid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         // Process groups & sessions (N2.5)
@@ -341,8 +343,21 @@ define_syscall_table! {
         (110, SYS_GETPPID,            Getppid,           "getppid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (111, SYS_GETPGRP,            Getpgrp,           "getpgrp",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (112, SYS_SETSID,             Setsid,            "setsid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        // Extended credentials, supplementary groups & capabilities (N2.4)
+        (113, SYS_SETREUID,           Setreuid,          "setreuid",           strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (114, SYS_SETREGID,           Setregid,          "setregid",           strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (115, SYS_GETGROUPS,          Getgroups,         "getgroups",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (116, SYS_SETGROUPS,          Setgroups,         "setgroups",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (117, SYS_SETRESUID,          Setresuid,         "setresuid",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (118, SYS_GETRESUID,          Getresuid,         "getresuid",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (119, SYS_SETRESGID,          Setresgid,         "setresgid",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (120, SYS_GETRESGID,          Getresgid,         "getresgid",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (121, SYS_GETPGID,            Getpgid,           "getpgid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (122, SYS_SETFSUID,           Setfsuid,          "setfsuid",           strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (123, SYS_SETFSGID,           Setfsgid,          "setfsgid",           strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (124, SYS_GETSID,             Getsid,            "getsid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (125, SYS_CAPGET,             Capget,            "capget",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (126, SYS_CAPSET,             Capset,            "capset",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         // Extended RT signals & alternate signal stack (N2.6a)
         (127, SYS_RT_SIGPENDING,      RtSigpending,      "rt_sigpending",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (128, SYS_RT_SIGTIMEDWAIT,    RtSigtimedwait,    "rt_sigtimedwait",    strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),

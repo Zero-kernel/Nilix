@@ -1075,18 +1075,8 @@ pub(super) fn sys_clone(
             let parent = parent_credentials_arc
                 .try_read()
                 .ok_or(SyscallError::EAGAIN)?;
-            let supplementary_groups = mm::AdmittedVec::try_copy_from_slice(
-                mm::HeapClass::CoreProcess,
-                &parent.supplementary_groups,
-            )
-            .map_err(|_| SyscallError::ENOMEM)?;
-            let credentials = crate::process::Credentials {
-                uid: parent.uid,
-                gid: parent.gid,
-                euid: parent.euid,
-                egid: parent.egid,
-                supplementary_groups,
-            };
+            let credentials = crate::process::Credentials::try_clone_from(&parent)
+                .map_err(|_| SyscallError::ENOMEM)?;
             let reservation = mm::try_reserve_heap(
                 mm::HeapClass::CoreProcess,
                 mm::arc_charge_bytes::<crate::process::SharedCredentials>()
@@ -3894,6 +3884,729 @@ pub(super) fn sys_getegid() -> SyscallResult {
     Ok(creds.egid as usize)
 }
 
+// ============================================================================
+// N2.4: POSIX/Linux Credentials (`set*id`), Supplementary Groups & Capabilities
+// ============================================================================
+
+/// Linux x86_64 `_LINUX_CAPABILITY_VERSION_*` constants (verified via `<linux/capability.h>`).
+pub(super) const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+pub(super) const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+pub(super) const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const CAP_HEADER_SIZE: usize = 8;
+const CAP_DATA_SIZE: usize = 12;
+
+fn creds_err_to_syscall(err: crate::process::CredentialsError) -> SyscallError {
+    match err {
+        crate::process::CredentialsError::NoCurrentProcess => SyscallError::ESRCH,
+        crate::process::CredentialsError::PermissionDenied => SyscallError::EPERM,
+        crate::process::CredentialsError::TooManyGroups => SyscallError::EINVAL,
+        crate::process::CredentialsError::OutOfMemory => SyscallError::ENOMEM,
+    }
+}
+
+/// Pure POSIX/Linux `setuid(2)` transition on `Credentials`.
+pub(super) fn apply_setuid_locked(
+    creds: &mut crate::process::Credentials,
+    uid: u32,
+) -> Result<bool, SyscallError> {
+    if uid == u32::MAX {
+        return Err(SyscallError::EINVAL);
+    }
+    let old_uid = creds.uid;
+    let old_euid = creds.euid;
+    let old_suid = creds.suid;
+    let old_fsuid = creds.fsuid;
+
+    if creds.has_cap(crate::process::CAP_SETUID) {
+        creds.uid = uid;
+        creds.euid = uid;
+        creds.suid = uid;
+        creds.fsuid = uid;
+    } else if uid == old_uid || uid == old_suid {
+        creds.euid = uid;
+        creds.fsuid = uid;
+    } else {
+        return Err(SyscallError::EPERM);
+    }
+    creds.apply_uid_cap_transition(old_uid, old_euid, old_suid);
+    Ok(creds.uid != old_uid
+        || creds.euid != old_euid
+        || creds.suid != old_suid
+        || creds.fsuid != old_fsuid)
+}
+
+/// Pure POSIX/Linux `setgid(2)` transition on `Credentials`.
+pub(super) fn apply_setgid_locked(
+    creds: &mut crate::process::Credentials,
+    gid: u32,
+) -> Result<bool, SyscallError> {
+    if gid == u32::MAX {
+        return Err(SyscallError::EINVAL);
+    }
+    let old_gid = creds.gid;
+    let old_egid = creds.egid;
+    let old_sgid = creds.sgid;
+    let old_fsgid = creds.fsgid;
+
+    if creds.has_cap(crate::process::CAP_SETGID) {
+        creds.gid = gid;
+        creds.egid = gid;
+        creds.sgid = gid;
+        creds.fsgid = gid;
+    } else if gid == old_gid || gid == old_sgid {
+        creds.egid = gid;
+        creds.fsgid = gid;
+    } else {
+        return Err(SyscallError::EPERM);
+    }
+    Ok(creds.gid != old_gid
+        || creds.egid != old_egid
+        || creds.sgid != old_sgid
+        || creds.fsgid != old_fsgid)
+}
+
+/// Pure POSIX/Linux `setreuid(2)` transition on `Credentials`.
+pub(super) fn apply_setreuid_locked(
+    creds: &mut crate::process::Credentials,
+    ruid: u32,
+    euid: u32,
+) -> Result<bool, SyscallError> {
+    let old_uid = creds.uid;
+    let old_euid = creds.euid;
+    let old_suid = creds.suid;
+    let old_fsuid = creds.fsuid;
+    let privileged = creds.has_cap(crate::process::CAP_SETUID);
+
+    let new_uid = if ruid == u32::MAX {
+        old_uid
+    } else {
+        if !privileged && ruid != old_uid && ruid != old_euid {
+            return Err(SyscallError::EPERM);
+        }
+        ruid
+    };
+    let new_euid = if euid == u32::MAX {
+        old_euid
+    } else {
+        if !privileged && euid != old_uid && euid != old_euid && euid != old_suid {
+            return Err(SyscallError::EPERM);
+        }
+        euid
+    };
+    let new_suid = if ruid != u32::MAX || (euid != u32::MAX && new_euid != old_uid) {
+        new_euid
+    } else {
+        old_suid
+    };
+    creds.uid = new_uid;
+    creds.euid = new_euid;
+    creds.suid = new_suid;
+    creds.fsuid = new_euid;
+    creds.apply_uid_cap_transition(old_uid, old_euid, old_suid);
+    Ok(creds.uid != old_uid
+        || creds.euid != old_euid
+        || creds.suid != old_suid
+        || creds.fsuid != old_fsuid)
+}
+
+/// Pure POSIX/Linux `setregid(2)` transition on `Credentials`.
+pub(super) fn apply_setregid_locked(
+    creds: &mut crate::process::Credentials,
+    rgid: u32,
+    egid: u32,
+) -> Result<bool, SyscallError> {
+    let old_gid = creds.gid;
+    let old_egid = creds.egid;
+    let old_sgid = creds.sgid;
+    let old_fsgid = creds.fsgid;
+    let privileged = creds.has_cap(crate::process::CAP_SETGID);
+
+    let new_gid = if rgid == u32::MAX {
+        old_gid
+    } else {
+        if !privileged && rgid != old_gid && rgid != old_egid {
+            return Err(SyscallError::EPERM);
+        }
+        rgid
+    };
+    let new_egid = if egid == u32::MAX {
+        old_egid
+    } else {
+        if !privileged && egid != old_gid && egid != old_egid && egid != old_sgid {
+            return Err(SyscallError::EPERM);
+        }
+        egid
+    };
+    let new_sgid = if rgid != u32::MAX || (egid != u32::MAX && new_egid != old_gid) {
+        new_egid
+    } else {
+        old_sgid
+    };
+    creds.gid = new_gid;
+    creds.egid = new_egid;
+    creds.sgid = new_sgid;
+    creds.fsgid = new_egid;
+    Ok(creds.gid != old_gid
+        || creds.egid != old_egid
+        || creds.sgid != old_sgid
+        || creds.fsgid != old_fsgid)
+}
+
+/// Pure Linux `setresuid(2)` transition on `Credentials`.
+pub(super) fn apply_setresuid_locked(
+    creds: &mut crate::process::Credentials,
+    ruid: u32,
+    euid: u32,
+    suid: u32,
+) -> Result<bool, SyscallError> {
+    let old_uid = creds.uid;
+    let old_euid = creds.euid;
+    let old_suid = creds.suid;
+    let old_fsuid = creds.fsuid;
+    let privileged = creds.has_cap(crate::process::CAP_SETUID);
+
+    let check = |v: u32| -> Result<(), SyscallError> {
+        if v != u32::MAX && !privileged && v != old_uid && v != old_euid && v != old_suid {
+            Err(SyscallError::EPERM)
+        } else {
+            Ok(())
+        }
+    };
+    check(ruid)?;
+    check(euid)?;
+    check(suid)?;
+
+    if ruid != u32::MAX {
+        creds.uid = ruid;
+    }
+    if euid != u32::MAX {
+        creds.euid = euid;
+    }
+    if suid != u32::MAX {
+        creds.suid = suid;
+    }
+    creds.fsuid = creds.euid;
+    creds.apply_uid_cap_transition(old_uid, old_euid, old_suid);
+    Ok(creds.uid != old_uid
+        || creds.euid != old_euid
+        || creds.suid != old_suid
+        || creds.fsuid != old_fsuid)
+}
+
+/// Pure Linux `setresgid(2)` transition on `Credentials`.
+pub(super) fn apply_setresgid_locked(
+    creds: &mut crate::process::Credentials,
+    rgid: u32,
+    egid: u32,
+    sgid: u32,
+) -> Result<bool, SyscallError> {
+    let old_gid = creds.gid;
+    let old_egid = creds.egid;
+    let old_sgid = creds.sgid;
+    let old_fsgid = creds.fsgid;
+    let privileged = creds.has_cap(crate::process::CAP_SETGID);
+
+    let check = |v: u32| -> Result<(), SyscallError> {
+        if v != u32::MAX && !privileged && v != old_gid && v != old_egid && v != old_sgid {
+            Err(SyscallError::EPERM)
+        } else {
+            Ok(())
+        }
+    };
+    check(rgid)?;
+    check(egid)?;
+    check(sgid)?;
+
+    if rgid != u32::MAX {
+        creds.gid = rgid;
+    }
+    if egid != u32::MAX {
+        creds.egid = egid;
+    }
+    if sgid != u32::MAX {
+        creds.sgid = sgid;
+    }
+    creds.fsgid = creds.egid;
+    Ok(creds.gid != old_gid
+        || creds.egid != old_egid
+        || creds.sgid != old_sgid
+        || creds.fsgid != old_fsgid)
+}
+
+/// Pure Linux `setfsuid(2)` transition: returns `(old_fsuid, changed)`.
+pub(super) fn apply_setfsuid_locked(
+    creds: &mut crate::process::Credentials,
+    fsuid: u32,
+    lsm_allowed: bool,
+) -> (u32, bool) {
+    let old = creds.fsuid;
+    if fsuid == u32::MAX || !lsm_allowed {
+        return (old, false);
+    }
+    let allowed = creds.has_cap(crate::process::CAP_SETUID)
+        || fsuid == creds.uid
+        || fsuid == creds.euid
+        || fsuid == creds.suid
+        || fsuid == old;
+    if allowed && fsuid != old {
+        creds.fsuid = fsuid;
+        return (old, true);
+    }
+    (old, false)
+}
+
+/// Pure Linux `setfsgid(2)` transition: returns `(old_fsgid, changed)`.
+pub(super) fn apply_setfsgid_locked(
+    creds: &mut crate::process::Credentials,
+    fsgid: u32,
+    lsm_allowed: bool,
+) -> (u32, bool) {
+    let old = creds.fsgid;
+    if fsgid == u32::MAX || !lsm_allowed {
+        return (old, false);
+    }
+    let allowed = creds.has_cap(crate::process::CAP_SETGID)
+        || fsgid == creds.gid
+        || fsgid == creds.egid
+        || fsgid == creds.sgid
+        || fsgid == old;
+    if allowed && fsgid != old {
+        creds.fsgid = fsgid;
+        return (old, true);
+    }
+    (old, false)
+}
+
+/// Pure Linux `capset(2)` validation and mutation on `Credentials`.
+pub(super) fn apply_capset_locked(
+    creds: &mut crate::process::Credentials,
+    new_eff: u64,
+    new_perm: u64,
+    new_inh: u64,
+) -> Result<bool, SyscallError> {
+    let mask = crate::process::CAP_VALID_MASK;
+    let eff = new_eff & mask;
+    let perm = new_perm & mask;
+    let inh = new_inh & mask;
+
+    // Linux `cap_capset`:
+    // 1. new permitted must be a subset of old permitted.
+    if (perm & !creds.cap_permitted) != 0 {
+        return Err(SyscallError::EPERM);
+    }
+    // 2. new effective must be a subset of new permitted.
+    if (eff & !perm) != 0 {
+        return Err(SyscallError::EPERM);
+    }
+    // 3. new inheritable cannot add bits outside (old_inh | old_perm) unless
+    //    CAP_SETPCAP is currently effective.
+    let has_setpcap = creds.has_cap(crate::process::CAP_SETPCAP);
+    if !has_setpcap && (inh & !(creds.cap_inheritable | creds.cap_permitted)) != 0 {
+        return Err(SyscallError::EPERM);
+    }
+
+    let changed =
+        creds.cap_effective != eff || creds.cap_permitted != perm || creds.cap_inheritable != inh;
+    creds.cap_effective = eff;
+    creds.cap_permitted = perm;
+    creds.cap_inheritable = inh;
+    Ok(changed)
+}
+
+/// `setuid(105)`
+pub(super) fn sys_setuid(uid: u32) -> SyscallResult {
+    if uid == u32::MAX {
+        return Err(SyscallError::EINVAL);
+    }
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_task_setuid(&ctx, uid, u32::MAX).map_err(lsm_error_to_syscall)?;
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let mut inner_err = None;
+    let res = shared.mutate(|creds| match apply_setuid_locked(creds, uid) {
+        Ok(true) => Ok(crate::process::CredentialMutation::Changed(())),
+        Ok(false) => Ok(crate::process::CredentialMutation::Unchanged(())),
+        Err(e) => {
+            inner_err = Some(e);
+            Err(crate::process::CredentialsError::PermissionDenied)
+        }
+    });
+    match res {
+        Ok(()) => Ok(0),
+        Err(e) => Err(inner_err.unwrap_or_else(|| creds_err_to_syscall(e))),
+    }
+}
+
+/// `setgid(106)`
+pub(super) fn sys_setgid(gid: u32) -> SyscallResult {
+    if gid == u32::MAX {
+        return Err(SyscallError::EINVAL);
+    }
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_task_setuid(&ctx, u32::MAX, gid).map_err(lsm_error_to_syscall)?;
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let mut inner_err = None;
+    let res = shared.mutate(|creds| match apply_setgid_locked(creds, gid) {
+        Ok(true) => Ok(crate::process::CredentialMutation::Changed(())),
+        Ok(false) => Ok(crate::process::CredentialMutation::Unchanged(())),
+        Err(e) => {
+            inner_err = Some(e);
+            Err(crate::process::CredentialsError::PermissionDenied)
+        }
+    });
+    match res {
+        Ok(()) => Ok(0),
+        Err(e) => Err(inner_err.unwrap_or_else(|| creds_err_to_syscall(e))),
+    }
+}
+
+/// `setreuid(113)`
+pub(super) fn sys_setreuid(ruid: u32, euid: u32) -> SyscallResult {
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_task_setresuid(&ctx, ruid, euid, u32::MAX).map_err(lsm_error_to_syscall)?;
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let mut inner_err = None;
+    let res = shared.mutate(|creds| match apply_setreuid_locked(creds, ruid, euid) {
+        Ok(true) => Ok(crate::process::CredentialMutation::Changed(())),
+        Ok(false) => Ok(crate::process::CredentialMutation::Unchanged(())),
+        Err(e) => {
+            inner_err = Some(e);
+            Err(crate::process::CredentialsError::PermissionDenied)
+        }
+    });
+    match res {
+        Ok(()) => Ok(0),
+        Err(e) => Err(inner_err.unwrap_or_else(|| creds_err_to_syscall(e))),
+    }
+}
+
+/// `setregid(114)`
+pub(super) fn sys_setregid(rgid: u32, egid: u32) -> SyscallResult {
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_task_setresuid(&ctx, rgid, egid, u32::MAX).map_err(lsm_error_to_syscall)?;
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let mut inner_err = None;
+    let res = shared.mutate(|creds| match apply_setregid_locked(creds, rgid, egid) {
+        Ok(true) => Ok(crate::process::CredentialMutation::Changed(())),
+        Ok(false) => Ok(crate::process::CredentialMutation::Unchanged(())),
+        Err(e) => {
+            inner_err = Some(e);
+            Err(crate::process::CredentialsError::PermissionDenied)
+        }
+    });
+    match res {
+        Ok(()) => Ok(0),
+        Err(e) => Err(inner_err.unwrap_or_else(|| creds_err_to_syscall(e))),
+    }
+}
+
+/// `setresuid(117)`
+pub(super) fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> SyscallResult {
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_task_setresuid(&ctx, ruid, euid, suid).map_err(lsm_error_to_syscall)?;
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let mut inner_err = None;
+    let res = shared.mutate(
+        |creds| match apply_setresuid_locked(creds, ruid, euid, suid) {
+            Ok(true) => Ok(crate::process::CredentialMutation::Changed(())),
+            Ok(false) => Ok(crate::process::CredentialMutation::Unchanged(())),
+            Err(e) => {
+                inner_err = Some(e);
+                Err(crate::process::CredentialsError::PermissionDenied)
+            }
+        },
+    );
+    match res {
+        Ok(()) => Ok(0),
+        Err(e) => Err(inner_err.unwrap_or_else(|| creds_err_to_syscall(e))),
+    }
+}
+
+/// `getresuid(118)`
+pub(super) fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> SyscallResult {
+    if ruid.is_null() || euid.is_null() || suid.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let creds = crate::process::current_full_credentials().ok_or(SyscallError::EPERM)?;
+    copy_to_user(ruid as *mut u8, &creds.uid.to_ne_bytes())?;
+    copy_to_user(euid as *mut u8, &creds.euid.to_ne_bytes())?;
+    copy_to_user(suid as *mut u8, &creds.suid.to_ne_bytes())?;
+    Ok(0)
+}
+
+/// `setresgid(119)`
+pub(super) fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> SyscallResult {
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_task_setresuid(&ctx, rgid, egid, sgid).map_err(lsm_error_to_syscall)?;
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let mut inner_err = None;
+    let res = shared.mutate(
+        |creds| match apply_setresgid_locked(creds, rgid, egid, sgid) {
+            Ok(true) => Ok(crate::process::CredentialMutation::Changed(())),
+            Ok(false) => Ok(crate::process::CredentialMutation::Unchanged(())),
+            Err(e) => {
+                inner_err = Some(e);
+                Err(crate::process::CredentialsError::PermissionDenied)
+            }
+        },
+    );
+    match res {
+        Ok(()) => Ok(0),
+        Err(e) => Err(inner_err.unwrap_or_else(|| creds_err_to_syscall(e))),
+    }
+}
+
+/// `getresgid(120)`
+pub(super) fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> SyscallResult {
+    if rgid.is_null() || egid.is_null() || sgid.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let creds = crate::process::current_full_credentials().ok_or(SyscallError::EPERM)?;
+    copy_to_user(rgid as *mut u8, &creds.gid.to_ne_bytes())?;
+    copy_to_user(egid as *mut u8, &creds.egid.to_ne_bytes())?;
+    copy_to_user(sgid as *mut u8, &creds.sgid.to_ne_bytes())?;
+    Ok(0)
+}
+
+/// `setfsuid(122)` — Linux always returns the previous `fsuid`.
+pub(super) fn sys_setfsuid(fsuid: u32) -> SyscallResult {
+    let lsm_allowed = if fsuid == u32::MAX {
+        true
+    } else {
+        let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+        lsm::hook_task_setuid(&ctx, fsuid, u32::MAX).is_ok()
+    };
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let prev = shared
+        .mutate(|creds| {
+            let (old, changed) = apply_setfsuid_locked(creds, fsuid, lsm_allowed);
+            Ok(if changed {
+                crate::process::CredentialMutation::Changed(old)
+            } else {
+                crate::process::CredentialMutation::Unchanged(old)
+            })
+        })
+        .map_err(creds_err_to_syscall)?;
+    Ok(prev as usize)
+}
+
+/// `setfsgid(123)` — Linux always returns the previous `fsgid`.
+pub(super) fn sys_setfsgid(fsgid: u32) -> SyscallResult {
+    let lsm_allowed = if fsgid == u32::MAX {
+        true
+    } else {
+        let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+        lsm::hook_task_setuid(&ctx, u32::MAX, fsgid).is_ok()
+    };
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let prev = shared
+        .mutate(|creds| {
+            let (old, changed) = apply_setfsgid_locked(creds, fsgid, lsm_allowed);
+            Ok(if changed {
+                crate::process::CredentialMutation::Changed(old)
+            } else {
+                crate::process::CredentialMutation::Unchanged(old)
+            })
+        })
+        .map_err(creds_err_to_syscall)?;
+    Ok(prev as usize)
+}
+
+/// `getgroups(115)`
+pub(super) fn sys_getgroups(size: i32, list: *mut u32) -> SyscallResult {
+    if size < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let groups = crate::process::current_supplementary_groups()
+        .map_err(creds_err_to_syscall)?
+        .ok_or(SyscallError::ESRCH)?;
+    let count = groups.len();
+    if size == 0 {
+        return Ok(count);
+    }
+    if (size as usize) < count {
+        return Err(SyscallError::EINVAL);
+    }
+    if count > 0 {
+        if list.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+        let mut raw = [0u8; crate::process::NGROUPS_MAX * 4];
+        for (i, &gid) in groups.iter().enumerate() {
+            raw[i * 4..i * 4 + 4].copy_from_slice(&gid.to_ne_bytes());
+        }
+        copy_to_user(list as *mut u8, &raw[..count * 4])?;
+    }
+    Ok(count)
+}
+
+/// `setgroups(116)`
+pub(super) fn sys_setgroups(size: usize, list: *const u32) -> SyscallResult {
+    if size > crate::process::NGROUPS_MAX {
+        return Err(SyscallError::EINVAL);
+    }
+    let mut gids = [0u32; crate::process::NGROUPS_MAX];
+    if size > 0 {
+        if list.is_null() {
+            return Err(SyscallError::EFAULT);
+        }
+        let mut raw = [0u8; crate::process::NGROUPS_MAX * 4];
+        copy_from_user(&mut raw[..size * 4], list as *const u8)?;
+        for i in 0..size {
+            gids[i] =
+                u32::from_ne_bytes([raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]]);
+        }
+    }
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::EPERM)?;
+    lsm::hook_task_setgroups(&ctx, &gids[..size]).map_err(lsm_error_to_syscall)?;
+    crate::process::set_current_supplementary_groups(&gids[..size])
+        .map_err(creds_err_to_syscall)?;
+    Ok(0)
+}
+
+/// Validate Linux `cap_user_header_t.version` and return the number of
+/// `cap_user_data_t` entries (`1` for V1, `2` for V2/V3).
+#[inline]
+pub(super) const fn cap_version_entries(version: u32) -> Option<usize> {
+    match version {
+        LINUX_CAPABILITY_VERSION_1 => Some(1),
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Some(2),
+        _ => None,
+    }
+}
+
+/// `capget(125)`
+pub(super) fn sys_capget(hdrp: *mut u8, datap: *mut u8) -> SyscallResult {
+    if hdrp.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let mut hdr_buf = [0u8; CAP_HEADER_SIZE];
+    copy_from_user(&mut hdr_buf, hdrp as *const u8)?;
+    let version = u32::from_ne_bytes([hdr_buf[0], hdr_buf[1], hdr_buf[2], hdr_buf[3]]);
+    let pid_arg = i32::from_ne_bytes([hdr_buf[4], hdr_buf[5], hdr_buf[6], hdr_buf[7]]);
+
+    let Some(entries) = cap_version_entries(version) else {
+        // Linux version probe: write preferred V3 back into header.
+        copy_to_user(hdrp, &LINUX_CAPABILITY_VERSION_3.to_ne_bytes())?;
+        return if datap.is_null() {
+            Ok(0)
+        } else {
+            Err(SyscallError::EINVAL)
+        };
+    };
+
+    if pid_arg < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if datap.is_null() {
+        return Ok(0);
+    }
+
+    let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let target_creds = if pid_arg == 0 {
+        crate::process::current_full_credentials().ok_or(SyscallError::ESRCH)?
+    } else {
+        let caller = get_process(caller_pid).ok_or(SyscallError::ESRCH)?;
+        let target_global = {
+            let p = caller.lock();
+            if p.tgid == pid_arg as usize || p.pid == pid_arg as usize {
+                caller_pid
+            } else {
+                match crate::pid_namespace::owning_namespace(&p.pid_ns_chain) {
+                    Some(ns) => ns
+                        .lookup_global(pid_arg as usize)
+                        .ok_or(SyscallError::ESRCH)?,
+                    None => pid_arg as usize,
+                }
+            }
+        };
+        let target_proc = get_process(target_global).ok_or(SyscallError::ESRCH)?;
+        let tp = target_proc.lock();
+        let guard = tp.try_credentials_read().ok_or(SyscallError::EAGAIN)?;
+        crate::process::FullCredentialsSnapshot::from_creds(&guard)
+    };
+
+    let mut out = [0u8; CAP_DATA_SIZE * 2];
+    let eff = target_creds.cap_effective & crate::process::CAP_VALID_MASK;
+    let perm = target_creds.cap_permitted & crate::process::CAP_VALID_MASK;
+    let inh = target_creds.cap_inheritable & crate::process::CAP_VALID_MASK;
+    out[0..4].copy_from_slice(&(eff as u32).to_ne_bytes());
+    out[4..8].copy_from_slice(&(perm as u32).to_ne_bytes());
+    out[8..12].copy_from_slice(&(inh as u32).to_ne_bytes());
+    if entries == 2 {
+        out[12..16].copy_from_slice(&((eff >> 32) as u32).to_ne_bytes());
+        out[16..20].copy_from_slice(&((perm >> 32) as u32).to_ne_bytes());
+        out[20..24].copy_from_slice(&((inh >> 32) as u32).to_ne_bytes());
+    }
+    copy_to_user(datap, &out[..entries * CAP_DATA_SIZE])?;
+    Ok(0)
+}
+
+/// `capset(126)`
+pub(super) fn sys_capset(hdrp: *const u8, datap: *const u8) -> SyscallResult {
+    if hdrp.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let mut hdr_buf = [0u8; CAP_HEADER_SIZE];
+    copy_from_user(&mut hdr_buf, hdrp)?;
+    let version = u32::from_ne_bytes([hdr_buf[0], hdr_buf[1], hdr_buf[2], hdr_buf[3]]);
+    let pid_arg = i32::from_ne_bytes([hdr_buf[4], hdr_buf[5], hdr_buf[6], hdr_buf[7]]);
+
+    let Some(entries) = cap_version_entries(version) else {
+        let _ = copy_to_user(hdrp as *mut u8, &LINUX_CAPABILITY_VERSION_3.to_ne_bytes());
+        return Err(SyscallError::EINVAL);
+    };
+    if datap.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    if pid_arg != 0 {
+        let caller = get_process(caller_pid).ok_or(SyscallError::ESRCH)?;
+        let caller_view_pid = {
+            let p = caller.lock();
+            p.pid_ns_chain.last().map(|m| m.pid).unwrap_or(caller_pid)
+        };
+        if pid_arg < 0 || (pid_arg as usize) != caller_view_pid {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
+    let mut data_buf = [0u8; CAP_DATA_SIZE * 2];
+    copy_from_user(&mut data_buf[..entries * CAP_DATA_SIZE], datap)?;
+    let eff_lo = u32::from_ne_bytes([data_buf[0], data_buf[1], data_buf[2], data_buf[3]]) as u64;
+    let perm_lo = u32::from_ne_bytes([data_buf[4], data_buf[5], data_buf[6], data_buf[7]]) as u64;
+    let inh_lo = u32::from_ne_bytes([data_buf[8], data_buf[9], data_buf[10], data_buf[11]]) as u64;
+    let (eff_hi, perm_hi, inh_hi) = if entries == 2 {
+        (
+            u32::from_ne_bytes([data_buf[12], data_buf[13], data_buf[14], data_buf[15]]) as u64,
+            u32::from_ne_bytes([data_buf[16], data_buf[17], data_buf[18], data_buf[19]]) as u64,
+            u32::from_ne_bytes([data_buf[20], data_buf[21], data_buf[22], data_buf[23]]) as u64,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    let new_eff = eff_lo | (eff_hi << 32);
+    let new_perm = perm_lo | (perm_hi << 32);
+    let new_inh = inh_lo | (inh_hi << 32);
+
+    let shared = crate::process::current_shared_credentials().ok_or(SyscallError::ESRCH)?;
+    let mut inner_err = None;
+    let res = shared.mutate(
+        |creds| match apply_capset_locked(creds, new_eff, new_perm, new_inh) {
+            Ok(true) => Ok(crate::process::CredentialMutation::Changed(())),
+            Ok(false) => Ok(crate::process::CredentialMutation::Unchanged(())),
+            Err(e) => {
+                inner_err = Some(e);
+                Err(crate::process::CredentialsError::PermissionDenied)
+            }
+        },
+    );
+    match res {
+        Ok(()) => Ok(0),
+        Err(e) => Err(inner_err.unwrap_or_else(|| creds_err_to_syscall(e))),
+    }
+}
+
 /// `waitid(2)` idtype: wait for any child.
 pub(super) const P_ALL: i32 = 0;
 /// `waitid(2)` idtype: wait for one child by PID.
@@ -4562,5 +5275,147 @@ mod st_k3_waitid_oracle_tests {
         // so every other field must be zero too.
         let buf = waitid_encode_siginfo(0, 1000, CLD_EXITED, 42);
         assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn n2_4_setuid_setgid_and_cap_emulation_rules() {
+        let mut root = crate::process::Credentials::with_ids(0, 0, 0, 0);
+        assert!(root.has_cap(crate::process::CAP_SETUID));
+        assert!(root.has_cap(crate::process::CAP_SETGID));
+
+        // Root setgid updates all four group IDs.
+        assert_eq!(apply_setgid_locked(&mut root, 2000), Ok(true));
+        assert_eq!(
+            (root.gid, root.egid, root.sgid, root.fsgid),
+            (2000, 2000, 2000, 2000)
+        );
+
+        // Root setuid(1000) permanently drops all UIDs and clears cap_effective/cap_permitted.
+        assert_eq!(apply_setuid_locked(&mut root, 1000), Ok(true));
+        assert_eq!(
+            (root.uid, root.euid, root.suid, root.fsuid),
+            (1000, 1000, 1000, 1000)
+        );
+        assert_eq!(root.cap_effective, 0);
+        assert_eq!(root.cap_permitted, 0);
+
+        // Unprivileged setuid(0) and setgid(0) fail with EPERM; u32::MAX fails EINVAL.
+        assert_eq!(apply_setuid_locked(&mut root, 0), Err(SyscallError::EPERM));
+        assert_eq!(apply_setgid_locked(&mut root, 0), Err(SyscallError::EPERM));
+        assert_eq!(
+            apply_setuid_locked(&mut root, u32::MAX),
+            Err(SyscallError::EINVAL)
+        );
+        assert_eq!(
+            apply_setgid_locked(&mut root, u32::MAX),
+            Err(SyscallError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn n2_4_setreuid_setresuid_and_fsuid_rules() {
+        let mut c = crate::process::Credentials::with_ids(0, 0, 0, 0);
+
+        // Temporarily drop euid to 1000 while retaining uid=0, suid=0.
+        assert_eq!(
+            apply_setresuid_locked(&mut c, u32::MAX, 1000, u32::MAX),
+            Ok(true)
+        );
+        assert_eq!((c.uid, c.euid, c.suid, c.fsuid), (0, 1000, 0, 1000));
+        assert_eq!(c.cap_effective, 0);
+        assert_eq!(c.cap_permitted, crate::process::CAP_VALID_MASK);
+
+        // Unprivileged swap back to saved/real 0 restores effective caps.
+        assert_eq!(
+            apply_setresuid_locked(&mut c, u32::MAX, 0, u32::MAX),
+            Ok(true)
+        );
+        assert_eq!(c.euid, 0);
+        assert_eq!(c.cap_effective, crate::process::CAP_VALID_MASK);
+
+        // setreuid(1000, 1000) updates saved UID too and drops capabilities.
+        assert_eq!(apply_setreuid_locked(&mut c, 1000, 1000), Ok(true));
+        assert_eq!((c.uid, c.euid, c.suid), (1000, 1000, 1000));
+        assert_eq!(c.cap_permitted, 0);
+
+        // setfsuid returns previous fsuid and ignores disallowed changes.
+        assert_eq!(apply_setfsuid_locked(&mut c, 0, true), (1000, false));
+        assert_eq!(apply_setfsuid_locked(&mut c, u32::MAX, true), (1000, false));
+        assert_eq!(c.fsuid, 1000);
+    }
+
+    #[test]
+    fn n2_4_capget_capset_version_and_subset_rules() {
+        assert_eq!(cap_version_entries(LINUX_CAPABILITY_VERSION_1), Some(1));
+        assert_eq!(cap_version_entries(LINUX_CAPABILITY_VERSION_2), Some(2));
+        assert_eq!(cap_version_entries(LINUX_CAPABILITY_VERSION_3), Some(2));
+        assert_eq!(cap_version_entries(0xdead_beef), None);
+
+        let mut c = crate::process::Credentials::with_ids(0, 0, 0, 0);
+        let admin_bit = 1u64 << crate::process::CAP_SYS_ADMIN;
+        let reduced = crate::process::CAP_VALID_MASK & !admin_bit;
+
+        // Dropping CAP_SYS_ADMIN from effective+permitted succeeds.
+        assert_eq!(apply_capset_locked(&mut c, reduced, reduced, 0), Ok(true));
+        assert_eq!(c.cap_effective & admin_bit, 0);
+        assert_eq!(c.cap_permitted & admin_bit, 0);
+
+        // Re-raising a dropped permitted cap fails with EPERM.
+        assert_eq!(
+            apply_capset_locked(&mut c, reduced | admin_bit, reduced | admin_bit, 0),
+            Err(SyscallError::EPERM)
+        );
+        // Setting effective outside permitted fails with EPERM.
+        assert_eq!(
+            apply_capset_locked(&mut c, reduced | admin_bit, reduced, 0),
+            Err(SyscallError::EPERM)
+        );
+    }
+
+    #[test]
+    fn n2_4_exec_setid_respects_no_new_privs_and_sets_at_secure() {
+        // Without no_new_privs: setuid=0 elevates euid and sets AT_SECURE=1.
+        let (sc, tr) = super::exec::compute_exec_setid_transition(
+            1000,
+            1000,
+            1000,
+            1000,
+            Some(0),
+            Some(42),
+            false,
+        );
+        assert_eq!(
+            (sc.uid, sc.euid, sc.gid, sc.egid, sc.at_secure),
+            (1000, 0, 1000, 42, true)
+        );
+        assert_eq!(
+            tr,
+            Some(super::exec::ExecSetidTransition {
+                new_euid: 0,
+                new_egid: 42
+            })
+        );
+
+        // With no_new_privs: S_ISUID / S_ISGID are suppressed completely.
+        let (sc_nnp, tr_nnp) = super::exec::compute_exec_setid_transition(
+            1000,
+            1000,
+            1000,
+            1000,
+            Some(0),
+            Some(42),
+            true,
+        );
+        assert_eq!(
+            (
+                sc_nnp.uid,
+                sc_nnp.euid,
+                sc_nnp.gid,
+                sc_nnp.egid,
+                sc_nnp.at_secure
+            ),
+            (1000, 1000, 1000, 1000, false)
+        );
+        assert_eq!(tr_nnp, None);
     }
 }

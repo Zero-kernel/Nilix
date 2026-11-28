@@ -418,21 +418,6 @@ pub const FEATURE_ABSENT_HOOKS: &[FeatureAbsentHook] = &[
         syscalls: &[],
         reason: "livepatch SUPPORTED=false; no production KernelOps implementor",
     },
-    FeatureAbsentHook {
-        hook: "hook_task_setgroups",
-        syscalls: &[116],
-        reason: "no setgroups arm",
-    },
-    FeatureAbsentHook {
-        hook: "hook_task_setresuid",
-        syscalls: &[113, 114, 117, 119],
-        reason: "no setreuid/setregid/setresuid/setresgid arms",
-    },
-    FeatureAbsentHook {
-        hook: "hook_task_setuid",
-        syscalls: &[105, 106, 122, 123],
-        reason: "no setuid/setgid/setfsuid/setfsgid arms",
-    },
 ];
 
 /// R191-3: a wired hook family that some of its syscalls do not reach yet

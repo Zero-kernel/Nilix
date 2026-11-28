@@ -913,8 +913,9 @@ impl Vfs {
         )
     }
 
-    /// N2.1: Read an executable file directly into a page-backed [`kernel_core::ExecImage`]
-    /// so binaries up to 16 MiB bypass the 2 MiB kernel heap.
+    /// N2.1 + N2.4: Read an executable file directly into a page-backed [`kernel_core::ExecImage`]
+    /// so binaries up to 16 MiB bypass the 2 MiB kernel heap, while capturing any
+    /// `S_ISUID` / `S_ISGID` inode bits for setuid/setgid exec.
     pub fn read_file_for_exec_image(
         &self,
         name: &str,
@@ -922,7 +923,9 @@ impl Vfs {
     ) -> Result<kernel_core::ExecImage, SyscallError> {
         let context = OperationContext::current().map_err(fs_error_to_syscall)?;
         let mut image = kernel_core::ExecImage::new();
-        self.read_exec_using_sink(name, context, |chunk| image.try_append(chunk, max))?;
+        let setid =
+            self.read_exec_using_sink(name, context, |chunk| image.try_append(chunk, max))?;
+        image.set_setid(setid);
         Ok(image)
     }
 
@@ -946,7 +949,7 @@ impl Vfs {
         context: OperationContext,
     ) -> Result<Vec<u8>, SyscallError> {
         let mut result = Vec::new();
-        self.read_exec_using_sink(name, context, |chunk| {
+        let _ = self.read_exec_using_sink(name, context, |chunk| {
             if result
                 .len()
                 .checked_add(chunk.len())
@@ -969,7 +972,7 @@ impl Vfs {
         name: &str,
         context: OperationContext,
         mut sink: F,
-    ) -> Result<(), SyscallError>
+    ) -> Result<kernel_core::ExecSetid, SyscallError>
     where
         F: FnMut(&[u8]) -> Result<(), SyscallError>,
     {
@@ -990,6 +993,11 @@ impl Vfs {
             &LsmFileCtx::new(stat.ino, stat.mode.to_raw(), hash_path(name)),
         )
         .map_err(|_| SyscallError::EACCES)?;
+        let mode_raw = stat.mode.to_raw();
+        let setid = kernel_core::ExecSetid {
+            setuid: (mode_raw & 0o4000 != 0).then_some(stat.uid),
+            setgid: (mode_raw & 0o2000 != 0).then_some(stat.gid),
+        };
         let mut offset = 0;
         let mut bytes = [0; 4096];
         loop {
@@ -1001,7 +1009,7 @@ impl Vfs {
                 return Err(SyscallError::EIO);
             }
             if count == 0 {
-                return Ok(());
+                return Ok(setid);
             }
             sink(&bytes[..count])?;
             offset += count as u64;

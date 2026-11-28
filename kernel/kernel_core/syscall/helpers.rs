@@ -2015,13 +2015,9 @@ mod clone_credential_lsm_tests {
     use crate::process::{child_creation_test_support::Fixture, Credentials, SharedCredentials};
 
     fn prospective() -> Arc<SharedCredentials> {
-        Arc::new(SharedCredentials::new(Credentials {
-            uid: 70001,
-            gid: 70002,
-            euid: 70001,
-            egid: 70002,
-            supplementary_groups: mm::AdmittedVec::new(mm::HeapClass::CoreProcess),
-        }))
+        Arc::new(SharedCredentials::new(Credentials::with_ids(
+            70001, 70002, 70001, 70002,
+        )))
     }
 
     #[test]
