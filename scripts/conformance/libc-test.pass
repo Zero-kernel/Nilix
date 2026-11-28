@@ -1,5 +1,5 @@
-# count: 110
-# Count-pinned libc-test conformance pass list (N2.2, #66).
+# count: 111
+# Count-pinned libc-test conformance pass list (N2.2, #66; +functional_socket in N2.8).
 # Sorted lexicographically; any deletion must record a reason in libc-test.removed.
 functional_argv
 functional_basename
@@ -31,6 +31,7 @@ functional_search_tsearch
 functional_sem_init
 functional_setjmp
 functional_snprintf
+functional_socket
 functional_sscanf
 functional_sscanf_long
 functional_stat

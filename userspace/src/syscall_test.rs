@@ -377,6 +377,10 @@ pub extern "C" fn _start() -> ! {
     test_process_migration_safety(&mut results);
     test_scheduler_load_balancing(&mut results);
     test_smp_work_stealing_safety(&mut results);
+    // N2.8: Loopback delivery, getsockname/getpeername, setsockopt/getsockopt, sendmsg/recvmsg, multi-iovec readv.
+    test_n2_8_loopback_udp_tcp_echo(&mut results);
+    test_n2_8_sockopts_and_negative(&mut results);
+    test_n2_8_sendmsg_recvmsg_and_readv(&mut results);
 
     // Print summary
     println("");
@@ -11842,4 +11846,817 @@ fn test_smp_work_stealing_safety(results: &mut TestResult) {
         }
         None => results.fail("SMP work stealing safety: could not reap host"),
     }
+}
+
+// ============================================================================
+// N2.8: Loopback Delivery + Socket Syscalls + Multi-Iovec readv
+// ============================================================================
+
+const N28_SYS_READ: u64 = 0;
+const N28_SYS_WRITE: u64 = 1;
+const N28_SYS_CLOSE: u64 = 3;
+const N28_SYS_READV: u64 = 19;
+const N28_SYS_PIPE: u64 = 22;
+const N28_SYS_SOCKET: u64 = 41;
+const N28_SYS_CONNECT: u64 = 42;
+const N28_SYS_ACCEPT: u64 = 43;
+const N28_SYS_SENDTO: u64 = 44;
+const N28_SYS_RECVFROM: u64 = 45;
+const N28_SYS_SENDMSG: u64 = 46;
+const N28_SYS_RECVMSG: u64 = 47;
+const N28_SYS_SHUTDOWN: u64 = 48;
+const N28_SYS_BIND: u64 = 49;
+const N28_SYS_LISTEN: u64 = 50;
+const N28_SYS_GETSOCKNAME: u64 = 51;
+const N28_SYS_GETPEERNAME: u64 = 52;
+const N28_SYS_SETSOCKOPT: u64 = 54;
+const N28_SYS_GETSOCKOPT: u64 = 55;
+
+const N28_AF_INET: u64 = 2;
+const N28_SOCK_STREAM: u64 = 1;
+const N28_SOCK_DGRAM: u64 = 2;
+const N28_SOCK_NONBLOCK: u64 = 0o4000;
+const N28_IPPROTO_IP: u64 = 0;
+const N28_SOL_SOCKET: u64 = 1;
+const N28_IPPROTO_TCP: u64 = 6;
+const N28_SO_REUSEADDR: u64 = 2;
+const N28_SO_TYPE: u64 = 3;
+const N28_SO_ERROR: u64 = 4;
+const N28_SO_SNDBUF: u64 = 7;
+const N28_SO_RCVBUF: u64 = 8;
+const N28_SO_KEEPALIVE: u64 = 9;
+const N28_SO_RCVTIMEO: u64 = 20;
+const N28_TCP_NODELAY: u64 = 1;
+const N28_IP_TTL: u64 = 2;
+const N28_MSG_TRUNC: i32 = 0x20;
+const N28_MSG_DONTWAIT: u64 = 0x40;
+const N28_SHUT_WR: u64 = 1;
+
+const N28_EFAULT: i32 = 14;
+const N28_EINVAL: i32 = 22;
+const N28_ENOTSOCK: i32 = 88;
+const N28_ENOPROTOOPT: i32 = 92;
+const N28_EOPNOTSUPP: i32 = 95;
+const N28_ENOTCONN: i32 = 107;
+const N28_ECONNREFUSED: i32 = 111;
+const N28_EINPROGRESS: i32 = 115;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct N28SockAddrIn {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: [u8; 4],
+    sin_zero: [u8; 8],
+}
+
+impl N28SockAddrIn {
+    const fn new(ip: [u8; 4], port: u16) -> Self {
+        Self {
+            sin_family: N28_AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: ip,
+            sin_zero: [0; 8],
+        }
+    }
+
+    const fn port(self) -> u16 {
+        u16::from_be(self.sin_port)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct N28Iovec {
+    iov_base: *mut u8,
+    iov_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct N28MsgHdr {
+    msg_name: *mut u8,
+    msg_namelen: u32,
+    _pad0: u32,
+    msg_iov: *const N28Iovec,
+    msg_iovlen: usize,
+    msg_control: *mut u8,
+    msg_controllen: usize,
+    msg_flags: i32,
+    _pad1: u32,
+}
+
+fn test_n2_8_loopback_udp_tcp_echo(results: &mut TestResult) {
+    print("Testing N2.8 loopback UDP/TCP echo, getsockname/getpeername, RST... ");
+    // 1. UDP loopback round-trip + getsockname/getpeername
+    let srv = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_DGRAM, 0) };
+    let cli = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_DGRAM, 0) };
+    if is_error(srv) || is_error(cli) {
+        results.fail("n2_8_loopback_udp_tcp_echo: UDP socket creation failed");
+        return;
+    }
+    let bind_addr = N28SockAddrIn::new([127, 0, 0, 1], 0);
+    let r_bind = unsafe {
+        syscall3(
+            N28_SYS_BIND,
+            srv,
+            &bind_addr as *const N28SockAddrIn as u64,
+            16,
+        )
+    };
+    if is_error(r_bind) {
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, srv) };
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, cli) };
+        results.fail("n2_8_loopback_udp_tcp_echo: UDP bind(127.0.0.1:0) failed");
+        return;
+    }
+
+    // getsockname truncation check: pass len=4, expect *len == 16
+    let mut trunc_sa = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut trunc_len: u32 = 4;
+    let r_trunc = unsafe {
+        syscall3(
+            N28_SYS_GETSOCKNAME,
+            srv,
+            &mut trunc_sa as *mut N28SockAddrIn as u64,
+            &mut trunc_len as *mut u32 as u64,
+        )
+    };
+    let mut srv_sa = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut srv_len: u32 = 16;
+    let r_name = unsafe {
+        syscall3(
+            N28_SYS_GETSOCKNAME,
+            srv,
+            &mut srv_sa as *mut N28SockAddrIn as u64,
+            &mut srv_len as *mut u32 as u64,
+        )
+    };
+    let mut peer_sa = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut peer_len: u32 = 16;
+    let r_unconn_peer = unsafe {
+        syscall3(
+            N28_SYS_GETPEERNAME,
+            srv,
+            &mut peer_sa as *mut N28SockAddrIn as u64,
+            &mut peer_len as *mut u32 as u64,
+        )
+    };
+    if is_error(r_trunc)
+        || trunc_len != 16
+        || is_error(r_name)
+        || srv_len != 16
+        || srv_sa.sin_addr != [127, 0, 0, 1]
+        || srv_sa.port() == 0
+        || !is_error(r_unconn_peer)
+        || errno(r_unconn_peer) != N28_ENOTCONN
+    {
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, srv) };
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, cli) };
+        results.fail("n2_8_loopback_udp_tcp_echo: UDP getsockname/getpeername mismatch");
+        return;
+    }
+
+    let msg = b"nilix-lo-udp!";
+    let r_send = unsafe {
+        syscall6(
+            N28_SYS_SENDTO,
+            cli,
+            msg.as_ptr() as u64,
+            msg.len() as u64,
+            0,
+            &srv_sa as *const N28SockAddrIn as u64,
+            16,
+        )
+    };
+    let mut rbuf = [0u8; 32];
+    let mut from_sa = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut from_len: u32 = 16;
+    let r_recv = unsafe {
+        syscall6(
+            N28_SYS_RECVFROM,
+            srv,
+            rbuf.as_mut_ptr() as u64,
+            rbuf.len() as u64,
+            N28_MSG_DONTWAIT,
+            &mut from_sa as *mut N28SockAddrIn as u64,
+            &mut from_len as *mut u32 as u64,
+        )
+    };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, srv) };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, cli) };
+
+    if r_send != msg.len() as u64
+        || r_recv != msg.len() as u64
+        || &rbuf[..msg.len()] != msg
+        || from_sa.sin_addr != [127, 0, 0, 1]
+        || from_sa.port() == 0
+    {
+        results.fail("n2_8_loopback_udp_tcp_echo: UDP loopback echo failed");
+        return;
+    }
+
+    // 2. TCP loopback 3-way handshake, getsockname/getpeername, bidirectional data, shutdown EOF
+    let lsock = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_STREAM, 0) };
+    let csock = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_STREAM, 0) };
+    if is_error(lsock) || is_error(csock) {
+        results.fail("n2_8_loopback_udp_tcp_echo: TCP socket creation failed");
+        return;
+    }
+    let lbind = N28SockAddrIn::new([127, 0, 0, 1], 0);
+    let mut laddr = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut llen: u32 = 16;
+    let ok_setup = !is_error(unsafe {
+        syscall3(
+            N28_SYS_BIND,
+            lsock,
+            &lbind as *const N28SockAddrIn as u64,
+            16,
+        )
+    }) && !is_error(unsafe {
+        syscall3(
+            N28_SYS_GETSOCKNAME,
+            lsock,
+            &mut laddr as *mut N28SockAddrIn as u64,
+            &mut llen as *mut u32 as u64,
+        )
+    }) && laddr.port() != 0
+        && !is_error(unsafe { syscall2(N28_SYS_LISTEN, lsock, 4) })
+        && !is_error(unsafe {
+            syscall3(
+                N28_SYS_CONNECT,
+                csock,
+                &laddr as *const N28SockAddrIn as u64,
+                16,
+            )
+        });
+    if !ok_setup {
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, csock) };
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, lsock) };
+        results.fail("n2_8_loopback_udp_tcp_echo: TCP loopback listen/connect failed");
+        return;
+    }
+
+    let mut acc_peer = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut acc_plen: u32 = 16;
+    let asock = unsafe {
+        syscall3(
+            N28_SYS_ACCEPT,
+            lsock,
+            &mut acc_peer as *mut N28SockAddrIn as u64,
+            &mut acc_plen as *mut u32 as u64,
+        )
+    };
+    if is_error(asock) {
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, csock) };
+        let _ = unsafe { syscall1(N28_SYS_CLOSE, lsock) };
+        results.fail("n2_8_loopback_udp_tcp_echo: TCP loopback accept failed");
+        return;
+    }
+
+    let mut c_local = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut c_peer = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut a_local = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut a_peer = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let (mut l1, mut l2, mut l3, mut l4) = (16u32, 16u32, 16u32, 16u32);
+    let names_ok = !is_error(unsafe {
+        syscall3(
+            N28_SYS_GETSOCKNAME,
+            csock,
+            &mut c_local as *mut N28SockAddrIn as u64,
+            &mut l1 as *mut u32 as u64,
+        )
+    }) && !is_error(unsafe {
+        syscall3(
+            N28_SYS_GETPEERNAME,
+            csock,
+            &mut c_peer as *mut N28SockAddrIn as u64,
+            &mut l2 as *mut u32 as u64,
+        )
+    }) && !is_error(unsafe {
+        syscall3(
+            N28_SYS_GETSOCKNAME,
+            asock,
+            &mut a_local as *mut N28SockAddrIn as u64,
+            &mut l3 as *mut u32 as u64,
+        )
+    }) && !is_error(unsafe {
+        syscall3(
+            N28_SYS_GETPEERNAME,
+            asock,
+            &mut a_peer as *mut N28SockAddrIn as u64,
+            &mut l4 as *mut u32 as u64,
+        )
+    }) && c_local.sin_addr == [127, 0, 0, 1]
+        && c_peer.sin_addr == [127, 0, 0, 1]
+        && c_peer.port() == laddr.port()
+        && a_local.port() == laddr.port()
+        && a_peer.port() == c_local.port()
+        && acc_peer.port() == c_local.port();
+
+    let ping = b"tcp-ping-n28";
+    let pong = b"tcp-pong-n28";
+    let mut b1 = [0u8; 32];
+    let mut b2 = [0u8; 32];
+    let s1 = unsafe {
+        syscall6(
+            N28_SYS_SENDTO,
+            csock,
+            ping.as_ptr() as u64,
+            ping.len() as u64,
+            0,
+            0,
+            0,
+        )
+    };
+    let r1 = unsafe {
+        syscall6(
+            N28_SYS_RECVFROM,
+            asock,
+            b1.as_mut_ptr() as u64,
+            b1.len() as u64,
+            N28_MSG_DONTWAIT,
+            0,
+            0,
+        )
+    };
+    let s2 = unsafe {
+        syscall3(
+            N28_SYS_WRITE,
+            asock,
+            pong.as_ptr() as u64,
+            pong.len() as u64,
+        )
+    };
+    let r2 = unsafe { syscall3(N28_SYS_READ, csock, b2.as_mut_ptr() as u64, b2.len() as u64) };
+    let sh = unsafe { syscall2(N28_SYS_SHUTDOWN, csock, N28_SHUT_WR) };
+    let eof = unsafe {
+        syscall6(
+            N28_SYS_RECVFROM,
+            asock,
+            b1.as_mut_ptr() as u64,
+            b1.len() as u64,
+            N28_MSG_DONTWAIT,
+            0,
+            0,
+        )
+    };
+
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, asock) };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, csock) };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, lsock) };
+
+    if !names_ok
+        || s1 != ping.len() as u64
+        || r1 != ping.len() as u64
+        || &b1[..ping.len()] != ping
+        || s2 != pong.len() as u64
+        || r2 != pong.len() as u64
+        || &b2[..pong.len()] != pong
+        || is_error(sh)
+        || eof != 0
+    {
+        results.fail("n2_8_loopback_udp_tcp_echo: TCP loopback data/names/EOF failed");
+        return;
+    }
+
+    // 3. Connect to closed loopback port -> ECONNREFUSED (blocking) & SO_ERROR (non-blocking)
+    let closed_addr = N28SockAddrIn::new([127, 0, 0, 1], 19999);
+    let r_blk_sock = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_STREAM, 0) };
+    let r_blk = unsafe {
+        syscall3(
+            N28_SYS_CONNECT,
+            r_blk_sock,
+            &closed_addr as *const N28SockAddrIn as u64,
+            16,
+        )
+    };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, r_blk_sock) };
+
+    let r_nb_sock = unsafe {
+        syscall3(
+            N28_SYS_SOCKET,
+            N28_AF_INET,
+            N28_SOCK_STREAM | N28_SOCK_NONBLOCK,
+            0,
+        )
+    };
+    let r_nb = unsafe {
+        syscall3(
+            N28_SYS_CONNECT,
+            r_nb_sock,
+            &closed_addr as *const N28SockAddrIn as u64,
+            16,
+        )
+    };
+    let mut so_err: i32 = -1;
+    let mut so_err_len: u32 = 4;
+    let r_so1 = unsafe {
+        syscall5(
+            N28_SYS_GETSOCKOPT,
+            r_nb_sock,
+            N28_SOL_SOCKET,
+            N28_SO_ERROR,
+            &mut so_err as *mut i32 as u64,
+            &mut so_err_len as *mut u32 as u64,
+        )
+    };
+    let mut so_err2: i32 = -1;
+    let mut so_err2_len: u32 = 4;
+    let r_so2 = unsafe {
+        syscall5(
+            N28_SYS_GETSOCKOPT,
+            r_nb_sock,
+            N28_SOL_SOCKET,
+            N28_SO_ERROR,
+            &mut so_err2 as *mut i32 as u64,
+            &mut so_err2_len as *mut u32 as u64,
+        )
+    };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, r_nb_sock) };
+
+    if !is_error(r_blk)
+        || errno(r_blk) != N28_ECONNREFUSED
+        || !is_error(r_nb)
+        || errno(r_nb) != N28_EINPROGRESS
+        || is_error(r_so1)
+        || so_err != N28_ECONNREFUSED
+        || is_error(r_so2)
+        || so_err2 != 0
+    {
+        results.fail("n2_8_loopback_udp_tcp_echo: closed-port RST / SO_ERROR check failed");
+        return;
+    }
+
+    results.pass("N2.8 loopback UDP/TCP echo, getsockname/getpeername, and RST/SO_ERROR");
+}
+
+fn test_n2_8_sockopts_and_negative(results: &mut TestResult) {
+    print("Testing N2.8 setsockopt/getsockopt & negative paths... ");
+    let tcp = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_STREAM, 0) };
+    let udp = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_DGRAM, 0) };
+    if is_error(tcp) || is_error(udp) {
+        results.fail("n2_8_sockopts_and_negative: socket creation failed");
+        return;
+    }
+
+    let get_i32 = |fd: u64, lvl: u64, opt: u64| -> (u64, i32, u32) {
+        let mut v: i32 = -999;
+        let mut l: u32 = 4;
+        let r = unsafe {
+            syscall5(
+                N28_SYS_GETSOCKOPT,
+                fd,
+                lvl,
+                opt,
+                &mut v as *mut i32 as u64,
+                &mut l as *mut u32 as u64,
+            )
+        };
+        (r, v, l)
+    };
+    let set_i32 = |fd: u64, lvl: u64, opt: u64, val: i32| -> u64 {
+        unsafe {
+            syscall5(
+                N28_SYS_SETSOCKOPT,
+                fd,
+                lvl,
+                opt,
+                &val as *const i32 as u64,
+                4,
+            )
+        }
+    };
+
+    let mut ok = true;
+    let (r, v, l) = get_i32(tcp, N28_SOL_SOCKET, N28_SO_TYPE);
+    ok &= !is_error(r) && v == 1 && l == 4;
+    let (r, v, l) = get_i32(udp, N28_SOL_SOCKET, N28_SO_TYPE);
+    ok &= !is_error(r) && v == 2 && l == 4;
+    let r = set_i32(tcp, N28_SOL_SOCKET, N28_SO_TYPE, 1);
+    ok &= is_error(r) && errno(r) == N28_ENOPROTOOPT;
+    let r = set_i32(tcp, N28_SOL_SOCKET, N28_SO_ERROR, 0);
+    ok &= is_error(r) && errno(r) == N28_ENOPROTOOPT;
+
+    ok &= !is_error(set_i32(tcp, N28_SOL_SOCKET, N28_SO_REUSEADDR, 1));
+    let (r, v, _) = get_i32(tcp, N28_SOL_SOCKET, N28_SO_REUSEADDR);
+    ok &= !is_error(r) && v == 1;
+    ok &= !is_error(set_i32(tcp, N28_SOL_SOCKET, N28_SO_KEEPALIVE, 1));
+    let (r, v, _) = get_i32(tcp, N28_SOL_SOCKET, N28_SO_KEEPALIVE);
+    ok &= !is_error(r) && v == 1;
+
+    ok &= !is_error(set_i32(tcp, N28_SOL_SOCKET, N28_SO_RCVBUF, 100));
+    let (r, v, _) = get_i32(tcp, N28_SOL_SOCKET, N28_SO_RCVBUF);
+    ok &= !is_error(r) && v == 4096;
+    ok &= !is_error(set_i32(tcp, N28_SOL_SOCKET, N28_SO_SNDBUF, 10_000_000));
+    let (r, v, _) = get_i32(tcp, N28_SOL_SOCKET, N28_SO_SNDBUF);
+    ok &= !is_error(r) && v == 262_144;
+
+    ok &= !is_error(set_i32(tcp, N28_IPPROTO_TCP, N28_TCP_NODELAY, 1));
+    let (r, v, _) = get_i32(tcp, N28_IPPROTO_TCP, N28_TCP_NODELAY);
+    ok &= !is_error(r) && v == 1;
+    let r = set_i32(udp, N28_IPPROTO_TCP, N28_TCP_NODELAY, 1);
+    ok &= is_error(r) && errno(r) == N28_ENOPROTOOPT;
+
+    ok &= !is_error(set_i32(udp, N28_IPPROTO_IP, N28_IP_TTL, 32));
+    let (r, v, _) = get_i32(udp, N28_IPPROTO_IP, N28_IP_TTL);
+    ok &= !is_error(r) && v == 32;
+    ok &= !is_error(set_i32(udp, N28_IPPROTO_IP, N28_IP_TTL, -1));
+    let (r, v, _) = get_i32(udp, N28_IPPROTO_IP, N28_IP_TTL);
+    ok &= !is_error(r) && v == 64;
+    let r0 = set_i32(udp, N28_IPPROTO_IP, N28_IP_TTL, 0);
+    let r256 = set_i32(udp, N28_IPPROTO_IP, N28_IP_TTL, 256);
+    ok &= is_error(r0) && errno(r0) == N28_EINVAL && is_error(r256) && errno(r256) == N28_EINVAL;
+
+    let tv_in: [i64; 2] = [1, 250_000];
+    let mut tv_out: [i64; 2] = [0, 0];
+    let mut tv_len: u32 = 16;
+    let r_set_tv = unsafe {
+        syscall5(
+            N28_SYS_SETSOCKOPT,
+            udp,
+            N28_SOL_SOCKET,
+            N28_SO_RCVTIMEO,
+            tv_in.as_ptr() as u64,
+            16,
+        )
+    };
+    let r_get_tv = unsafe {
+        syscall5(
+            N28_SYS_GETSOCKOPT,
+            udp,
+            N28_SOL_SOCKET,
+            N28_SO_RCVTIMEO,
+            tv_out.as_mut_ptr() as u64,
+            &mut tv_len as *mut u32 as u64,
+        )
+    };
+    ok &= !is_error(r_set_tv) && !is_error(r_get_tv) && tv_len == 16 && tv_out == tv_in;
+
+    let r_unk = set_i32(tcp, N28_SOL_SOCKET, 9999, 1);
+    ok &= is_error(r_unk) && errno(r_unk) == N28_ENOPROTOOPT;
+    let r_notsock = set_i32(1, N28_SOL_SOCKET, N28_SO_REUSEADDR, 1);
+    ok &= is_error(r_notsock) && errno(r_notsock) == N28_ENOTSOCK;
+    let r_efault = unsafe {
+        syscall5(
+            N28_SYS_SETSOCKOPT,
+            tcp,
+            N28_SOL_SOCKET,
+            N28_SO_REUSEADDR,
+            0,
+            4,
+        )
+    };
+    ok &= is_error(r_efault) && errno(r_efault) == N28_EFAULT;
+
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, tcp) };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, udp) };
+
+    if ok {
+        results.pass("N2.8 setsockopt/getsockopt round-trip, bounds, and negative checks");
+    } else {
+        results.fail("n2_8_sockopts_and_negative: sockopt round-trip or negative check failed");
+    }
+}
+
+fn test_n2_8_sendmsg_recvmsg_and_readv(results: &mut TestResult) {
+    print("Testing N2.8 sendmsg/recvmsg & multi-iovec readv... ");
+    // 1. Multi-iovec readv on a pipe
+    let mut pipe_fds = [-1i32; 2];
+    if is_error(unsafe { syscall1(N28_SYS_PIPE, pipe_fds.as_mut_ptr() as u64) }) {
+        results.fail("n2_8_sendmsg_recvmsg_and_readv: pipe creation failed");
+        return;
+    }
+    let payload = b"HelloNilix!!";
+    let w = unsafe {
+        syscall3(
+            N28_SYS_WRITE,
+            pipe_fds[1] as u64,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
+        )
+    };
+    let mut p0 = [0u8; 5];
+    let mut p1 = [0u8; 5];
+    let mut p2 = [0u8; 4];
+    let pipe_iov = [
+        N28Iovec {
+            iov_base: core::ptr::null_mut(),
+            iov_len: 0,
+        },
+        N28Iovec {
+            iov_base: p0.as_mut_ptr(),
+            iov_len: p0.len(),
+        },
+        N28Iovec {
+            iov_base: core::ptr::null_mut(),
+            iov_len: 0,
+        },
+        N28Iovec {
+            iov_base: p1.as_mut_ptr(),
+            iov_len: p1.len(),
+        },
+        N28Iovec {
+            iov_base: p2.as_mut_ptr(),
+            iov_len: p2.len(),
+        },
+    ];
+    let rv = unsafe {
+        syscall3(
+            N28_SYS_READV,
+            pipe_fds[0] as u64,
+            pipe_iov.as_ptr() as u64,
+            pipe_iov.len() as u64,
+        )
+    };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, pipe_fds[0] as u64) };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, pipe_fds[1] as u64) };
+    if w != 12 || rv != 12 || &p0 != b"Hello" || &p1 != b"Nilix" || &p2[..2] != b"!!" {
+        results.fail("n2_8_sendmsg_recvmsg_and_readv: multi-iovec pipe readv failed");
+        return;
+    }
+
+    // 2. UDP loopback sendmsg / recvmsg scatter-gather + MSG_TRUNC + msg_controllen != 0 -> EOPNOTSUPP
+    let srv = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_DGRAM, 0) };
+    let cli = unsafe { syscall3(N28_SYS_SOCKET, N28_AF_INET, N28_SOCK_DGRAM, 0) };
+    if is_error(srv) || is_error(cli) {
+        results.fail("n2_8_sendmsg_recvmsg_and_readv: UDP socket failed");
+        return;
+    }
+    let baddr = N28SockAddrIn::new([127, 0, 0, 1], 0);
+    let mut saddr = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut slen: u32 = 16;
+    let bound = !is_error(unsafe {
+        syscall3(N28_SYS_BIND, srv, &baddr as *const N28SockAddrIn as u64, 16)
+    }) && !is_error(unsafe {
+        syscall3(
+            N28_SYS_GETSOCKNAME,
+            srv,
+            &mut saddr as *mut N28SockAddrIn as u64,
+            &mut slen as *mut u32 as u64,
+        )
+    });
+
+    let mut ctrl = [0u8; 16];
+    let mut dummy = [0u8; 4];
+    let ctrl_iov = [N28Iovec {
+        iov_base: dummy.as_mut_ptr(),
+        iov_len: 4,
+    }];
+    let mut bad_hdr = N28MsgHdr {
+        msg_name: &mut saddr as *mut N28SockAddrIn as *mut u8,
+        msg_namelen: 16,
+        _pad0: 0,
+        msg_iov: ctrl_iov.as_ptr(),
+        msg_iovlen: 1,
+        msg_control: ctrl.as_mut_ptr(),
+        msg_controllen: 16,
+        msg_flags: 0,
+        _pad1: 0,
+    };
+    let r_bad_send =
+        unsafe { syscall3(N28_SYS_SENDMSG, cli, &bad_hdr as *const N28MsgHdr as u64, 0) };
+    let r_bad_recv = unsafe {
+        syscall3(
+            N28_SYS_RECVMSG,
+            srv,
+            &mut bad_hdr as *mut N28MsgHdr as u64,
+            N28_MSG_DONTWAIT,
+        )
+    };
+
+    let mut s0 = *b"ABCD";
+    let mut s1 = *b"1234";
+    let mut s2 = *b"WXYZ";
+    let send_iov = [
+        N28Iovec {
+            iov_base: s0.as_mut_ptr(),
+            iov_len: 4,
+        },
+        N28Iovec {
+            iov_base: core::ptr::null_mut(),
+            iov_len: 0,
+        },
+        N28Iovec {
+            iov_base: s1.as_mut_ptr(),
+            iov_len: 4,
+        },
+        N28Iovec {
+            iov_base: s2.as_mut_ptr(),
+            iov_len: 4,
+        },
+    ];
+    let send_hdr = N28MsgHdr {
+        msg_name: &mut saddr as *mut N28SockAddrIn as *mut u8,
+        msg_namelen: 16,
+        _pad0: 0,
+        msg_iov: send_iov.as_ptr(),
+        msg_iovlen: send_iov.len(),
+        msg_control: core::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+        _pad1: 0,
+    };
+    let sent = unsafe {
+        syscall3(
+            N28_SYS_SENDMSG,
+            cli,
+            &send_hdr as *const N28MsgHdr as u64,
+            0,
+        )
+    };
+
+    let mut r0 = [0u8; 6];
+    let mut r1 = [0u8; 6];
+    let recv_iov = [
+        N28Iovec {
+            iov_base: r0.as_mut_ptr(),
+            iov_len: 6,
+        },
+        N28Iovec {
+            iov_base: r1.as_mut_ptr(),
+            iov_len: 6,
+        },
+    ];
+    let mut peer = N28SockAddrIn::new([0, 0, 0, 0], 0);
+    let mut recv_hdr = N28MsgHdr {
+        msg_name: &mut peer as *mut N28SockAddrIn as *mut u8,
+        msg_namelen: 16,
+        _pad0: 0,
+        msg_iov: recv_iov.as_ptr(),
+        msg_iovlen: recv_iov.len(),
+        msg_control: core::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+        _pad1: 0,
+    };
+    let recvd = unsafe {
+        syscall3(
+            N28_SYS_RECVMSG,
+            srv,
+            &mut recv_hdr as *mut N28MsgHdr as u64,
+            N28_MSG_DONTWAIT,
+        )
+    };
+
+    let sent2 = unsafe {
+        syscall3(
+            N28_SYS_SENDMSG,
+            cli,
+            &send_hdr as *const N28MsgHdr as u64,
+            0,
+        )
+    };
+    let mut short_buf = [0u8; 5];
+    let short_iov = [N28Iovec {
+        iov_base: short_buf.as_mut_ptr(),
+        iov_len: 5,
+    }];
+    let mut trunc_hdr = N28MsgHdr {
+        msg_name: core::ptr::null_mut(),
+        msg_namelen: 0,
+        _pad0: 0,
+        msg_iov: short_iov.as_ptr(),
+        msg_iovlen: 1,
+        msg_control: core::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+        _pad1: 0,
+    };
+    let recvd2 = unsafe {
+        syscall3(
+            N28_SYS_RECVMSG,
+            srv,
+            &mut trunc_hdr as *mut N28MsgHdr as u64,
+            N28_MSG_DONTWAIT,
+        )
+    };
+
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, srv) };
+    let _ = unsafe { syscall1(N28_SYS_CLOSE, cli) };
+
+    if !bound
+        || !is_error(r_bad_send)
+        || errno(r_bad_send) != N28_EOPNOTSUPP
+        || !is_error(r_bad_recv)
+        || errno(r_bad_recv) != N28_EOPNOTSUPP
+        || sent != 12
+        || recvd != 12
+        || &r0 != b"ABCD12"
+        || &r1 != b"34WXYZ"
+        || peer.sin_addr != [127, 0, 0, 1]
+        || recv_hdr.msg_namelen != 16
+        || recv_hdr.msg_flags != 0
+        || sent2 != 12
+        || recvd2 != 5
+        || &short_buf != b"ABCD1"
+        || (trunc_hdr.msg_flags & N28_MSG_TRUNC) == 0
+    {
+        results.fail("n2_8_sendmsg_recvmsg_and_readv: sendmsg/recvmsg check failed");
+        return;
+    }
+
+    results.pass(
+        "N2.8 sendmsg/recvmsg scatter-gather, MSG_TRUNC, EOPNOTSUPP control, and multi-iovec readv",
+    );
 }

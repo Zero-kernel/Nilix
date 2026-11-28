@@ -56,8 +56,8 @@ use crate::icmp::{
     ICMP_TYPE_DEST_UNREACHABLE, ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST,
 };
 use crate::ipv4::{
-    build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
-    IPV4_HEADER_MIN_LEN,
+    build_ipv4_header, compute_checksum, parse_ipv4, parse_ipv4_loopback, Ipv4Addr, Ipv4Error,
+    Ipv4Header, Ipv4Proto, IPV4_HEADER_MIN_LEN,
 };
 use crate::socket::{socket_table, TcpConnectResult, TcpReplyBinding};
 use crate::tcp::{
@@ -66,7 +66,7 @@ use crate::tcp::{
 };
 use crate::udp::{parse_udp, parse_udp_header, UdpError, UdpHeader, UdpStats, UDP_HEADER_LEN};
 use crate::WirePacket;
-use crate::DEFAULT_MTU;
+use crate::{DEFAULT_MTU, ETH_HEADER_SIZE};
 use cap::NamespaceId;
 use mm::dma::{alloc_dma_buffer, DMA_PAGE_SIZE};
 
@@ -568,7 +568,7 @@ pub fn process_frame(
     if let ProcessResult::Reply(ref mut reply_frame) = result {
         let egress_class = reply_frame.egress_class;
         if !matches!(
-            egress_firewall_allows_prepared(reply_frame, net_ns_id.0, now_ms, egress_class),
+            egress_firewall_allows_prepared(reply_frame, net_ns_id.0, now_ms, egress_class, false),
             EgressFirewallDecision::Allow
         ) {
             return ProcessResult::Dropped(DropReason::Firewall {
@@ -698,6 +698,7 @@ fn egress_firewall_allows_prepared(
     net_ns_id: u64,
     now_ms: u64,
     egress_class: PreparedEgressClass,
+    is_loopback: bool,
 ) -> EgressFirewallDecision {
     // Parse Ethernet header; non-IPv4 frames (ARP, etc.) are passed through.
     let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
@@ -708,10 +709,17 @@ fn egress_firewall_allows_prepared(
         return EgressFirewallDecision::Allow;
     }
 
-    // Parse IPv4 header.
-    let (ip_hdr, _opts, l4_bytes) = match parse_ipv4(ip_payload) {
-        Ok(r) => r,
-        Err(_) => return EgressFirewallDecision::Malformed,
+    // Parse IPv4 header (loopback replies may carry 127.0.0.0/8 source).
+    let (ip_hdr, _opts, l4_bytes) = if is_loopback {
+        match parse_ipv4_loopback(ip_payload) {
+            Ok(r) => r,
+            Err(_) => return EgressFirewallDecision::Malformed,
+        }
+    } else {
+        match parse_ipv4(ip_payload) {
+            Ok(r) => r,
+            Err(_) => return EgressFirewallDecision::Malformed,
+        }
     };
 
     let proto = match ip_hdr.proto() {
@@ -748,6 +756,7 @@ fn egress_firewall_allows_prepared(
         src_port,
         dst_port,
         ct_state: ct_decision,
+        is_loopback,
     };
 
     let Some(fw_table) = try_firewall_table_for_ns(net_ns_id) else {
@@ -783,6 +792,7 @@ fn egress_firewall_allows_prepared(
     net_ns_id: u64,
     now_ms: u64,
     _egress_class: PreparedEgressClass,
+    is_loopback: bool,
 ) -> EgressFirewallDecision {
     let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
         Ok(r) => r,
@@ -792,9 +802,16 @@ fn egress_firewall_allows_prepared(
         return EgressFirewallDecision::Allow;
     }
 
-    let (ip_hdr, _opts, l4_bytes) = match parse_ipv4(ip_payload) {
-        Ok(r) => r,
-        Err(_) => return EgressFirewallDecision::Malformed,
+    let (ip_hdr, _opts, l4_bytes) = if is_loopback {
+        match parse_ipv4_loopback(ip_payload) {
+            Ok(r) => r,
+            Err(_) => return EgressFirewallDecision::Malformed,
+        }
+    } else {
+        match parse_ipv4(ip_payload) {
+            Ok(r) => r,
+            Err(_) => return EgressFirewallDecision::Malformed,
+        }
     };
 
     let proto = match ip_hdr.proto() {
@@ -817,6 +834,7 @@ fn egress_firewall_allows_prepared(
         src_port,
         dst_port,
         ct_state: None,
+        is_loopback,
     };
 
     let Some(fw_table) = try_firewall_table_for_ns(net_ns_id) else {
@@ -846,14 +864,63 @@ fn process_ipv4(
     net_ns_id: NamespaceId,
     now_ms: u64,
 ) -> ProcessResult {
+    process_ipv4_inner(
+        packet, eth_hdr, our_mac, our_ip, stats, net_ns_id, now_ms, false,
+    )
+}
+
+/// Process a loopback (`lo`) IPv4 packet in process context.
+fn process_ipv4_loopback(
+    packet: &[u8],
+    stats: &NetStats,
+    net_ns_id: NamespaceId,
+    now_ms: u64,
+) -> ProcessResult {
+    let synth_eth = EthHeader {
+        dst: EthAddr::ZERO,
+        src: EthAddr::ZERO,
+        ethertype: ETHERTYPE_IPV4,
+    };
+    process_ipv4_inner(
+        packet,
+        &synth_eth,
+        EthAddr::ZERO,
+        Ipv4Addr::LOCALHOST,
+        stats,
+        net_ns_id,
+        now_ms,
+        true,
+    )
+}
+
+fn process_ipv4_inner(
+    packet: &[u8],
+    eth_hdr: &EthHeader,
+    our_mac: EthAddr,
+    our_ip: Ipv4Addr,
+    stats: &NetStats,
+    net_ns_id: NamespaceId,
+    now_ms: u64,
+    is_loopback: bool,
+) -> ProcessResult {
     stats.inc_ipv4_rx();
 
-    // Parse and validate IPv4 header first
-    let (ip_hdr, _options, payload) = match parse_ipv4(packet) {
-        Ok(result) => result,
-        Err(e) => {
-            stats.inc_rx_errors();
-            return ProcessResult::Dropped(DropReason::Ipv4Error(e));
+    // Parse and validate IPv4 header first (external wire keeps strict R44-3 anti-spoofing)
+    let (ip_hdr, _options, payload) = if is_loopback {
+        match parse_ipv4_loopback(packet) {
+            Ok(result) => result,
+            Err(e) => {
+                stats.inc_rx_errors();
+                return ProcessResult::Dropped(DropReason::Ipv4Error(e));
+            }
+        }
+    } else {
+        match parse_ipv4(packet) {
+            Ok(result) => result,
+            Err(e) => {
+                stats.inc_rx_errors();
+                return ProcessResult::Dropped(DropReason::Ipv4Error(e));
+            }
         }
     };
 
@@ -861,10 +928,20 @@ fn process_ipv4(
     // Security: We accept broadcast for informational purposes but will NOT
     // generate responses to broadcast destinations (Smurf attack prevention)
     let is_broadcast_dst = ip_hdr.dst.is_broadcast();
-    if ip_hdr.dst != our_ip && !is_broadcast_dst {
-        // Not for us, silently drop (no error)
-        return ProcessResult::Handled;
-    }
+    let effective_our_ip = if is_loopback {
+        let local_match = ip_hdr.dst.is_loopback()
+            || tx_net_config(net_ns_id.0).is_ok_and(|cfg| cfg.our_ip == ip_hdr.dst);
+        if !local_match {
+            return ProcessResult::Handled;
+        }
+        ip_hdr.dst
+    } else {
+        if ip_hdr.dst != our_ip && !is_broadcast_dst {
+            // Not for us, silently drop (no error)
+            return ProcessResult::Handled;
+        }
+        our_ip
+    };
 
     // Fragment handling with secure reassembly
     // R48-6 + R60: Process fragments through reassembly cache with anti-DoS limits
@@ -908,11 +985,12 @@ fn process_ipv4(
                 &ip_hdr,
                 eth_hdr,
                 our_mac,
-                our_ip,
+                effective_our_ip,
                 stats,
                 net_ns_id,
                 now_ms,
                 is_broadcast_dst,
+                is_loopback,
             )
         }
         Some(Ipv4Proto::Udp) => {
@@ -925,6 +1003,7 @@ fn process_ipv4(
                 is_broadcast_dst,
                 net_ns_id,
                 now_ms,
+                is_loopback,
             )
         }
         Some(Ipv4Proto::Tcp) => {
@@ -937,6 +1016,7 @@ fn process_ipv4(
                 is_broadcast_dst,
                 net_ns_id,
                 now_ms,
+                is_loopback,
             )
         }
         None => {
@@ -968,6 +1048,7 @@ fn process_udp(
     is_broadcast_dst: bool,
     net_ns_id: NamespaceId,
     now_ms: u64,
+    is_loopback: bool,
 ) -> ProcessResult {
     stats.udp_stats.inc_rx_packets();
 
@@ -997,11 +1078,26 @@ fn process_udp(
     // Record bytes received
     stats.udp_stats.add_rx_bytes(data.len() as u64);
 
-    // Conntrack: Update connection tracking state (used by firewall)
+    // Conntrack: Update connection tracking state (used by firewall).
+    // On loopback RX, the TX leg already committed this exact packet's conntrack
+    // state; query read-only instead of double-advancing/double-counting.
     #[cfg(feature = "conntrack")]
-    let ct_result = {
+    let (ct_decision, ct_exhausted) = if is_loopback {
+        (
+            egress_ct_decision(
+                net_ns_id.0,
+                Ipv4Proto::Udp,
+                ip_hdr.src,
+                ip_hdr.dst,
+                Some(header.src_port),
+                Some(header.dst_port),
+                PreparedEgressClass::DeferredOutbound,
+            ),
+            false,
+        )
+    } else {
         use crate::conntrack::ct_process_udp;
-        Some(ct_process_udp(
+        let r = ct_process_udp(
             // R107-2 FIX: Include network namespace in conntrack key.
             net_ns_id.0,
             ip_hdr.src,
@@ -1010,18 +1106,15 @@ fn process_udp(
             header.dst_port,
             payload.len(),
             now_ms,
-        ))
+        );
+        (Some(r.decision), r.resource_exhausted)
     };
     #[cfg(not(feature = "conntrack"))]
-    let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+    let (ct_decision, ct_exhausted): (Option<crate::conntrack::CtDecision>, bool) = (None, false);
 
     // RF178-7 FIX: Resource failure is an ingress hard drop, not merely an
     // INVALID state that a broader firewall ACCEPT rule could override.
-    if ct_result
-        .as_ref()
-        .map(|result| result.resource_exhausted)
-        .unwrap_or(false)
-    {
+    if ct_exhausted {
         return ProcessResult::Dropped(DropReason::ConntrackExhausted);
     }
 
@@ -1033,7 +1126,8 @@ fn process_udp(
         proto: Ipv4Proto::Udp,
         src_port: Some(header.src_port),
         dst_port: Some(header.dst_port),
-        ct_state: ct_result.as_ref().map(|r| r.decision),
+        ct_state: ct_decision,
+        is_loopback,
     };
     let Some(fw_table) = try_firewall_table_for_ns(net_ns_id.0) else {
         return ProcessResult::Dropped(DropReason::Firewall {
@@ -1050,8 +1144,9 @@ fn process_udp(
 
     // Deliver to socket layer
     // R90-2 FIX: Use namespace ID from receiving device instead of hardcoded root
-    if socket_table().deliver_udp(
+    if socket_table().deliver_udp_for_dst(
         net_ns_id,
+        ip_hdr.dst,
         header.dst_port,
         ip_hdr.src,
         header.src_port,
@@ -1088,6 +1183,7 @@ fn process_icmp(
     net_ns_id: NamespaceId,
     now_ms: u64,
     is_broadcast_dst: bool,
+    is_loopback: bool,
 ) -> ProcessResult {
     stats.inc_icmp_rx();
 
@@ -1103,9 +1199,22 @@ fn process_icmp(
     // R64-2 FIX: Add firewall evaluation for ICMP traffic
     // ICMP uses conntrack for RELATED state (e.g., ICMP errors for tracked connections)
     #[cfg(feature = "conntrack")]
-    let ct_result = {
+    let (ct_decision, ct_exhausted) = if is_loopback {
+        (
+            egress_ct_decision(
+                net_ns_id.0,
+                Ipv4Proto::Icmp,
+                ip_hdr.src,
+                ip_hdr.dst,
+                None,
+                None,
+                PreparedEgressClass::DeferredOutbound,
+            ),
+            false,
+        )
+    } else {
         use crate::conntrack::ct_process_icmp;
-        Some(ct_process_icmp(
+        let r = ct_process_icmp(
             // R107-2 FIX: Include network namespace in conntrack key.
             net_ns_id.0,
             ip_hdr.src,
@@ -1119,17 +1228,14 @@ fn process_icmp(
             },
             packet.len(),
             now_ms,
-        ))
+        );
+        (Some(r.decision), r.resource_exhausted)
     };
     #[cfg(not(feature = "conntrack"))]
-    let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+    let (ct_decision, ct_exhausted): (Option<crate::conntrack::CtDecision>, bool) = (None, false);
 
     // RF178-7 FIX: Conntrack admission failure is fail-closed before firewall.
-    if ct_result
-        .as_ref()
-        .map(|result| result.resource_exhausted)
-        .unwrap_or(false)
-    {
+    if ct_exhausted {
         return ProcessResult::Dropped(DropReason::ConntrackExhausted);
     }
 
@@ -1141,7 +1247,8 @@ fn process_icmp(
         proto: Ipv4Proto::Icmp,
         src_port: None, // ICMP has no ports
         dst_port: None,
-        ct_state: ct_result.as_ref().map(|r| r.decision),
+        ct_state: ct_decision,
+        is_loopback,
     };
     let Some(fw_table) = try_firewall_table_for_ns(net_ns_id.0) else {
         return ProcessResult::Dropped(DropReason::Firewall {
@@ -1282,6 +1389,7 @@ fn process_tcp(
     is_broadcast_dst: bool,
     net_ns_id: NamespaceId,
     now_ms: u64,
+    is_loopback: bool,
 ) -> ProcessResult {
     // Security: ignore TCP to broadcast/multicast destinations
     if is_broadcast_dst || ip_hdr.dst.is_multicast() {
@@ -1314,11 +1422,26 @@ fn process_tcp(
     // Extract payload (data after TCP header)
     let tcp_payload = &payload[hdr_len..];
 
-    // Conntrack: Update connection tracking state (used by firewall)
+    // Conntrack: Update connection tracking state (used by firewall).
+    // On loopback RX, the TX side already committed this packet's conntrack
+    // transition; query read-only to avoid double-updating the shared flow.
     #[cfg(feature = "conntrack")]
-    let ct_result = {
+    let (ct_decision, ct_exhausted) = if is_loopback {
+        (
+            egress_ct_decision(
+                net_ns_id.0,
+                Ipv4Proto::Tcp,
+                ip_hdr.src,
+                ip_hdr.dst,
+                Some(tcp_hdr.src_port),
+                Some(tcp_hdr.dst_port),
+                PreparedEgressClass::DeferredOutbound,
+            ),
+            false,
+        )
+    } else {
         use crate::conntrack::ct_process_tcp;
-        Some(ct_process_tcp(
+        let r = ct_process_tcp(
             // R107-2 FIX: Include network namespace in conntrack key.
             net_ns_id.0,
             ip_hdr.src,
@@ -1328,17 +1451,14 @@ fn process_tcp(
             tcp_hdr.flags,
             tcp_payload.len(),
             now_ms,
-        ))
+        );
+        (Some(r.decision), r.resource_exhausted)
     };
     #[cfg(not(feature = "conntrack"))]
-    let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+    let (ct_decision, ct_exhausted): (Option<crate::conntrack::CtDecision>, bool) = (None, false);
 
     // RF178-7 FIX: Conntrack admission failure is fail-closed before firewall.
-    if ct_result
-        .as_ref()
-        .map(|result| result.resource_exhausted)
-        .unwrap_or(false)
-    {
+    if ct_exhausted {
         return ProcessResult::Dropped(DropReason::ConntrackExhausted);
     }
 
@@ -1350,7 +1470,8 @@ fn process_tcp(
         proto: Ipv4Proto::Tcp,
         src_port: Some(tcp_hdr.src_port),
         dst_port: Some(tcp_hdr.dst_port),
-        ct_state: ct_result.as_ref().map(|r| r.decision),
+        ct_state: ct_decision,
+        is_loopback,
     };
     let Some(fw_table) = try_firewall_table_for_ns(net_ns_id.0) else {
         return ProcessResult::Dropped(DropReason::Firewall {
@@ -1937,7 +2058,264 @@ mod tx_auth {
 }
 use tx_auth::resolve_authorized_tx_device;
 
-/// Build complete Ethernet frame and transmit via network device.
+/// Select the IPv4 source address for an outbound packet from a socket.
+///
+/// Matches the source address that `build_frame_and_transmit_opts` will stamp
+/// in the IPv4 header so transport pseudo-header checksums (UDP/TCP) always
+/// agree with the IPv4 header, both on loopback (`lo`) and external (`eth0`).
+pub fn select_source_ip(bound_ip: Option<[u8; 4]>, dst_ip: Ipv4Addr, net_ns_id: u64) -> Ipv4Addr {
+    if let Some(ip) = bound_ip {
+        let addr = Ipv4Addr(ip);
+        if !addr.is_unspecified() {
+            return addr;
+        }
+    }
+    if dst_ip.is_loopback() {
+        return Ipv4Addr::LOCALHOST;
+    }
+    if let Ok(cfg) = tx_net_config(net_ns_id) {
+        return cfg.our_ip;
+    }
+    Ipv4Addr::UNSPECIFIED
+}
+
+/// Maximum loopback IPv4 payload length (fits in IPv4 `total_len` u16 without fragmentation).
+const LOOPBACK_MAX_L4_PAYLOAD: usize = (u16::MAX as usize) - IPV4_HEADER_MIN_LEN;
+
+/// Maximum iterative loopback reply hops per TX call (bounds stack & prevents infinite ping-pong).
+const MAX_LOOPBACK_CHAIN: usize = 16;
+
+/// Verify that `net_ns_id` is a live namespace with loopback (`lo`) enabled.
+///
+/// Every live `NetNamespace` (root and `CLONE_NEWNET` children) owns a private
+/// loopback interface even before any physical NIC (`eth0`) or `NetConfigSnapshot`
+/// is configured. Destroyed/unknown namespaces fail closed with `LinkDown`.
+fn netns_has_live_loopback(net_ns_id: u64) -> bool {
+    if crate::socket::netns_device_hooks_registered() {
+        crate::socket::netns_arp_cache(net_ns_id).is_some()
+    } else {
+        net_ns_id == 0
+    }
+}
+
+/// Deliver a committed loopback IPv4 packet and any resulting reply chain
+/// iteratively in process context with zero socket/conntrack locks held across hops.
+fn deliver_loopback_chain(initial_ip_packet: WirePacket, net_ns_id: u64, now_ms: u64) {
+    let stats = rx_ingress_net_stats();
+    let ns = NamespaceId::new(net_ns_id);
+
+    let mut ring: [Option<WirePacket>; MAX_LOOPBACK_CHAIN] = [const { None }; MAX_LOOPBACK_CHAIN];
+    ring[0] = Some(initial_ip_packet);
+    let mut head = 0usize;
+    let mut tail = 1usize;
+    let mut steps = 0usize;
+
+    while head != tail && steps < MAX_LOOPBACK_CHAIN {
+        let Some(pkt) = ring[head].take() else {
+            break;
+        };
+        head = (head + 1) % MAX_LOOPBACK_CHAIN;
+        steps += 1;
+
+        stats.inc_rx_packets();
+        let result = process_ipv4_loopback(&pkt, stats, ns, now_ms);
+        if let ProcessResult::Reply(mut reply) = result {
+            let egress_class = reply.egress_class;
+            if !matches!(
+                egress_firewall_allows_prepared(&reply, net_ns_id, now_ms, egress_class, true),
+                EgressFirewallDecision::Allow
+            ) {
+                continue;
+            }
+            reply.authorize(net_ns_id, now_ms);
+            let Some(ip_slice) = reply.as_slice().get(ETH_HEADER_SIZE..) else {
+                continue;
+            };
+            let Ok(next_ip_pkt) = WirePacket::try_copy_from_slice(ip_slice) else {
+                continue;
+            };
+            if complete_prepared_reply_transaction(reply, now_ms, net_ns_id, stats, true, || Ok(()))
+                .is_ok()
+            {
+                let next_tail = (tail + 1) % MAX_LOOPBACK_CHAIN;
+                if next_tail != head {
+                    ring[tail] = Some(next_ip_pkt);
+                    tail = next_tail;
+                }
+            }
+        }
+    }
+}
+
+/// N2.8: Loopback (`NextHop::Local`) transmit leg.
+///
+/// Evaluates the per-namespace egress firewall (`is_loopback = true`), commits
+/// egress conntrack and any active-open TCP reply binding BEFORE delivering,
+/// releases all locks, and then runs the iterative loopback RX chain in process
+/// context.
+#[allow(clippy::too_many_arguments)]
+fn transmit_loopback(
+    proto: Ipv4Proto,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    payload: &[u8],
+    transport: ValidatedTransport,
+    net_ns_id: u64,
+    tcp_binding: Option<TcpReplyBinding>,
+    ttl: u8,
+) -> Result<(), TxError> {
+    if payload.is_empty() || payload.len() > LOOPBACK_MAX_L4_PAYLOAD {
+        return Err(TxError::InvalidBuffer);
+    }
+
+    let (src_port, dst_port) = transport.ports();
+
+    #[cfg(feature = "conntrack")]
+    let ct_decision = egress_ct_decision(
+        net_ns_id,
+        proto,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        PreparedEgressClass::DeferredOutbound,
+    );
+    #[cfg(not(feature = "conntrack"))]
+    let ct_decision: Option<crate::conntrack::CtDecision> = None;
+
+    let fw_pkt = FirewallPacket {
+        net_ns_id,
+        src_ip,
+        dst_ip,
+        proto,
+        src_port,
+        dst_port,
+        ct_state: ct_decision,
+        is_loopback: true,
+    };
+    let Some(fw_table) = try_firewall_table_for_ns(net_ns_id) else {
+        return Err(TxError::FirewallDenied);
+    };
+    let fw_verdict = fw_table.evaluate(&fw_pkt);
+    if matches!(
+        fw_verdict.action,
+        FirewallAction::Drop | FirewallAction::Reject { .. }
+    ) {
+        return Err(TxError::FirewallDenied);
+    }
+
+    let ip_hdr = build_ipv4_header(src_ip, dst_ip, proto, payload.len() as u16, ttl.max(1));
+    let ip_packet =
+        WirePacket::try_from_slices(&[&ip_hdr, payload]).map_err(|_| TxError::NoMemory)?;
+    let now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
+
+    #[cfg(feature = "conntrack")]
+    {
+        use crate::conntrack::{
+            ct_egress_tcp, ct_egress_tcp_with_commit, ct_egress_udp, CtEgressResult,
+        };
+
+        let outcome = match proto {
+            Ipv4Proto::Tcp => {
+                let ValidatedTransport::Tcp(tcp) = transport else {
+                    return Err(TxError::InvalidBuffer);
+                };
+                let header_len = tcp.header_len();
+                if header_len < TCP_HEADER_MIN_LEN || header_len > payload.len() {
+                    return Err(TxError::InvalidBuffer);
+                }
+                if let Some(binding) = tcp_binding.as_ref() {
+                    let mut operation = socket_table()
+                        .lock_tcp_reply_operation(binding, &tcp)
+                        .ok_or(TxError::InvalidBuffer)?;
+                    let outcome = ct_egress_tcp_with_commit(
+                        net_ns_id,
+                        src_ip,
+                        dst_ip,
+                        tcp.src_port,
+                        tcp.dst_port,
+                        tcp.flags,
+                        payload.len() - header_len,
+                        now_ms,
+                        || Ok(()),
+                        || operation.commit(&tcp, now_ms),
+                    );
+                    drop(operation);
+                    outcome
+                } else {
+                    ct_egress_tcp(
+                        net_ns_id,
+                        src_ip,
+                        dst_ip,
+                        tcp.src_port,
+                        tcp.dst_port,
+                        tcp.flags,
+                        payload.len() - header_len,
+                        now_ms,
+                        || Ok(()),
+                    )
+                }
+            }
+            Ipv4Proto::Udp => {
+                let ValidatedTransport::Udp(udp) = transport else {
+                    return Err(TxError::InvalidBuffer);
+                };
+                if udp.length as usize != payload.len() || payload.len() < UDP_HEADER_LEN {
+                    return Err(TxError::InvalidBuffer);
+                }
+                ct_egress_udp(
+                    net_ns_id,
+                    src_ip,
+                    dst_ip,
+                    udp.src_port,
+                    udp.dst_port,
+                    payload.len() - UDP_HEADER_LEN,
+                    now_ms,
+                    || Ok(()),
+                )
+            }
+            _ => {
+                deliver_loopback_chain(ip_packet, net_ns_id, now_ms);
+                return Ok(());
+            }
+        };
+
+        match outcome {
+            CtEgressResult::Committed(_) => {
+                deliver_loopback_chain(ip_packet, net_ns_id, now_ms);
+                return Ok(());
+            }
+            CtEgressResult::Rejected(_) => return Err(TxError::InvalidBuffer),
+            CtEgressResult::QueueFailed(error) => return Err(error),
+            CtEgressResult::QueuedOwnerStale(_) => return Err(TxError::InvalidBuffer),
+            CtEgressResult::StateLost { .. } => return Err(TxError::IoError),
+        }
+    }
+
+    #[cfg(not(feature = "conntrack"))]
+    {
+        if let Some(binding) = tcp_binding.as_ref() {
+            if proto != Ipv4Proto::Tcp {
+                return Err(TxError::InvalidBuffer);
+            }
+            let ValidatedTransport::Tcp(tcp) = transport else {
+                return Err(TxError::InvalidBuffer);
+            };
+            let mut operation = socket_table()
+                .lock_tcp_reply_operation(binding, &tcp)
+                .ok_or(TxError::InvalidBuffer)?;
+            let committed = operation.commit(&tcp, now_ms);
+            drop(operation);
+            if !committed {
+                return Err(TxError::InvalidBuffer);
+            }
+        }
+        deliver_loopback_chain(ip_packet, net_ns_id, now_ms);
+        Ok(())
+    }
+}
+
+/// Build complete Ethernet frame and transmit via network device (or deliver locally via `lo`).
 /// R162-7-2 FIX: Added net_ns_id for per-namespace egress firewall evaluation.
 fn build_frame_and_transmit(
     proto: Ipv4Proto,
@@ -1946,7 +2324,27 @@ fn build_frame_and_transmit(
     net_ns_id: u64,
     tcp_binding: Option<TcpReplyBinding>,
 ) -> Result<(), TxError> {
-    if payload.is_empty() || payload.len() > DEFAULT_MTU {
+    build_frame_and_transmit_opts(
+        proto,
+        None,
+        dst_ip,
+        payload,
+        net_ns_id,
+        tcp_binding,
+        crate::socket::DEFAULT_IP_TTL,
+    )
+}
+
+fn build_frame_and_transmit_opts(
+    proto: Ipv4Proto,
+    src_ip_hint: Option<Ipv4Addr>,
+    dst_ip: Ipv4Addr,
+    payload: &[u8],
+    net_ns_id: u64,
+    tcp_binding: Option<TcpReplyBinding>,
+    ttl: u8,
+) -> Result<(), TxError> {
+    if payload.is_empty() || payload.len() > LOOPBACK_MAX_L4_PAYLOAD {
         return Err(TxError::InvalidBuffer);
     }
 
@@ -1956,6 +2354,28 @@ fn build_frame_and_transmit(
     // statistics with input that never formed a valid packet.
     let transport =
         validate_transport_payload(proto, payload).map_err(|_| TxError::InvalidBuffer)?;
+
+    // N2.8: Per-namespace loopback (`lo`) delivery for 127.0.0.0/8.
+    // Every live namespace owns its own loopback interface even without `eth0`
+    // or a configured `NetConfigSnapshot`.
+    if dst_ip.is_loopback() {
+        if !netns_has_live_loopback(net_ns_id) {
+            return Err(TxError::LinkDown);
+        }
+        let effective_src = src_ip_hint
+            .filter(|ip| !ip.is_unspecified() && ip.is_valid_loopback_source())
+            .unwrap_or(Ipv4Addr::LOCALHOST);
+        return transmit_loopback(
+            proto,
+            effective_src,
+            dst_ip,
+            payload,
+            transport,
+            net_ns_id,
+            tcp_binding,
+            ttl,
+        );
+    }
 
     // R164-7 FIX: Evaluate egress firewall for ALL builds, not only conntrack.
     // The stateless firewall (src/dst IP, ports, protocol) is evaluated
@@ -1970,6 +2390,29 @@ fn build_frame_and_transmit(
     // ROOT's source IP. One acquisition; the snapshot rules every
     // downstream consumer (RF180-41).
     let cfg_pre = tx_net_config(net_ns_id)?;
+
+    // N2.8: Self-addressed traffic (`dst_ip == cfg_pre.our_ip`) also routes via
+    // this namespace's loopback interface (`NextHop::Local`).
+    if next_hop(dst_ip, &cfg_pre) == NextHop::Local {
+        let effective_src = src_ip_hint
+            .filter(|ip| !ip.is_unspecified() && ip.is_valid_loopback_source())
+            .unwrap_or(cfg_pre.our_ip);
+        return transmit_loopback(
+            proto,
+            effective_src,
+            dst_ip,
+            payload,
+            transport,
+            net_ns_id,
+            tcp_binding,
+            ttl,
+        );
+    }
+
+    // External Ethernet MTU limit.
+    if payload.len() > DEFAULT_MTU {
+        return Err(TxError::InvalidBuffer);
+    }
 
     // U13-1 FIX: resolve and mint the device-ownership token before any
     // namespace-specific policy, ARP probing, frame construction, or DMA
@@ -2002,6 +2445,7 @@ fn build_frame_and_transmit(
         src_port,
         dst_port,
         ct_state: ct_decision,
+        is_loopback: false,
     };
     let Some(fw_table) = try_firewall_table_for_ns(net_ns_id) else {
         return Err(TxError::FirewallDenied);
@@ -2050,7 +2494,7 @@ fn build_frame_and_transmit(
     };
 
     // Build IPv4 header
-    let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
+    let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, ttl.max(1));
 
     // RF180-41 FIX: build the complete wire frame with one admitted allocation.
     let frame = try_build_ethernet_frame_from_parts(
@@ -2196,7 +2640,7 @@ fn preflight_prepared_reply(reply: &PreparedReply, now_ms: u64) -> Result<u64, T
     if reply.is_empty() || reply.len() > DMA_PAGE_SIZE {
         return Err(TxError::InvalidBuffer);
     }
-    match egress_firewall_allows_prepared(reply, net_ns_id, now_ms, reply.egress_class) {
+    match egress_firewall_allows_prepared(reply, net_ns_id, now_ms, reply.egress_class, false) {
         EgressFirewallDecision::Allow => {}
         EgressFirewallDecision::Deny => return Err(TxError::FirewallDenied),
         EgressFirewallDecision::Malformed => return Err(TxError::InvalidBuffer),
@@ -2631,7 +3075,7 @@ where
     };
     data.copy_from_slice(&reply);
 
-    complete_prepared_reply_transaction(reply, now_ms, net_ns_id, stats, move || {
+    complete_prepared_reply_transaction(reply, now_ms, net_ns_id, stats, false, move || {
         queue(buf).map_err(|(error, _returned)| error)
     })
 }
@@ -2641,6 +3085,7 @@ fn complete_prepared_reply_transaction<F>(
     now_ms: u64,
     net_ns_id: u64,
     stats: &NetStats,
+    is_loopback: bool,
     queue: F,
 ) -> Result<(), PreparedReplyTxError>
 where
@@ -2663,13 +3108,25 @@ where
             IPPROTO_TCP,
         };
 
-        let (ip, _options, l4_bytes) = match parse_ipv4(ip_bytes) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                return Err(PreparedReplyTxError::Retryable(
-                    TxError::InvalidBuffer,
-                    reply,
-                ));
+        let (ip, _options, l4_bytes) = if is_loopback {
+            match parse_ipv4_loopback(ip_bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Err(PreparedReplyTxError::Retryable(
+                        TxError::InvalidBuffer,
+                        reply,
+                    ));
+                }
+            }
+        } else {
+            match parse_ipv4(ip_bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Err(PreparedReplyTxError::Retryable(
+                        TxError::InvalidBuffer,
+                        reply,
+                    ));
+                }
             }
         };
 
@@ -2852,13 +3309,25 @@ where
 
     #[cfg(not(feature = "conntrack"))]
     if eth.ethertype == ETHERTYPE_IPV4 {
-        let (ip, _options, l4_bytes) = match parse_ipv4(ip_bytes) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                return Err(PreparedReplyTxError::Retryable(
-                    TxError::InvalidBuffer,
-                    reply,
-                ));
+        let (ip, _options, l4_bytes) = if is_loopback {
+            match parse_ipv4_loopback(ip_bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Err(PreparedReplyTxError::Retryable(
+                        TxError::InvalidBuffer,
+                        reply,
+                    ));
+                }
+            }
+        } else {
+            match parse_ipv4(ip_bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Err(PreparedReplyTxError::Retryable(
+                        TxError::InvalidBuffer,
+                        reply,
+                    ));
+                }
             }
         };
         if ip.proto() == Some(Ipv4Proto::Tcp) {
@@ -2952,14 +3421,51 @@ pub fn transmit_tcp_segment(
     build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, segment, net_ns_id, None)
 }
 
+/// Transmit a serialized TCP segment with explicit source IP hint and IPv4 TTL.
+pub fn transmit_tcp_segment_opts(
+    src_ip: Option<Ipv4Addr>,
+    dst_ip: Ipv4Addr,
+    segment: &[u8],
+    net_ns_id: u64,
+    ttl: u8,
+) -> Result<(), TxError> {
+    build_frame_and_transmit_opts(
+        Ipv4Proto::Tcp,
+        src_ip,
+        dst_ip,
+        segment,
+        net_ns_id,
+        None,
+        ttl,
+    )
+}
+
 /// Transmit the exact initial active-open SYN and publish SYN-SENT only after
 /// the device accepts it. The private binding keeps a close/stale socket from
 /// queueing a control packet whose TCB can no longer commit.
 pub fn transmit_tcp_connect(result: TcpConnectResult, net_ns_id: u64) -> Result<(), TxError> {
+    transmit_tcp_connect_opts(result, net_ns_id, crate::socket::DEFAULT_IP_TTL)
+}
+
+/// Transmit the initial active-open SYN with an explicit IPv4 TTL.
+pub fn transmit_tcp_connect_opts(
+    result: TcpConnectResult,
+    net_ns_id: u64,
+    ttl: u8,
+) -> Result<(), TxError> {
+    let src_ip = (!result.src_ip.is_unspecified()).then_some(result.src_ip);
     let dst_ip = result.dst_ip;
     let segment = result.segment;
     let binding = result.egress_binding;
-    build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, &segment, net_ns_id, Some(binding))
+    build_frame_and_transmit_opts(
+        Ipv4Proto::Tcp,
+        src_ip,
+        dst_ip,
+        &segment,
+        net_ns_id,
+        Some(binding),
+        ttl,
+    )
 }
 
 /// Transmit a serialized UDP datagram (without IP/Ethernet headers).
@@ -2980,6 +3486,25 @@ pub fn transmit_udp_datagram(
     net_ns_id: u64,
 ) -> Result<(), TxError> {
     build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram, net_ns_id, None)
+}
+
+/// Transmit a serialized UDP datagram with explicit source IP hint and IPv4 TTL.
+pub fn transmit_udp_datagram_opts(
+    src_ip: Option<Ipv4Addr>,
+    dst_ip: Ipv4Addr,
+    datagram: &[u8],
+    net_ns_id: u64,
+    ttl: u8,
+) -> Result<(), TxError> {
+    build_frame_and_transmit_opts(
+        Ipv4Proto::Udp,
+        src_ip,
+        dst_ip,
+        datagram,
+        net_ns_id,
+        None,
+        ttl,
+    )
 }
 
 // ============================================================================
@@ -4106,12 +4631,13 @@ mod tests {
         let mut reply = PreparedReply::new(frame);
         reply.authorize(NS, now_ms);
         let stats = NetStats::new();
-        let reply = match complete_prepared_reply_transaction(reply, now_ms + 1, NS, &stats, || {
-            Err(TxError::QueueFull)
-        }) {
-            Err(PreparedReplyTxError::Retryable(TxError::QueueFull, reply)) => reply,
-            _ => panic!("QueueFull must return the original prepared owner"),
-        };
+        let reply =
+            match complete_prepared_reply_transaction(reply, now_ms + 1, NS, &stats, false, || {
+                Err(TxError::QueueFull)
+            }) {
+                Err(PreparedReplyTxError::Retryable(TxError::QueueFull, reply)) => reply,
+                _ => panic!("QueueFull must return the original prepared owner"),
+            };
         let after_reject = conntrack_table()
             .lookup(&key)
             .expect("QueueFull retains the ingress-created flow");
@@ -4119,7 +4645,8 @@ mod tests {
         assert_eq!(after_reject.packets_reply, before_commit.packets_reply);
 
         assert!(
-            complete_prepared_reply_transaction(reply, now_ms + 2, NS, &stats, || Ok(())).is_ok()
+            complete_prepared_reply_transaction(reply, now_ms + 2, NS, &stats, false, || Ok(()))
+                .is_ok()
         );
         let committed = conntrack_table()
             .lookup(&key)
@@ -4203,7 +4730,7 @@ mod tests {
         reply.tcp_close = Some(token);
         reply.authorize(NS, 5);
         let stats = NetStats::new();
-        let retry = match complete_prepared_reply_transaction(reply, 6, NS, &stats, || {
+        let retry = match complete_prepared_reply_transaction(reply, 6, NS, &stats, false, || {
             Err(TxError::QueueFull)
         }) {
             Err(PreparedReplyTxError::Retryable(TxError::QueueFull, owner)) => owner,
@@ -4213,7 +4740,9 @@ mod tests {
             table.lookup(&key).unwrap().state,
             CtProtoState::Tcp(TcpCtState::FinWait2)
         );
-        assert!(complete_prepared_reply_transaction(retry, 7, NS, &stats, || Ok(())).is_ok());
+        assert!(
+            complete_prepared_reply_transaction(retry, 7, NS, &stats, false, || Ok(())).is_ok()
+        );
         assert_eq!(
             table.lookup(&key).unwrap().state,
             CtProtoState::Tcp(TcpCtState::TimeWait)
@@ -4299,7 +4828,7 @@ mod tests {
                     // A committed-state lookup deliberately hides this flow.
                     assert!(table.lookup(&key).is_none());
                     if let Err(PreparedReplyTxError::Retryable(TxError::InvalidBuffer, owner)) =
-                        complete_prepared_reply_transaction(reply, 4, NS, &stats, || {
+                        complete_prepared_reply_transaction(reply, 4, NS, &stats, false, || {
                             rst_queued.set(true);
                             Ok(())
                         })
@@ -4330,7 +4859,9 @@ mod tests {
                 CtProtoState::Tcp(TcpCtState::Established)
             );
             let reply = retry.expect("contention preserves the prepared retry owner");
-            assert!(complete_prepared_reply_transaction(reply, 5, NS, &stats, || Ok(())).is_ok());
+            assert!(
+                complete_prepared_reply_transaction(reply, 5, NS, &stats, false, || Ok(())).is_ok()
+            );
             assert_eq!(
                 table.lookup(&key).unwrap().state,
                 CtProtoState::Tcp(TcpCtState::Close)
@@ -4508,5 +5039,168 @@ mod tests {
             .expect("root ns must be admitted by the unregistered-hook arm");
         // Dropping an unconsumed token is safe (authorized-but-unsent).
         drop(token);
+    }
+
+    #[test]
+    fn n2_8_select_source_ip_consistency() {
+        // Explicit non-zero bound IP wins.
+        assert_eq!(
+            select_source_ip(Some([127, 0, 0, 2]), Ipv4Addr::LOCALHOST, 0),
+            Ipv4Addr::new(127, 0, 0, 2)
+        );
+        // Unbound or 0.0.0.0 targeting 127/8 resolves to 127.0.0.1.
+        assert_eq!(
+            select_source_ip(None, Ipv4Addr::LOCALHOST, 0),
+            Ipv4Addr::LOCALHOST
+        );
+        assert_eq!(
+            select_source_ip(Some([0, 0, 0, 0]), Ipv4Addr::new(127, 0, 0, 9), 0),
+            Ipv4Addr::LOCALHOST
+        );
+        // Unbound targeting external resolves to root our_ip.
+        assert_eq!(
+            select_source_ip(None, Ipv4Addr::new(10, 0, 2, 2), 0),
+            network_config().our_ip
+        );
+    }
+
+    #[test]
+    fn n2_8_loopback_udp_and_tcp_handshake_delivery() {
+        use crate::socket::{BindCharge, SocketLabel};
+        use cap::{CapId, NamespaceId};
+        use lsm::ProcessCtx;
+
+        mm::publish_heap_budgets();
+        let _serial = crate::conntrack::GLOBAL_CONNTRACK_TEST_LOCK.lock();
+
+        let table = socket_table();
+        let proc_ctx = ProcessCtx::new(1, 1, 0, 0, 0, 0);
+        let label = SocketLabel {
+            creator: proc_ctx,
+            secmark: 0,
+        };
+        let ns = NamespaceId::new(0);
+
+        // 1. UDP loopback send -> deliver -> recv
+        let udp_srv = table.create_udp_socket(label, ns).expect("udp srv");
+        let udp_cli = table.create_udp_socket(label, ns).expect("udp cli");
+        let srv_port = table
+            .bind_udp(
+                &udp_srv,
+                &proc_ctx,
+                CapId::INVALID,
+                Ipv4Addr::LOCALHOST,
+                None,
+                true,
+                BindCharge::None,
+            )
+            .expect("bind udp srv");
+        let dgram = table
+            .send_to_udp(
+                &udp_cli,
+                &proc_ctx,
+                CapId::INVALID,
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::LOCALHOST,
+                srv_port,
+                b"lo-udp-ok",
+            )
+            .expect("build udp dgram");
+        transmit_udp_datagram_opts(
+            Some(Ipv4Addr::LOCALHOST),
+            Ipv4Addr::LOCALHOST,
+            &dgram,
+            0,
+            64,
+        )
+        .expect("loopback udp tx");
+        let mut received = alloc::vec::Vec::new();
+        let got_len = table
+            .recv_from_udp_with_commit(&udp_srv, &proc_ctx, CapId::INVALID, Some(0), |pkt| {
+                assert_eq!(pkt.src_ip, Ipv4Addr::LOCALHOST);
+                received.extend_from_slice(pkt.payload());
+                Ok::<usize, ()>(pkt.payload().len())
+            })
+            .expect("recv udp");
+        assert_eq!(got_len, 9);
+        assert_eq!(received.as_slice(), b"lo-udp-ok");
+        table.close(udp_cli.id);
+        table.close(udp_srv.id);
+
+        // 2. TCP loopback 3-way handshake -> accept -> bidirectional data
+        let tcp_srv = table.create_tcp_socket(label, ns).expect("tcp srv");
+        let tcp_cli = table.create_tcp_socket(label, ns).expect("tcp cli");
+        let lport = table
+            .bind_tcp(
+                &tcp_srv,
+                &proc_ctx,
+                CapId::INVALID,
+                Ipv4Addr::LOCALHOST,
+                None,
+                true,
+                BindCharge::None,
+            )
+            .expect("bind tcp srv");
+        table
+            .listen(&tcp_srv, &proc_ctx, CapId::INVALID, 4, true)
+            .expect("listen");
+        let syn = table
+            .connect(
+                &tcp_cli,
+                &proc_ctx,
+                CapId::INVALID,
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::LOCALHOST,
+                lport,
+                Some(0),
+            )
+            .expect("connect");
+        transmit_tcp_connect_opts(syn, 0, 64).expect("loopback syn tx");
+        assert_eq!(tcp_cli.tcp_state(), Some(crate::TcpState::Established));
+        let accepted = table
+            .poll_accept_ready(&tcp_srv)
+            .expect("poll accept")
+            .expect("accepted child ready");
+        assert_eq!(accepted.tcp_state(), Some(crate::TcpState::Established));
+
+        let (sent, segs) = table
+            .tcp_send(&tcp_cli, &proc_ctx, CapId::INVALID, b"lo-tcp-ok")
+            .expect("tcp send");
+        assert_eq!(sent, 9);
+        for seg in segs {
+            transmit_tcp_segment_opts(Some(Ipv4Addr::LOCALHOST), Ipv4Addr::LOCALHOST, &seg, 0, 64)
+                .expect("loopback tcp data tx");
+        }
+        let mut tcp_rx = alloc::vec::Vec::new();
+        let n = table
+            .tcp_recv_with_commit(&accepted, &proc_ctx, CapId::INVALID, 32, Some(0), |data| {
+                tcp_rx.extend_from_slice(data);
+                Ok::<(), ()>(())
+            })
+            .expect("tcp recv");
+        assert_eq!(n, 9);
+        assert_eq!(tcp_rx.as_slice(), b"lo-tcp-ok");
+
+        table.close(accepted.id);
+        table.close(tcp_cli.id);
+        table.close(tcp_srv.id);
+
+        // 3. Closed loopback port returns RST -> SO_ERROR == ECONNREFUSED (111)
+        let tcp_refused = table.create_tcp_socket(label, ns).expect("tcp refused");
+        let syn_refused = table
+            .connect(
+                &tcp_refused,
+                &proc_ctx,
+                CapId::INVALID,
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::LOCALHOST,
+                19998,
+                Some(0),
+            )
+            .expect("connect closed port");
+        transmit_tcp_connect_opts(syn_refused, 0, 64).expect("loopback syn tx");
+        assert_eq!(tcp_refused.take_pending_error(), 111);
+        assert_eq!(tcp_refused.take_pending_error(), 0);
+        table.close(tcp_refused.id);
     }
 }

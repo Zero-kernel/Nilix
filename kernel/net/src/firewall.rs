@@ -289,6 +289,8 @@ pub struct FirewallRule {
     pub proto: Option<Ipv4Proto>,
     /// Conntrack state mask
     pub ct_state: CtStateMask,
+    /// Loopback interface match (None = any, Some(true) = lo only, Some(false) = non-lo only)
+    pub loopback: Option<bool>,
     /// Action to take on match
     pub action: FirewallAction,
     /// Whether to log when this rule matches
@@ -310,6 +312,7 @@ impl FirewallRule {
             && match_field_port(self.dst_port, packet.dst_port)
             && match_field_proto(self.proto, packet.proto)
             && self.ct_state.matches(packet.ct_state)
+            && match_field_bool(self.loopback, packet.is_loopback)
     }
 }
 
@@ -330,6 +333,7 @@ impl FirewallRuleBuilder {
                 dst_port: None,
                 proto: None,
                 ct_state: CtStateMask::ANY,
+                loopback: None,
                 // R160-7 FIX: Use default() (Drop) instead of Accept.
                 action: FirewallAction::default(),
                 log: false,
@@ -372,6 +376,11 @@ impl FirewallRuleBuilder {
         self
     }
 
+    pub fn loopback(mut self, is_loopback: bool) -> Self {
+        self.rule.loopback = Some(is_loopback);
+        self
+    }
+
     pub fn action(mut self, action: FirewallAction) -> Self {
         self.rule.action = action;
         self
@@ -402,6 +411,9 @@ pub struct FirewallPacket {
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
     pub ct_state: Option<CtDecision>,
+    /// True iff this packet is traversing the per-namespace loopback (`lo`) path.
+    /// External NIC (`eth0`) frames always set this to `false`.
+    pub is_loopback: bool,
 }
 
 // ============================================================================
@@ -607,6 +619,14 @@ fn match_field_proto(rule: Option<Ipv4Proto>, value: Ipv4Proto) -> bool {
 }
 
 #[inline]
+fn match_field_bool(rule: Option<bool>, value: bool) -> bool {
+    match rule {
+        Some(expected) => expected == value,
+        None => true,
+    }
+}
+
+#[inline]
 fn ipv4_to_u32(addr: Ipv4Addr) -> u32 {
     u32::from_be_bytes(addr.0)
 }
@@ -619,13 +639,14 @@ fn ipv4_to_u32(addr: Ipv4Addr) -> u32 {
 ///
 /// # R94-12 FIX: Default Deny Policy
 ///
-/// The firewall now uses a "default deny" (DROP) policy. Only traffic matching
-/// explicit ACCEPT rules will be permitted. This is the security-first approach:
-/// - INVALID packets are dropped (conntrack detected invalid state)
-/// - ESTABLISHED/RELATED packets are accepted (replies to existing connections)
-/// - All other traffic is dropped by default
+/// The firewall uses a "default deny" (DROP) policy for external interfaces:
+/// - INVALID packets are dropped (conntrack detected invalid state, prio 1000)
+/// - ESTABLISHED/RELATED packets are accepted (replies to existing connections, prio 900)
+/// - Loopback (`lo`) traffic is accepted by default (N2.8, prio 850, below INVALID DROP;
+///   only matches packets tagged `is_loopback == true` by the loopback path, never `eth0`)
+/// - All other external traffic is dropped by default
 ///
-/// To permit new inbound/outbound connections, explicit rules must be added.
+/// Administrators may replace the rule table atomically (including denying `lo`).
 fn default_rules() -> Vec<FirewallRule> {
     vec![
         // Rule 1: Drop INVALID packets (high priority)
@@ -642,9 +663,15 @@ fn default_rules() -> Vec<FirewallRule> {
             .action(FirewallAction::Accept)
             .log(false)
             .build(),
-        // R94-12 FIX: Removed catch-all Accept rule.
-        // New connections require explicit ACCEPT rules.
-        // Default policy (DROP) applies to unmatched traffic.
+        // Rule 3: Accept loopback (lo) traffic by default (N2.8).
+        // Below INVALID DROP (1000); external NIC (eth0) frames always set
+        // `is_loopback = false`, preserving default-DROP on external wire.
+        FirewallRule::builder(3)
+            .priority(850)
+            .loopback(true)
+            .action(FirewallAction::Accept)
+            .log(false)
+            .build(),
     ]
 }
 
@@ -653,7 +680,7 @@ fn default_rules() -> Vec<FirewallRule> {
 /// allocator panic from an IRQ/receive path.
 fn default_rules_try() -> Option<Vec<FirewallRule>> {
     let mut rules = Vec::new();
-    rules.try_reserve_exact(2).ok()?;
+    rules.try_reserve_exact(3).ok()?;
     rules.push(
         FirewallRule::builder(1)
             .priority(1000)
@@ -666,6 +693,14 @@ fn default_rules_try() -> Option<Vec<FirewallRule>> {
         FirewallRule::builder(2)
             .priority(900)
             .ct_state(CtStateMask::ESTABLISHED.or(CtStateMask::RELATED))
+            .action(FirewallAction::Accept)
+            .log(false)
+            .build(),
+    );
+    rules.push(
+        FirewallRule::builder(3)
+            .priority(850)
+            .loopback(true)
             .action(FirewallAction::Accept)
             .log(false)
             .build(),
@@ -926,5 +961,54 @@ mod tests {
         assert!(mask.matches(Some(CtDecision::Related)));
         assert!(!mask.matches(Some(CtDecision::New)));
         assert!(!mask.matches(Some(CtDecision::Invalid)));
+    }
+
+    #[test]
+    fn n2_8_default_firewall_loopback_policy() {
+        let table = FirewallTable::new_with_rules(FirewallAction::Drop, default_rules())
+            .expect("default rules fit");
+        let lo_new = FirewallPacket {
+            net_ns_id: 0,
+            src_ip: Ipv4Addr::LOCALHOST,
+            dst_ip: Ipv4Addr::LOCALHOST,
+            proto: Ipv4Proto::Udp,
+            src_port: Some(40000),
+            dst_port: Some(40001),
+            ct_state: Some(CtDecision::New),
+            is_loopback: true,
+        };
+        let verdict = table.evaluate(&lo_new);
+        assert_eq!(verdict.action, FirewallAction::Accept);
+        assert_eq!(verdict.rule_id, Some(3));
+
+        // INVALID still drops even on loopback (rule 1 prio 1000 > rule 3 prio 850).
+        let lo_invalid = FirewallPacket {
+            ct_state: Some(CtDecision::Invalid),
+            ..lo_new
+        };
+        let verdict = table.evaluate(&lo_invalid);
+        assert_eq!(verdict.action, FirewallAction::Drop);
+        assert_eq!(verdict.rule_id, Some(1));
+
+        // External wire (is_loopback = false) stays default-DROP even with 127.0.0.1 IPs.
+        let wire_new = FirewallPacket {
+            is_loopback: false,
+            ..lo_new
+        };
+        let verdict = table.evaluate(&wire_new);
+        assert_eq!(verdict.action, FirewallAction::Drop);
+        assert_eq!(verdict.rule_id, None);
+
+        // Admin replace_rules can explicitly deny loopback.
+        table
+            .replace_rules(alloc::vec![FirewallRule::builder(99)
+                .priority(1000)
+                .loopback(true)
+                .action(FirewallAction::Drop)
+                .build()])
+            .expect("replace fits");
+        let verdict = table.evaluate(&lo_new);
+        assert_eq!(verdict.action, FirewallAction::Drop);
+        assert_eq!(verdict.rule_id, Some(99));
     }
 }

@@ -1646,6 +1646,7 @@ impl NetworkLoopbackTest {
             dst_port: Some(80),
             proto: Ipv4Proto::Tcp,
             ct_state: Some(conntrack::CtDecision::New),
+            is_loopback: false,
         };
 
         let before = table.stats();

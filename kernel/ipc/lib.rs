@@ -420,8 +420,7 @@ fn pipe_create_callback(
 fn fd_read_callback(
     fd: i32,
     buf: &mut [u8],
-    user_dst: *mut u8,
-    copyout: kernel_core::syscall::FdReadCopyout,
+    copyout: &mut dyn FnMut(&[u8]) -> Result<(), SyscallError>,
     entry_proc: Option<&process::ProcessArc>,
 ) -> Result<usize, SyscallError> {
     use vfs::traits::FileHandle;
@@ -438,7 +437,7 @@ fn fd_read_callback(
         drop(fd_obj); // GAP-5 slice 3: the fd-table guard goes first
         drop(proc); // Release lock before potentially blocking pipe I/O
         return pipe_clone
-            .read_with_commit(buf, |bytes| copyout(user_dst, bytes))
+            .read_with_commit(buf, |bytes| copyout(bytes))
             .map_err(|error| match error {
                 pipe::PipeReadTransactionError::Pipe(error) => pipe_error_to_syscall(error),
                 pipe::PipeReadTransactionError::Commit(error) => error,
@@ -500,7 +499,7 @@ fn fd_read_callback(
                     return Err(vfs::types::FsError::Io);
                 }
             };
-            match copyout(user_dst, bytes) {
+            match copyout(bytes) {
                 Ok(()) => {
                     committed_len = Some(bytes.len());
                     committed_next_offset = Some(next_offset);
