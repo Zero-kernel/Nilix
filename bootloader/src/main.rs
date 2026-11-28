@@ -72,6 +72,178 @@ const _: () = assert!(KASLR_MAX_SLIDE.is_multiple_of(KASLR_SLIDE_GRANULARITY));
 const _: () = assert!(KERNEL_PHYS_BASE + KASLR_MAX_SLIDE < KERNEL_PHYS_WINDOW_END);
 const _: () = assert!(KASLR_SLOT_COUNT <= u16::MAX as usize + 1);
 
+/// U55-6: Position-independent 64-bit CR3-switch-and-jump stub copied into a
+/// dedicated 4 KiB `LOADER_CODE` page below `DIRECT_MAP_MAX_ADDRESS`.
+///
+/// Register contract on entry (interrupts disabled, EFER.NXE=1, CR0.WP=1):
+/// - `rax`: new CR3 value (PML4 physical address | CR3 flags)
+/// - `rdi`: `BootInfo` pointer (System V AMD64 arg 1 for kernel `_start`)
+/// - `r8`:  high-half kernel entry virtual address
+///
+/// Instructions:
+/// - `0f 22 d8`: `mov cr3, rax`  (switches to W^X-hardened PML4)
+/// - `41 ff e0`: `jmp r8`        (transfers directly to high-half RX kernel `_start`)
+/// - `0f 0b`:    `ud2`           (unreachable trap)
+const CR3_TRANSITION_STUB: [u8; 8] = [0x0F, 0x22, 0xD8, 0x41, 0xFF, 0xE0, 0x0F, 0x0B];
+
+/// U55-6: Fail-closed verification of the boot page tables before `ExitBootServices`.
+///
+/// Proves that from the very first instruction after `mov cr3, rax`:
+/// 1. Neither `PML4[0]` (identity map) nor `PML4[511]` (high-half direct map)
+///    contains any leaf that is simultaneously writable and executable (W+X).
+/// 2. In `PML4[0]`, the ONLY executable leaf is the single 4 KiB R-X CR3
+///    transition stub page at `transition_stub_phys`.
+/// 3. No physical frame mapped executable in `PML4[0]` or `PML4[511]` has a
+///    live writable alias in the other hierarchy.
+/// 4. `PML4[510]` (recursive mapping) has `NO_EXECUTE` set.
+unsafe fn verify_boot_page_tables(pml4_frame: u64, transition_stub_phys: u64) {
+    use x86_64::structures::paging::{PageTable, PageTableFlags as Flags};
+
+    let pml4 = &*(pml4_frame as *const PageTable);
+
+    // 1. Recursive slot must remain non-executable.
+    let rec = &pml4[510];
+    if rec.is_unused() || !rec.flags().contains(Flags::NO_EXECUTE) {
+        panic!("U55-6: PML4[510] recursive mapping missing or executable");
+    }
+
+    let lookup_writable = |root_idx: usize, target_phys: u64| -> bool {
+        let pml4e = &pml4[root_idx];
+        if pml4e.is_unused() || !pml4e.flags().contains(Flags::PRESENT) {
+            return false;
+        }
+        let mut eff_w = pml4e.flags().contains(Flags::WRITABLE);
+        let pdpt = &*(pml4e.addr().as_u64() as *const PageTable);
+        let pdpt_idx = if root_idx == 511 {
+            if target_phys >= KERNEL_PHYS_WINDOW_END {
+                return false;
+            }
+            510usize
+        } else {
+            let idx = (target_phys / 0x4000_0000) as usize;
+            if idx >= 512 {
+                return false;
+            }
+            idx
+        };
+        let pdpte = &pdpt[pdpt_idx];
+        if pdpte.is_unused() || !pdpte.flags().contains(Flags::PRESENT) {
+            return false;
+        }
+        eff_w &= pdpte.flags().contains(Flags::WRITABLE);
+        if pdpte.flags().contains(Flags::HUGE_PAGE) {
+            return eff_w;
+        }
+        let pd = &*(pdpte.addr().as_u64() as *const PageTable);
+        let pd_idx = ((target_phys % 0x4000_0000) / 0x20_0000) as usize;
+        let pde = &pd[pd_idx];
+        if pde.is_unused() || !pde.flags().contains(Flags::PRESENT) {
+            return false;
+        }
+        eff_w &= pde.flags().contains(Flags::WRITABLE);
+        if pde.flags().contains(Flags::HUGE_PAGE) {
+            return eff_w;
+        }
+        let pt = &*(pde.addr().as_u64() as *const PageTable);
+        let pt_idx = ((target_phys % 0x20_0000) / KERNEL_PAGE_SIZE) as usize;
+        let pte = &pt[pt_idx];
+        if pte.is_unused() || !pte.flags().contains(Flags::PRESENT) {
+            return false;
+        }
+        eff_w && pte.flags().contains(Flags::WRITABLE)
+    };
+
+    let mut low_exec_leaves = 0usize;
+    let mut high_exec_leaves = 0usize;
+
+    for &(root_idx, other_idx) in &[(0usize, 511usize), (511usize, 0usize)] {
+        let pml4e = &pml4[root_idx];
+        if pml4e.is_unused() || !pml4e.flags().contains(Flags::PRESENT) {
+            panic!("U55-6: expected PML4[{}] to be present", root_idx);
+        }
+        let p4_w = pml4e.flags().contains(Flags::WRITABLE);
+        let p4_x = !pml4e.flags().contains(Flags::NO_EXECUTE);
+        let pdpt = &*(pml4e.addr().as_u64() as *const PageTable);
+        for pdpte in pdpt.iter() {
+            if pdpte.is_unused() || !pdpte.flags().contains(Flags::PRESENT) {
+                continue;
+            }
+            let p3_w = p4_w && pdpte.flags().contains(Flags::WRITABLE);
+            let p3_x = p4_x && !pdpte.flags().contains(Flags::NO_EXECUTE);
+            if pdpte.flags().contains(Flags::HUGE_PAGE) {
+                if p3_w && p3_x {
+                    panic!("U55-6: 1 GiB RWX leaf in PML4[{}]", root_idx);
+                }
+                if p3_x {
+                    panic!(
+                        "U55-6: unexpected 1 GiB executable leaf in PML4[{}]",
+                        root_idx
+                    );
+                }
+                continue;
+            }
+            let pd = &*(pdpte.addr().as_u64() as *const PageTable);
+            for pde in pd.iter() {
+                if pde.is_unused() || !pde.flags().contains(Flags::PRESENT) {
+                    continue;
+                }
+                let p2_w = p3_w && pde.flags().contains(Flags::WRITABLE);
+                let p2_x = p3_x && !pde.flags().contains(Flags::NO_EXECUTE);
+                if pde.flags().contains(Flags::HUGE_PAGE) {
+                    if p2_w && p2_x {
+                        panic!("U55-6: 2 MiB RWX leaf in PML4[{}]", root_idx);
+                    }
+                    if p2_x {
+                        panic!(
+                            "U55-6: unexpected 2 MiB executable leaf in PML4[{}]",
+                            root_idx
+                        );
+                    }
+                    continue;
+                }
+                let pt = &*(pde.addr().as_u64() as *const PageTable);
+                for pte in pt.iter() {
+                    if pte.is_unused() || !pte.flags().contains(Flags::PRESENT) {
+                        continue;
+                    }
+                    let p1_w = p2_w && pte.flags().contains(Flags::WRITABLE);
+                    let p1_x = p2_x && !pte.flags().contains(Flags::NO_EXECUTE);
+                    if p1_w && p1_x {
+                        panic!("U55-6: 4 KiB RWX leaf in PML4[{}]", root_idx);
+                    }
+                    if p1_x {
+                        let phys = pte.addr().as_u64();
+                        if root_idx == 0 {
+                            if phys != transition_stub_phys {
+                                panic!("U55-6: unexpected executable leaf in PML4[0]");
+                            }
+                            low_exec_leaves += 1;
+                        } else {
+                            high_exec_leaves += 1;
+                        }
+                        if lookup_writable(other_idx, phys) {
+                            panic!(
+                                "U55-6: live writable alias in PML4[{}] for executable leaf in PML4[{}]",
+                                other_idx, root_idx
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if low_exec_leaves != 1 {
+        panic!(
+            "U55-6: expected exactly 1 executable leaf in PML4[0] (transition stub), found {}",
+            low_exec_leaves
+        );
+    }
+    if high_exec_leaves == 0 {
+        panic!("U55-6: expected at least 1 executable kernel leaf in PML4[511]");
+    }
+}
+
 /// ELF relocation type: R_X86_64_RELATIVE (base + addend)
 const R_X86_64_RELATIVE: u32 = 8;
 
@@ -1092,7 +1264,7 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     };
 
     // 构建四级页表结构，将物理内核地址映射到高半区虚拟地址
-    let (pml4_frame, entry_point_to_jump) = unsafe {
+    let (pml4_frame, entry_point_to_jump, transition_stub_phys) = unsafe {
         // 最早的 VGA 写入 - 在任何其他操作之前
         let vga = 0xb8000 as *mut u8;
         let msg = b"SETUP";
@@ -1106,6 +1278,32 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         };
 
         let boot_services = system_table.boot_services();
+
+        // U55-6: Allocate a dedicated 4 KiB LOADER_CODE page for the CR3-switch
+        // transition stub so PML4[0] never needs any RWX region or bootloader
+        // .text execution after `mov cr3`.
+        let transition_stub_phys = boot_services
+            .allocate_pages(
+                AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                MemoryType::LOADER_CODE,
+                1,
+            )
+            .expect("Failed to allocate CR3 transition stub page");
+        if !transition_stub_phys.is_multiple_of(KERNEL_PAGE_SIZE)
+            || transition_stub_phys >= KERNEL_PHYS_WINDOW_END
+        {
+            panic!("U55-6: CR3 transition stub allocation is misaligned or outside direct map");
+        }
+        core::ptr::write_bytes(
+            transition_stub_phys as *mut u8,
+            0,
+            KERNEL_PAGE_SIZE as usize,
+        );
+        core::ptr::copy_nonoverlapping(
+            CR3_TRANSITION_STUB.as_ptr(),
+            transition_stub_phys as *mut u8,
+            CR3_TRANSITION_STUB.len(),
+        );
 
         // 分配并清零 PML4
         let pml4_frame = boot_services
@@ -1141,9 +1339,10 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
 
         // Map the high-half direct window with huge pages except for the small
-        // set of 2 MiB buckets that overlap the kernel image.  Those buckets
-        // use 4 KiB leaves so legitimate text/rodata/data boundaries retain
-        // exact W^X permissions even when KASLR shifts them within a huge page.
+        // set of 2 MiB buckets that overlap the kernel image, the first 2 MiB
+        // (SMP trampoline / low MMIO), or the CR3 transition stub.  Those
+        // buckets use 4 KiB leaves so text/rodata/data boundaries and live
+        // aliases enforce exact W^X from the first instruction after CR3 load.
         // 虚拟地址 0xffffffff80000000 映射到物理地址 0
         // 由于使用2MB大页，必须从2MB边界开始，所以实际映射：
         // 虚拟 0xffffffff80000000 → 物理 0x0
@@ -1162,6 +1361,8 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         //   transaction.
         // - Executable pages become RX, writable pages become RW+NX, and
         //   read-only/gap pages become R+NX.
+        // - The CR3 transition stub's high-half alias is R+NX so it has zero
+        //   writable alias while executing in PML4[0].
         // - No final high-half leaf is both writable and executable.
         // R188-U55-8 FIX: use the exact address returned by UEFI allocation,
         // not a recomputation from the requested base and slide.  The latter
@@ -1176,16 +1377,23 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     .expect("kernel page extent overflow"),
             )
             .expect("kernel physical extent overflow");
+        if transition_stub_phys >= kernel_phys_start && transition_stub_phys < kernel_phys_end {
+            panic!("U55-6: CR3 transition stub overlaps loaded kernel image");
+        }
         let start_pd_idx = (kernel_phys_start / 0x200000) as usize;
         // Last PD entry that actually contains kernel bytes (inclusive).
         // saturating_sub(1) handles the edge case where kernel_phys_end is
         // exactly on a 2 MiB boundary — without it the ceil formula would
         // mark one extra 2 MiB page as executable.
         let end_pd_idx = (kernel_phys_end.saturating_sub(1) / 0x200000) as usize;
+        let stub_pd_idx = (transition_stub_phys / 0x200000) as usize;
 
         for i in 0..512usize {
             let bucket_start = (i as u64) * 0x200000;
-            if i >= start_pd_idx && i <= end_pd_idx {
+            // Split PD[0] (0..2 MiB for 4 KiB SMP trampoline alias control),
+            // all kernel image buckets, and the CR3 transition stub bucket.
+            let split_bucket = i == 0 || (i >= start_pd_idx && i <= end_pd_idx) || i == stub_pd_idx;
+            if split_bucket {
                 let pt_frame = boot_services
                     .allocate_pages(
                         AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
@@ -1200,18 +1408,24 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     let phys_page = bucket_start
                         .checked_add((page_index as u64) * KERNEL_PAGE_SIZE)
                         .expect("kernel PT physical address overflow");
-                    let flags = match kernel_permissions.get(phys_page) {
-                        Some(permissions) if permissions & KERNEL_PAGE_EXECUTABLE != 0 => {
-                            Flags::PRESENT
+                    let flags = if phys_page == transition_stub_phys {
+                        // U55-6: High-half alias of the R-X CR3 transition stub
+                        // must be non-writable and non-executable (R--).
+                        Flags::PRESENT | Flags::NO_EXECUTE
+                    } else {
+                        match kernel_permissions.get(phys_page) {
+                            Some(permissions) if permissions & KERNEL_PAGE_EXECUTABLE != 0 => {
+                                Flags::PRESENT
+                            }
+                            Some(permissions) if permissions & KERNEL_PAGE_WRITABLE != 0 => {
+                                Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
+                            }
+                            Some(permissions) if permissions & KERNEL_PAGE_CLAIMED != 0 => {
+                                Flags::PRESENT | Flags::NO_EXECUTE
+                            }
+                            Some(_) => Flags::PRESENT | Flags::NO_EXECUTE,
+                            None => Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
                         }
-                        Some(permissions) if permissions & KERNEL_PAGE_WRITABLE != 0 => {
-                            Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
-                        }
-                        Some(permissions) if permissions & KERNEL_PAGE_CLAIMED != 0 => {
-                            Flags::PRESENT | Flags::NO_EXECUTE
-                        }
-                        Some(_) => Flags::PRESENT | Flags::NO_EXECUTE,
-                        None => Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
                     };
                     (&mut *pt_ptr)[page_index].set_addr(PhysAddr::new(phys_page), flags);
                 }
@@ -1248,13 +1462,18 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let pdpt_low_ptr = pdpt_low_frame as *mut PageTable;
         core::ptr::write_bytes(pdpt_low_ptr as *mut u8, 0, 4096);
 
-        // 恒等映射前 4GB（需要4个PD，每个PD映射1GB）
-        // 这样可以确保 bootloader 代码、UEFI 固件、硬件MMIO（包括APIC在0xfee00000）都能访问
-        //
-        // 安全说明：
-        // - 暂时保持 RWX 以确保 bootloader 可以正常运行
-        // - 内核启动后通过 security::cleanup_identity_map() 将其加固为 RO+NX
-        // - 这是一个已知的启动阶段安全妥协
+        // U55-6: Hardened 0..4 GiB early-boot identity map with ZERO RWX leaves
+        // and ZERO writable aliases of executable pages:
+        // - Every 2 MiB huge page is mapped RW+NX (never executable).
+        // - In PDPT[0] (0..1 GiB), PD[0], all kernel-image buckets, and the
+        //   CR3 transition stub bucket are split into 4 KiB leaves:
+        //   * `transition_stub_phys` is the ONLY executable page in PML4[0],
+        //     mapped strictly R-X (and R-- in PML4[511]).
+        //   * Kernel `.text`, `.rodata`, and gaps are mapped R-- (RO+NX) so
+        //     kernel `.text` has ZERO writable aliases in PML4[0].
+        //   * Kernel `.data`/`.bss` and non-kernel pages (bootloader stack,
+        //     BootInfo, MMIO, RAM) are mapped RW+NX until kernel
+        //     `cleanup_identity_map()` hardens PML4[0] to RO+NX.
         for pdpt_idx in 0..4usize {
             let pd_low_frame = boot_services
                 .allocate_pages(
@@ -1268,11 +1487,49 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
             // 每个PD映射512个2MB页（1GB）
             for i in 0..512usize {
-                let phys_addr = PhysAddr::new(((pdpt_idx * 512 + i) as u64) * 0x200000);
-                (&mut *pd_low_ptr)[i].set_addr(
-                    phys_addr,
-                    Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE,
-                );
+                let bucket_start = ((pdpt_idx * 512 + i) as u64) * 0x200000;
+                let split_bucket = pdpt_idx == 0
+                    && (i == 0 || (i >= start_pd_idx && i <= end_pd_idx) || i == stub_pd_idx);
+                if split_bucket {
+                    let pt_frame = boot_services
+                        .allocate_pages(
+                            AllocateType::MaxAddress(DIRECT_MAP_MAX_ADDRESS),
+                            MemoryType::LOADER_DATA,
+                            1,
+                        )
+                        .expect("Failed to allocate low identity PT");
+                    let pt_ptr = pt_frame as *mut PageTable;
+                    core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
+
+                    for page_index in 0..512usize {
+                        let phys_page = bucket_start
+                            .checked_add((page_index as u64) * KERNEL_PAGE_SIZE)
+                            .expect("low identity PT physical address overflow");
+                        let flags = if phys_page == transition_stub_phys {
+                            // Strictly R-X for the 8-byte CR3 switch & jump stub.
+                            Flags::PRESENT
+                        } else if let Some(permissions) = kernel_permissions.get(phys_page) {
+                            if permissions & KERNEL_PAGE_WRITABLE != 0 {
+                                Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
+                            } else {
+                                // Kernel .text / .rodata / gaps: RO+NX (no writable alias).
+                                Flags::PRESENT | Flags::NO_EXECUTE
+                            }
+                        } else {
+                            // Bootloader stack, BootInfo, MMIO, RAM: RW+NX.
+                            Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
+                        };
+                        (&mut *pt_ptr)[page_index].set_addr(PhysAddr::new(phys_page), flags);
+                    }
+
+                    (&mut *pd_low_ptr)[i]
+                        .set_addr(PhysAddr::new(pt_frame), Flags::PRESENT | Flags::WRITABLE);
+                } else {
+                    (&mut *pd_low_ptr)[i].set_addr(
+                        PhysAddr::new(bucket_start),
+                        Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE | Flags::NO_EXECUTE,
+                    );
+                }
             }
 
             (&mut *pdpt_low_ptr)[pdpt_idx].set_addr(
@@ -1302,11 +1559,15 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE,
         );
 
+        // U55-6: Verify W^X and zero cross-alias W+X before ExitBootServices.
+        verify_boot_page_tables(pml4_frame, transition_stub_phys);
+        info!("U55-6: Boot page tables verified (0 RWX leaves, 0 cross-alias W+X, 1 R-X handoff page)");
+
         // F9: the new tables are loaded only after ExitBootServices (below).
         // Boot services run on the active CR3, and OVMF's memory protection
         // edits it (it splits huge pages and allocates the new tables top-down,
         // above the kernel's 1 GiB direct map once the guest has 2 GiB).
-        (pml4_frame, entry_point)
+        (pml4_frame, entry_point, transition_stub_phys)
     };
 
     // 获取 GOP 帧缓冲区信息（必须在 exit_boot_services 之前）
@@ -1421,11 +1682,16 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         core::mem::forget(memory_map);
     }
 
-    // 加载新的页表. F9: only now, with boot services gone, so the firmware
-    // never runs on (or edits) the kernel's tables. The bootloader's code,
-    // stack and data are below 4 GiB and stay reachable through the identity map.
+    // U55-6: Switch to the W^X-hardened PML4 and jump directly into high-half
+    // kernel `_start` via the single 4 KiB R-X transition stub page.
+    // F9: only now, with boot services gone, so firmware never runs on or edits
+    // the kernel's tables. Bootloader `.text` is NX under the new PML4, so
+    // execution never continues in the bootloader image after `mov cr3, rax`.
     unsafe {
-        use x86_64::{registers::control::Cr3, structures::paging::PhysFrame, PhysAddr};
+        use x86_64::registers::{
+            control::{Cr0, Cr0Flags, Cr3},
+            model_specific::{Efer, EferFlags},
+        };
 
         // 在切换前写 VGA 测试
         let vga = 0xb8000 as *mut u8;
@@ -1435,28 +1701,27 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             core::ptr::write_volatile(vga.offset(80 * 23 * 2 + i as isize * 2 + 1), 0x0A);
         }
 
-        Cr3::write(
-            PhysFrame::containing_address(PhysAddr::new(pml4_frame)),
-            Cr3::read().1,
-        );
+        // Disable interrupts and ensure both EFER.NXE and CR0.WP are enabled
+        // BEFORE loading the W^X page tables so NX bits are honored (never
+        // reserved-bit #PF) and Ring-0 writes honor read-only PTEs from
+        // instruction 0 of the kernel.
+        core::arch::asm!("cli", options(nomem, nostack));
+        Efer::update(|flags| flags.insert(EferFlags::NO_EXECUTE_ENABLE));
+        Cr0::update(|flags| flags.insert(Cr0Flags::WRITE_PROTECT));
 
-        // 在切换后写 VGA 测试
-        let msg2 = b"AFCR3";
-        for (i, &byte) in msg2.iter().enumerate() {
-            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2), byte);
-            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2 + 1), 0x0C);
-        }
-    }
+        let (_, cr3_flags) = Cr3::read();
+        let new_cr3 = (pml4_frame & 0x000F_FFFF_FFFF_F000) | (cr3_flags.bits() & 0x18);
 
-    // 跳转到内核入口点 - 使用内联汇编确保正确跳转
-    // 通过 rdi 传递 BootInfo 指针（System V AMD64 ABI 第一个参数）
-    unsafe {
+        // Jump to the 8-byte stub (`mov cr3, rax; jmp r8; ud2`) at
+        // `transition_stub_phys`, which is executable in both UEFI's CR3 and
+        // our new PML4[0] (strictly R-X, with R-- in PML4[511]).
         core::arch::asm!(
-            "mov rdi, {boot_info}",
-            "jmp {entry}",
-            boot_info = in(reg) boot_info_ptr as u64,
-            entry = in(reg) entry_point_to_jump,
-            options(noreturn)
+            "jmp {stub}",
+            stub = in(reg) transition_stub_phys,
+            in("rax") new_cr3,
+            in("rdi") boot_info_ptr as u64,
+            in("r8") entry_point_to_jump,
+            options(noreturn),
         );
     }
 }

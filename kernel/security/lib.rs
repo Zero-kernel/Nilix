@@ -84,7 +84,47 @@ pub use memory_hardening::{
 pub use rng::{chacha20_xor_keystream, fill_random, rdrand_available, try_fill_random, RngError};
 pub use spectre::{MitigationStatus, SpectreError, VulnerabilityInfo};
 pub use tests::{run_security_tests, SecurityTest, TestContext, TestReport, TestResult};
-pub use wxorx::{PageLevel, ValidationSummary, Violation, WxorxError};
+pub use wxorx::{PageLevel, ValidationSummary, Violation, ViolationKind, WxorxError};
+
+/// U55-6: Snapshot of the early-boot (pre-hardening) W^X + cross-alias audit
+/// recorded at the start of `security::init()`, BEFORE `cleanup_identity_map()`
+/// or `enforce_nx_for_kernel()` modifies a single PTE.
+#[derive(Debug, Clone, Copy)]
+pub struct EarlyBootWxorxSnapshot {
+    pub audited: bool,
+    pub violations: usize,
+    pub alias_violations: usize,
+    pub low_identity_exec_pages: usize,
+}
+
+static EARLY_BOOT_WX_AUDITED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static EARLY_BOOT_WX_VIOLATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static EARLY_BOOT_WX_ALIAS_VIOLATIONS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static EARLY_BOOT_LOW_EXEC_PAGES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Return the recorded early-boot (pre-hardening) W^X + alias audit snapshot.
+pub fn early_boot_wxorx_snapshot() -> EarlyBootWxorxSnapshot {
+    use core::sync::atomic::Ordering;
+    let audited = EARLY_BOOT_WX_AUDITED.load(Ordering::Acquire);
+    EarlyBootWxorxSnapshot {
+        audited,
+        violations: EARLY_BOOT_WX_VIOLATIONS.load(Ordering::Relaxed),
+        alias_violations: EARLY_BOOT_WX_ALIAS_VIOLATIONS.load(Ordering::Relaxed),
+        low_identity_exec_pages: EARLY_BOOT_LOW_EXEC_PAGES.load(Ordering::Relaxed),
+    }
+}
+
+fn record_early_boot_wxorx(summary: &ValidationSummary) {
+    use core::sync::atomic::Ordering;
+    EARLY_BOOT_WX_VIOLATIONS.store(summary.violations, Ordering::Relaxed);
+    EARLY_BOOT_WX_ALIAS_VIOLATIONS.store(summary.alias_violations, Ordering::Relaxed);
+    EARLY_BOOT_LOW_EXEC_PAGES.store(summary.low_identity_exec_pages, Ordering::Relaxed);
+    EARLY_BOOT_WX_AUDITED.store(true, Ordering::Release);
+}
 
 /// Security subsystem error types
 #[derive(Debug)]
@@ -193,7 +233,9 @@ pub struct SecurityReport {
     pub identity_cleanup: CleanupOutcome,
     /// NX enforcement summary (if enabled)
     pub nx_summary: Option<NxEnforcementSummary>,
-    /// W^X validation summary (if enabled)
+    /// Pre-hardening (early-boot handoff) W^X validation summary
+    pub early_wxorx_summary: Option<ValidationSummary>,
+    /// Post-hardening W^X validation summary (if enabled)
     pub wxorx_summary: Option<ValidationSummary>,
     /// Whether CSPRNG is ready
     pub rng_ready: bool,
@@ -213,6 +255,7 @@ impl SecurityReport {
         SecurityReport {
             identity_cleanup: CleanupOutcome::Skipped,
             nx_summary: None,
+            early_wxorx_summary: None,
             wxorx_summary: None,
             rng_ready: false,
             kptr_guard_active: false,
@@ -384,6 +427,70 @@ pub fn init(
         kptr::disable();
     }
 
+    // U55-6: Pre-hardening early-boot handoff W^X + cross-alias audit.
+    // Runs BEFORE cleanup_identity_map() and enforce_nx_for_kernel() to prove
+    // that the bootloader handed over zero RWX leaves, zero cross-alias W+X
+    // frames, and at most one 4 KiB R-X CR3 transition stub page in PML4[0].
+    {
+        match wxorx::validate_active(config.phys_offset) {
+            Ok(summary) => {
+                record_early_boot_wxorx(&summary);
+                report.early_wxorx_summary = Some(summary);
+                if summary.low_identity_exec_pages > 1 {
+                    klog!(
+                        Warn,
+                        "      WARNING: early-boot handoff has {} executable pages in PML4[0] (expected <= 1)",
+                        summary.low_identity_exec_pages
+                    );
+                    report.total_violations += summary.low_identity_exec_pages - 1;
+                    if config.strict_wxorx {
+                        return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(summary)));
+                    }
+                } else {
+                    klog_always!(
+                        "    [0/7] Early-boot W^X handoff verified (0 violations, 0 alias W+X, {} low-exec page)",
+                        summary.low_identity_exec_pages
+                    );
+                }
+            }
+            Err(WxorxError::PolicyViolation(summary)) => {
+                record_early_boot_wxorx(&summary);
+                report.early_wxorx_summary = Some(summary);
+                report.total_violations += summary.violations;
+                if config.strict_wxorx {
+                    klog!(
+                        Error,
+                        "      Early-boot W^X handoff violation: {} total ({} alias) (strict mode)",
+                        summary.violations,
+                        summary.alias_violations
+                    );
+                    return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(summary)));
+                }
+                klog!(
+                    Warn,
+                    "      WARNING: Early-boot W^X handoff violation: {} total ({} alias)",
+                    summary.violations,
+                    summary.alias_violations
+                );
+            }
+            Err(e) => {
+                if config.strict_wxorx {
+                    klog!(
+                        Error,
+                        "      Early-boot W^X handoff validation error: {:?} (strict mode)",
+                        e
+                    );
+                    return Err(SecurityError::Wxorx(e));
+                }
+                klog!(
+                    Warn,
+                    "      WARNING: Early-boot W^X handoff validation error: {:?}",
+                    e
+                );
+            }
+        }
+    }
+
     // Step 2: Clean up identity mapping
     klog_always!(
         "    [2/7] Cleaning identity map ({:?})...",
@@ -409,7 +516,26 @@ pub fn init(
         match wxorx::validate_active(config.phys_offset) {
             Ok(summary) => {
                 // X-3 FIX: Ok now means zero violations by contract
+                // U55-6: After identity-map cleanup, PML4[0] must have 0 executable pages.
                 report.wxorx_summary = Some(summary);
+                if !matches!(report.identity_cleanup, CleanupOutcome::Skipped)
+                    && summary.low_identity_exec_pages > 0
+                {
+                    report.total_violations += summary.low_identity_exec_pages;
+                    if config.strict_wxorx {
+                        klog!(
+                            Error,
+                            "      {} executable page(s) remain in PML4[0] after identity cleanup (strict mode)",
+                            summary.low_identity_exec_pages
+                        );
+                        return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(summary)));
+                    }
+                    klog!(
+                        Warn,
+                        "      WARNING: {} executable page(s) remain in PML4[0] after identity cleanup",
+                        summary.low_identity_exec_pages
+                    );
+                }
             }
             Err(WxorxError::PolicyViolation(summary)) => {
                 // X-3 FIX: PolicyViolation now contains the full summary
@@ -418,15 +544,17 @@ pub fn init(
                 if config.strict_wxorx {
                     klog!(
                         Error,
-                        "      {} W^X violation(s) detected (strict mode)",
-                        summary.violations
+                        "      {} W^X violation(s) detected ({} alias) (strict mode)",
+                        summary.violations,
+                        summary.alias_violations
                     );
                     return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(summary)));
                 }
                 klog!(
                     Warn,
-                    "      WARNING: {} W^X violation(s) detected",
-                    summary.violations
+                    "      WARNING: {} W^X violation(s) detected ({} alias)",
+                    summary.violations,
+                    summary.alias_violations
                 );
             }
             Err(WxorxError::Violation(v)) => {
@@ -434,6 +562,8 @@ pub fn init(
                 report.wxorx_summary = Some(ValidationSummary {
                     scanned_entries: 0,
                     violations: 1,
+                    alias_violations: usize::from(v.kind == ViolationKind::CrossAliasWx),
+                    low_identity_exec_pages: 0,
                     first_violation: Some(v),
                 });
 

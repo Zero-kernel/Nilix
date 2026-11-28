@@ -1,7 +1,8 @@
 //! W^X (Write XOR Execute) Policy Enforcement
 //!
 //! This module validates that no memory pages are simultaneously writable and executable,
-//! which is a fundamental security principle to prevent code injection attacks.
+//! either directly on a single leaf PTE or indirectly via live physical-frame aliases
+//! across virtual mappings (e.g. `PML4[0]` identity map vs `PML4[511]` high-half map).
 //!
 //! # Security Rationale
 //!
@@ -9,18 +10,20 @@
 //! - Code pages are read-only and executable (R-X)
 //! - Data pages are writable but not executable (RW-)
 //! - No page can be both writable AND executable (RWX)
-//!
-//! This prevents attackers from:
-//! 1. Injecting code into writable buffers and executing it
-//! 2. Modifying existing code pages
+//! - No supervisor-executable physical frame has a live writable alias anywhere
+//!   in the active page table hierarchy (U55-6)
 //!
 //! # Implementation
 //!
-//! The validator walks the 4-level x86_64 page table hierarchy:
-//! - PML4 (Page Map Level 4) - 512 GB regions
-//! - PDPT (Page Directory Pointer Table) - 1 GB regions (can be huge pages)
-//! - PD (Page Directory) - 2 MB regions (can be huge pages)
-//! - PT (Page Table) - 4 KB pages
+//! The validator walks the 4-level x86_64 page table hierarchy in two bounded,
+//! allocation-free passes:
+//! 1. Compute effective permissions (AND of `WRITABLE`, AND of `!NO_EXECUTE`,
+//!    AND of `USER_ACCESSIBLE` across PML4/PDPT/PD/PT), report direct RWX leaves,
+//!    count low-identity (`PML4[0]`) executable pages, and collect coalesced
+//!    executable physical ranges.
+//! 2. Verify no writable leaf (`eff_w && !eff_x`) overlaps any executable
+//!    physical range (for supervisor-executable ranges, no writable alias at all;
+//!    for user-executable ranges, no user-writable alias).
 
 use mm::page_table::{self, RECURSIVE_INDEX};
 use x86_64::{
@@ -29,14 +32,30 @@ use x86_64::{
     PhysAddr, VirtAddr,
 };
 
+/// Maximum coalesced executable physical ranges tracked without heap allocation.
+const MAX_EXEC_RANGES: usize = 128;
+
+/// Kind of W^X policy violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationKind {
+    /// A single leaf mapping is effectively both writable and executable.
+    DirectRwx,
+    /// A writable leaf aliases a physical frame mapped executable elsewhere.
+    CrossAliasWx,
+}
+
 /// Summary of W^X validation
 #[derive(Debug, Clone, Copy)]
 pub struct ValidationSummary {
     /// Total page table entries scanned
     pub scanned_entries: usize,
-    /// Number of W^X violations found
+    /// Total number of W^X violations found (direct RWX + cross-alias W+X)
     pub violations: usize,
-    /// First concrete violation observed during the walk.  Keeping the full
+    /// Number of cross-alias W+X violations found (subset of `violations`)
+    pub alias_violations: usize,
+    /// Number of effectively executable 4 KiB pages under `PML4[0]` (identity map)
+    pub low_identity_exec_pages: usize,
+    /// First concrete violation observed during the walk. Keeping the full
     /// count and one location gives callers actionable diagnostics without
     /// changing the fixed-size summary contract for subsequent entries.
     pub first_violation: Option<Violation>,
@@ -53,6 +72,8 @@ pub struct Violation {
     pub level: PageLevel,
     /// Page flags that caused the violation
     pub flags: PageTableFlags,
+    /// Whether this violation was a direct RWX leaf or a writable alias of an executable frame
+    pub kind: ViolationKind,
 }
 
 /// Page table hierarchy level
@@ -85,71 +106,207 @@ pub enum WxorxError {
     InvalidStructure,
 }
 
-/// Validate W^X policy on the currently active page tables
+#[derive(Debug, Clone, Copy)]
+struct ExecRange {
+    start: u64,
+    end: u64,
+    user: bool,
+}
+
+impl ExecRange {
+    const EMPTY: Self = Self {
+        start: 0,
+        end: 0,
+        user: false,
+    };
+}
+
+struct ExecRangeSet {
+    ranges: [ExecRange; MAX_EXEC_RANGES],
+    len: usize,
+}
+
+impl ExecRangeSet {
+    const fn new() -> Self {
+        Self {
+            ranges: [ExecRange::EMPTY; MAX_EXEC_RANGES],
+            len: 0,
+        }
+    }
+
+    fn insert(&mut self, start: u64, end: u64, user: bool) -> Result<(), WxorxError> {
+        if start >= end {
+            return Ok(());
+        }
+
+        // Fast-path merge with existing adjacent or overlapping range of the
+        // same privilege domain so contiguous `.text` collapses to one entry.
+        for existing in &mut self.ranges[..self.len] {
+            if existing.user == user && start <= existing.end && existing.start <= end {
+                existing.start = existing.start.min(start);
+                existing.end = existing.end.max(end);
+                return Ok(());
+            }
+        }
+
+        if self.len >= MAX_EXEC_RANGES {
+            return Err(WxorxError::IncompleteWalk(
+                "Executable physical range table overflow during cross-alias W^X check",
+            ));
+        }
+        self.ranges[self.len] = ExecRange { start, end, user };
+        self.len += 1;
+        Ok(())
+    }
+
+    fn overlaps_writable(&self, start: u64, end: u64, writable_is_user: bool) -> bool {
+        if start >= end {
+            return false;
+        }
+        for existing in &self.ranges[..self.len] {
+            if start < existing.end && existing.start < end {
+                // Supervisor-executable frames may NEVER have a writable alias
+                // (neither supervisor nor user). User-executable frames may not
+                // have a user-writable alias (the kernel's high-half physmap is
+                // supervisor-only and does not grant Ring-3 write access).
+                if !existing.user || writable_is_user {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectivePerms {
+    writable: bool,
+    executable: bool,
+    user: bool,
+}
+
+impl EffectivePerms {
+    const ROOT: Self = Self {
+        writable: true,
+        executable: true,
+        user: true,
+    };
+
+    #[inline]
+    fn combine(self, flags: PageTableFlags) -> Self {
+        Self {
+            writable: self.writable && flags.contains(PageTableFlags::WRITABLE),
+            executable: self.executable && !flags.contains(PageTableFlags::NO_EXECUTE),
+            user: self.user && flags.contains(PageTableFlags::USER_ACCESSIBLE),
+        }
+    }
+}
+
+/// Validate W^X policy (direct RWX + cross-alias W+X) on the currently active page tables.
 ///
-/// This function walks the entire page table hierarchy starting from CR3
-/// and checks that no leaf page has both WRITABLE and !NO_EXECUTE flags.
-///
-/// # Arguments
-///
-/// * `phys_offset` - Virtual address offset for physical memory access
+/// Reads CR3 directly and walks all present mappings excluding `RECURSIVE_INDEX`.
 ///
 /// # Returns
 ///
-/// X-3 FIX: API semantic clarification:
-/// - `Ok(summary)` if no W^X violations are present.
+/// - `Ok(summary)` if zero direct RWX and zero cross-alias W+X violations exist.
 /// - `Err(WxorxError::PolicyViolation(summary))` if any violations are found.
-///
-/// # Security Note
-///
-/// This function reads from CR3 directly, so it validates the actual
-/// active page tables, not any cached or stale references.
 pub fn validate_active(phys_offset: VirtAddr) -> Result<ValidationSummary, WxorxError> {
-    // Read current CR3 to get the root page table
     let (cr3, _) = Cr3::read();
     let root_phys = cr3.start_address();
-    let root_virt = phys_offset + root_phys.as_u64();
+    validate_hierarchy(root_phys, |phys| {
+        let virt = phys_offset + phys.as_u64();
+        Ok(unsafe { &*(virt.as_u64() as *const PageTable) })
+    })
+}
 
-    let pml4: &PageTable = unsafe { &*(root_virt.as_u64() as *const PageTable) };
-
+/// Pure, testable page-table W^X and cross-alias validator.
+pub fn validate_hierarchy<'a, F>(
+    root_phys: PhysAddr,
+    read_table: F,
+) -> Result<ValidationSummary, WxorxError>
+where
+    F: Fn(PhysAddr) -> Result<&'a PageTable, WxorxError>,
+{
+    let pml4 = read_table(root_phys)?;
     let mut summary = ValidationSummary {
         scanned_entries: 0,
         violations: 0,
+        alias_violations: 0,
+        low_identity_exec_pages: 0,
         first_violation: None,
     };
+    let mut exec_ranges = ExecRangeSet::new();
 
-    // Walk all PML4 entries
-    for (pml4_idx, pml4_entry) in pml4.iter().enumerate() {
-        // 【W^X 修复】跳过递归页表槽 (PML4[510])
-        //
-        // 递归映射允许通过特殊虚拟地址访问任意页表帧。当验证器遍历递归槽时，
-        // 会将中间页表条目（PML4/PDPT/PD）误认为是叶子 PTE，从而报告假阳性。
-        // 这些条目本身是 writable + !NO_EXECUTE，但它们不是实际的内存映射。
-        // NX 位只在叶子页表条目上强制执行。
-        if pml4_idx == RECURSIVE_INDEX {
-            continue;
-        }
+    let mut scanned_entries = 0usize;
+    // Pass 1: Check direct RWX, count low-identity executable pages, and collect
+    // coalesced executable physical ranges across the active hierarchy.
+    walk_pml4(
+        pml4,
+        &read_table,
+        true,
+        &mut |pml4_idx, virt_base, phys, size, level, flags, eff| {
+            if eff.executable && pml4_idx == 0 {
+                let pages = (size / 4096) as usize;
+                summary.low_identity_exec_pages =
+                    summary.low_identity_exec_pages.saturating_add(pages);
+            }
 
-        if pml4_entry.is_unused() {
-            continue;
-        }
+            if eff.writable && eff.executable {
+                record_violation(
+                    &mut summary,
+                    Violation {
+                        virt_base: VirtAddr::new(virt_base),
+                        phys,
+                        level,
+                        flags,
+                        kind: ViolationKind::DirectRwx,
+                    },
+                );
+            }
 
-        summary.scanned_entries += 1;
+            if eff.executable {
+                let phys_start = phys.as_u64();
+                let phys_end = phys_start.saturating_add(size);
+                exec_ranges.insert(phys_start, phys_end, eff.user)?;
+            }
+            Ok(())
+        },
+        &mut scanned_entries,
+    )?;
+    summary.scanned_entries = scanned_entries;
 
-        // Calculate the virtual address base for this PML4 entry
-        let virt_base = canonicalize(pml4_idx as u64 * (512 * 1024 * 1024 * 1024));
-
-        // Get PDPT
-        let pdpt_phys = pml4_entry.addr();
-        let pdpt_virt = phys_offset + pdpt_phys.as_u64();
-        let pdpt: &PageTable = unsafe { &*(pdpt_virt.as_u64() as *const PageTable) };
-
-        // Walk PDPT entries
-        walk_pdpt(pdpt, virt_base, phys_offset, &mut summary)?;
+    // Pass 2: Check every writable non-executable leaf against all collected
+    // executable physical ranges to catch live cross-alias W+X mappings.
+    if exec_ranges.len > 0 {
+        let mut ignored_count = 0usize;
+        walk_pml4(
+            pml4,
+            &read_table,
+            false,
+            &mut |_pml4_idx, virt_base, phys, size, level, flags, eff| {
+                if eff.writable && !eff.executable {
+                    let phys_start = phys.as_u64();
+                    let phys_end = phys_start.saturating_add(size);
+                    if exec_ranges.overlaps_writable(phys_start, phys_end, eff.user) {
+                        summary.alias_violations = summary.alias_violations.saturating_add(1);
+                        record_violation(
+                            &mut summary,
+                            Violation {
+                                virt_base: VirtAddr::new(virt_base),
+                                phys,
+                                level,
+                                flags,
+                                kind: ViolationKind::CrossAliasWx,
+                            },
+                        );
+                    }
+                }
+                Ok(())
+            },
+            &mut ignored_count,
+        )?;
     }
 
-    // X-3 FIX: Return Err if violations found, not Ok with violations
-    // This prevents callers from misinterpreting "Ok" as "no violations"
     if summary.violations > 0 {
         return Err(WxorxError::PolicyViolation(summary));
     }
@@ -157,115 +314,231 @@ pub fn validate_active(phys_offset: VirtAddr) -> Result<ValidationSummary, Wxorx
     Ok(summary)
 }
 
-/// Walk PDPT level
-fn walk_pdpt(
-    pdpt: &PageTable,
-    base: u64,
-    phys_offset: VirtAddr,
-    summary: &mut ValidationSummary,
-) -> Result<(), WxorxError> {
-    for (pdpt_idx, pdpt_entry) in pdpt.iter().enumerate() {
-        if pdpt_entry.is_unused() {
+fn walk_pml4<'a, F, V>(
+    pml4: &'a PageTable,
+    read_table: &F,
+    count_entries: bool,
+    visit_leaf: &mut V,
+    scanned_entries: &mut usize,
+) -> Result<(), WxorxError>
+where
+    F: Fn(PhysAddr) -> Result<&'a PageTable, WxorxError>,
+    V: FnMut(
+        usize,
+        u64,
+        PhysAddr,
+        u64,
+        PageLevel,
+        PageTableFlags,
+        EffectivePerms,
+    ) -> Result<(), WxorxError>,
+{
+    for (pml4_idx, pml4_entry) in pml4.iter().enumerate() {
+        // Skip recursive page table slot (PML4[510]): intermediate page-table
+        // entries exposed through recursion are not memory leaves.
+        if pml4_idx == RECURSIVE_INDEX {
             continue;
         }
 
-        summary.scanned_entries += 1;
+        let flags = pml4_entry.flags();
+        if pml4_entry.is_unused() || !flags.contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+
+        if count_entries {
+            *scanned_entries += 1;
+        }
+
+        let p4_perms = EffectivePerms::ROOT.combine(flags);
+        let virt_base = canonicalize(pml4_idx as u64 * (512 * 1024 * 1024 * 1024));
+        let pdpt = read_table(pml4_entry.addr())?;
+
+        walk_pdpt(
+            pml4_idx,
+            pdpt,
+            virt_base,
+            p4_perms,
+            read_table,
+            count_entries,
+            visit_leaf,
+            scanned_entries,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_pdpt<'a, F, V>(
+    pml4_idx: usize,
+    pdpt: &'a PageTable,
+    base: u64,
+    parent_perms: EffectivePerms,
+    read_table: &F,
+    count_entries: bool,
+    visit_leaf: &mut V,
+    scanned_entries: &mut usize,
+) -> Result<(), WxorxError>
+where
+    F: Fn(PhysAddr) -> Result<&'a PageTable, WxorxError>,
+    V: FnMut(
+        usize,
+        u64,
+        PhysAddr,
+        u64,
+        PageLevel,
+        PageTableFlags,
+        EffectivePerms,
+    ) -> Result<(), WxorxError>,
+{
+    for (pdpt_idx, pdpt_entry) in pdpt.iter().enumerate() {
         let flags = pdpt_entry.flags();
+        if pdpt_entry.is_unused() || !flags.contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+
+        if count_entries {
+            *scanned_entries += 1;
+        }
+
+        let perms = parent_perms.combine(flags);
         let virt_base = base + (pdpt_idx as u64 * 1024 * 1024 * 1024);
 
-        // Check for 1GB huge page
         if flags.contains(PageTableFlags::HUGE_PAGE) {
-            if is_wxorx_violation(flags) {
-                record_violation(
-                    summary,
-                    Violation {
-                        virt_base: VirtAddr::new(virt_base),
-                        phys: pdpt_entry.addr(),
-                        level: PageLevel::Huge1G,
-                        flags,
-                    },
-                );
-                // Continue checking to count all violations
-            }
+            visit_leaf(
+                pml4_idx,
+                virt_base,
+                pdpt_entry.addr(),
+                1024 * 1024 * 1024,
+                PageLevel::Huge1G,
+                flags,
+                perms,
+            )?;
             continue;
         }
 
-        // Get PD
-        let pd_phys = pdpt_entry.addr();
-        let pd_virt = phys_offset + pd_phys.as_u64();
-        let pd: &PageTable = unsafe { &*(pd_virt.as_u64() as *const PageTable) };
-
-        walk_pd(pd, virt_base, phys_offset, summary)?;
+        let pd = read_table(pdpt_entry.addr())?;
+        walk_pd(
+            pml4_idx,
+            pd,
+            virt_base,
+            perms,
+            read_table,
+            count_entries,
+            visit_leaf,
+            scanned_entries,
+        )?;
     }
 
     Ok(())
 }
 
-/// Walk PD (Page Directory) level
-fn walk_pd(
-    pd: &PageTable,
+#[allow(clippy::too_many_arguments)]
+fn walk_pd<'a, F, V>(
+    pml4_idx: usize,
+    pd: &'a PageTable,
     base: u64,
-    phys_offset: VirtAddr,
-    summary: &mut ValidationSummary,
-) -> Result<(), WxorxError> {
+    parent_perms: EffectivePerms,
+    read_table: &F,
+    count_entries: bool,
+    visit_leaf: &mut V,
+    scanned_entries: &mut usize,
+) -> Result<(), WxorxError>
+where
+    F: Fn(PhysAddr) -> Result<&'a PageTable, WxorxError>,
+    V: FnMut(
+        usize,
+        u64,
+        PhysAddr,
+        u64,
+        PageLevel,
+        PageTableFlags,
+        EffectivePerms,
+    ) -> Result<(), WxorxError>,
+{
     for (pd_idx, pd_entry) in pd.iter().enumerate() {
-        if pd_entry.is_unused() {
+        let flags = pd_entry.flags();
+        if pd_entry.is_unused() || !flags.contains(PageTableFlags::PRESENT) {
             continue;
         }
 
-        summary.scanned_entries += 1;
-        let flags = pd_entry.flags();
+        if count_entries {
+            *scanned_entries += 1;
+        }
+
+        let perms = parent_perms.combine(flags);
         let virt_base = base + (pd_idx as u64 * 2 * 1024 * 1024);
 
-        // Check for 2MB huge page
         if flags.contains(PageTableFlags::HUGE_PAGE) {
-            if is_wxorx_violation(flags) {
-                record_violation(
-                    summary,
-                    Violation {
-                        virt_base: VirtAddr::new(virt_base),
-                        phys: pd_entry.addr(),
-                        level: PageLevel::Huge2M,
-                        flags,
-                    },
-                );
-            }
+            visit_leaf(
+                pml4_idx,
+                virt_base,
+                pd_entry.addr(),
+                2 * 1024 * 1024,
+                PageLevel::Huge2M,
+                flags,
+                perms,
+            )?;
             continue;
         }
 
-        // Get PT
-        let pt_phys = pd_entry.addr();
-        let pt_virt = phys_offset + pt_phys.as_u64();
-        let pt: &PageTable = unsafe { &*(pt_virt.as_u64() as *const PageTable) };
-
-        walk_pt(pt, virt_base, summary)?;
+        let pt = read_table(pd_entry.addr())?;
+        walk_pt(
+            pml4_idx,
+            pt,
+            virt_base,
+            perms,
+            count_entries,
+            visit_leaf,
+            scanned_entries,
+        )?;
     }
 
     Ok(())
 }
 
-/// Walk PT (Page Table) level - 4KB pages
-fn walk_pt(pt: &PageTable, base: u64, summary: &mut ValidationSummary) -> Result<(), WxorxError> {
+#[allow(clippy::too_many_arguments)]
+fn walk_pt<V>(
+    pml4_idx: usize,
+    pt: &PageTable,
+    base: u64,
+    parent_perms: EffectivePerms,
+    count_entries: bool,
+    visit_leaf: &mut V,
+    scanned_entries: &mut usize,
+) -> Result<(), WxorxError>
+where
+    V: FnMut(
+        usize,
+        u64,
+        PhysAddr,
+        u64,
+        PageLevel,
+        PageTableFlags,
+        EffectivePerms,
+    ) -> Result<(), WxorxError>,
+{
     for (pt_idx, pt_entry) in pt.iter().enumerate() {
-        if pt_entry.is_unused() {
+        let flags = pt_entry.flags();
+        if pt_entry.is_unused() || !flags.contains(PageTableFlags::PRESENT) {
             continue;
         }
 
-        summary.scanned_entries += 1;
-        let flags = pt_entry.flags();
-        let virt_addr = base + (pt_idx as u64 * 4096);
-
-        if is_wxorx_violation(flags) {
-            record_violation(
-                summary,
-                Violation {
-                    virt_base: VirtAddr::new(virt_addr),
-                    phys: pt_entry.addr(),
-                    level: PageLevel::P1,
-                    flags,
-                },
-            );
+        if count_entries {
+            *scanned_entries += 1;
         }
+
+        let perms = parent_perms.combine(flags);
+        let virt_addr = base + (pt_idx as u64 * 4096);
+        visit_leaf(
+            pml4_idx,
+            virt_addr,
+            pt_entry.addr(),
+            4096,
+            PageLevel::P1,
+            flags,
+            perms,
+        )?;
     }
 
     Ok(())
@@ -297,7 +570,6 @@ fn is_wxorx_violation(flags: PageTableFlags) -> bool {
 /// - Bits 48-63 must match bit 47 (sign extension)
 #[inline]
 fn canonicalize(addr: u64) -> u64 {
-    // If bit 47 is set, extend with 1s in bits 48-63
     if addr & (1 << 47) != 0 {
         addr | 0xFFFF_0000_0000_0000
     } else {
@@ -306,15 +578,6 @@ fn canonicalize(addr: u64) -> u64 {
 }
 
 /// Check a single virtual address for W^X compliance
-///
-/// # Arguments
-///
-/// * `virt_addr` - The virtual address to check
-/// * `phys_offset` - Physical memory offset
-///
-/// # Returns
-///
-/// `true` if the page is W^X compliant, `false` if it violates the policy
 pub fn check_address(virt_addr: VirtAddr, phys_offset: VirtAddr) -> Result<bool, WxorxError> {
     unsafe {
         page_table::with_current_manager(phys_offset, |manager| {
@@ -329,28 +592,223 @@ pub fn check_address(virt_addr: VirtAddr, phys_offset: VirtAddr) -> Result<bool,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    struct MockHierarchy {
+        tables: Vec<(u64, Box<PageTable>)>,
+    }
+
+    impl MockHierarchy {
+        fn new() -> Self {
+            Self { tables: Vec::new() }
+        }
+
+        fn alloc(&mut self) -> (PhysAddr, usize) {
+            let idx = self.tables.len();
+            let phys = ((idx as u64) + 1) * 0x1000;
+            self.tables.push((phys, Box::new(PageTable::new())));
+            (PhysAddr::new(phys), idx)
+        }
+
+        fn table_mut(&mut self, idx: usize) -> &mut PageTable {
+            &mut self.tables[idx].1
+        }
+
+        fn read(&self, phys: PhysAddr) -> Result<&PageTable, WxorxError> {
+            self.tables
+                .iter()
+                .find(|(p, _)| *p == phys.as_u64())
+                .map(|(_, t)| &**t)
+                .ok_or(WxorxError::InvalidStructure)
+        }
+    }
 
     #[test]
     fn test_is_wxorx_violation() {
-        // R-X (Read + Execute) - OK
         let rx = PageTableFlags::PRESENT;
         assert!(!is_wxorx_violation(rx));
 
-        // RW- (Read + Write + No-Execute) - OK
         let rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
         assert!(!is_wxorx_violation(rw));
 
-        // RWX (Read + Write + Execute) - VIOLATION
         let rwx = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         assert!(is_wxorx_violation(rwx));
     }
 
     #[test]
     fn test_canonicalize() {
-        // Low address - no change
         assert_eq!(canonicalize(0x1234), 0x1234);
-
-        // High half address - sign extend
         assert_eq!(canonicalize(0x0000_8000_0000_0000), 0xFFFF_8000_0000_0000);
+    }
+
+    #[test]
+    fn test_clean_boot_handoff_hierarchy_passes() {
+        let mut h = MockHierarchy::new();
+        let (pml4_phys, pml4) = h.alloc();
+        let (pdpt_low_phys, pdpt_low) = h.alloc();
+        let (pd_low_phys, pd_low) = h.alloc();
+        let (pt_low_phys, pt_low) = h.alloc();
+        let (pdpt_hi_phys, pdpt_hi) = h.alloc();
+        let (pd_hi_phys, pd_hi) = h.alloc();
+        let (pt_hi_phys, pt_hi) = h.alloc();
+
+        let rw_parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let rx = PageTableFlags::PRESENT;
+        let ro_nx = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+        let rw_nx = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+
+        h.table_mut(pml4)[0].set_addr(pdpt_low_phys, rw_parent);
+        h.table_mut(pml4)[511].set_addr(pdpt_hi_phys, rw_parent);
+        h.table_mut(pml4)[RECURSIVE_INDEX].set_addr(pml4_phys, rw_nx);
+
+        h.table_mut(pdpt_low)[0].set_addr(pd_low_phys, rw_parent);
+        h.table_mut(pd_low)[0].set_addr(pt_low_phys, rw_parent);
+        // Transition stub at 0x9000: R-X in PML4[0], R-- in PML4[511]
+        h.table_mut(pt_low)[9].set_addr(PhysAddr::new(0x9000), rx);
+        // Kernel .text at 0x100000 (PTE 256): R-- in PML4[0], R-X in PML4[511]
+        h.table_mut(pt_low)[256].set_addr(PhysAddr::new(0x10_0000), ro_nx);
+        // Kernel .data at 0x101000 (PTE 257): RW- in both
+        h.table_mut(pt_low)[257].set_addr(PhysAddr::new(0x10_1000), rw_nx);
+
+        h.table_mut(pdpt_hi)[510].set_addr(pd_hi_phys, rw_parent);
+        h.table_mut(pd_hi)[0].set_addr(pt_hi_phys, rw_parent);
+        h.table_mut(pt_hi)[9].set_addr(PhysAddr::new(0x9000), ro_nx);
+        h.table_mut(pt_hi)[256].set_addr(PhysAddr::new(0x10_0000), rx);
+        h.table_mut(pt_hi)[257].set_addr(PhysAddr::new(0x10_1000), rw_nx);
+
+        let summary = validate_hierarchy(pml4_phys, |p| h.read(p))
+            .expect("clean handoff hierarchy must pass W^X + alias audit");
+        assert_eq!(summary.violations, 0);
+        assert_eq!(summary.alias_violations, 0);
+        assert_eq!(summary.low_identity_exec_pages, 1);
+    }
+
+    #[test]
+    fn test_detects_cross_alias_writable_kernel_text_in_identity_map() {
+        let mut h = MockHierarchy::new();
+        let (pml4_phys, pml4) = h.alloc();
+        let (pdpt_low_phys, pdpt_low) = h.alloc();
+        let (pd_low_phys, pd_low) = h.alloc();
+        let (pdpt_hi_phys, pdpt_hi) = h.alloc();
+        let (pd_hi_phys, pd_hi) = h.alloc();
+        let (pt_hi_phys, pt_hi) = h.alloc();
+
+        let rw_parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let rx = PageTableFlags::PRESENT;
+        let rw_nx_huge = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::HUGE_PAGE
+            | PageTableFlags::NO_EXECUTE;
+
+        h.table_mut(pml4)[0].set_addr(pdpt_low_phys, rw_parent);
+        h.table_mut(pml4)[511].set_addr(pdpt_hi_phys, rw_parent);
+        h.table_mut(pdpt_low)[0].set_addr(pd_low_phys, rw_parent);
+        // Buggy identity map: 0..2 MiB is RW+NX (writable alias of kernel .text!)
+        h.table_mut(pd_low)[0].set_addr(PhysAddr::new(0), rw_nx_huge);
+
+        h.table_mut(pdpt_hi)[510].set_addr(pd_hi_phys, rw_parent);
+        h.table_mut(pd_hi)[0].set_addr(pt_hi_phys, rw_parent);
+        h.table_mut(pt_hi)[256].set_addr(PhysAddr::new(0x10_0000), rx);
+
+        let err = validate_hierarchy(pml4_phys, |p| h.read(p))
+            .expect_err("writable identity alias of kernel .text must fail");
+        match err {
+            WxorxError::PolicyViolation(summary) => {
+                assert_eq!(summary.violations, 1);
+                assert_eq!(summary.alias_violations, 1);
+                assert_eq!(
+                    summary.first_violation.expect("violation").kind,
+                    ViolationKind::CrossAliasWx
+                );
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_detects_cross_alias_smp_trampoline_high_half_writable() {
+        let mut h = MockHierarchy::new();
+        let (pml4_phys, pml4) = h.alloc();
+        let (pdpt_low_phys, pdpt_low) = h.alloc();
+        let (pd_low_phys, pd_low) = h.alloc();
+        let (pt_low_phys, pt_low) = h.alloc();
+        let (pdpt_hi_phys, pdpt_hi) = h.alloc();
+        let (pd_hi_phys, pd_hi) = h.alloc();
+        let (pt_hi_phys, pt_hi) = h.alloc();
+
+        let rw_parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let rx = PageTableFlags::PRESENT;
+        let rw_nx = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+
+        h.table_mut(pml4)[0].set_addr(pdpt_low_phys, rw_parent);
+        h.table_mut(pml4)[511].set_addr(pdpt_hi_phys, rw_parent);
+        h.table_mut(pdpt_low)[0].set_addr(pd_low_phys, rw_parent);
+        h.table_mut(pd_low)[0].set_addr(pt_low_phys, rw_parent);
+        // 0x8000 is R-X in PML4[0]
+        h.table_mut(pt_low)[8].set_addr(PhysAddr::new(0x8000), rx);
+
+        h.table_mut(pdpt_hi)[510].set_addr(pd_hi_phys, rw_parent);
+        h.table_mut(pd_hi)[0].set_addr(pt_hi_phys, rw_parent);
+        // Buggy high-half alias: 0xffffffff80008000 is RW+NX while 0x8000 is R-X
+        h.table_mut(pt_hi)[8].set_addr(PhysAddr::new(0x8000), rw_nx);
+
+        let err = validate_hierarchy(pml4_phys, |p| h.read(p))
+            .expect_err("writable high-half alias of R-X trampoline must fail");
+        match err {
+            WxorxError::PolicyViolation(summary) => {
+                assert_eq!(summary.violations, 1);
+                assert_eq!(summary.alias_violations, 1);
+                assert_eq!(summary.low_identity_exec_pages, 1);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_user_text_allows_supervisor_physmap_but_rejects_user_writable_alias() {
+        let mut h = MockHierarchy::new();
+        let (pml4_phys, pml4) = h.alloc();
+        let (pdpt_u_phys, pdpt_u) = h.alloc();
+        let (pd_u_phys, pd_u) = h.alloc();
+        let (pt_u_phys, pt_u) = h.alloc();
+        let (pdpt_hi_phys, pdpt_hi) = h.alloc();
+        let (pd_hi_phys, pd_hi) = h.alloc();
+        let (pt_hi_phys, pt_hi) = h.alloc();
+
+        let u_parent =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let k_parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let u_rx = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        let u_rw_nx = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        let k_rw_nx =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+
+        h.table_mut(pml4)[1].set_addr(pdpt_u_phys, u_parent);
+        h.table_mut(pdpt_u)[0].set_addr(pd_u_phys, u_parent);
+        h.table_mut(pd_u)[0].set_addr(pt_u_phys, u_parent);
+        h.table_mut(pt_u)[0].set_addr(PhysAddr::new(0x20_0000), u_rx);
+
+        h.table_mut(pml4)[511].set_addr(pdpt_hi_phys, k_parent);
+        h.table_mut(pdpt_hi)[510].set_addr(pd_hi_phys, k_parent);
+        h.table_mut(pd_hi)[1].set_addr(pt_hi_phys, k_parent);
+        // Supervisor-only physmap for the user frame is expected.
+        h.table_mut(pt_hi)[0].set_addr(PhysAddr::new(0x20_0000), k_rw_nx);
+
+        assert!(validate_hierarchy(pml4_phys, |p| h.read(p)).is_ok());
+
+        // Adding a user-writable alias of the same user-executable frame must fail.
+        h.table_mut(pt_u)[1].set_addr(PhysAddr::new(0x20_0000), u_rw_nx);
+        let err = validate_hierarchy(pml4_phys, |p| h.read(p))
+            .expect_err("user-writable alias of user-executable frame must fail");
+        match err {
+            WxorxError::PolicyViolation(summary) => {
+                assert_eq!(summary.alias_violations, 1);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 }

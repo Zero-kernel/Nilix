@@ -265,9 +265,10 @@ pub struct TestContext {
 ///
 /// A `TestReport` summarizing all test results.
 pub fn run_security_tests(ctx: &TestContext) -> TestReport {
-    let tests: [&dyn SecurityTest; 9] = [
+    let tests: [&dyn SecurityTest; 10] = [
         &QuickValidationTest,
         &WxorxFullValidationTest,
+        &EarlyBootWxorxHandoffTest,
         &RngEntropyTest,
         &KptrGuardTest,
         &SpectreStatusTest,
@@ -421,6 +422,65 @@ impl SecurityTest for WxorxFullValidationTest {
                 TestResult::Fail("Active page tables violate W^X policy")
             }
             Err(_) => TestResult::Deferred("W^X validation could not complete its page-table walk"),
+        }
+    }
+}
+
+/// U55-6: Verify early-boot (pre-hardening) W^X + cross-alias handoff and
+/// post-cleanup/post-SMP zero low-identity executable pages + CR0.WP + EFER.NXE.
+struct EarlyBootWxorxHandoffTest;
+
+impl SecurityTest for EarlyBootWxorxHandoffTest {
+    fn name(&self) -> &'static str {
+        "early_boot_wxorx_handoff"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify early-boot W^X/alias handoff and zero post-cleanup PML4[0] exec pages (U55-6)"
+    }
+
+    fn run(&self, ctx: &TestContext) -> TestResult {
+        use x86_64::registers::{
+            control::{Cr0, Cr0Flags},
+            model_specific::{Efer, EferFlags},
+        };
+
+        if !Efer::read().contains(EferFlags::NO_EXECUTE_ENABLE) {
+            return TestResult::Fail("IA32_EFER.NXE is not enabled");
+        }
+        if !Cr0::read().contains(Cr0Flags::WRITE_PROTECT) {
+            return TestResult::Fail("CR0.WP is not enabled");
+        }
+
+        let early = crate::early_boot_wxorx_snapshot();
+        if !early.audited {
+            return TestResult::Fail("Early-boot pre-hardening W^X audit did not run");
+        }
+        if early.violations != 0 || early.alias_violations != 0 {
+            return TestResult::Fail("Early-boot handoff had W^X or cross-alias violations");
+        }
+        if early.low_identity_exec_pages > 1 {
+            return TestResult::Fail(
+                "Early-boot handoff exposed more than one executable page in PML4[0]",
+            );
+        }
+
+        match wxorx::validate_active(ctx.phys_offset) {
+            Ok(summary) => {
+                if summary.alias_violations != 0 {
+                    TestResult::Fail("Active page tables have cross-alias W+X violations")
+                } else if summary.low_identity_exec_pages != 0 {
+                    TestResult::Fail("Executable page(s) remain in PML4[0] after boot hardening")
+                } else {
+                    TestResult::Pass
+                }
+            }
+            Err(wxorx::WxorxError::PolicyViolation(_)) => {
+                TestResult::Fail("Active page tables violate W^X or cross-alias policy")
+            }
+            Err(_) => {
+                TestResult::Deferred("W^X handoff validation could not complete page-table walk")
+            }
         }
     }
 }

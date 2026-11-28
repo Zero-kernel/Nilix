@@ -113,13 +113,6 @@ static bss_end: u8 = 0;
 /// VGA MMIO region size (4 KiB)
 const VGA_MMIO_SIZE: usize = 0x1000;
 
-/// SMP trampoline physical address (must match arch/smp.rs TRAMPOLINE_PHYS)
-/// This page needs to remain executable for AP startup.
-const SMP_TRAMPOLINE_PHYS: u64 = 0x8000;
-
-/// SMP trampoline size (covers the code + data area)
-const SMP_TRAMPOLINE_SIZE: usize = 0x1000; // 4KB page
-
 /// Clean up the identity mapping created by the bootloader
 ///
 /// The bootloader creates an identity mapping (physical == virtual) for the
@@ -608,10 +601,14 @@ fn harden_identity_pd_entry(
 
 /// Harden a page table in the identity mapping, preserving MMIO and stack pages
 ///
-/// # L-5 FIX Addendum: SMP Trampoline Handling
+/// # U55-6: Zero Executable Identity Pages After Cleanup
 ///
-/// The SMP trampoline at 0x8000 must remain executable for AP startup.
-/// We mark it read-only (no write) but keep it executable (no NX).
+/// Both the bootloader CR3 transition stub page and the SMP AP trampoline page
+/// (`0x8000`) are hardened to RO+NX here. `arch::smp::start_aps()` transitions
+/// `0x8000` cleanly (`RW+NX` write -> `PML4[511]` RO+NX -> `PML4[0]` R-X ->
+/// `PML4[0]` RO+NX) only when APs actually exist, eliminating any live
+/// writable/executable alias on `0x8000` (and keeping single-core systems
+/// permanently NX across all of `PML4[0]`).
 ///
 /// # L-5 FIX Addendum: Stack Preservation
 ///
@@ -636,17 +633,12 @@ fn harden_identity_pt(pt: &mut PageTable, pd_base: u64, current_rsp: u64) -> usi
                 mmio.insert(PageTableFlags::GLOBAL);
             }
             flags = mmio;
-        } else if is_smp_trampoline_page(page_vaddr) {
-            // SMP trampoline: read-only but MUST remain executable for AP startup
-            // Do NOT add NO_EXECUTE here - APs need to run code from this page
-            flags.remove(PageTableFlags::WRITABLE);
-            // Explicitly do NOT insert NO_EXECUTE
         } else if is_stack_page(page_vaddr, current_rsp) {
             // Stack pages: keep writable but add NX (code shouldn't run from stack)
             flags.insert(PageTableFlags::NO_EXECUTE);
             // Explicitly do NOT remove WRITABLE
         } else {
-            // Normal pages: make read-only, add NX
+            // Normal pages (including bootloader transition stub & 0x8000): RO+NX
             flags.remove(PageTableFlags::WRITABLE);
             flags.insert(PageTableFlags::NO_EXECUTE);
         }
@@ -828,21 +820,6 @@ fn is_mmio_page(vaddr: u64) -> bool {
     }
 
     false
-}
-
-/// Check if a page address is the SMP trampoline page
-///
-/// The SMP trampoline is used to boot Application Processors (APs) and must
-/// remain executable. It's located at a fixed low address (0x8000) because
-/// APs start in real mode and can only address the first 1MB.
-#[inline]
-fn is_smp_trampoline_page(vaddr: u64) -> bool {
-    overlaps(
-        vaddr,
-        vaddr.saturating_add(0x1000),
-        SMP_TRAMPOLINE_PHYS,
-        SMP_TRAMPOLINE_PHYS + SMP_TRAMPOLINE_SIZE as u64,
-    )
 }
 
 /// Check if a 2MB region contains any MMIO address
