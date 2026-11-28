@@ -16,14 +16,10 @@ use x86_64::{
     structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB},
     VirtAddr,
 };
-use xmas_elf::{
-    header::{Class, Machine, Type as ElfType},
-    program::Type as PhType,
-    ElfFile,
-};
 
 // R93-6 FIX: Import cgroup module for memory accounting
 use crate::cgroup;
+use crate::syscall::SyscallError;
 
 /// 用户地址空间起始（4MB）
 ///
@@ -65,15 +61,551 @@ pub const USER_STACK_GUARD_SIZE: usize = 0x1000;
 /// 页大小
 const PAGE_SIZE: usize = 0x1000;
 
-/// R151-2 FIX: Maximum pages per single ELF PT_LOAD segment.
+/// N2.1: Maximum executable image size accepted by `execve(59)` and `spawn_image(517)`.
 ///
-/// Caps attacker-controlled `p_memsz` to bound kernel heap usage when tracking
-/// mapped pages. 256 pages × 4 KiB = 1 MiB maximum per segment. Each
-/// MappedEntry is 16 bytes, so 256 entries = 4 KiB — well within heap budget.
-const MAX_ELF_SEGMENT_PAGES: usize = 256;
+/// Raised from 256 KiB to 16 MiB by backing images larger than
+/// `EXEC_IMAGE_HEAP_FAST_BYTES` with physical 4 KiB frames (`ExecImage::Paged`),
+/// keeping kernel heap usage bounded to ~32 KiB of frame descriptors for a full
+/// 16 MiB static binary (such as unmodified static BusyBox).
+pub const MAX_EXEC_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Z-10 fix: 页映射记录类型，用于失败时统一回滚
-type MappedEntry = (Page<Size4KiB>, PhysFrame<Size4KiB>);
+/// Small-image threshold that stays on the kernel heap before spilling to
+/// physical 4 KiB frames (`ExecImage::Paged`). Fits easily inside the 2 MiB
+/// kernel heap alongside argv/envp/stack staging.
+pub const EXEC_IMAGE_HEAP_FAST_BYTES: usize = 64 * 1024;
+
+/// N2.1: Maximum pages per single ELF `PT_LOAD` segment.
+///
+/// Raised from 256 pages (1 MiB) to 4096 pages (16 MiB). Rollback tracking now
+/// records one `MappedRange` per segment (O(segments), <= 528 bytes total)
+/// instead of a per-page `Vec<(Page, PhysFrame)>`, eliminating the heap pressure
+/// that originally forced the 1 MiB cap.
+pub const MAX_ELF_SEGMENT_PAGES: usize = 4096;
+
+/// N2.1: Aggregate ceiling on mapped `PT_LOAD` pages across all segments in one
+/// ELF binary (8192 pages = 32 MiB) so a crafted binary with `MAX_ELF_LOAD_SEGMENTS`
+/// max-sized segments cannot exhaust physical memory in a single exec.
+pub const MAX_ELF_TOTAL_PAGES: usize = 8192;
+
+/// Maximum `PT_LOAD` segments permitted in one ELF binary.
+pub const MAX_ELF_LOAD_SEGMENTS: usize = 32;
+
+/// ELF64 ABI constants used by the panic-free direct header/phdr parser.
+const ELF64_EHDR_SIZE: usize = 64;
+const ELF64_PHDR_SIZE: usize = 56;
+const ELF64_CLASS_64: u8 = 2;
+const ELF64_DATA_LSB: u8 = 1;
+const ELF64_ET_EXEC: u16 = 2;
+const ELF64_EM_X86_64: u16 = 62;
+const ELF64_PT_LOAD: u32 = 1;
+const ELF64_PT_PHDR: u32 = 6;
+const ELF64_PF_X: u32 = 1;
+const ELF64_PF_W: u32 = 2;
+
+/// Z-10 / N2.1: O(segments) mapped-range record used for rollback on ELF load
+/// failure. Each entry covers `[page_base, page_base + page_count * PAGE_SIZE)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MappedRange {
+    page_base: usize,
+    page_count: usize,
+}
+
+/// N2.1: Executable image buffer backing `execve(59)` and `spawn_image(517)`.
+///
+/// Images up to `EXEC_IMAGE_HEAP_FAST_BYTES` (64 KiB) use a regular heap `Vec<u8>`.
+/// Larger images up to `MAX_EXEC_IMAGE_BYTES` (16 MiB) are backed by individual
+/// 4 KiB physical frames (`Paged`), consuming only 8 bytes of kernel heap per
+/// 4 KiB page and requiring zero contiguous physical memory.
+pub enum ExecImage {
+    Heap(Vec<u8>),
+    Paged {
+        frames: Vec<PhysFrame<Size4KiB>>,
+        len: usize,
+    },
+}
+
+impl core::fmt::Debug for ExecImage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Heap(v) => f
+                .debug_struct("ExecImage::Heap")
+                .field("len", &v.len())
+                .finish(),
+            Self::Paged { frames, len } => f
+                .debug_struct("ExecImage::Paged")
+                .field("len", len)
+                .field("frames", &frames.len())
+                .finish(),
+        }
+    }
+}
+
+impl Default for ExecImage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecImage {
+    /// Create an empty executable image buffer.
+    #[inline]
+    pub const fn new() -> Self {
+        Self::Heap(Vec::new())
+    }
+
+    /// Wrap an existing heap byte vector as an `ExecImage`.
+    #[inline]
+    pub const fn from_vec(bytes: Vec<u8>) -> Self {
+        Self::Heap(bytes)
+    }
+
+    /// Total byte length of the image.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Heap(v) => v.len(),
+            Self::Paged { len, .. } => *len,
+        }
+    }
+
+    /// True if the image contains zero bytes.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// True if backed by physical 4 KiB frames instead of the kernel heap.
+    #[inline]
+    pub fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged { .. })
+    }
+
+    /// Zero-copy slice of up to `min(max_len, PAGE_SIZE, self.len())` leading bytes.
+    ///
+    /// Covers ELF magic (`\x7FELF`), shebang (`#!` up to 256 B), and the LSM
+    /// `EXEC_HASH_WINDOW` (4096 B) without allocating or copying.
+    pub fn prefix_slice(&self, max_len: usize) -> &[u8] {
+        let want = cmp::min(self.len(), cmp::min(max_len, PAGE_SIZE));
+        if want == 0 {
+            return &[];
+        }
+        match self {
+            Self::Heap(v) => &v[..want],
+            Self::Paged { frames, .. } => {
+                let first = frames[0];
+                // SAFETY: frame 0 is owned by `self` for the lifetime of `&self`
+                // and mapped through the direct physical map.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        phys_to_virt(first.start_address()).as_ptr::<u8>(),
+                        want,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Bounds-checked read of `dst.len()` bytes starting at `offset`.
+    pub fn read_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), ElfLoadError> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or(ElfLoadError::OutOfBounds)?;
+        if end > self.len() {
+            return Err(ElfLoadError::OutOfBounds);
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::Heap(v) => {
+                dst.copy_from_slice(&v[offset..end]);
+                Ok(())
+            }
+            Self::Paged { frames, .. } => {
+                let mut pos = offset;
+                let mut written = 0usize;
+                while written < dst.len() {
+                    let page_idx = pos / PAGE_SIZE;
+                    let page_off = pos % PAGE_SIZE;
+                    let copy_len = cmp::min(PAGE_SIZE - page_off, dst.len() - written);
+                    let frame = *frames.get(page_idx).ok_or(ElfLoadError::OutOfBounds)?;
+                    // SAFETY: `frame` is owned by `self` and `page_off + copy_len <= PAGE_SIZE`.
+                    unsafe {
+                        let src = phys_to_virt(frame.start_address())
+                            .as_ptr::<u8>()
+                            .add(page_off);
+                        ptr::copy_nonoverlapping(src, dst.as_mut_ptr().add(written), copy_len);
+                    }
+                    pos += copy_len;
+                    written += copy_len;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Append `chunk` to this image, enforcing `max_len` (`E2BIG`) and spilling
+    /// transparently to physical 4 KiB frames above `EXEC_IMAGE_HEAP_FAST_BYTES`.
+    pub fn try_append(&mut self, chunk: &[u8], max_len: usize) -> Result<(), SyscallError> {
+        let cur_len = self.len();
+        let new_len = cur_len
+            .checked_add(chunk.len())
+            .ok_or(SyscallError::E2BIG)?;
+        if new_len > max_len {
+            return Err(SyscallError::E2BIG);
+        }
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(any(test, feature = "host_harness"))]
+        {
+            match self {
+                Self::Heap(v) => {
+                    v.try_reserve(chunk.len())
+                        .map_err(|_| SyscallError::ENOMEM)?;
+                    v.extend_from_slice(chunk);
+                    Ok(())
+                }
+                Self::Paged { .. } => Err(SyscallError::ENOMEM),
+            }
+        }
+
+        #[cfg(not(any(test, feature = "host_harness")))]
+        {
+            if matches!(self, Self::Heap(_)) && new_len <= EXEC_IMAGE_HEAP_FAST_BYTES {
+                if let Self::Heap(v) = self {
+                    v.try_reserve(chunk.len())
+                        .map_err(|_| SyscallError::ENOMEM)?;
+                    v.extend_from_slice(chunk);
+                    return Ok(());
+                }
+            }
+
+            if let Self::Heap(v) = self {
+                let mut paged = Self::Paged {
+                    frames: Vec::new(),
+                    len: 0,
+                };
+                if !v.is_empty() {
+                    paged.append_to_paged(v)?;
+                }
+                *self = paged;
+            }
+            self.append_to_paged(chunk)
+        }
+    }
+
+    /// Construct an `ExecImage` of exact size `len` by pulling chunks from
+    /// `fill_chunk(offset, dst)`. Spills directly to physical frames above
+    /// `EXEC_IMAGE_HEAP_FAST_BYTES` so large `spawn_image` calls never touch the
+    /// 2 MiB kernel heap for payload bytes.
+    pub fn try_from_reader<F>(
+        len: usize,
+        max_len: usize,
+        mut fill_chunk: F,
+    ) -> Result<Self, SyscallError>
+    where
+        F: FnMut(usize, &mut [u8]) -> Result<(), SyscallError>,
+    {
+        if len > max_len {
+            return Err(SyscallError::E2BIG);
+        }
+        if len == 0 {
+            return Ok(Self::new());
+        }
+
+        #[cfg(not(any(test, feature = "host_harness")))]
+        if len > EXEC_IMAGE_HEAP_FAST_BYTES {
+            let needed_frames = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+            let mut img = Self::Paged {
+                frames: Vec::new(),
+                len: 0,
+            };
+            img.reserve_paged_frames(needed_frames)?;
+            if let Self::Paged {
+                ref frames,
+                len: ref mut img_len,
+            } = img
+            {
+                for (page_idx, frame) in frames.iter().enumerate() {
+                    let off = page_idx * PAGE_SIZE;
+                    let chunk_len = cmp::min(PAGE_SIZE, len - off);
+                    // SAFETY: frame is freshly allocated and exclusively owned by `img`.
+                    let dst = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            phys_to_virt(frame.start_address()).as_mut_ptr::<u8>(),
+                            chunk_len,
+                        )
+                    };
+                    fill_chunk(off, dst)?;
+                    *img_len = off + chunk_len;
+                }
+            }
+            return Ok(img);
+        }
+
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len)
+            .map_err(|_| SyscallError::ENOMEM)?;
+        buf.resize(len, 0);
+        fill_chunk(0, &mut buf)?;
+        Ok(Self::Heap(buf))
+    }
+
+    #[cfg(not(any(test, feature = "host_harness")))]
+    fn reserve_paged_frames(&mut self, needed_frames: usize) -> Result<(), SyscallError> {
+        let Self::Paged { frames, .. } = self else {
+            return Err(SyscallError::EINVAL);
+        };
+        if frames.len() >= needed_frames {
+            return Ok(());
+        }
+        frames
+            .try_reserve(needed_frames - frames.len())
+            .map_err(|_| SyscallError::ENOMEM)?;
+        let mut batch = [PhysFrame::containing_address(x86_64::PhysAddr::new(0)); 32];
+        while frames.len() < needed_frames {
+            let want = cmp::min(batch.len(), needed_frames - frames.len());
+            let got = mm::buddy_allocator::alloc_physical_pages_batch(&mut batch[..want]);
+            if got == 0 {
+                return Err(SyscallError::ENOMEM);
+            }
+            frames.extend_from_slice(&batch[..got]);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "host_harness")))]
+    fn append_to_paged(&mut self, chunk: &[u8]) -> Result<(), SyscallError> {
+        let cur_len = self.len();
+        let new_len = cur_len
+            .checked_add(chunk.len())
+            .ok_or(SyscallError::E2BIG)?;
+        let needed_frames = (new_len + PAGE_SIZE - 1) / PAGE_SIZE;
+        self.reserve_paged_frames(needed_frames)?;
+        if let Self::Paged { frames, len } = self {
+            let mut pos = *len;
+            let mut written = 0usize;
+            while written < chunk.len() {
+                let page_idx = pos / PAGE_SIZE;
+                let page_off = pos % PAGE_SIZE;
+                let copy_len = cmp::min(PAGE_SIZE - page_off, chunk.len() - written);
+                let frame = frames[page_idx];
+                // SAFETY: `frame` is owned by `self` and `page_off + copy_len <= PAGE_SIZE`.
+                unsafe {
+                    let dst = phys_to_virt(frame.start_address())
+                        .as_mut_ptr::<u8>()
+                        .add(page_off);
+                    ptr::copy_nonoverlapping(chunk.as_ptr().add(written), dst, copy_len);
+                }
+                pos += copy_len;
+                written += copy_len;
+            }
+            *len = new_len;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExecImage {
+    fn drop(&mut self) {
+        if let Self::Paged { frames, .. } = self {
+            #[cfg(not(any(test, feature = "host_harness")))]
+            if !frames.is_empty() {
+                mm::buddy_allocator::free_physical_pages_batch(frames);
+            }
+            frames.clear();
+        }
+    }
+}
+
+/// Abstract read-only view over an ELF image (contiguous slice or frame-backed `ExecImage`).
+trait ElfImageSource {
+    fn len(&self) -> usize;
+    fn read_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), ElfLoadError>;
+    /// Optional raw base address alignment check for contiguous byte slices (R172-02 parity).
+    fn base_align_mod8(&self) -> usize {
+        0
+    }
+}
+
+impl ElfImageSource for [u8] {
+    #[inline]
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    #[inline]
+    fn read_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), ElfLoadError> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or(ElfLoadError::OutOfBounds)?;
+        let src = self.get(offset..end).ok_or(ElfLoadError::OutOfBounds)?;
+        dst.copy_from_slice(src);
+        Ok(())
+    }
+
+    #[inline]
+    fn base_align_mod8(&self) -> usize {
+        (self.as_ptr() as usize) & 7
+    }
+}
+
+impl ElfImageSource for ExecImage {
+    #[inline]
+    fn len(&self) -> usize {
+        ExecImage::len(self)
+    }
+
+    #[inline]
+    fn read_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), ElfLoadError> {
+        ExecImage::read_at(self, offset, dst)
+    }
+}
+
+/// Parsed fields of an ELF64 executable header.
+#[derive(Debug, Clone, Copy)]
+struct Elf64Header {
+    entry: u64,
+    phoff: u64,
+    phentsize: u16,
+    phnum: u16,
+}
+
+/// Parsed fields of an ELF64 program header entry.
+#[derive(Debug, Clone, Copy)]
+struct Elf64Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+}
+
+impl Elf64Phdr {
+    #[inline]
+    const fn is_write(self) -> bool {
+        (self.p_flags & ELF64_PF_W) != 0
+    }
+
+    #[inline]
+    const fn is_execute(self) -> bool {
+        (self.p_flags & ELF64_PF_X) != 0
+    }
+}
+
+fn parse_and_validate_elf64_header<S: ElfImageSource + ?Sized>(
+    source: &S,
+) -> Result<Elf64Header, ElfLoadError> {
+    let mut hdr = [0u8; ELF64_EHDR_SIZE];
+    source
+        .read_at(0, &mut hdr)
+        .map_err(|_| ElfLoadError::InvalidMagic)?;
+
+    if hdr[0..4] != [0x7F, b'E', b'L', b'F'] {
+        return Err(ElfLoadError::InvalidMagic);
+    }
+    if hdr[4] != ELF64_CLASS_64 {
+        return Err(ElfLoadError::UnsupportedClass);
+    }
+    if hdr[5] != ELF64_DATA_LSB {
+        return Err(ElfLoadError::NotLittleEndian);
+    }
+
+    let e_type = u16::from_le_bytes([hdr[16], hdr[17]]);
+    let e_machine = u16::from_le_bytes([hdr[18], hdr[19]]);
+    if e_machine != ELF64_EM_X86_64 {
+        return Err(ElfLoadError::UnsupportedMachine);
+    }
+    if e_type != ELF64_ET_EXEC {
+        return Err(ElfLoadError::UnsupportedType);
+    }
+
+    let entry = u64::from_le_bytes([
+        hdr[24], hdr[25], hdr[26], hdr[27], hdr[28], hdr[29], hdr[30], hdr[31],
+    ]);
+    let phoff = u64::from_le_bytes([
+        hdr[32], hdr[33], hdr[34], hdr[35], hdr[36], hdr[37], hdr[38], hdr[39],
+    ]);
+    let phentsize = u16::from_le_bytes([hdr[54], hdr[55]]);
+    let phnum = u16::from_le_bytes([hdr[56], hdr[57]]);
+
+    // R172-02 FIX: bound and 8-byte align the program-header table before
+    // iterating program headers.
+    if phnum != 0 {
+        if phentsize as usize != ELF64_PHDR_SIZE {
+            return Err(ElfLoadError::OutOfBounds);
+        }
+        let table_bytes = (phnum as u64)
+            .checked_mul(ELF64_PHDR_SIZE as u64)
+            .ok_or(ElfLoadError::OutOfBounds)?;
+        let table_end = phoff
+            .checked_add(table_bytes)
+            .ok_or(ElfLoadError::OutOfBounds)?;
+        if table_end > source.len() as u64 {
+            return Err(ElfLoadError::OutOfBounds);
+        }
+        if ((source.base_align_mod8()).wrapping_add(phoff as usize)) & 7 != 0 {
+            return Err(ElfLoadError::OutOfBounds);
+        }
+    }
+
+    Ok(Elf64Header {
+        entry,
+        phoff,
+        phentsize,
+        phnum,
+    })
+}
+
+fn read_elf64_phdr<S: ElfImageSource + ?Sized>(
+    source: &S,
+    hdr: &Elf64Header,
+    index: u16,
+) -> Result<Elf64Phdr, ElfLoadError> {
+    let off = hdr
+        .phoff
+        .checked_add((index as u64) * (ELF64_PHDR_SIZE as u64))
+        .ok_or(ElfLoadError::OutOfBounds)? as usize;
+    let mut raw = [0u8; ELF64_PHDR_SIZE];
+    source.read_at(off, &mut raw)?;
+    Ok(Elf64Phdr {
+        p_type: u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        p_flags: u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+        p_offset: u64::from_le_bytes([
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+        ]),
+        p_vaddr: u64::from_le_bytes([
+            raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+        ]),
+        p_filesz: u64::from_le_bytes([
+            raw[32], raw[33], raw[34], raw[35], raw[36], raw[37], raw[38], raw[39],
+        ]),
+        p_memsz: u64::from_le_bytes([
+            raw[40], raw[41], raw[42], raw[43], raw[44], raw[45], raw[46], raw[47],
+        ]),
+    })
+}
+
+/// Pure segment-budget policy helper (unit-testable on host without page tables).
+#[inline]
+pub(crate) fn check_segment_page_budget(
+    segment_pages: usize,
+    accumulated_pages: usize,
+) -> Result<usize, ElfLoadError> {
+    if segment_pages > MAX_ELF_SEGMENT_PAGES {
+        return Err(ElfLoadError::SegmentOutOfRange);
+    }
+    let next_total = accumulated_pages
+        .checked_add(segment_pages)
+        .ok_or(ElfLoadError::SegmentOutOfRange)?;
+    if next_total > MAX_ELF_TOTAL_PAGES {
+        return Err(ElfLoadError::SegmentOutOfRange);
+    }
+    Ok(next_total)
+}
 
 /// ELF 加载错误
 #[derive(Debug, Clone, Copy)]
@@ -164,56 +696,43 @@ pub struct ElfLoadResult {
 ///
 /// 成功返回入口点和用户栈顶，失败返回错误码
 pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResult, ElfLoadError> {
-    let elf = ElfFile::new(image).map_err(|_| ElfLoadError::InvalidMagic)?;
+    load_elf_source(image, cgroup_id)
+}
 
-    // 验证 ELF 头
-    validate_elf_header(&elf)?;
+/// N2.1: Load an ELF64 executable from an [`ExecImage`] (either heap-backed or
+/// physical-frame-backed up to `MAX_EXEC_IMAGE_BYTES` = 16 MiB).
+pub fn load_elf_image(
+    image: &ExecImage,
+    cgroup_id: cgroup::CgroupId,
+) -> Result<ElfLoadResult, ElfLoadError> {
+    load_elf_source(image, cgroup_id)
+}
 
-    // R149-3 FIX: Use caller-provided cgroup_id instead of re-reading via
-    // current_cgroup_id(). sys_exec captures this under the process lock and
-    // passes it here, eliminating the TOCTOU gap where concurrent cgroup
-    // migration could cause the ExecSpaceGuard to uncharge the wrong cgroup.
+fn load_elf_source<S: ElfImageSource + ?Sized>(
+    source: &S,
+    cgroup_id: cgroup::CgroupId,
+) -> Result<ElfLoadResult, ElfLoadError> {
+    let hdr = parse_and_validate_elf64_header(source)?;
 
-    // Z-10 fix: 追踪所有已映射的页，用于失败时统一回滚
-    // 这确保如果段 N 失败，段 0..N-1 的映射也会被清理
-    //
-    // 【性能优化】预分配容量避免动态扩容导致的堆分配
-    // 估算：典型 ELF 约 10 个 LOAD 段 + 512 页用户栈
-    // 每段平均 10 页 = 100 页 + 512 = ~612 页
-    // 使用 1024 作为合理上限，避免堆碎片化
-    // R154-14 FIX: Use fallible allocation to avoid panic on heap exhaustion.
-    // Start with empty Vec; load_segment_tracked uses try_reserve internally.
-    let mut all_mappings: Vec<MappedEntry> = Vec::new();
-
-    // 追踪所有段的最高地址，用于计算 brk_start
+    // Z-10 / N2.1: Track mapped page ranges (O(segments), <= 33 entries = 528 B)
+    // for rollback on any error, eliminating per-page heap tracking vectors.
+    let mut all_mappings: Vec<MappedRange> = Vec::new();
     let mut highest_segment_end: usize = 0;
-
-    // R125-1 FIX: Accumulate total cgroup-charged bytes across all segments
-    // and the user stack.  Returned in ElfLoadResult so the caller can
-    // uncharge on exec rollback (ExecSpaceGuard::drop).
     let mut charged_bytes: u64 = 0;
-
-    // M2-1 SLICE-4d: accumulate the intermediate PT/PD/PDPT frame identities each helper
-    // records for this fresh AS (segments + stack). sys_exec folds them into the new AS
-    // ledger + a forced PT-kmem charge at the success commit. Bounded by
-    // MAX_ELF_LOAD_SEGMENTS x MAX_ELF_SEGMENT_PAGES; grown fallibly (try_reserve) below.
     let mut pt_frames_acc: Vec<PhysFrame<Size4KiB>> = Vec::new();
-
-    // R154-5 FIX: Limit PT_LOAD segment count to prevent DoS via crafted ELF
-    // with thousands of tiny segments (e_phnum allows up to 65535). Each segment
-    // triggers cgroup charge, heap growth, PT mapping, and TLB flush.
-    const MAX_ELF_LOAD_SEGMENTS: usize = 32;
     let mut load_segment_count: usize = 0;
+    let mut total_segment_pages: usize = 0;
+    let mut loaded_ranges: Vec<(usize, usize)> = Vec::new();
 
-    // R154-12 FIX: Track loaded segment vaddr ranges to detect overlaps.
-    // A malicious ELF with overlapping PT_LOAD segments could cause double-map
-    // of the same virtual pages, leading to cgroup charge confusion, stale TLB
-    // entries, or data corruption from a later segment overwriting an earlier one.
-    let mut loaded_ranges: Vec<(usize, usize)> = Vec::new(); // (start, end) pairs
-
-    // 加载所有 PT_LOAD 段
-    for ph in elf.program_iter() {
-        if ph.get_type() == Ok(PhType::Load) {
+    for idx in 0..hdr.phnum {
+        let ph = match read_elf64_phdr(source, &hdr, idx) {
+            Ok(p) => p,
+            Err(e) => {
+                rollback_all_mappings(&mut all_mappings, cgroup_id);
+                return Err(e);
+            }
+        };
+        if ph.p_type == ELF64_PT_LOAD {
             load_segment_count += 1;
             if load_segment_count > MAX_ELF_LOAD_SEGMENTS {
                 klog!(
@@ -226,22 +745,12 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                 return Err(ElfLoadError::TooManySegments);
             }
 
-            // 计算段结束地址
-            let vaddr = ph.virtual_addr() as usize;
-            let memsz = ph.mem_size() as usize;
+            let vaddr = ph.p_vaddr as usize;
+            let memsz = ph.p_memsz as usize;
             if memsz > 0 {
-                // R155-16 FIX: Use checked_add instead of saturating_add.
-                // saturating_add silently clamps to usize::MAX on overflow,
-                // producing a bogus segment_end that passes overlap checks
-                // and causes incorrect page mappings. Return an error instead.
                 let segment_end = match vaddr.checked_add(memsz) {
                     Some(end) => end,
                     None => {
-                        // R165-12 FIX: Debug, not Error — these messages echo
-                        // attacker-controlled ELF virtual addresses; emitting them
-                        // at Error level leaks address-layout info (and lets an
-                        // unprivileged user flood the log) in Balanced/Performance
-                        // profiles. The syscall still returns the error to userspace.
                         klog!(
                             Debug,
                             "ELF loader: PT_LOAD segment vaddr {:#x} + memsz {:#x} overflows",
@@ -253,22 +762,13 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                     }
                 };
 
-                // R154-12 + R160-I1 FIX: Check overlap using page-aligned ranges.
-                // Two segments with non-overlapping byte ranges may share the same
-                // page, causing map_page to fail with PageAlreadyMapped. Aligning
-                // to page boundaries catches this at validation time.
                 let page_mask: usize = 0xFFF;
                 let page_start = vaddr & !page_mask;
-                // R165-13 FIX: saturating_add for the page-align-up. segment_end
-                // (= vaddr + memsz) is already overflow-checked above, but a VA at
-                // the very top of the address space could still overflow when
-                // adding page_mask, panicking in debug builds on a crafted ELF.
                 let page_end = segment_end.saturating_add(page_mask) & !page_mask;
                 for &(prev_start, prev_end) in loaded_ranges.iter() {
                     let prev_page_start = prev_start & !page_mask;
                     let prev_page_end = prev_end.saturating_add(page_mask) & !page_mask;
                     if page_start < prev_page_end && prev_page_start < page_end {
-                        // R165-12 FIX: Debug, not Error — attacker-controlled VAs.
                         klog!(Debug,
                             "ELF loader: PT_LOAD segment [{:#x}, {:#x}) overlaps with [{:#x}, {:#x}) at page level",
                             vaddr, segment_end, prev_start, prev_end
@@ -277,7 +777,6 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                         return Err(ElfLoadError::OverlappingSegments);
                     }
                 }
-                // R156-13 FIX: Fallible push for consistency with tracked.try_reserve.
                 if loaded_ranges.try_reserve(1).is_err() {
                     rollback_all_mappings(&mut all_mappings, cgroup_id);
                     return Err(ElfLoadError::OutOfMemory);
@@ -289,18 +788,21 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                 }
             }
 
-            let (seg_charged, seg_pt) =
-                match load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        rollback_all_mappings(&mut all_mappings, cgroup_id);
-                        return Err(e);
-                    }
-                };
+            let (seg_charged, seg_pages, seg_pt) = match load_segment_tracked(
+                source,
+                &ph,
+                total_segment_pages,
+                &mut all_mappings,
+                cgroup_id,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    rollback_all_mappings(&mut all_mappings, cgroup_id);
+                    return Err(e);
+                }
+            };
+            total_segment_pages = total_segment_pages.saturating_add(seg_pages);
             charged_bytes = charged_bytes.saturating_add(seg_charged);
-            // M2-1 SLICE-4d: fold this segment's recorded PT frames into the accumulator
-            // (fallible — on OOM tear down the partial AS and fail, mirroring load_elf's
-            // other try_reserve sites).
             if pt_frames_acc.try_reserve(seg_pt.len()).is_err() {
                 rollback_all_mappings(&mut all_mappings, cgroup_id);
                 return Err(ElfLoadError::OutOfMemory);
@@ -309,7 +811,6 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         }
     }
 
-    // 分配用户栈
     let (stack_charged, stack_pt) = match allocate_user_stack_tracked(&mut all_mappings, cgroup_id)
     {
         Ok(v) => v,
@@ -319,30 +820,15 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         }
     };
     charged_bytes = charged_bytes.saturating_add(stack_charged);
-    // M2-1 SLICE-4d: fold the user stack's recorded PT frames into the accumulator.
     if pt_frames_acc.try_reserve(stack_pt.len()).is_err() {
         rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::OutOfMemory);
     }
     pt_frames_acc.extend(stack_pt);
 
-    // 计算 brk_start：段末尾向上对齐到页边界
     let brk_start = (highest_segment_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-    // 验证 brk_start 不与栈区域重叠
-    // 栈区域：[USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP)
-    // NOTE: this is the ARCHITECTURAL window base (incl. the M0-7 low guard page); brk
-    // must stay below the WHOLE window, so the guard is brk-safe by this very check.
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
-    // R172-26 FIX: strict `>` (half-open window), single-sourced via user_stack_window(). The
-    // old `>=` was one page over-conservative: brk_start == stack_base is an EMPTY heap abutting
-    // the window (zero overlap), and the first non-empty grow is independently rejected at
-    // runtime by the strict `>` brk gate (syscall.rs). Aligning here removes the load-time vs
-    // runtime boundary disagreement. `stack_base` (== user_stack_window().0) is kept for the log.
     if brk_start > user_stack_window().0 {
-        // R165-12 FIX: Debug, not Error — keep this user VA out of production logs.
-        // (USER_STACK_TOP is a FIXED constant; there is NO user-stack ASLR in M0, so
-        // `stack_base` is deterministic — Debug here is log hygiene, not ASLR.)
         klog!(
             Debug,
             "ELF loader: brk_start 0x{:x} overlaps with stack at 0x{:x}",
@@ -353,20 +839,14 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         return Err(ElfLoadError::OverlapWithStack);
     }
 
-    // R105-2 FIX: Diagnostic address log moved to debug-gated kprintln!.
-    // These are user-space VAs (not kernel), but still should not appear in
-    // production logs to avoid aiding ROP/JOP gadget searches.
     kprintln!(
         "ELF loaded: entry=0x{:x}, brk_start=0x{:x}",
-        elf.header.pt2.entry_point(),
+        hdr.entry,
         brk_start
     );
 
-    // R24-9 fix: 验证入口点地址是 canonical 且在用户空间范围内
-    // 防止恶意 ELF 设置内核地址或非法地址导致 #GP 或代码执行到错误位置
-    let entry = elf.header.pt2.entry_point();
+    let entry = hdr.entry;
     if entry < USER_BASE as u64 || entry >= USER_STACK_TOP {
-        // R165-12 FIX: Debug, not Error — echoes an attacker-controlled VA.
         klog!(
             Debug,
             "ELF loader: invalid entry point 0x{:x} (valid range: 0x{:x}-0x{:x})",
@@ -377,24 +857,17 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::SegmentOutOfRange);
     }
-    // 验证 canonical（虽然上面的范围检查已经隐含了这一点，但显式检查更安全）
     let sign_extended = ((entry as i64) >> 47) as u64;
     if sign_extended != 0 && sign_extended != 0x1FFFF {
-        // R163-22 FIX: Use Debug level — Error would expose attacker-controlled
-        // values in production logs (PO-8 / INV-11 compliance).
         klog!(Debug, "ELF loader: non-canonical entry point");
         rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::SegmentOutOfRange);
     }
 
-    // R162-23 FIX: Verify entry point falls within a loaded PT_LOAD segment.
-    // A crafted ELF could set e_entry to an unmapped gap between segments,
-    // causing the process to fault immediately on execution.
     let entry_in_segment = loaded_ranges
         .iter()
         .any(|&(start, end)| (entry as usize) >= start && (entry as usize) < end);
     if !entry_in_segment {
-        // R165-12 FIX: Debug, not Error — echoes an attacker-controlled VA.
         klog!(
             Debug,
             "ELF loader: entry point 0x{:x} not within any loaded segment",
@@ -404,27 +877,16 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         return Err(ElfLoadError::SegmentOutOfRange);
     }
 
-    // 【修复】初始 RSP 必须在已映射的栈页内
-    // 栈分配从 (USER_STACK_TOP - USER_STACK_SIZE) 到 USER_STACK_TOP
-    // 但 USER_STACK_TOP 所在的页边界不在映射范围内
-    // 设置 RSP 为最后一个映射页的顶部，减去 16 字节确保 ABI 16字节对齐
     let initial_rsp = USER_STACK_TOP - 16;
-
-    // M0 #1 (auxv): capture program-header info for the SysV auxiliary vector.
-    // `phent`/`phnum` are unconditional header reads; `phdr` (AT_PHDR) uses the
-    // two-tier PT_PHDR / covering-PT_LOAD computation (0 = "omit the triple").
-    // `elf` is borrowed for the whole function, so reading it here is safe.
-    let phdr = compute_phdr_va(&elf);
-    let phent = elf.header.pt2.ph_entry_size();
-    let phnum = elf.header.pt2.ph_count();
+    let phdr = compute_phdr_va_from_source(source, &hdr);
+    let phent = hdr.phentsize;
+    let phnum = hdr.phnum;
 
     Ok(ElfLoadResult {
         entry,
         user_stack_top: initial_rsp,
         brk_start,
         charged_bytes,
-        // M2-1 SLICE-4d: the recorded PT/PD/PDPT frames sys_exec folds into the fresh AS
-        // ledger + a forced PT-kmem charge at the success commit.
         pt_frames: pt_frames_acc,
         phdr,
         phent,
@@ -457,43 +919,39 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
 /// `ET_DYN` is rejected by [`validate_elf_header`], so the load bias is always `0` for
 /// accepted images; if PIE support is added, this is the single site that needs
 /// `+ load_bias`.
-fn compute_phdr_va(elf: &ElfFile) -> u64 {
-    // Program-header table size in bytes (e_phentsize * e_phnum).
-    let e_phoff = elf.header.pt2.ph_offset();
-    let table_bytes = match (elf.header.pt2.ph_entry_size() as u64)
-        .checked_mul(elf.header.pt2.ph_count() as u64)
-    {
+fn compute_phdr_va_from_source<S: ElfImageSource + ?Sized>(source: &S, hdr: &Elf64Header) -> u64 {
+    let e_phoff = hdr.phoff;
+    let table_bytes = match (hdr.phentsize as u64).checked_mul(hdr.phnum as u64) {
         Some(b) if b != 0 => b,
-        _ => return 0, // no program headers (or overflow): omit the triple.
+        _ => return 0,
     };
 
-    // --- Step 1: derive a CANDIDATE user VA for the phdr table. ---
     let mut candidate: u64 = 0;
-    // Tier 1: explicit PT_PHDR.
-    for ph in elf.program_iter() {
-        if ph.get_type() == Ok(PhType::Phdr) {
-            candidate = ph.virtual_addr();
+    for idx in 0..hdr.phnum {
+        let Ok(ph) = read_elf64_phdr(source, hdr, idx) else {
+            return 0;
+        };
+        if ph.p_type == ELF64_PT_PHDR {
+            candidate = ph.p_vaddr;
             break;
         }
     }
-    // Tier 2: the PT_LOAD that file-backs the ENTIRE table.
     if candidate == 0 {
         if let Some(table_end) = e_phoff.checked_add(table_bytes) {
-            for ph in elf.program_iter() {
-                if ph.get_type() != Ok(PhType::Load) {
+            for idx in 0..hdr.phnum {
+                let Ok(ph) = read_elf64_phdr(source, hdr, idx) else {
+                    return 0;
+                };
+                if ph.p_type != ELF64_PT_LOAD {
                     continue;
                 }
-                let seg_off = ph.offset();
-                let seg_file_end = match seg_off.checked_add(ph.file_size()) {
+                let seg_off = ph.p_offset;
+                let seg_file_end = match seg_off.checked_add(ph.p_filesz) {
                     Some(e) => e,
                     None => continue,
                 };
-                // [e_phoff, table_end) ⊆ [seg_off, seg_file_end).
                 if seg_off <= e_phoff && table_end <= seg_file_end {
-                    candidate = ph
-                        .virtual_addr()
-                        .checked_add(e_phoff - seg_off)
-                        .unwrap_or(0);
+                    candidate = ph.p_vaddr.checked_add(e_phoff - seg_off).unwrap_or(0);
                     break;
                 }
             }
@@ -503,235 +961,114 @@ fn compute_phdr_va(elf: &ElfFile) -> u64 {
         return 0;
     }
 
-    // --- Step 2: VALIDATE the candidate against file-backed PT_LOAD coverage + user
-    // bounds. Reject (return 0) anything outside, so AT_PHDR is always a real user VA. ---
     let cand_end = match candidate.checked_add(table_bytes) {
         Some(e) => e,
         None => return 0,
     };
     let user_floor = USER_BASE as u64;
-    // R172-X-F2: route the last guard-INCLUSIVE re-derivation through the single source
-    // (algebraically identical to USER_STACK_TOP - USER_STACK_SIZE).
-    let user_ceiling = user_stack_window().0 as u64; // strictly below the stack.
+    let user_ceiling = user_stack_window().0 as u64;
     if candidate < user_floor || cand_end > user_ceiling {
         return 0;
     }
-    for ph in elf.program_iter() {
-        if ph.get_type() != Ok(PhType::Load) {
+    for idx in 0..hdr.phnum {
+        let Ok(ph) = read_elf64_phdr(source, hdr, idx) else {
+            return 0;
+        };
+        if ph.p_type != ELF64_PT_LOAD {
             continue;
         }
-        let seg_va = ph.virtual_addr();
-        let seg_va_file_end = match seg_va.checked_add(ph.file_size()) {
+        let seg_va = ph.p_vaddr;
+        let seg_va_file_end = match seg_va.checked_add(ph.p_filesz) {
             Some(e) => e,
             None => continue,
         };
-        // Whole table VA range must be inside this segment's FILE-backed VA range.
         if seg_va <= candidate && cand_end <= seg_va_file_end {
             return candidate;
         }
     }
 
-    // Candidate not covered by any file-backed PT_LOAD VA range: omit.
     0
 }
 
-/// 验证 ELF 头
-fn validate_elf_header(elf: &ElfFile) -> Result<(), ElfLoadError> {
-    let hdr = &elf.header;
-
-    // 验证魔数
-    if hdr.pt1.magic != [0x7F, b'E', b'L', b'F'] {
-        return Err(ElfLoadError::InvalidMagic);
+fn validate_elf_source<S: ElfImageSource + ?Sized>(source: &S) -> Result<(), ElfLoadError> {
+    let hdr = parse_and_validate_elf64_header(source)?;
+    for idx in 0..hdr.phnum {
+        let _ = read_elf64_phdr(source, &hdr, idx)?;
     }
-
-    // 验证 64 位
-    match hdr.pt1.class() {
-        Class::SixtyFour => {}
-        _ => return Err(ElfLoadError::UnsupportedClass),
-    }
-
-    // 验证小端
-    match hdr.pt1.data() {
-        xmas_elf::header::Data::LittleEndian => {}
-        _ => return Err(ElfLoadError::NotLittleEndian),
-    }
-
-    // 验证 x86_64
-    if hdr.pt2.machine().as_machine() != Machine::X86_64 {
-        return Err(ElfLoadError::UnsupportedMachine);
-    }
-
-    // 验证可执行文件
-    if hdr.pt2.type_().as_type() != ElfType::Executable {
-        return Err(ElfLoadError::UnsupportedType);
-    }
-
-    // R172-02 FIX (untrusted-input panic=abort DoS): bound + align the program-header table
-    // BEFORE any `program_iter()` is reached on attacker bytes. xmas-elf's
-    // `parse_program_header` slices `&input[off..off+entsize]` with NO bounds check, and
-    // `zero::read::<ProgramHeader64>` then asserts BOTH (a) the slice is large enough AND
-    // (b) the slice base is `align_of::<ProgramHeader64>()`-aligned (8). Either assert
-    // failing is `panic=abort` -> permanent CPU halt: a ~100-byte crafted ELF with a bad
-    // `e_phoff`/`e_phnum`/`e_phentsize` (or an unaligned `e_phoff`) is an unauthenticated
-    // full-system DoS via execve(59)/spawn_image(517). `validate_elf_header` dominates every
-    // `program_iter()` call (load loop, AT_PHDR derivation), so one fail-closed check here
-    // closes the class. `header::sanity_check` does NOT exist in xmas-elf-0.9.1 (do not call).
-    const PH64_ENTSIZE: u64 = 56; // size_of::<xmas_elf::program::ProgramHeader64>() (fixed ELF64 ABI)
-    const PH64_ALIGN: usize = 8; // align_of::<ProgramHeader64>() — zero::read asserts this
-    let e_phnum = hdr.pt2.ph_count();
-    if e_phnum != 0 {
-        let e_phoff = hdr.pt2.ph_offset();
-        let e_phentsize = hdr.pt2.ph_entry_size() as u64;
-        // Exact ELF64 entry size: a smaller entsize makes the crate slice/read overlap or
-        // run short; a larger one over-reads. Reject both (readable-but-bad => reject, FX-18).
-        if e_phentsize != PH64_ENTSIZE {
-            return Err(ElfLoadError::OutOfBounds);
-        }
-        // [e_phoff, e_phoff + e_phnum*e_phentsize) must lie within the image (checked math).
-        let table_bytes = (e_phnum as u64)
-            .checked_mul(e_phentsize)
-            .ok_or(ElfLoadError::OutOfBounds)?;
-        let table_end = e_phoff
-            .checked_add(table_bytes)
-            .ok_or(ElfLoadError::OutOfBounds)?;
-        if table_end > elf.input.len() as u64 {
-            return Err(ElfLoadError::OutOfBounds);
-        }
-        // Alignment: each entry is at `input.as_ptr() + e_phoff + i*56`; since 56 % 8 == 0,
-        // every entry shares the alignment of `(input base + e_phoff)`. If that is not
-        // 8-aligned, the first `program_iter()` read panics — reject fail-closed instead.
-        let table_base = (elf.input.as_ptr() as usize).wrapping_add(e_phoff as usize);
-        if table_base & (PH64_ALIGN - 1) != 0 {
-            return Err(ElfLoadError::OutOfBounds);
-        }
-    }
-
+    let _ = compute_phdr_va_from_source(source, &hdr);
     Ok(())
 }
 
 /// Pure, host-safe ELF pre-flight validation — the exact parse [`load_elf`] runs
 /// on untrusted bytes BEFORE it maps anything, with NO page-table, frame-allocator,
 /// or cgroup work.
-///
-/// `load_elf` performs this same validation (header checks + the R172-02
-/// program-header-table bounds/alignment guard) and then walks `program_iter()`
-/// to map PT_LOAD segments. Exposing the validation as a standalone pure function
-/// lets a host fuzz harness exercise the attacker-controlled parse path (crafted
-/// ELF headers / program-header tables) reached via execve(59)/spawn_image(517)
-/// directly, without a live address space.
-///
-/// Returns `Ok(())` if the image passes the loader's pre-flight checks, or the
-/// same [`ElfLoadError`] the loader would return. Never maps memory; must never
-/// panic on malformed input — that is precisely the DoS class R172-02 closed.
 pub fn validate_elf_image(image: &[u8]) -> Result<(), ElfLoadError> {
-    let elf = ElfFile::new(image).map_err(|_| ElfLoadError::InvalidMagic)?;
-
-    // Header + R172-02 program-header-table bounds/alignment guard. This
-    // dominates every `program_iter()` walk below, exactly as in `load_elf`.
-    validate_elf_header(&elf)?;
-
-    // Walk the program headers the loader relies on. This is the operation that
-    // used to `panic=abort` on crafted input; it is safe now only because the
-    // R172-02 guard above has bounded and aligned the table.
-    for ph in elf.program_iter() {
-        let _ = ph.get_type();
-        let _ = ph.virtual_addr();
-        let _ = ph.mem_size();
-        let _ = ph.file_size();
-        let _ = ph.offset();
-    }
-
-    // Pure AT_PHDR user-VA derivation (checked math over the same headers).
-    let _ = compute_phdr_va(&elf);
-
-    Ok(())
+    validate_elf_source(image)
 }
 
-/// Z-10 fix: 加载单个程序段并追踪映射，便于失败时全局回滚
-///
-/// # Arguments
-///
-/// * `elf` - ELF 文件引用
-/// * `ph` - 程序头
-/// * `tracked` - 全局映射追踪向量，成功映射的页会被追加到此向量
-/// * `cgroup_id` - R93-6 FIX: Cgroup ID for memory accounting
-///
-/// # Returns
-///
-/// 成功返回 Ok(charged_bytes)，失败时调用方负责使用 tracked 进行全局回滚。
-/// R125-1 FIX: Returns the number of bytes charged to the cgroup for this
-/// segment so the caller can accumulate the total for exec rollback.
-fn load_segment_tracked(
-    elf: &ElfFile,
-    ph: &xmas_elf::program::ProgramHeader,
-    tracked: &mut Vec<MappedEntry>,
+/// N2.1: Pure pre-flight validation for an [`ExecImage`] (heap or frame-backed).
+pub fn validate_exec_image(image: &ExecImage) -> Result<(), ElfLoadError> {
+    validate_elf_source(image)
+}
+
+/// Z-10 / N2.1: Load a single `PT_LOAD` segment, zeroing and populating each
+/// allocated frame directly before mapping so no per-page tracking vector is
+/// allocated on the kernel heap.
+fn load_segment_tracked<S: ElfImageSource + ?Sized>(
+    source: &S,
+    ph: &Elf64Phdr,
+    accumulated_pages: usize,
+    tracked: &mut Vec<MappedRange>,
     cgroup_id: cgroup::CgroupId,
-) -> Result<(u64, Vec<PhysFrame<Size4KiB>>), ElfLoadError> {
-    let vaddr = ph.virtual_addr() as usize;
-    let memsz = ph.mem_size() as usize;
-    let filesz = ph.file_size() as usize;
-    let offset = ph.offset() as usize;
+) -> Result<(u64, usize, Vec<PhysFrame<Size4KiB>>), ElfLoadError> {
+    let vaddr = ph.p_vaddr as usize;
+    let memsz = ph.p_memsz as usize;
+    let filesz = ph.p_filesz as usize;
+    let offset = ph.p_offset as usize;
 
-    // 跳过大小为 0 的段
     if memsz == 0 {
-        return Ok((0, Vec::new()));
+        return Ok((0, 0, Vec::new()));
     }
-
-    // R93-18 FIX: Reject malformed ELF with p_filesz > p_memsz.
-    // In valid ELF, filesz <= memsz (the extra memsz - filesz bytes are BSS, zeroed).
-    // If filesz > memsz, the segment is malformed and could cause truncated loads
-    // or buffer overflows when copying file data.
     if filesz > memsz {
         return Err(ElfLoadError::OutOfBounds);
     }
 
-    // 边界检查
     let end = vaddr.checked_add(memsz).ok_or(ElfLoadError::OutOfBounds)?;
-
     if vaddr < USER_BASE {
         return Err(ElfLoadError::SegmentOutOfRange);
     }
-
-    // R172-26 FIX: `end` is the EXCLUSIVE segment end; it intrudes the half-open stack window
-    // [stack_base, USER_STACK_TOP) iff `end > stack_base`, NOT `>=` (end == stack_base means
-    // the segment is [.., stack_base), disjoint). The old `>=` was one page over-conservative.
-    // Single-sourced through user_stack_window().0 (usize; drops the as-u64 casts) so all the
-    // load-time guards share the runtime SoT and cannot drift apart.
     if end > user_stack_window().0 {
         return Err(ElfLoadError::OverlapWithStack);
     }
-
-    // 验证文件数据边界
-    if offset.saturating_add(filesz) > elf.input.len() {
+    if offset.checked_add(filesz).is_none_or(|e| e > source.len()) {
         return Err(ElfLoadError::OutOfBounds);
     }
 
-    // 【W-1 安全修复】W^X (Write XOR Execute) 检查
-    // 拒绝同时可写可执行的段，防止代码注入攻击
-    // 恶意程序可能利用 RWX 段在运行时注入并执行任意代码
-    let writable = ph.flags().is_write();
-    let executable = ph.flags().is_execute();
+    let writable = ph.is_write();
+    let executable = ph.is_execute();
     if writable && executable {
         return Err(ElfLoadError::WritableExecutableSegment);
     }
 
-    // 计算需要映射的页
     let page_base = vaddr & !(PAGE_SIZE - 1);
     let page_offset = vaddr - page_base;
-    let map_len = page_offset + memsz;
-    let page_count = (map_len + PAGE_SIZE - 1) / PAGE_SIZE;
+    let map_len = page_offset
+        .checked_add(memsz)
+        .ok_or(ElfLoadError::OutOfBounds)?;
+    let page_count = map_len
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(ElfLoadError::OutOfBounds)?
+        / PAGE_SIZE;
 
-    // R151-2 FIX: Reject segments whose page_count exceeds the heap-safe limit.
-    // The VA-range check above permits memsz up to ~140 TB but does not bound
-    // page_count. A crafted ELF with small p_filesz but huge p_memsz exhausts
-    // the 1 MiB heap via Vec::with_capacity(page_count).
-    if page_count > MAX_ELF_SEGMENT_PAGES {
-        return Err(ElfLoadError::SegmentOutOfRange);
+    // N2.1: enforce both per-segment (16 MiB) and per-binary aggregate (32 MiB)
+    // page ceilings before touching cgroup charges or allocating frames.
+    let _ = check_segment_page_budget(page_count, accumulated_pages)?;
+
+    // Reserve the single O(1) rollback slot before pre-charging or mapping.
+    if tracked.try_reserve(1).is_err() {
+        return Err(ElfLoadError::OutOfMemory);
     }
 
-    // R93-6 FIX: Pre-charge memory for this segment.
-    // This enforces cgroup memory limits during ELF loading, preventing bypass
-    // by loading large binaries that exceed memory.max.
     let charge_bytes = (page_count * PAGE_SIZE) as u64;
     if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
         klog!(
@@ -742,36 +1079,15 @@ fn load_segment_tracked(
         return Err(ElfLoadError::CgroupLimitExceeded);
     }
 
-    // R100-7 FIX: Record how many pages are already tracked before this segment.
-    // If mapping fails mid-way, we must uncharge bytes for pages that were
-    // pre-charged but never mapped (and thus won't be counted in rollback).
-    let tracked_before = tracked.len();
-
-    // 确定页权限
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if ph.flags().is_write() {
+    if writable {
         flags |= PageTableFlags::WRITABLE;
     }
-    if !ph.flags().is_execute() {
+    if !executable {
         flags |= PageTableFlags::NO_EXECUTE;
     }
 
-    // Z-10 fix: 本段成功映射的页（用于数据复制）
-    // 【性能优化】预分配精确容量，避免 push 时重新分配
-    // R151-2 FIX: Use fallible allocation instead of infallible with_capacity.
-    let mut segment_mapped: Vec<MappedEntry> = Vec::new();
-    if segment_mapped.try_reserve_exact(page_count).is_err() {
-        // Cgroup was already charged; uncharge since no pages were mapped.
-        cgroup::uncharge_memory(cgroup_id, charge_bytes);
-        return Err(ElfLoadError::OutOfMemory);
-    }
-    // M2-1 SLICE-4d: the PT-recording shim so the intermediate PT/PD/PDPT frames map_page
-    // builds for this segment are recorded (charged + ledgered by sys_exec at the success
-    // commit). DATA frames below use allocate_data_frame (unrecorded); only map_page's
-    // trait allocate_frame records page-table frames.
     let mut frame_alloc = crate::syscall::RecordingFrameAllocator::new();
-
-    // R105-2 FIX: Segment layout diagnostics moved to debug-gated kprintln!.
     kprintln!(
         "  load_segment: vaddr=0x{:x}, memsz={}, filesz={}, pages={}",
         vaddr,
@@ -782,13 +1098,14 @@ fn load_segment_tracked(
     kprintln!(
         "    flags: R={} W={} X={} => PTFlags: 0x{:x}",
         true,
-        ph.flags().is_write(),
-        ph.flags().is_execute(),
+        writable,
+        executable,
         flags.bits()
     );
 
-    // 注意：用户地址空间的 4MB-6MB 区域已准备好 4KB 页表
-    // ELF 加载器直接创建新的 4KB 页映射
+    let mut mapped_in_segment: usize = 0;
+    let mut remaining_copy = filesz;
+    let mut src_off = offset;
 
     let map_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
@@ -796,52 +1113,51 @@ fn load_segment_tracked(
                 let va = VirtAddr::new((page_base + i * PAGE_SIZE) as u64);
                 let page: Page<Size4KiB> = Page::containing_address(va);
 
-                // M2-1 SLICE-4d: DATA frame via the inherent allocate_data_frame (NOT
-                // recorded); the map_page below records only the intermediate tables.
                 let frame = frame_alloc
                     .allocate_data_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
-                // R172-24 FIX: reserve BOTH tracking vectors BEFORE map_page (mirror the
-                // stack path allocate_user_stack_tracked / R158-9). The old order mapped
-                // FIRST then `tracked.try_reserve(1)?`, so a reserve-OOM left a mapped-but-
-                // UNTRACKED frame: reclaimed only by the whole-AS free_address_space backstop
-                // and mis-uncharged by the post-loop `tracked.len()` delta (transient cgroup
-                // skew + a latent leak if a future refactor made this failure recoverable).
-                // Reserve-before-map makes "no frame is mapped unless its rollback slot
-                // exists" hold by construction; the reserve-fail branch never maps, so no
-                // prune/unmap is needed (strictly simpler than the map-then-reserve sites).
-                if tracked.try_reserve(1).is_err() || segment_mapped.try_reserve(1).is_err() {
-                    frame_alloc.deallocate_frame(frame);
-                    return Err(ElfLoadError::OutOfMemory);
+                // Zero and populate the frame via direct physical map before mapping.
+                let base = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+                ptr::write_bytes(base, 0, PAGE_SIZE);
+                if remaining_copy > 0 {
+                    let start = if i == 0 { page_offset } else { 0 };
+                    let copy_len = cmp::min(PAGE_SIZE - start, remaining_copy);
+                    let dst = core::slice::from_raw_parts_mut(base.add(start), copy_len);
+                    if let Err(e) = source.read_at(src_off, dst) {
+                        frame_alloc.deallocate_frame(frame);
+                        return Err(e);
+                    }
+                    remaining_copy -= copy_len;
+                    src_off += copy_len;
                 }
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    // R165-12 FIX: Debug, not Error — leaks the loaded segment VA.
                     klog!(
                         Debug,
                         "ELF loader: map_page FAILED for va=0x{:x}: {:?}",
                         va.as_u64(),
                         e
                     );
-                    // Z-10 fix: 释放刚分配但未映射成功的帧
-                    // 调用方会使用 tracked 回滚所有已成功映射的页
                     frame_alloc.deallocate_frame(frame);
                     return Err(ElfLoadError::MapFailed);
                 }
 
-                // Z-10 fix: 追加到本段和全局追踪向量 (capacity reserved above -> infallible).
-                segment_mapped.push((page, frame));
-                tracked.push((page, frame));
+                mapped_in_segment += 1;
             }
             Ok(())
         })
     };
 
+    if mapped_in_segment > 0 {
+        // Capacity was reserved above -> infallible.
+        tracked.push(MappedRange {
+            page_base,
+            page_count: mapped_in_segment,
+        });
+    }
+
     if let Err(e) = map_result {
-        // R100-7 FIX: Uncharge cgroup bytes for pages that were pre-charged
-        // but never mapped. rollback_all_mappings will handle the tracked pages.
-        let mapped_in_segment = tracked.len().saturating_sub(tracked_before);
         let unmapped_bytes = charge_bytes.saturating_sub((mapped_in_segment * PAGE_SIZE) as u64);
         if unmapped_bytes > 0 {
             cgroup::uncharge_memory(cgroup_id, unmapped_bytes);
@@ -849,37 +1165,7 @@ fn load_segment_tracked(
         return Err(e);
     }
 
-    // 【修复】使用直映物理地址访问内存，避免依赖当前 CR3
-    // 首先清零所有映射的页面（防止信息泄漏）
-    for (_, frame) in segment_mapped.iter() {
-        let base = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
-        unsafe {
-            ptr::write_bytes(base, 0, PAGE_SIZE);
-        }
-    }
-
-    // 复制文件内容到正确的偏移位置
-    let mut remaining_copy = filesz;
-    let mut src_off = offset;
-    for (idx, (_, frame)) in segment_mapped.iter().enumerate() {
-        if remaining_copy == 0 {
-            break;
-        }
-        let base = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
-        let start = if idx == 0 { page_offset } else { 0 };
-        let len = cmp::min(PAGE_SIZE - start, remaining_copy);
-        unsafe {
-            ptr::copy_nonoverlapping(elf.input.as_ptr().add(src_off), base.add(start), len);
-        }
-        remaining_copy -= len;
-        src_off += len;
-    }
-
-    // M2-1 SLICE-4d: yield the recorded PT/PD/PDPT frame identities alongside the charged
-    // DATA bytes. On every Err path above the frames ride in the new AS and are reclaimed
-    // wholesale by free_address_space on exec rollback (the recorder is dropped, never
-    // charged); this Ok path hands them to load_elf -> sys_exec's success-commit fold.
-    Ok((charge_bytes, frame_alloc.take_pt_frames()))
+    Ok((charge_bytes, page_count, frame_alloc.take_pt_frames()))
 }
 
 /// M0-7 SLICE 5: the user-stack map geometry — SINGLE source of truth for BOTH the
@@ -1056,14 +1342,15 @@ pub fn run_user_stack_guard_range_self_test() {
 /// R125-1 FIX: Returns the number of bytes charged to the cgroup for the
 /// stack so the caller can accumulate the total for exec rollback.
 fn allocate_user_stack_tracked(
-    tracked: &mut Vec<MappedEntry>,
+    tracked: &mut Vec<MappedRange>,
     cgroup_id: cgroup::CgroupId,
 ) -> Result<(u64, Vec<PhysFrame<Size4KiB>>), ElfLoadError> {
-    // M0-7 SLICE 5: Map only the EAGER top region (16KB = 4 pages). The rest of the
-    // stack window grows on-demand via #PF handler. The guard page remains unmapped.
     let (_, usable_base, eager_floor, eager_page_count) = user_stack_layout();
 
-    // R93-6 FIX: Pre-charge memory for eager stack region only.
+    if tracked.try_reserve(1).is_err() {
+        return Err(ElfLoadError::OutOfMemory);
+    }
+
     let charge_bytes = (eager_page_count * PAGE_SIZE) as u64;
     if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
         klog!(
@@ -1074,46 +1361,29 @@ fn allocate_user_stack_tracked(
         return Err(ElfLoadError::CgroupLimitExceeded);
     }
 
-    // R100-7 FIX: Record tracked count before stack mapping for accurate
-    // partial-failure uncharge (same pattern as load_segment_tracked).
-    let tracked_before = tracked.len();
-
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
 
-    // Z-10 fix: 本段成功映射的页（用于数据清零）
-    // R154-14 FIX: Use fallible allocation to avoid panic on heap exhaustion.
-    let mut stack_mapped: Vec<MappedEntry> = Vec::new();
-    // M2-1 SLICE-4d: PT-recording shim (see load_segment_tracked) — DATA via
-    // allocate_data_frame (unrecorded), intermediate tables recorded by the trait.
     let mut frame_alloc = crate::syscall::RecordingFrameAllocator::new();
+    let mut mapped_stack: usize = 0;
 
     let map_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
-            // M0-7 SLICE 5: Map eager_page_count pages starting at eager_floor
-            // (the top of the stack, growing downward toward usable_base)
             for i in 0..eager_page_count {
                 let va = VirtAddr::new((eager_floor + i * PAGE_SIZE) as u64);
                 let page: Page<Size4KiB> = Page::containing_address(va);
 
-                // M2-1 SLICE-4d: DATA frame via allocate_data_frame (NOT recorded).
                 let frame = frame_alloc
                     .allocate_data_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
-                // R158-9 FIX: Reserve tracking space BEFORE map_page so a failed
-                // reservation cannot leave a mapped-but-untracked page.
-                if tracked.try_reserve(1).is_err() || stack_mapped.try_reserve(1).is_err() {
-                    frame_alloc.deallocate_frame(frame);
-                    return Err(ElfLoadError::OutOfMemory);
-                }
+                // Zero stack frame via direct physical map before mapping.
+                let base = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
+                ptr::write_bytes(base, 0, PAGE_SIZE);
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    // R165-12 FIX: Debug, not Error — keep this user VA out of
-                    // production logs (the stack VA is a FIXED constant, NOT KASLR-
-                    // randomized; Debug here is log hygiene).
                     klog!(
                         Debug,
                         "ELF loader: map_page FAILED for stack va=0x{:x}: {:?}",
@@ -1124,14 +1394,8 @@ fn allocate_user_stack_tracked(
                     return Err(ElfLoadError::MapFailed);
                 }
 
-                stack_mapped.push((page, frame));
-                tracked.push((page, frame));
+                mapped_stack += 1;
             }
-            // M0-7 SLICE 5: the low guard page + lazy region MUST stay unmapped.
-            // The loop maps only [eager_floor, USER_STACK_TOP), so
-            // [stack_base, usable_base) remains the unmapped guard and
-            // [usable_base, eager_floor) is the lazy region (unmapped until #PF).
-            // reclaim would double-free — is caught at boot (debug builds).
             debug_assert!(
                 mgr.translate_addr(VirtAddr::new((usable_base - USER_STACK_GUARD_SIZE) as u64))
                     .is_none(),
@@ -1141,10 +1405,14 @@ fn allocate_user_stack_tracked(
         })
     };
 
+    if mapped_stack > 0 {
+        tracked.push(MappedRange {
+            page_base: eager_floor,
+            page_count: mapped_stack,
+        });
+    }
+
     if let Err(e) = map_result {
-        // R100-7 FIX: Uncharge cgroup bytes for stack pages that were pre-charged
-        // but never mapped.
-        let mapped_stack = tracked.len().saturating_sub(tracked_before);
         let unmapped_bytes = charge_bytes.saturating_sub((mapped_stack * PAGE_SIZE) as u64);
         if unmapped_bytes > 0 {
             cgroup::uncharge_memory(cgroup_id, unmapped_bytes);
@@ -1152,61 +1420,22 @@ fn allocate_user_stack_tracked(
         return Err(e);
     }
 
-    // 【修复】使用直映物理地址清零栈区域
-    // R100-5 FIX: 清零所有已映射的栈页（eager_page_count 页）以防信息泄漏。
-    // M0-7 SLICE 5: eager_page_count、charge_bytes 与下面的 remaining 都源自同一
-    // user_stack_layout() 的 eager_page_count，三者恒一致；故 remaining 恰在覆盖
-    // 最后一页后归零。下方两个断言把这一 lockstep 钉死：半改 eager_page_count 会导致
-    // 少清零（信息泄漏）或多扣费（cgroup 泄漏）。
-    let mut remaining = eager_page_count * PAGE_SIZE;
-    for (_, frame) in stack_mapped.iter() {
-        let base = unsafe { phys_to_virt(frame.start_address()).as_mut_ptr::<u8>() };
-        let len = cmp::min(PAGE_SIZE, remaining);
-        unsafe {
-            ptr::write_bytes(base, 0, len);
-        }
-        remaining -= len;
-        if remaining == 0 {
-            break;
-        }
-    }
     debug_assert_eq!(
-        stack_mapped.len(),
-        eager_page_count,
+        mapped_stack, eager_page_count,
         "stack mapped-page count must equal page_count (charge/zero lockstep)"
     );
-    debug_assert_eq!(
-        remaining, 0,
-        "stack zeroing must cover exactly page_count pages"
-    );
 
-    // M2-1 SLICE-4d: yield the recorded PT-frame identities alongside the charged bytes.
     Ok((charge_bytes, frame_alloc.take_pt_frames()))
 }
 
-/// Z-10 fix: 回滚所有已追踪的映射（段 + 栈）
-///
-/// 当 ELF 加载过程中任何步骤失败时，调用此函数清理所有已成功建立的映射，
-/// 防止物理帧泄漏和半成品地址空间。
-///
-/// # Arguments
-///
-/// * `tracked` - 已追踪的映射向量，函数会清空此向量
-/// * `cgroup_id` - R93-6 FIX: Cgroup ID for memory uncharging
-///
-/// # Safety
-///
-/// 必须在当前进程的地址空间上下文中调用（CR3 指向目标页表）
-fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::CgroupId) {
+fn rollback_all_mappings(tracked: &mut Vec<MappedRange>, cgroup_id: cgroup::CgroupId) {
     if tracked.is_empty() {
         return;
     }
 
-    let page_count = tracked.len();
+    let page_count: usize = tracked.iter().map(|r| r.page_count).sum();
     klog!(Warn, "ELF loader: rolling back {} mapped pages", page_count);
 
-    // R93-6 FIX: Uncharge memory for all pages being rolled back.
-    // This ensures cgroup memory accounting remains accurate on failure.
     let uncharge_bytes = (page_count * PAGE_SIZE) as u64;
     cgroup::uncharge_memory(cgroup_id, uncharge_bytes);
 
@@ -1214,20 +1443,23 @@ fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::Cgro
 
     unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| {
-            while let Some((page, _expected_frame)) = tracked.pop() {
-                // 尝试取消映射并释放物理帧
-                match mgr.unmap_page(page) {
-                    Ok(unmapped_frame) => {
-                        frame_alloc.deallocate_frame(unmapped_frame);
-                    }
-                    Err(e) => {
-                        klog!(
-                            Warn,
-                            "ELF rollback: unmap_page failed for va=0x{:x}: {:?}",
-                            page.start_address().as_u64(),
-                            e
-                        );
-                        // 继续尝试回滚其他页，不要因为一个失败就停止
+            while let Some(range) = tracked.pop() {
+                for i in (0..range.page_count).rev() {
+                    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(
+                        (range.page_base + i * PAGE_SIZE) as u64,
+                    ));
+                    match mgr.unmap_page(page) {
+                        Ok(unmapped_frame) => {
+                            frame_alloc.deallocate_frame(unmapped_frame);
+                        }
+                        Err(e) => {
+                            klog!(
+                                Warn,
+                                "ELF rollback: unmap_page failed for va=0x{:x}: {:?}",
+                                page.start_address().as_u64(),
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -1238,35 +1470,159 @@ fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::Cgro
 /// 打印 ELF 文件信息（调试用）
 // R163-21 FIX: Use Debug level — Info-level VA disclosure aids ASLR bypass.
 pub fn print_elf_info(image: &[u8]) {
-    if let Ok(elf) = ElfFile::new(image) {
-        let hdr = &elf.header;
+    if let Ok(hdr) = parse_and_validate_elf64_header(image) {
         klog!(Debug, "=== ELF Info ===");
-        klog!(Debug, "Entry point: 0x{:x}", hdr.pt2.entry_point());
-        klog!(Debug, "Program headers: {}", hdr.pt2.ph_count());
+        klog!(Debug, "Entry point: 0x{:x}", hdr.entry);
+        klog!(Debug, "Program headers: {}", hdr.phnum);
 
-        // R172-02 FIX: this debug helper is the OTHER program_iter() site (besides load_elf);
-        // gate it on validate_elf_header too so a crafted ELF can never panic=abort here
-        // either (closes the panic CLASS module-wide, not just the exec path). No-op return
-        // on a malformed table — it is only diagnostics.
-        if validate_elf_header(&elf).is_err() {
-            klog!(
-                Debug,
-                "  (program-header table failed validation; not iterating)"
-            );
-            return;
-        }
-
-        for (i, ph) in elf.program_iter().enumerate() {
-            if ph.get_type() == Ok(PhType::Load) {
-                klog!(
-                    Debug,
-                    "  Segment {}: vaddr=0x{:x}, memsz=0x{:x}, filesz=0x{:x}",
-                    i,
-                    ph.virtual_addr(),
-                    ph.mem_size(),
-                    ph.file_size()
-                );
+        for idx in 0..hdr.phnum {
+            if let Ok(ph) = read_elf64_phdr(image, &hdr, idx) {
+                if ph.p_type == ELF64_PT_LOAD {
+                    klog!(
+                        Debug,
+                        "  Segment {}: vaddr=0x{:x}, memsz=0x{:x}, filesz=0x{:x}",
+                        idx,
+                        ph.p_vaddr,
+                        ph.p_memsz,
+                        ph.p_filesz
+                    );
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_synthetic_elf64(
+        file_len: usize,
+        p_vaddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
+    ) -> Vec<u8> {
+        let mut buf = alloc::vec![0u8; file_len];
+        // ELF64 header
+        buf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        buf[4] = ELF64_CLASS_64;
+        buf[5] = ELF64_DATA_LSB;
+        buf[6] = 1; // EV_CURRENT
+        buf[16..18].copy_from_slice(&ELF64_ET_EXEC.to_le_bytes());
+        buf[18..20].copy_from_slice(&ELF64_EM_X86_64.to_le_bytes());
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        buf[24..32].copy_from_slice(&(p_vaddr + 0x100).to_le_bytes()); // e_entry
+        buf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        buf[52..54].copy_from_slice(&(ELF64_EHDR_SIZE as u16).to_le_bytes());
+        buf[54..56].copy_from_slice(&(ELF64_PHDR_SIZE as u16).to_le_bytes());
+        buf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        // One PT_LOAD at offset 64
+        let ph = &mut buf[64..64 + ELF64_PHDR_SIZE];
+        ph[0..4].copy_from_slice(&ELF64_PT_LOAD.to_le_bytes());
+        ph[4..8].copy_from_slice(&(4u32 | ELF64_PF_X).to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        ph[16..24].copy_from_slice(&p_vaddr.to_le_bytes());
+        ph[24..32].copy_from_slice(&p_vaddr.to_le_bytes());
+        ph[32..40].copy_from_slice(&p_filesz.to_le_bytes());
+        ph[40..48].copy_from_slice(&p_memsz.to_le_bytes());
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn n2_1_exec_image_append_read_and_e2big_limits() {
+        assert_eq!(MAX_EXEC_IMAGE_BYTES, 16 * 1024 * 1024);
+        assert!(MAX_EXEC_IMAGE_BYTES > 256 * 1024);
+
+        let mut img = ExecImage::new();
+        assert!(img.is_empty());
+        assert_eq!(img.prefix_slice(16), &[]);
+
+        // Append 300 KiB (> legacy 256 KiB ceiling) across chunk boundaries.
+        let chunk = [0xA5u8; 4096];
+        for _ in 0..75 {
+            img.try_append(&chunk, MAX_EXEC_IMAGE_BYTES)
+                .expect("300 KiB image must fit within N2.1 ceiling");
+        }
+        assert_eq!(img.len(), 300 * 1024);
+        assert_eq!(img.prefix_slice(4096).len(), 4096);
+        assert_eq!(img.prefix_slice(8192).len(), 4096);
+
+        let mut probe = [0u8; 64];
+        img.read_at(300 * 1024 - 64, &mut probe)
+            .expect("tail read succeeds");
+        assert!(probe.iter().all(|&b| b == 0xA5));
+        assert!(matches!(
+            img.read_at(300 * 1024 - 32, &mut probe),
+            Err(ElfLoadError::OutOfBounds)
+        ));
+
+        // Exceeding max_len returns E2BIG without mutating length.
+        assert_eq!(img.try_append(&[1u8], 300 * 1024), Err(SyscallError::E2BIG));
+        assert_eq!(img.len(), 300 * 1024);
+
+        // try_from_reader enforces E2BIG before allocating.
+        assert!(matches!(
+            ExecImage::try_from_reader(MAX_EXEC_IMAGE_BYTES + 1, MAX_EXEC_IMAGE_BYTES, |_, _| Ok(
+                ()
+            )),
+            Err(SyscallError::E2BIG)
+        ));
+    }
+
+    #[test]
+    fn n2_1_elf_segment_and_total_page_budgets() {
+        assert_eq!(MAX_ELF_SEGMENT_PAGES, 4096);
+        assert_eq!(MAX_ELF_TOTAL_PAGES, 8192);
+
+        // 2 MiB (512 pages) and 16 MiB (4096 pages) segments are now accepted.
+        assert_eq!(check_segment_page_budget(512, 0).unwrap(), 512);
+        assert_eq!(
+            check_segment_page_budget(MAX_ELF_SEGMENT_PAGES, 0).unwrap(),
+            MAX_ELF_SEGMENT_PAGES
+        );
+        // Two 16 MiB segments fit within the 32 MiB aggregate cap.
+        assert_eq!(
+            check_segment_page_budget(MAX_ELF_SEGMENT_PAGES, MAX_ELF_SEGMENT_PAGES).unwrap(),
+            MAX_ELF_TOTAL_PAGES
+        );
+        // Single segment > 16 MiB is rejected.
+        assert!(matches!(
+            check_segment_page_budget(MAX_ELF_SEGMENT_PAGES + 1, 0),
+            Err(ElfLoadError::SegmentOutOfRange)
+        ));
+        // Aggregate > 32 MiB is rejected.
+        assert!(matches!(
+            check_segment_page_budget(1, MAX_ELF_TOTAL_PAGES),
+            Err(ElfLoadError::SegmentOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn n2_1_validate_large_elf_and_phdr_bounds() {
+        let len = 300 * 1024;
+        let bytes = build_synthetic_elf64(len, USER_BASE as u64, len as u64, 2 * 1024 * 1024);
+        let img = ExecImage::from_vec(bytes);
+        validate_exec_image(&img).expect("300 KiB ELF with 2 MiB PT_LOAD must validate");
+
+        let hdr = parse_and_validate_elf64_header(&img).expect("header parses");
+        let phdr_va = compute_phdr_va_from_source(&img, &hdr);
+        assert_eq!(phdr_va, USER_BASE as u64 + 64);
+
+        // R172-02: bad e_phentsize and unaligned e_phoff still fail closed.
+        let mut bad_entsize = build_synthetic_elf64(256, USER_BASE as u64, 256, 4096);
+        bad_entsize[54..56].copy_from_slice(&52u16.to_le_bytes());
+        assert!(matches!(
+            validate_elf_image(&bad_entsize),
+            Err(ElfLoadError::OutOfBounds)
+        ));
+
+        let mut bad_align = build_synthetic_elf64(256, USER_BASE as u64, 256, 4096);
+        bad_align[32..40].copy_from_slice(&66u64.to_le_bytes());
+        assert!(matches!(
+            validate_elf_image(&bad_align),
+            Err(ElfLoadError::OutOfBounds)
+        ));
     }
 }

@@ -502,8 +502,8 @@ pub type CpusetTaskLeftCallback = fn(u32);
 /// skip pattern in syscall_entry_stub to bypass the CR3 switch entirely).
 pub type KptiCr3UpdateCallback = fn(u64, u64);
 
-/// 最大文件描述符数量（每进程）
-pub const MAX_FD: i32 = 256;
+/// N2.1: 最大文件描述符数量（每进程，提升至 Linux 默认软上限 / FD_SETSIZE = 1024）
+pub const MAX_FD: i32 = 1024;
 const FD_RESERVATION_WORDS: usize = (MAX_FD as usize + 63) / 64;
 
 /// Linux mutable open-file-description status bits supported by this kernel.
@@ -8255,7 +8255,7 @@ pub fn request_exit_group_atomic(
 /// every PID-keyed registration, so T cannot take it over). Built by T,
 /// stored only in L's PCB, taken only by L.
 pub struct ExecHandoff {
-    pub(crate) elf_data: Vec<u8>,
+    pub(crate) elf_data: crate::elf_loader::ExecImage,
     pub(crate) argv: Vec<Vec<u8>>,
     pub(crate) envp: Vec<Vec<u8>>,
     pub(crate) execfn: Vec<u8>,
@@ -8313,7 +8313,7 @@ pub struct HandoffThreadState {
 
 impl ExecHandoff {
     pub(crate) fn try_new(
-        elf_data: Vec<u8>,
+        elf_data: crate::elf_loader::ExecImage,
         argv: Vec<Vec<u8>>,
         envp: Vec<Vec<u8>>,
         execfn: Vec<u8>,
@@ -8492,7 +8492,7 @@ pub fn poll_exec_handoff(leader: &ProcessArc) -> HandoffPoll {
 /// The parts of a handoff the leader's exec consumes, after its thread state
 /// has been installed.
 pub struct TakenExecHandoff {
-    pub elf_data: Vec<u8>,
+    pub elf_data: crate::elf_loader::ExecImage,
     pub argv: Vec<Vec<u8>>,
     pub envp: Vec<Vec<u8>>,
     pub execfn: Vec<u8>,
@@ -11774,7 +11774,7 @@ mod thread_group_tests {
             assert!(!wait_abort_locked(&l));
             l.exec_handoff = Some(
                 ExecHandoff::try_new(
-                    Vec::new(),
+                    crate::elf_loader::ExecImage::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -11856,7 +11856,7 @@ mod thread_group_tests {
             assert!(leader_accepts_exec_handoff(&l, 1, &group));
             l.exec_handoff = Some(
                 ExecHandoff::try_new(
-                    Vec::new(),
+                    crate::elf_loader::ExecImage::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -16690,5 +16690,32 @@ mod process_hotpath_tests {
         for (i, &addr) in flushed_frames.iter().enumerate() {
             assert_eq!(addr, 0x10_0000 + (i as u64) * 4096);
         }
+    }
+
+    #[test]
+    fn n2_1_fd_ceiling_1024_rlimit_and_reservation_bitmap() {
+        assert_eq!(MAX_FD, 1024);
+        assert_eq!(FD_RESERVATION_WORDS, 16);
+
+        let limits = default_rlimits();
+        assert_eq!(limits[RLIMIT_NOFILE].rlim_cur, 1024);
+        assert_eq!(limits[RLIMIT_NOFILE].rlim_max, 1024);
+
+        let mut fds = FdState::new();
+        assert!(!fds.fd_is_reserved(512));
+        assert!(!fds.fd_is_reserved(1023));
+        assert!(!fds.set_fd_reserved(512, true));
+        assert!(fds.fd_is_reserved(512));
+        assert!(!fds.set_fd_reserved(1023, true));
+        assert!(fds.fd_is_reserved(1023));
+        // Out-of-range fds fail closed without panicking.
+        assert!(!fds.set_fd_reserved(1024, true));
+        assert!(!fds.fd_is_reserved(1024));
+        assert!(!fds.set_fd_reserved(-1, true));
+        assert!(!fds.fd_is_reserved(-1));
+        assert!(fds.set_fd_reserved(512, false));
+        assert!(!fds.fd_is_reserved(512));
+        assert!(fds.set_fd_reserved(1023, false));
+        assert!(!fds.fd_is_reserved(1023));
     }
 }

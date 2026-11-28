@@ -534,21 +534,36 @@ pub(super) fn sys_ppoll(
     }
 }
 
-/// Copy in the three select fd_sets into fixed `[u64; 4]` buffers (nb ≤ MAX_FD=256
-/// ⇒ words ≤ 4), trimming stale bits ≥ nb. Preflights each non-NULL set WRITABLE
-/// (they are written back). Returns `(words, rset, wset, eset, has_r, has_w,
-/// has_e)`.
+/// N2.1: number of `u64` words required to hold `MAX_FD` select fd_set bits
+/// (16 words = 1024 bits = Linux `FD_SETSIZE`).
+const SELECT_FD_SET_WORDS: usize = (crate::process::MAX_FD as usize + 63) / 64;
+
+/// Copy in the three select fd_sets into fixed `[u64; SELECT_FD_SET_WORDS]`
+/// buffers (nb ≤ MAX_FD ⇒ words ≤ SELECT_FD_SET_WORDS), trimming stale bits ≥ nb.
+/// Preflights each non-NULL set WRITABLE (they are written back). Returns
+/// `(words, rset, wset, eset, has_r, has_w, has_e)`.
 #[allow(clippy::type_complexity)]
 pub(super) fn select_copyin_sets(
     readfds: *mut u8,
     writefds: *mut u8,
     exceptfds: *mut u8,
     nb: usize,
-) -> Result<(usize, [u64; 4], [u64; 4], [u64; 4], bool, bool, bool), SyscallError> {
+) -> Result<
+    (
+        usize,
+        [u64; SELECT_FD_SET_WORDS],
+        [u64; SELECT_FD_SET_WORDS],
+        [u64; SELECT_FD_SET_WORDS],
+        bool,
+        bool,
+        bool,
+    ),
+    SyscallError,
+> {
     let words = crate::poll::fd_set_words(nb);
-    let mut rset = [0u64; 4];
-    let mut wset = [0u64; 4];
-    let mut eset = [0u64; 4];
+    let mut rset = [0u64; SELECT_FD_SET_WORDS];
+    let mut wset = [0u64; SELECT_FD_SET_WORDS];
+    let mut eset = [0u64; SELECT_FD_SET_WORDS];
     let bytes = words * 8;
     let mut copy_one = |ptr: *mut u8, dst: &mut [u64]| -> Result<bool, SyscallError> {
         if ptr.is_null() {
@@ -580,10 +595,14 @@ pub(super) fn select_build_entries(
     eset: &[u64],
     nb: usize,
 ) -> Result<AdmittedVec<PollEntry>, SyscallError> {
-    // The maximum is small, but an unbounded number of blocked callers can
-    // retain these vectors. Charge the exact backing for the complete wait and
-    // copyout lifetime rather than treating the per-call cap as aggregate proof.
-    let mut entries = try_admitted_vec(mm::HeapClass::BlockingIo, nb)?;
+    // Count only active bits before reserving so `select(1024, ...)` with a
+    // handful of watched descriptors charges only the exact entries needed.
+    let mut active = 0usize;
+    for w in 0..words {
+        active += (rset[w] | wset[w] | eset[w]).count_ones() as usize;
+    }
+    let active = core::cmp::min(active, nb);
+    let mut entries = try_admitted_vec(mm::HeapClass::BlockingIo, active)?;
     for fd in 0..nb {
         let r = crate::poll::fd_set_test(&rset[..words], fd);
         let w = crate::poll::fd_set_test(&wset[..words], fd);
@@ -630,9 +649,9 @@ pub(super) fn select_writeback_sets(
     writefds: *mut u8,
     exceptfds: *mut u8,
 ) -> Result<usize, SyscallError> {
-    let mut orset = [0u64; 4];
-    let mut owset = [0u64; 4];
-    let mut oeset = [0u64; 4];
+    let mut orset = [0u64; SELECT_FD_SET_WORDS];
+    let mut owset = [0u64; SELECT_FD_SET_WORDS];
+    let mut oeset = [0u64; SELECT_FD_SET_WORDS];
     let mut total = 0usize;
     for e in entries {
         let (rd, wr, ex) = crate::poll::select_bits(e.revents);

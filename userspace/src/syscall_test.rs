@@ -383,6 +383,8 @@ pub extern "C" fn _start() -> ! {
     test_n2_8_sendmsg_recvmsg_and_readv(&mut results);
     // N2.5: Process groups, sessions, controlling terminal ioctls, kill(-pgid), wait4/waitid job control.
     test_n2_5_job_control_sessions_and_wait(&mut results);
+    // N2.1: >256 KiB exec image, >1 MiB PT_LOAD segment, and 1024 fd ceiling.
+    test_n2_1_exec_segment_and_fd_ceilings(&mut results);
 
     // Print summary
     println("");
@@ -12965,4 +12967,158 @@ fn test_n2_5_job_control_sessions_and_wait(results: &mut TestResult) {
     results.pass(
         "N2.5 pgid/sid, controlling terminal ioctls, kill(-pgid), wait4/waitid stop & continue",
     );
+}
+
+// ===========================================================================
+// N2.1: Raise 256 KiB Exec Image Limit, 1 MiB Segment Limit & FD Ceiling
+// ===========================================================================
+
+const N21_SYS_SELECT: u64 = 23;
+const N21_SYS_DUP2: u64 = 33;
+const N21_SYS_GETRLIMIT: u64 = 97;
+const N21_RLIMIT_NOFILE: u64 = 7;
+const N21_EBADF: i32 = 9;
+
+fn test_n2_1_exec_segment_and_fd_ceilings(results: &mut TestResult) {
+    print("Testing N2.1 >256 KiB exec image, >1 MiB PT_LOAD segment, and 1024 fd ceiling... ");
+
+    // 1. FD ceiling = 1024 (RLIMIT_NOFILE, dup2 to 512 & 1023, reject 1024, select on fd 512).
+    let mut rl = [0u64; 2];
+    let r_rl = unsafe { syscall2(N21_SYS_GETRLIMIT, N21_RLIMIT_NOFILE, rl.as_mut_ptr() as u64) };
+    let r_dup512 = unsafe { syscall2(N21_SYS_DUP2, 1, 512) };
+    let r_dup1023 = unsafe { syscall2(N21_SYS_DUP2, 1, 1023) };
+    let r_dup1024 = unsafe { syscall2(N21_SYS_DUP2, 1, 1024) };
+
+    let mut wset = [0u64; 16];
+    wset[512 / 64] = 1u64 << (512 % 64);
+    let mut tv = [0i64; 2];
+    let r_sel = unsafe {
+        syscall5(
+            N21_SYS_SELECT,
+            513,
+            0,
+            wset.as_mut_ptr() as u64,
+            0,
+            tv.as_mut_ptr() as u64,
+        )
+    };
+    let sel_bit_ready = (wset[512 / 64] & (1u64 << (512 % 64))) != 0;
+
+    unsafe {
+        let _ = sys_close(512);
+        let _ = sys_close(1023);
+    }
+
+    if is_error(r_rl)
+        || rl[0] != 1024
+        || rl[1] != 1024
+        || r_dup512 != 512
+        || r_dup1023 != 1023
+        || !is_error(r_dup1024)
+        || errno(r_dup1024) != N21_EBADF
+        || r_sel != 1
+        || !sel_bit_ready
+    {
+        results.fail("n2_1: 1024 fd ceiling / dup2 / select check failed");
+        return;
+    }
+
+    // 2. Stage a 512 KiB (>256 KiB) ELF64 image with a 2 MiB (>1 MiB) PT_LOAD
+    //    segment (512 KiB file-backed + 1536 KiB zeroed BSS), execute it via
+    //    sys_spawn_image(517), and verify the child reads the tail sentinel byte
+    //    (0x5d at +512 KiB - 1) plus zeroed BSS byte (0x00 at +2 MiB - 1) and
+    //    exits with 0x5d.
+    const IMG_LEN: usize = 512 * 1024;
+    const SEG_MEMSZ: u64 = 2 * 1024 * 1024;
+    const BASE: u64 = 0x0040_0000;
+    const CODE_OFF: usize = 0x78;
+    const SENTINEL: u8 = 0x5d;
+
+    let buf_addr = unsafe { mmap_anon(IMG_LEN, false) };
+    if buf_addr < 0 {
+        results.fail("n2_1: mmap_anon for 512 KiB ELF image failed");
+        return;
+    }
+    let img = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, IMG_LEN) };
+
+    let write_le = |dst: &mut [u8], off: usize, val: u64, n: usize| {
+        for i in 0..n {
+            dst[off + i] = (val >> (8 * i)) as u8;
+        }
+    };
+    img[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    img[4] = 2; // ELFCLASS64
+    img[5] = 1; // ELFDATA2LSB
+    img[6] = 1; // EV_CURRENT
+    write_le(img, 0x10, 2, 2); // ET_EXEC
+    write_le(img, 0x12, 0x3e, 2); // EM_X86_64
+    write_le(img, 0x14, 1, 4); // EV_CURRENT
+    write_le(img, 0x18, BASE + CODE_OFF as u64, 8); // e_entry
+    write_le(img, 0x20, 0x40, 8); // e_phoff
+    write_le(img, 0x34, 64, 2); // e_ehsize
+    write_le(img, 0x36, 56, 2); // e_phentsize
+    write_le(img, 0x38, 1, 2); // e_phnum
+    write_le(img, 0x3a, 64, 2); // e_shentsize
+
+    // PT_LOAD: R+X, vaddr=0x400000, filesz=512 KiB, memsz=2 MiB
+    write_le(img, 0x40, 1, 4); // PT_LOAD
+    write_le(img, 0x44, 5, 4); // PF_R | PF_X
+    write_le(img, 0x48, 0, 8); // p_offset
+    write_le(img, 0x50, BASE, 8); // p_vaddr
+    write_le(img, 0x58, BASE, 8); // p_paddr
+    write_le(img, 0x60, IMG_LEN as u64, 8); // p_filesz
+    write_le(img, 0x68, SEG_MEMSZ, 8); // p_memsz
+    write_le(img, 0x70, 0x1000, 8); // p_align
+
+    // Entry code:
+    //   mov eax, 0x0047ffff        ; BASE + 512 KiB - 1
+    //   movzx edi, byte ptr [rax]  ; sentinel byte = 0x5d
+    //   mov eax, 0x005fffff        ; BASE + 2 MiB - 1
+    //   movzx esi, byte ptr [rax]  ; BSS tail byte = 0x00
+    //   add edi, esi               ; exit code = 0x5d
+    //   mov eax, 60                ; SYS_exit
+    //   syscall
+    //   ud2
+    const CODE: [u8; 25] = [
+        0xb8, 0xff, 0xff, 0x47, 0x00, 0x0f, 0xb6, 0x38, 0xb8, 0xff, 0xff, 0x5f, 0x00, 0x0f, 0xb6,
+        0x30, 0x01, 0xf7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05,
+    ];
+    img[CODE_OFF..CODE_OFF + CODE.len()].copy_from_slice(&CODE);
+    img[CODE_OFF + CODE.len()] = 0x0f;
+    img[CODE_OFF + CODE.len() + 1] = 0x0b;
+    img[IMG_LEN - 1] = SENTINEL;
+
+    let child = unsafe { sys_fork() };
+    if is_error(child) {
+        unsafe {
+            let _ = munmap(buf_addr as usize, IMG_LEN);
+        }
+        results.fail("n2_1: fork failed");
+        return;
+    }
+    if child == 0 {
+        let _ = unsafe {
+            syscall4(
+                userspace::syscall::SYS_SPAWN_IMAGE,
+                buf_addr as u64,
+                IMG_LEN as u64,
+                0,
+                0,
+            )
+        };
+        unsafe { userspace::syscall::sys_exit(99) };
+    }
+
+    let mut status: i32 = -1;
+    let r_wait = unsafe { syscall4(N25_SYS_WAIT4, child, &mut status as *mut i32 as u64, 0, 0) };
+    unsafe {
+        let _ = munmap(buf_addr as usize, IMG_LEN);
+    }
+
+    if r_wait != child || status != ((SENTINEL as i32) << 8) {
+        results.fail("n2_1: 512 KiB exec image / 2 MiB PT_LOAD segment execution failed");
+        return;
+    }
+
+    results.pass("N2.1 >256 KiB exec image, >1 MiB PT_LOAD segment, and 1024 fd ceiling");
 }

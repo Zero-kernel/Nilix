@@ -796,22 +796,22 @@ fn fork_prepare_child_state(
     // on the common non-threaded fork path.
     if parent.capability_table_is_shared() {
         // Build a histogram: CapId → count of child fds carrying it.
-        let mut child_cap_counts = [(cap::CapId::INVALID, 0usize); crate::process::MAX_FD as usize];
-        let mut child_cap_count_len = 0usize;
+        // N2.1: allocate fallibly on the heap sized to the child's actual fd count
+        // rather than a `MAX_FD`-sized kernel-stack array (16 KiB at MAX_FD=1024).
         let child_files = child.files.lock();
+        let mut child_cap_counts: alloc::vec::Vec<(cap::CapId, usize)> = alloc::vec::Vec::new();
+        child_cap_counts
+            .try_reserve_exact(child_files.fd_table.len())
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
         for desc in child_files.fd_table.values() {
             if let Some(cid) = desc.cap_id() {
-                let Some(slot) = child_cap_counts.get_mut(child_cap_count_len) else {
-                    return Err(ForkError::MemoryAllocationFailed);
-                };
-                *slot = (cid, 1);
-                child_cap_count_len += 1;
+                child_cap_counts.push((cid, 1));
             }
         }
         drop(child_files);
-        child_cap_counts[..child_cap_count_len].sort_unstable_by_key(|entry| entry.0);
+        child_cap_counts.sort_unstable_by_key(|entry| entry.0);
         let mut unique_len = 0usize;
-        for index in 0..child_cap_count_len {
+        for index in 0..child_cap_counts.len() {
             let (cid, count) = child_cap_counts[index];
             if unique_len != 0 && child_cap_counts[unique_len - 1].0 == cid {
                 child_cap_counts[unique_len - 1].1 = child_cap_counts[unique_len - 1]

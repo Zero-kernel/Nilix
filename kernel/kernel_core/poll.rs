@@ -37,7 +37,7 @@ pub const POLLRDHUP: i16 = 0x2000;
 pub const POLL_ALWAYS: i16 = POLLERR | POLLHUP | POLLNVAL;
 
 /// Upper bound on `nfds` for poll/ppoll and on the effective fd range for
-/// select/pselect6. select is additionally clamped to `MAX_FD` (256) in the
+/// select/pselect6. select is additionally clamped to `MAX_FD` (1024) in the
 /// handler; this constant bounds the poll array + the fd_set logical width so a
 /// crafted `nfds` cannot drive an unbounded allocation.
 pub const POLL_MAX_NFDS: usize = 1024;

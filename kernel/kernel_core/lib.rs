@@ -102,7 +102,9 @@ pub mod usercopy;
 pub mod wait_kick;
 
 pub use elf_loader::{
-    load_elf, validate_elf_image, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP,
+    load_elf, load_elf_image, validate_elf_image, validate_exec_image, ElfLoadError, ElfLoadResult,
+    ExecImage, MAX_ELF_SEGMENT_PAGES, MAX_ELF_TOTAL_PAGES, MAX_EXEC_IMAGE_BYTES, USER_STACK_SIZE,
+    USER_STACK_TOP,
 };
 // M0 #1 (auxv): shared SysV AMD64 initial-user-stack builder, used by both sys_exec
 // and the usermode_test boot diagnostic (the real M0 musl gate path).
