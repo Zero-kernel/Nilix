@@ -273,30 +273,68 @@ impl FramebufferWriter {
         let fg = self.fg_pixel;
         let bg = self.bg_pixel;
         let mut row_addr = self.fb_base + base_offset as u64;
+        let aligned_u64 = (row_addr & 7) == 0 && (stride & 7) == 0;
 
         if c == ' ' {
-            for _ in 0..CHAR_HEIGHT {
-                let row_ptr = row_addr as *mut u32;
-                unsafe {
-                    for col in 0..CHAR_WIDTH {
-                        ptr::write_volatile(row_ptr.add(col), bg);
+            if aligned_u64 {
+                let bg2 = ((bg as u64) << 32) | (bg as u64);
+                for _ in 0..CHAR_HEIGHT {
+                    let row_ptr = row_addr as *mut u64;
+                    unsafe {
+                        ptr::write_volatile(row_ptr, bg2);
+                        ptr::write_volatile(row_ptr.add(1), bg2);
+                        ptr::write_volatile(row_ptr.add(2), bg2);
+                        ptr::write_volatile(row_ptr.add(3), bg2);
                     }
+                    row_addr += stride as u64;
                 }
-                row_addr += stride as u64;
+            } else {
+                for _ in 0..CHAR_HEIGHT {
+                    let row_ptr = row_addr as *mut u32;
+                    unsafe {
+                        for col in 0..CHAR_WIDTH {
+                            ptr::write_volatile(row_ptr.add(col), bg);
+                        }
+                    }
+                    row_addr += stride as u64;
+                }
             }
             return;
         }
 
         let bitmap = get_font_bitmap(c);
-        for &bits in bitmap.iter() {
-            let row_ptr = row_addr as *mut u32;
-            unsafe {
-                for col in 0..CHAR_WIDTH {
-                    let pixel = if (bits >> (7 - col)) & 1 != 0 { fg } else { bg };
-                    ptr::write_volatile(row_ptr.add(col), pixel);
+        if aligned_u64 {
+            let fg64 = fg as u64;
+            let bg64 = bg as u64;
+            for &bits in bitmap.iter() {
+                let row_ptr = row_addr as *mut u64;
+                let p0 = if (bits & 0x80) != 0 { fg64 } else { bg64 };
+                let p1 = if (bits & 0x40) != 0 { fg64 } else { bg64 };
+                let p2 = if (bits & 0x20) != 0 { fg64 } else { bg64 };
+                let p3 = if (bits & 0x10) != 0 { fg64 } else { bg64 };
+                let p4 = if (bits & 0x08) != 0 { fg64 } else { bg64 };
+                let p5 = if (bits & 0x04) != 0 { fg64 } else { bg64 };
+                let p6 = if (bits & 0x02) != 0 { fg64 } else { bg64 };
+                let p7 = if (bits & 0x01) != 0 { fg64 } else { bg64 };
+                unsafe {
+                    ptr::write_volatile(row_ptr, p0 | (p1 << 32));
+                    ptr::write_volatile(row_ptr.add(1), p2 | (p3 << 32));
+                    ptr::write_volatile(row_ptr.add(2), p4 | (p5 << 32));
+                    ptr::write_volatile(row_ptr.add(3), p6 | (p7 << 32));
                 }
+                row_addr += stride as u64;
             }
-            row_addr += stride as u64;
+        } else {
+            for &bits in bitmap.iter() {
+                let row_ptr = row_addr as *mut u32;
+                unsafe {
+                    for col in 0..CHAR_WIDTH {
+                        let pixel = if (bits >> (7 - col)) & 1 != 0 { fg } else { bg };
+                        ptr::write_volatile(row_ptr.add(col), pixel);
+                    }
+                }
+                row_addr += stride as u64;
+            }
         }
     }
 

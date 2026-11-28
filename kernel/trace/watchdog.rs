@@ -196,6 +196,8 @@ struct WatchdogState {
     alloc_guard: Mutex<()>,
     /// Global generation counter for unique handle generation (64-bit, R89-2).
     next_generation: AtomicU64,
+    /// O(1) slot search hint (updated under `alloc_guard`).
+    next_slot_hint: core::sync::atomic::AtomicUsize,
 }
 
 impl WatchdogState {
@@ -205,6 +207,7 @@ impl WatchdogState {
             slots: core::array::from_fn(|_| WatchdogSlot::new()),
             alloc_guard: Mutex::new(()),
             next_generation: AtomicU64::new(1), // Start at 1 so 0 is never valid
+            next_slot_hint: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -256,8 +259,12 @@ pub fn register_watchdog(
     let st = state();
     let _guard = st.alloc_guard.lock();
 
-    // Find first inactive slot
-    for (idx, slot) in st.slots.iter().enumerate() {
+    // Find first inactive slot starting at hint for O(1) steady-state allocation
+    let slot_count = st.slots.len();
+    let start = st.next_slot_hint.load(Ordering::Relaxed) % slot_count;
+    for offset in 0..slot_count {
+        let idx = (start + offset) % slot_count;
+        let slot = &st.slots[idx];
         if !slot.active.load(Ordering::Acquire) {
             // R89-2 FIX: Allocate generation atomically, preventing wrap to zero
             let gen = st
@@ -280,6 +287,8 @@ pub fn register_watchdog(
 
             // Publish slot as active (must be last)
             slot.active.store(true, Ordering::Release);
+            st.next_slot_hint
+                .store((idx + 1) % slot_count, Ordering::Relaxed);
 
             return Ok(WatchdogHandle {
                 slot: idx,
@@ -324,6 +333,7 @@ pub fn unregister_watchdog(handle: &WatchdogHandle) -> Result<(), WatchdogError>
 
     // Now safe to clear (we hold alloc_guard, serializing with registration)
     slot.clear();
+    st.next_slot_hint.store(handle.slot, Ordering::Relaxed);
     Ok(())
 }
 

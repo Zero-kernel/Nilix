@@ -102,8 +102,8 @@ pub use page_table::{
     KSTACK_REGION_END, MAX_DIRECT_MAP_LIMIT, PHYSICAL_MEMORY_OFFSET,
 };
 pub use tlb_shootdown::{
-    flush_all_address_spaces, flush_current_as_all, flush_current_as_page, flush_current_as_range,
-    force_init_tlb_shootdown_locals, get_stats as get_tlb_stats,
+    flush_all_address_spaces, flush_current_as_all, flush_current_as_page, flush_current_as_pages,
+    flush_current_as_range, force_init_tlb_shootdown_locals, get_stats as get_tlb_stats,
 };
 pub use x86_64::structures::paging::PhysFrame;
 

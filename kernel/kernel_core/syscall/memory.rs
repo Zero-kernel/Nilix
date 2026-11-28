@@ -3565,8 +3565,26 @@ pub(super) fn check_mmap_range(
         return Err(MmapRangeError::Occupied);
     }
 
-    // Existing mappings; pending entries count as occupied.
-    for (&region_base, &region_len_with_flags) in mm.mmap_regions.iter() {
+    // Existing mappings (non-overlapping half-open intervals sorted by base):
+    // O(log N) predecessor + successor probes in the BTreeMap replace an O(N)
+    // full-map scan on every `mmap()`.
+    if let Some((&region_base, &region_len_with_flags)) = mm.mmap_regions.range(..=base).next_back()
+    {
+        let region_end = region_base
+            .checked_add(mmap_region_len(region_len_with_flags))
+            .ok_or(MmapRangeError::Corrupt)?;
+        if base < region_end && end > region_base {
+            return Err(MmapRangeError::Occupied);
+        }
+    }
+    if let Some((&region_base, &region_len_with_flags)) = mm
+        .mmap_regions
+        .range((
+            core::ops::Bound::Excluded(base),
+            core::ops::Bound::Excluded(end),
+        ))
+        .next()
+    {
         let region_end = region_base
             .checked_add(mmap_region_len(region_len_with_flags))
             .ok_or(MmapRangeError::Corrupt)?;
@@ -3776,6 +3794,7 @@ pub(super) fn sys_mmap(
     flags: i32,
     fd: i32,
     _offset: i64,
+    entry_proc: Option<&ProcessArc>,
 ) -> SyscallResult {
     #[cfg(feature = "kcov")]
     {
@@ -3784,9 +3803,12 @@ pub(super) fn sys_mmap(
 
     use x86_64::structures::paging::PageTableFlags;
 
-    // 获取当前进程
+    // 获取当前进程（复用 syscall 入口已解析的 ProcessArc，避免重复查 PROCESS_TABLE）
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let process = match entry_proc {
+        Some(proc_arc) => proc_arc.clone(),
+        None => get_process(pid).ok_or(SyscallError::ESRCH)?,
+    };
 
     // 验证参数
     if length == 0 {
@@ -3964,9 +3986,7 @@ pub(super) fn sys_mmap(
         let is_lazy_private = !is_prot_none && !is_shared && !shape.populate;
         if is_lazy_private {
             let pages = length_aligned / 0x1000;
-            if mm::buddy_allocator::get_allocator_stats()
-                .is_some_and(|stats| pages > stats.free_pages)
-            {
+            if !mm::buddy_allocator::has_at_least_free_pages(pages) {
                 return Err(SyscallError::ENOMEM);
             }
             mm.reserve_shared_fault_pt(Some((base, length_aligned)))
@@ -4375,7 +4395,11 @@ pub(super) fn sys_mmap(
 /// sys_munmap - 取消内存映射
 ///
 /// 使用当前进程的地址空间进行取消映射，确保进程隔离
-pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
+pub(super) fn sys_munmap(
+    addr: usize,
+    length: usize,
+    entry_proc: Option<&ProcessArc>,
+) -> SyscallResult {
     #[cfg(feature = "kcov")]
     {
         coverage::trace_pc(1060); // sys_munmap entry
@@ -4400,9 +4424,12 @@ pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         coverage::trace_pc(1061); // sys_munmap validation passed
     }
 
-    // 获取当前进程
+    // 获取当前进程（复用 syscall 入口已解析的 ProcessArc）
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let process = match entry_proc {
+        Some(proc_arc) => proc_arc.clone(),
+        None => get_process(pid).ok_or(SyscallError::ESRCH)?,
+    };
     // 对齐到页边界（使用 checked_add 防止整数溢出）
     let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 

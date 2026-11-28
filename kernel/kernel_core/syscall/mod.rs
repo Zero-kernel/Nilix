@@ -895,9 +895,10 @@ pub fn syscall_dispatcher(
                 arg3 as i32,
                 arg4 as i32,
                 arg5 as i64,
+                entry_proc.as_ref(),
             ),
             Sc::Mprotect => sys_mprotect(arg0 as usize, arg1 as usize, arg2 as i32),
-            Sc::Munmap => sys_munmap(arg0 as usize, arg1 as usize),
+            Sc::Munmap => sys_munmap(arg0 as usize, arg1 as usize, entry_proc.as_ref()),
 
             // 架构相关
             Sc::ArchPrctl => sys_arch_prctl(arg0 as i32, arg1 as u64),
@@ -1024,15 +1025,24 @@ pub fn syscall_dispatcher(
             // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504, 513, 516)
             Sc::CgroupCreate => sys_cgroup_create(arg0 as u64, arg1 as u32),
             Sc::CgroupDestroy => sys_cgroup_destroy(arg0 as u64),
-            Sc::CgroupAttach => sys_cgroup_attach(arg0 as u64),
-            Sc::CgroupSetLimit => sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2),
+            Sc::CgroupAttach => sys_cgroup_attach(arg0 as u64, entry_proc.as_ref()),
+            Sc::CgroupSetLimit => {
+                sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2, entry_proc.as_ref())
+            }
             // 504 is the FROZEN v1 stats ABI (2-arg, writes the 104-byte v1 prefix, returns 0).
-            Sc::CgroupGetStats => sys_cgroup_get_stats(arg0 as u64, arg1 as *mut CgroupStatsBuf),
+            Sc::CgroupGetStats => sys_cgroup_get_stats(
+                arg0 as u64,
+                arg1 as *mut CgroupStatsBuf,
+                entry_proc.as_ref(),
+            ),
             Sc::CgroupDelegate => sys_cgroup_delegate(arg0 as u64, arg1 as u64),
             // J.2: v2 stats with statx-style size negotiation (writes min(buf_len, sizeof)).
-            Sc::CgroupGetStats2 => {
-                sys_cgroup_get_stats2(arg0 as u64, arg1 as *mut CgroupStatsBuf, arg2 as usize)
-            }
+            Sc::CgroupGetStats2 => sys_cgroup_get_stats2(
+                arg0 as u64,
+                arg1 as *mut CgroupStatsBuf,
+                arg2 as usize,
+                entry_proc.as_ref(),
+            ),
 
             // M0-4: Zero-OS-private (517) raw in-memory-image spawn — the pre-M0-4
             // execve(image, image_len, argv, envp) behavior, relocated off 59 so that
