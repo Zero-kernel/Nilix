@@ -336,7 +336,13 @@ define_syscall_table! {
         (104, SYS_GETGID,             Getgid,            "getgid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (107, SYS_GETEUID,            Geteuid,           "geteuid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (108, SYS_GETEGID,            Getegid,           "getegid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
+        // Process groups & sessions (N2.5)
+        (109, SYS_SETPGID,            Setpgid,           "setpgid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (110, SYS_GETPPID,            Getppid,           "getppid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
+        (111, SYS_GETPGRP,            Getpgrp,           "getpgrp",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (112, SYS_SETSID,             Setsid,            "setsid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (121, SYS_GETPGID,            Getpgid,           "getpgid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (124, SYS_GETSID,             Getsid,            "getsid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         // Extended RT signals & alternate signal stack (N2.6a)
         (127, SYS_RT_SIGPENDING,      RtSigpending,      "rt_sigpending",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (128, SYS_RT_SIGTIMEDWAIT,    RtSigtimedwait,    "rt_sigtimedwait",    strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),

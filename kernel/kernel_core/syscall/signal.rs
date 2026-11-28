@@ -36,8 +36,138 @@ pub(super) enum KillTarget {
     ThreadInGroup(ProcessId),
 }
 
-pub(super) fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
-    kill_common(pid, sig, KillTarget::Process, None)
+pub(super) fn sys_kill(pid: i32, sig: i32) -> SyscallResult {
+    // Validate signal early for group/broadcast kill so invalid signals fail
+    // with EINVAL even if no target process exists.
+    if sig != 0 {
+        crate::signal::Signal::from_raw(sig)?;
+    }
+    if pid > 0 {
+        return kill_common(pid as ProcessId, sig, KillTarget::Process, None);
+    }
+
+    // N2.5: POSIX process-group and broadcast kill(2):
+    // - pid == 0  -> every process in caller's process group
+    // - pid < -1  -> every process in process group `-pid`
+    // - pid == -1 -> every permissible process except PID 1 and caller
+    let self_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let (self_tgid, self_pgid, owning_ns) = {
+        let self_proc = get_process(self_pid).ok_or(SyscallError::ESRCH)?;
+        let p = self_proc.lock();
+        (
+            p.tgid,
+            p.thread_group.pgid(),
+            crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+        )
+    };
+
+    let target_pgid: Option<ProcessId> = if pid == 0 {
+        Some(self_pgid)
+    } else if pid < -1 {
+        let local_pgid = (-(pid as i64)) as ProcessId;
+        let resolved = match &owning_ns {
+            Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(ns, local_pgid)
+                .ok_or(SyscallError::ESRCH)?,
+            None => local_pgid,
+        };
+        Some(resolved)
+    } else {
+        None // pid == -1 broadcast
+    };
+
+    // Snapshot matching thread-group leaders in caller's namespace without
+    // holding PROCESS_TABLE across kill_common.
+    let mut targets: Vec<ProcessId> = Vec::new();
+    {
+        let table = crate::process::PROCESS_TABLE.lock();
+        for (slot_pid, slot) in table.iter().enumerate() {
+            let Some(arc) = slot else { continue };
+            let p = arc.lock();
+            if p.tgid != slot_pid
+                || matches!(p.state, ProcessState::Zombie | ProcessState::Terminated)
+            {
+                continue;
+            }
+            let matched = match target_pgid {
+                Some(pg) => p.thread_group.pgid() == pg,
+                None => p.tgid != 1 && p.tgid != self_tgid,
+            };
+            if !matched {
+                continue;
+            }
+            let view_pid = match &owning_ns {
+                Some(ns) => match ns.lookup_ns_pid(slot_pid) {
+                    Some(v) => v,
+                    None => continue,
+                },
+                None => slot_pid,
+            };
+            if targets.try_reserve(1).is_err() {
+                return Err(SyscallError::ENOMEM);
+            }
+            targets.push(view_pid);
+        }
+    }
+    drop(owning_ns);
+
+    if targets.is_empty() {
+        return Err(SyscallError::ESRCH);
+    }
+
+    // Deliver to non-self members first so a fatal self-signal in the same
+    // process group still signals sibling processes before self-terminating.
+    let mut self_view: Option<ProcessId> = None;
+    let mut delivered = 0usize;
+    let mut last_err: Option<SyscallError> = None;
+    for target_view in targets {
+        let is_self = target_view == self_tgid
+            || get_process(self_pid).and_then(|p| {
+                crate::pid_namespace::pid_in_owning_namespace(&p.lock().pid_ns_chain)
+            }) == Some(target_view);
+        if is_self {
+            self_view = Some(target_view);
+            continue;
+        }
+        match kill_common(target_view, sig, KillTarget::Process, None) {
+            Ok(_) => delivered += 1,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(sv) = self_view {
+        match kill_common(sv, sig, KillTarget::Process, None) {
+            Ok(_) => delivered += 1,
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    if delivered > 0 {
+        Ok(0)
+    } else {
+        Err(last_err.unwrap_or(SyscallError::ESRCH))
+    }
+}
+
+/// N2.5: Kernel-authoritative signal broadcast to all live processes in global `pgid`
+/// (used by controlling-terminal hangup on `TIOCNOTTY`).
+pub(super) fn send_signal_to_pgid_kernel(pgid: ProcessId, signal: crate::signal::Signal) {
+    let mut targets: Vec<ProcessId> = Vec::new();
+    {
+        let table = crate::process::PROCESS_TABLE.lock();
+        for (slot_pid, slot) in table.iter().enumerate() {
+            let Some(arc) = slot else { continue };
+            let p = arc.lock();
+            if p.tgid == slot_pid
+                && !matches!(p.state, ProcessState::Zombie | ProcessState::Terminated)
+                && p.thread_group.pgid() == pgid
+                && targets.try_reserve(1).is_ok()
+            {
+                targets.push(slot_pid);
+            }
+        }
+    }
+    for tgid in targets {
+        let _ = crate::signal::send_signal_kernel(tgid, signal);
+    }
 }
 
 /// tkill(2). musl's raise() uses it with the caller's own tid.
@@ -976,6 +1106,9 @@ pub(super) fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Sig
             }
             SignalAction::Stop => {
                 stop = crate::process::try_mark_job_control_stopped_locked(&mut proc);
+                if stop {
+                    proc.thread_group.record_stop_event(sig.as_u8());
+                }
             }
             SignalAction::Continue | SignalAction::Ignore => {}
         }
@@ -987,6 +1120,7 @@ pub(super) fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Sig
     if stop {
         // GAP-5 G7 (review D2): a stop stops the whole group, as at send time.
         let _ = crate::process::propagate_group_job_control(pid, false);
+        crate::process::notify_parent_of_job_control_event(pid, true);
         crate::process::wait_for_job_control_resume(pid, generation);
     }
 }

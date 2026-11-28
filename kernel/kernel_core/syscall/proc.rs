@@ -1979,30 +1979,61 @@ pub(super) fn sys_wait4(
     if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
         return Err(SyscallError::EINVAL);
     }
-    if pid_sel == 0 || pid_sel < -1 {
-        return Err(SyscallError::EINVAL);
-    }
     let target = if pid_sel > 0 {
         WaitTarget::Pid(pid_sel as ProcessId)
-    } else {
+    } else if pid_sel == -1 {
         WaitTarget::Any
+    } else if pid_sel == 0 {
+        let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let caller = entry_proc
+            .as_ref()
+            .cloned()
+            .or_else(|| get_process(caller_pid))
+            .ok_or(SyscallError::ESRCH)?;
+        let pgid = caller.lock().thread_group.pgid();
+        WaitTarget::Pgid(pgid)
+    } else {
+        // pid_sel < -1: wait for any child whose PGID equals `-pid_sel`
+        // (resolved in caller's PID namespace).
+        let local_pgid = (-pid_sel) as ProcessId;
+        let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let caller = entry_proc
+            .as_ref()
+            .cloned()
+            .or_else(|| get_process(caller_pid))
+            .ok_or(SyscallError::ESRCH)?;
+        let owning_ns = crate::pid_namespace::owning_namespace(&caller.lock().pid_ns_chain);
+        let global_pgid = match owning_ns {
+            Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(&ns, local_pgid)
+                .ok_or(SyscallError::ECHILD)?,
+            None => local_pgid,
+        };
+        WaitTarget::Pgid(global_pgid)
+    };
+
+    let opts = WaitOptions {
+        nohang: options & WNOHANG != 0,
+        nowait: false,
+        exited: true,
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
     };
 
     // The wstatus store is the core's `publish` step: it runs at the point the
-    // old inline code wrote it — after a reapable zombie is chosen, before the
-    // child is unlinked and cleaned up — so an EFAULT leaves the zombie
-    // reapable and restores the parent to Ready.
+    // old inline code wrote it — after a child event is chosen, before the
+    // child is unlinked/cleaned up — so an EFAULT leaves the event reportable
+    // and restores the parent to Ready.
     let publish = |outcome: &WaitOutcome| -> Result<(), SyscallError> {
         if status.is_null() {
             return Ok(());
         }
-        let wstatus: i32 = (outcome.exit_code & 0xff) << 8;
+        let wstatus: i32 = outcome.event.encode_wstatus();
         copy_to_user(status as *mut u8, &wstatus.to_ne_bytes())
     };
 
-    match wait_reap_core_with_parent(target, options & WNOHANG != 0, false, publish, entry_proc)? {
+    match wait_reap_core_opts(target, opts, publish, entry_proc)? {
         Some(outcome) => Ok(outcome.view_pid),
-        // WNOHANG with nothing reapable.
+        // WNOHANG with nothing reportable.
         None => Ok(0),
     }
 }
@@ -2018,13 +2049,56 @@ pub(super) enum WaitTarget {
     Any,
     /// Exactly this child, named in the caller's PID namespace.
     Pid(ProcessId),
+    /// Any child whose process group ID equals this global PGID
+    /// (`wait4(0, ..)`, `wait4(-pgid, ..)`, `waitid(P_PGID, ..)`).
+    Pgid(ProcessId),
 }
 
-/// A reaped child, described both globally and as the caller sees it.
+/// Which state transitions a wait call is willing to observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WaitOptions {
+    pub(super) nohang: bool,
+    pub(super) nowait: bool,
+    pub(super) exited: bool,
+    pub(super) stopped: bool,
+    pub(super) continued: bool,
+}
+
+/// State transition reported by `wait4` / `waitid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitEventKind {
+    Exited(i32),
+    Stopped(u8),
+    Continued,
+}
+
+impl WaitEventKind {
+    /// Encode as Linux x86_64 `wait4` packed `wstatus`.
+    #[inline]
+    pub(super) const fn encode_wstatus(self) -> i32 {
+        match self {
+            Self::Exited(code) => (code & 0xff) << 8,
+            Self::Stopped(sig) => ((sig as i32) << 8) | 0x7f,
+            Self::Continued => 0xffff,
+        }
+    }
+
+    /// Encode as Linux x86_64 `waitid` `(si_code, si_status)`.
+    #[inline]
+    pub(super) const fn encode_waitid_code_status(self) -> (i32, i32) {
+        match self {
+            Self::Exited(code) => (CLD_EXITED, code & 0xff),
+            Self::Stopped(sig) => (CLD_STOPPED, sig as i32),
+            Self::Continued => (CLD_CONTINUED, crate::signal::Signal::SIGCONT.as_i32()),
+        }
+    }
+}
+
+/// A reported child event, described both globally and as the caller sees it.
 pub(super) struct WaitOutcome {
     pub(super) global_pid: ProcessId,
     pub(super) view_pid: ProcessId,
-    pub(super) exit_code: i32,
+    pub(super) event: WaitEventKind,
 }
 
 /// Resolve the wake filter before publishing Blocked. A PID selector must
@@ -2057,7 +2131,7 @@ pub(super) fn prepare_child_wait_checked(
     mut lookup: impl FnMut(ProcessId) -> Option<crate::process::ProcessArc>,
 ) -> Result<bool, SyscallError> {
     let wake_pid = match target {
-        WaitTarget::Any => Some(0),
+        WaitTarget::Any | WaitTarget::Pgid(_) => Some(0),
         WaitTarget::Pid(want) => children.iter().find_map(|&global| {
             let child = lookup(global)?;
             let child = child.lock();
@@ -2290,8 +2364,8 @@ mod selective_wait_tests {
         fn assert_target(&self, result: Result<Option<WaitOutcome>, SyscallError>) {
             let outcome = result.unwrap().expect("target must be reported");
             assert_eq!(
-                (outcome.global_pid, outcome.view_pid, outcome.exit_code),
-                (self.base + 3, 4, 22)
+                (outcome.global_pid, outcome.view_pid, outcome.event),
+                (self.base + 3, 4, WaitEventKind::Exited(22))
             );
             let caller = self.caller.lock();
             assert_eq!(caller.state, ProcessState::Ready);
@@ -2565,12 +2639,37 @@ pub(super) fn wait_reap_core_with_parent<W>(
     target: WaitTarget,
     nohang: bool,
     nowait: bool,
+    publish: W,
+    entry_proc: Option<ProcessArc>,
+) -> Result<Option<WaitOutcome>, SyscallError>
+where
+    W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
+{
+    wait_reap_core_opts(
+        target,
+        WaitOptions {
+            nohang,
+            nowait,
+            exited: true,
+            stopped: false,
+            continued: false,
+        },
+        publish,
+        entry_proc,
+    )
+}
+
+pub(super) fn wait_reap_core_opts<W>(
+    target: WaitTarget,
+    opts: WaitOptions,
     mut publish: W,
     entry_proc: Option<ProcessArc>,
 ) -> Result<Option<WaitOutcome>, SyscallError>
 where
     W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
 {
+    let nohang = opts.nohang;
+    let nowait = opts.nowait;
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let parent = entry_proc
         .or_else(|| get_process(pid))
@@ -2594,13 +2693,17 @@ where
             FastWaitCheck::MultiThread(Arc::clone(&proc.thread_group))
         } else if crate::signal::should_abort_pending_block(&proc) {
             FastWaitCheck::AbortEintr
-        } else if let WaitTarget::Pid(want) = target {
-            let ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
-                .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone());
-            if Arc::ptr_eq(&ns, &crate::pid_namespace::ROOT_PID_NAMESPACE)
-                && proc.children.contains(&want)
-            {
-                FastWaitCheck::DirectCandidate(want, ns)
+        } else if opts.exited {
+            if let WaitTarget::Pid(want) = target {
+                let ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+                    .unwrap_or_else(|| crate::pid_namespace::ROOT_PID_NAMESPACE.clone());
+                if Arc::ptr_eq(&ns, &crate::pid_namespace::ROOT_PID_NAMESPACE)
+                    && proc.children.contains(&want)
+                {
+                    FastWaitCheck::DirectCandidate(want, ns)
+                } else {
+                    FastWaitCheck::SlowPath
+                }
             } else {
                 FastWaitCheck::SlowPath
             }
@@ -2610,7 +2713,7 @@ where
     };
     match fast_check {
         FastWaitCheck::MultiThread(group) => {
-            return wait_reap_group(target, nohang, nowait, publish, pid, &parent, &group);
+            return wait_reap_group_opts(target, opts, publish, pid, &parent, &group);
         }
         FastWaitCheck::AbortEintr => {
             return Err(SyscallError::EINTR);
@@ -2634,7 +2737,7 @@ where
                     Some(WaitOutcome {
                         global_pid: want,
                         view_pid: want,
-                        exit_code: child.exit_code.unwrap_or(0),
+                        event: WaitEventKind::Exited(child.exit_code.unwrap_or(0)),
                     })
                 } else {
                     None
@@ -2846,7 +2949,7 @@ where
         // A selected zombie whose teardown/switch-out is still in flight: the
         // wake was genuine, only early (wake_reaper_after_switch follows).
         let mut selected_zombie_pending = false;
-        let mut zombie_child: Option<(ProcessId, i32, ProcessId)> = None;
+        let mut reported_child: Option<(ProcessId, WaitEventKind, ProcessId)> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
 
         for child_pid in child_list.as_slice().iter() {
@@ -2864,9 +2967,17 @@ where
                     let Some(view_pid) = child.wait_pid_in_namespace(&parent_namespace) else {
                         continue;
                     };
-                    if let WaitTarget::Pid(want) = target {
-                        if view_pid != want {
-                            continue;
+                    match target {
+                        WaitTarget::Any => {}
+                        WaitTarget::Pid(want) => {
+                            if view_pid != want {
+                                continue;
+                            }
+                        }
+                        WaitTarget::Pgid(want_pgid) => {
+                            if child.thread_group.pgid() != want_pgid {
+                                continue;
+                            }
                         }
                     }
 
@@ -2877,7 +2988,8 @@ where
                     // threads are auto-reaped), and a zombie leader only once it
                     // is the last member. A lone zombie leader cannot gain
                     // members, so this stays true through cleanup_zombie.
-                    if child.state == ProcessState::Zombie
+                    if opts.exited
+                        && child.state == ProcessState::Zombie
                         && child
                             .teardown_done
                             .load(core::sync::atomic::Ordering::Acquire)
@@ -2888,11 +3000,44 @@ where
                         && child.tgid == *child_pid
                         && child.thread_group.members() == 1
                     {
-                        zombie_child = Some((*child_pid, child.exit_code.unwrap_or(0), view_pid));
+                        reported_child = Some((
+                            *child_pid,
+                            WaitEventKind::Exited(child.exit_code.unwrap_or(0)),
+                            view_pid,
+                        ));
                         break;
                     }
-                    if child.state == ProcessState::Zombie {
+                    if opts.exited && child.state == ProcessState::Zombie {
                         selected_zombie_pending = true;
+                    }
+                    // N2.5: Report WUNTRACED / WSTOPPED and WCONTINUED on live child leaders.
+                    if !matches!(child.state, ProcessState::Zombie | ProcessState::Terminated)
+                        && child.tgid == *child_pid
+                    {
+                        if opts.stopped {
+                            let stop_sig = if nowait {
+                                child.thread_group.peek_stop_event()
+                            } else {
+                                child.thread_group.take_stop_event()
+                            };
+                            if let Some(sig) = stop_sig {
+                                reported_child =
+                                    Some((*child_pid, WaitEventKind::Stopped(sig), view_pid));
+                                break;
+                            }
+                        }
+                        if opts.continued {
+                            let cont = if nowait {
+                                child.thread_group.peek_continue_event()
+                            } else {
+                                child.thread_group.take_continue_event()
+                            };
+                            if cont {
+                                reported_child =
+                                    Some((*child_pid, WaitEventKind::Continued, view_pid));
+                                break;
+                            }
+                        }
                     }
                 }
                 None => {
@@ -2906,66 +3051,104 @@ where
             }
         }
 
-        if let Some((child_pid, exit_code, parent_view_pid)) = zombie_child {
+        if let Some((child_pid, event, parent_view_pid)) = reported_child {
             let outcome = WaitOutcome {
                 global_pid: child_pid,
                 view_pid: parent_view_pid,
-                exit_code,
+                event,
             };
 
-            // GAP-5 G8: the group may have gained a thread that waits too; one
-            // waiter claims the zombie. A loser rescans once the winner's reap
-            // has removed the child.
-            if !nowait && !crate::process::claim_wait_reap(child_pid) {
-                {
+            match event {
+                WaitEventKind::Stopped(sig) => {
+                    if let Err(e) = publish(&outcome) {
+                        if !nowait {
+                            if let Some(c) = get_process(child_pid) {
+                                c.lock().thread_group.record_stop_event(sig);
+                            }
+                        }
+                        let mut proc = parent.lock();
+                        proc.enter_ready_at(crate::get_ticks());
+                        proc.waiting_child = None;
+                        return Err(e);
+                    }
                     let mut proc = parent.lock();
-                    proc.enter_ready_at(crate::get_ticks());
                     proc.waiting_child = None;
+                    proc.enter_ready_at(crate::get_ticks());
+                    return Ok(Some(outcome));
                 }
-                crate::force_reschedule();
-                continue;
-            }
-
-            // Report to the caller before committing the reap. A failure here
-            // must restore Ready and leave the zombie reapable, matching Linux
-            // EFAULT semantics for a bad status/siginfo pointer.
-            if let Err(e) = publish(&outcome) {
-                if !nowait {
-                    crate::process::release_wait_reap(child_pid);
+                WaitEventKind::Continued => {
+                    if let Err(e) = publish(&outcome) {
+                        if !nowait {
+                            if let Some(c) = get_process(child_pid) {
+                                c.lock().thread_group.record_continue_event();
+                            }
+                        }
+                        let mut proc = parent.lock();
+                        proc.enter_ready_at(crate::get_ticks());
+                        proc.waiting_child = None;
+                        return Err(e);
+                    }
+                    let mut proc = parent.lock();
+                    proc.waiting_child = None;
+                    proc.enter_ready_at(crate::get_ticks());
+                    return Ok(Some(outcome));
                 }
-                let mut proc = parent.lock();
-                proc.enter_ready_at(crate::get_ticks());
-                proc.waiting_child = None;
-                return Err(e);
+                WaitEventKind::Exited(exit_code) => {
+                    // GAP-5 G8: the group may have gained a thread that waits too; one
+                    // waiter claims the zombie. A loser rescans once the winner's reap
+                    // has removed the child.
+                    if !nowait && !crate::process::claim_wait_reap(child_pid) {
+                        {
+                            let mut proc = parent.lock();
+                            proc.enter_ready_at(crate::get_ticks());
+                            proc.waiting_child = None;
+                        }
+                        crate::force_reschedule();
+                        continue;
+                    }
+
+                    // Report to the caller before committing the reap. A failure here
+                    // must restore Ready and leave the zombie reapable, matching Linux
+                    // EFAULT semantics for a bad status/siginfo pointer.
+                    if let Err(e) = publish(&outcome) {
+                        if !nowait {
+                            crate::process::release_wait_reap(child_pid);
+                        }
+                        let mut proc = parent.lock();
+                        proc.enter_ready_at(crate::get_ticks());
+                        proc.waiting_child = None;
+                        return Err(e);
+                    }
+
+                    if nowait {
+                        // WNOWAIT: leave the child linked and un-cleaned so a later
+                        // wait can reap it. Only the parent's own wait state is undone.
+                        let mut proc = parent.lock();
+                        proc.waiting_child = None;
+                        proc.enter_ready_at(crate::get_ticks());
+                        return Ok(Some(outcome));
+                    }
+
+                    {
+                        let mut proc = parent.lock();
+                        proc.children.retain(|&c| c != child_pid);
+                        proc.waiting_child = None;
+                        proc.enter_ready_at(crate::get_ticks());
+                    }
+
+                    // 清理僵尸进程资源
+                    cleanup_zombie(child_pid);
+
+                    kprintln!(
+                        "sys_wait: reaped child {} (ns_pid={}) with exit code {}",
+                        child_pid,
+                        parent_view_pid,
+                        exit_code
+                    );
+                    // F.1: Return namespace-local PID to parent (Linux semantics)
+                    return Ok(Some(outcome));
+                }
             }
-
-            if nowait {
-                // WNOWAIT: leave the child linked and un-cleaned so a later
-                // wait can reap it. Only the parent's own wait state is undone.
-                let mut proc = parent.lock();
-                proc.waiting_child = None;
-                proc.enter_ready_at(crate::get_ticks());
-                return Ok(Some(outcome));
-            }
-
-            {
-                let mut proc = parent.lock();
-                proc.children.retain(|&c| c != child_pid);
-                proc.waiting_child = None;
-                proc.enter_ready_at(crate::get_ticks());
-            }
-
-            // 清理僵尸进程资源
-            cleanup_zombie(child_pid);
-
-            kprintln!(
-                "sys_wait: reaped child {} (ns_pid={}) with exit code {}",
-                child_pid,
-                parent_view_pid,
-                exit_code
-            );
-            // F.1: Return namespace-local PID to parent (Linux semantics)
-            return Ok(Some(outcome));
         }
 
         // 清理过期的子进程 PID
@@ -3043,6 +3226,33 @@ pub(super) fn wait_reap_group<W>(
     target: WaitTarget,
     nohang: bool,
     nowait: bool,
+    publish: W,
+    pid: ProcessId,
+    caller: &crate::process::ProcessArc,
+    group: &Arc<crate::process::ThreadGroup>,
+) -> Result<Option<WaitOutcome>, SyscallError>
+where
+    W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
+{
+    wait_reap_group_opts(
+        target,
+        WaitOptions {
+            nohang,
+            nowait,
+            exited: true,
+            stopped: false,
+            continued: false,
+        },
+        publish,
+        pid,
+        caller,
+        group,
+    )
+}
+
+pub(super) fn wait_reap_group_opts<W>(
+    target: WaitTarget,
+    opts: WaitOptions,
     mut publish: W,
     pid: ProcessId,
     caller: &crate::process::ProcessArc,
@@ -3051,6 +3261,8 @@ pub(super) fn wait_reap_group<W>(
 where
     W: FnMut(&WaitOutcome) -> Result<(), SyscallError>,
 {
+    let nohang = opts.nohang;
+    let nowait = opts.nowait;
     struct ChildWaiter<'a>(&'a crate::process::ThreadGroup);
     impl Drop for ChildWaiter<'_> {
         fn drop(&mut self) {
@@ -3084,8 +3296,8 @@ where
         let mut grew = false;
         // A candidate that becomes reapable without a report: poll for it.
         let mut transient = false;
-        // (child, exit code, view pid)
-        let mut found: Option<(ProcessId, i32, ProcessId)> = None;
+        // (child, event, view pid)
+        let mut found: Option<(ProcessId, WaitEventKind, ProcessId)> = None;
         'scan: {
             let table = crate::process::PROCESS_TABLE.lock();
             for (slot_pid, slot) in table.iter().enumerate() {
@@ -3108,46 +3320,84 @@ where
                 let Some(view_pid) = child.wait_pid_in_namespace(&parent_namespace) else {
                     continue;
                 };
-                if let WaitTarget::Pid(want) = target {
-                    if view_pid != want {
-                        continue;
+                match target {
+                    WaitTarget::Any => {}
+                    WaitTarget::Pid(want) => {
+                        if view_pid != want {
+                            continue;
+                        }
+                        wake_pid = child_pid;
                     }
-                    wake_pid = child_pid;
+                    WaitTarget::Pgid(want_pgid) => {
+                        if child.thread_group.pgid() != want_pgid {
+                            continue;
+                        }
+                    }
                 }
                 selected_exists = true;
                 // A zombie leader whose group is empty is reported once its
                 // teardown is published and it has switched out for good.
-                let reportable = child.state == ProcessState::Zombie
+                if opts.exited && child.state == ProcessState::Zombie {
+                    let reportable = child.tgid == child_pid && child.thread_group.members() == 1;
+                    let reapable = reportable
+                        && child
+                            .teardown_done
+                            .load(core::sync::atomic::Ordering::Acquire)
+                        && !child.on_cpu.load(core::sync::atomic::Ordering::Acquire)
+                        && !child
+                            .switch_reap_pending
+                            .load(core::sync::atomic::Ordering::Acquire);
+                    if !reapable {
+                        transient |= reportable;
+                        continue;
+                    }
+                    if !nowait
+                        && child
+                            .wait_claimed
+                            .compare_exchange(
+                                false,
+                                true,
+                                core::sync::atomic::Ordering::AcqRel,
+                                core::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_err()
+                    {
+                        transient = true;
+                        continue;
+                    }
+                    found = Some((
+                        child_pid,
+                        WaitEventKind::Exited(child.exit_code.unwrap_or(0)),
+                        view_pid,
+                    ));
+                    break;
+                }
+                if !matches!(child.state, ProcessState::Zombie | ProcessState::Terminated)
                     && child.tgid == child_pid
-                    && child.thread_group.members() == 1;
-                let reapable = reportable
-                    && child
-                        .teardown_done
-                        .load(core::sync::atomic::Ordering::Acquire)
-                    && !child.on_cpu.load(core::sync::atomic::Ordering::Acquire)
-                    && !child
-                        .switch_reap_pending
-                        .load(core::sync::atomic::Ordering::Acquire);
-                if !reapable {
-                    transient |= reportable;
-                    continue;
-                }
-                if !nowait
-                    && child
-                        .wait_claimed
-                        .compare_exchange(
-                            false,
-                            true,
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        )
-                        .is_err()
                 {
-                    transient = true;
-                    continue;
+                    if opts.stopped {
+                        let stop_sig = if nowait {
+                            child.thread_group.peek_stop_event()
+                        } else {
+                            child.thread_group.take_stop_event()
+                        };
+                        if let Some(sig) = stop_sig {
+                            found = Some((child_pid, WaitEventKind::Stopped(sig), view_pid));
+                            break;
+                        }
+                    }
+                    if opts.continued {
+                        let cont = if nowait {
+                            child.thread_group.peek_continue_event()
+                        } else {
+                            child.thread_group.take_continue_event()
+                        };
+                        if cont {
+                            found = Some((child_pid, WaitEventKind::Continued, view_pid));
+                            break;
+                        }
+                    }
                 }
-                found = Some((child_pid, child.exit_code.unwrap_or(0), view_pid));
-                break;
             }
         }
         if grew {
@@ -3157,37 +3407,64 @@ where
         #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
         selective_wait_tests::group_wait_phase(selective_wait_tests::GroupWaitPhase::Scanned);
 
-        if let Some((child_pid, exit_code, view_pid)) = found {
+        if let Some((child_pid, event, view_pid)) = found {
             let outcome = WaitOutcome {
                 global_pid: child_pid,
                 view_pid,
-                exit_code,
+                event,
             };
-            if let Err(e) = publish(&outcome) {
-                if !nowait {
-                    crate::process::release_wait_reap(child_pid);
+            match event {
+                WaitEventKind::Stopped(sig) => {
+                    if let Err(e) = publish(&outcome) {
+                        if !nowait {
+                            if let Some(c) = get_process(child_pid) {
+                                c.lock().thread_group.record_stop_event(sig);
+                            }
+                        }
+                        return Err(e);
+                    }
+                    return Ok(Some(outcome));
                 }
-                return Err(e);
-            }
-            if nowait {
-                return Ok(Some(outcome));
-            }
-            // GAP-5 G8 (review D2): the child may have been reparented since
-            // the scan (its parent thread exited). Unlink it from its current
-            // parent; reparenting runs under the same table lock.
-            {
-                let table = crate::process::PROCESS_TABLE.lock();
-                let parent_pid = table
-                    .get(child_pid)
-                    .and_then(Option::as_ref)
-                    .map(|child| child.lock().ppid);
-                if let Some(parent) = parent_pid.and_then(|p| table.get(p).and_then(Option::as_ref))
-                {
-                    parent.lock().children.retain(|&c| c != child_pid);
+                WaitEventKind::Continued => {
+                    if let Err(e) = publish(&outcome) {
+                        if !nowait {
+                            if let Some(c) = get_process(child_pid) {
+                                c.lock().thread_group.record_continue_event();
+                            }
+                        }
+                        return Err(e);
+                    }
+                    return Ok(Some(outcome));
+                }
+                WaitEventKind::Exited(_) => {
+                    if let Err(e) = publish(&outcome) {
+                        if !nowait {
+                            crate::process::release_wait_reap(child_pid);
+                        }
+                        return Err(e);
+                    }
+                    if nowait {
+                        return Ok(Some(outcome));
+                    }
+                    // GAP-5 G8 (review D2): the child may have been reparented since
+                    // the scan (its parent thread exited). Unlink it from its current
+                    // parent; reparenting runs under the same table lock.
+                    {
+                        let table = crate::process::PROCESS_TABLE.lock();
+                        let parent_pid = table
+                            .get(child_pid)
+                            .and_then(Option::as_ref)
+                            .map(|child| child.lock().ppid);
+                        if let Some(parent) =
+                            parent_pid.and_then(|p| table.get(p).and_then(Option::as_ref))
+                        {
+                            parent.lock().children.retain(|&c| c != child_pid);
+                        }
+                    }
+                    cleanup_zombie(child_pid);
+                    return Ok(Some(outcome));
                 }
             }
-            cleanup_zombie(child_pid);
-            return Ok(Some(outcome));
         }
         if !selected_exists {
             return Err(SyscallError::ECHILD);
@@ -3631,6 +3908,257 @@ pub(super) const WNOWAIT: i32 = 0x0100_0000;
 
 /// `si_code` for a child that exited normally.
 pub(super) const CLD_EXITED: i32 = 1;
+/// `si_code` for a child that stopped (N2.5 `WUNTRACED`/`WSTOPPED`).
+pub(super) const CLD_STOPPED: i32 = 5;
+/// `si_code` for a stopped child that resumed via `SIGCONT` (N2.5 `WCONTINUED`).
+pub(super) const CLD_CONTINUED: i32 = 6;
+
+// ============================================================================
+// N2.5: Process Group & Session Syscalls (`setpgid`, `getpgid`, `getpgrp`,
+// `setsid`, `getsid`)
+// ============================================================================
+
+/// Translate a global PID/PGID/SID into the caller's PID namespace (returning
+/// `0` if outside the namespace, matching Linux `pid_vnr` semantics).
+#[inline]
+fn translate_id_for_caller(
+    global_id: ProcessId,
+    owning_ns: &Option<crate::pid_namespace::PidNamespaceArc>,
+) -> ProcessId {
+    match owning_ns {
+        Some(ns) => ns.lookup_ns_pid(global_id).unwrap_or(0),
+        None => global_id,
+    }
+}
+
+/// sys_getpgrp - get process group ID of calling process (syscall 111, N2.5).
+pub(super) fn sys_getpgrp() -> SyscallResult {
+    sys_getpgid(0)
+}
+
+/// sys_getpgid - get process group ID of `pid` (0 = caller) (syscall 121, N2.5).
+pub(super) fn sys_getpgid(pid: i32) -> SyscallResult {
+    if pid < 0 {
+        return Err(SyscallError::ESRCH);
+    }
+    let caller = current_pid().ok_or(SyscallError::ESRCH)?;
+    let (caller_pgid, owning_ns) = {
+        let arc = get_process(caller).ok_or(SyscallError::ESRCH)?;
+        let p = arc.lock();
+        (
+            p.thread_group.pgid(),
+            crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+        )
+    };
+    let global_pgid = if pid == 0 {
+        caller_pgid
+    } else {
+        let target_global = match &owning_ns {
+            Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(ns, pid as ProcessId)
+                .ok_or(SyscallError::ESRCH)?,
+            None => pid as ProcessId,
+        };
+        let target = get_process(target_global).ok_or(SyscallError::ESRCH)?;
+        let t = target.lock();
+        if matches!(t.state, ProcessState::Zombie | ProcessState::Terminated) {
+            return Err(SyscallError::ESRCH);
+        }
+        t.thread_group.pgid()
+    };
+    Ok(translate_id_for_caller(global_pgid, &owning_ns))
+}
+
+/// sys_getsid - get session ID of `pid` (0 = caller) (syscall 124, N2.5).
+pub(super) fn sys_getsid(pid: i32) -> SyscallResult {
+    if pid < 0 {
+        return Err(SyscallError::ESRCH);
+    }
+    let caller = current_pid().ok_or(SyscallError::ESRCH)?;
+    let (caller_sid, owning_ns) = {
+        let arc = get_process(caller).ok_or(SyscallError::ESRCH)?;
+        let p = arc.lock();
+        (
+            p.thread_group.sid(),
+            crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+        )
+    };
+    let global_sid = if pid == 0 {
+        caller_sid
+    } else {
+        let target_global = match &owning_ns {
+            Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(ns, pid as ProcessId)
+                .ok_or(SyscallError::ESRCH)?,
+            None => pid as ProcessId,
+        };
+        let target = get_process(target_global).ok_or(SyscallError::ESRCH)?;
+        let t = target.lock();
+        if matches!(t.state, ProcessState::Zombie | ProcessState::Terminated) {
+            return Err(SyscallError::ESRCH);
+        }
+        t.thread_group.sid()
+    };
+    Ok(translate_id_for_caller(global_sid, &owning_ns))
+}
+
+/// sys_setsid - create a new session and process group (syscall 112, N2.5).
+///
+/// Fails with `EPERM` if any live process already belongs to a process group
+/// whose PGID equals the caller's TGID (including the caller itself).
+pub(super) fn sys_setsid() -> SyscallResult {
+    let caller = current_pid().ok_or(SyscallError::ESRCH)?;
+    let (caller_tgid, owning_ns) = {
+        let arc = get_process(caller).ok_or(SyscallError::ESRCH)?;
+        let p = arc.lock();
+        (
+            p.tgid,
+            crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+        )
+    };
+
+    {
+        let table = crate::process::PROCESS_TABLE.lock();
+        for slot in table.iter() {
+            let Some(arc) = slot else { continue };
+            let p = arc.lock();
+            if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
+                continue;
+            }
+            if p.thread_group.pgid() == caller_tgid {
+                return Err(SyscallError::EPERM);
+            }
+        }
+        let Some(caller_arc) = table.get(caller).and_then(Option::as_ref) else {
+            return Err(SyscallError::ESRCH);
+        };
+        let tg = &caller_arc.lock().thread_group;
+        tg.set_sid(caller_tgid);
+        tg.set_pgid(caller_tgid);
+        tg.set_has_ctty(false);
+    }
+
+    Ok(translate_id_for_caller(caller_tgid, &owning_ns))
+}
+
+/// Pure POSIX `setpgid(2)` rule check (factored for hosted unit tests).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_setpgid_rules(
+    caller_tgid: ProcessId,
+    caller_sid: ProcessId,
+    target_tgid: ProcessId,
+    target_ppid: ProcessId,
+    target_sid: ProcessId,
+    target_has_execed: bool,
+    new_pgid: ProcessId,
+    new_pgid_exists_in_session: bool,
+) -> Result<(), SyscallError> {
+    let is_self = target_tgid == caller_tgid;
+    let is_child = target_ppid == caller_tgid;
+    if !is_self && !is_child {
+        return Err(SyscallError::ESRCH);
+    }
+    if is_child && target_has_execed {
+        return Err(SyscallError::EACCES);
+    }
+    if target_sid != caller_sid {
+        return Err(SyscallError::EPERM);
+    }
+    // A session leader cannot change its own process group.
+    if target_tgid == target_sid {
+        return Err(SyscallError::EPERM);
+    }
+    if new_pgid != target_tgid && !new_pgid_exists_in_session {
+        return Err(SyscallError::EPERM);
+    }
+    Ok(())
+}
+
+/// sys_setpgid - set process group ID of self or an un-exec'd child (syscall 109, N2.5).
+pub(super) fn sys_setpgid(pid: i32, pgid: i32) -> SyscallResult {
+    if pid < 0 || pgid < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let caller = current_pid().ok_or(SyscallError::ESRCH)?;
+    let (caller_tgid, caller_sid, owning_ns) = {
+        let arc = get_process(caller).ok_or(SyscallError::ESRCH)?;
+        let p = arc.lock();
+        (
+            p.tgid,
+            p.thread_group.sid(),
+            crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+        )
+    };
+
+    let target_global = if pid == 0 {
+        caller_tgid
+    } else {
+        match &owning_ns {
+            Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(ns, pid as ProcessId)
+                .ok_or(SyscallError::ESRCH)?,
+            None => pid as ProcessId,
+        }
+    };
+
+    let table = crate::process::PROCESS_TABLE.lock();
+    let target_arc = table
+        .get(target_global)
+        .and_then(Option::as_ref)
+        .ok_or(SyscallError::ESRCH)?;
+    let (target_tgid, target_ppid, target_sid, target_execed, target_group) = {
+        let t = target_arc.lock();
+        if matches!(t.state, ProcessState::Zombie | ProcessState::Terminated) {
+            return Err(SyscallError::ESRCH);
+        }
+        (
+            t.tgid,
+            t.ppid,
+            t.thread_group.sid(),
+            t.thread_group.has_execed(),
+            Arc::clone(&t.thread_group),
+        )
+    };
+
+    let new_pgid = if pgid == 0 {
+        target_tgid
+    } else {
+        match &owning_ns {
+            Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(ns, pgid as ProcessId)
+                .ok_or(SyscallError::EPERM)?,
+            None => pgid as ProcessId,
+        }
+    };
+
+    let pgid_in_session = if new_pgid == target_tgid {
+        true
+    } else {
+        let mut found = false;
+        for slot in table.iter() {
+            let Some(arc) = slot else { continue };
+            let p = arc.lock();
+            if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
+                continue;
+            }
+            if p.thread_group.sid() == caller_sid && p.thread_group.pgid() == new_pgid {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+
+    validate_setpgid_rules(
+        caller_tgid,
+        caller_sid,
+        target_tgid,
+        target_ppid,
+        target_sid,
+        target_execed,
+        new_pgid,
+        pgid_in_session,
+    )?;
+
+    target_group.set_pgid(new_pgid);
+    Ok(0)
+}
 
 /// Byte offsets into the x86_64 `siginfo_t` fields `waitid` fills.
 /// Layout: si_signo(0) si_errno(4) si_code(8) __pad(12) then the _sigchld
@@ -3670,30 +4198,43 @@ pub(super) fn waitid_validate_args(
     idtype: i32,
     id: i32,
     options: i32,
-) -> Result<WaitTarget, SyscallError> {
+) -> Result<(WaitTarget, WaitOptions), SyscallError> {
     const KNOWN: i32 = WNOHANG | WUNTRACED | WEXITED | WCONTINUED | WNOWAIT;
     if options & !KNOWN != 0 {
         return Err(SyscallError::EINVAL);
     }
-    // No stop/continue event ledger exists, so these can never be satisfied.
-    if options & (WUNTRACED | WCONTINUED) != 0 {
-        return Err(SyscallError::EINVAL);
-    }
-    if options & WEXITED == 0 {
+    // POSIX/Linux: at least one of WEXITED, WSTOPPED(==WUNTRACED), WCONTINUED
+    // must be specified in `options`.
+    if options & (WEXITED | WUNTRACED | WCONTINUED) == 0 {
         return Err(SyscallError::EINVAL);
     }
 
-    match idtype {
-        P_ALL => Ok(WaitTarget::Any),
+    let target = match idtype {
+        P_ALL => WaitTarget::Any,
         P_PID => {
             if id <= 0 {
                 return Err(SyscallError::EINVAL);
             }
-            Ok(WaitTarget::Pid(id as ProcessId))
+            WaitTarget::Pid(id as ProcessId)
         }
-        P_PGID => Err(SyscallError::EINVAL),
-        _ => Err(SyscallError::EINVAL),
-    }
+        P_PGID => {
+            if id < 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            // id == 0 means caller's own PGID (resolved by sys_waitid before scan).
+            WaitTarget::Pgid(id as ProcessId)
+        }
+        _ => return Err(SyscallError::EINVAL),
+    };
+
+    let opts = WaitOptions {
+        nohang: options & WNOHANG != 0,
+        nowait: options & WNOWAIT != 0,
+        exited: options & WEXITED != 0,
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+    };
+    Ok((target, opts))
 }
 
 /// Pure `siginfo_t` encoder for `waitid`. Always returns the full 128 bytes so
@@ -3724,14 +4265,34 @@ pub(super) fn sys_waitid(
     infop: *mut u8,
     options: i32,
 ) -> Result<usize, SyscallError> {
-    let target = waitid_validate_args(idtype, id, options)?;
+    let (mut target, opts) = waitid_validate_args(idtype, id, options)?;
+    if let WaitTarget::Pgid(local_pgid) = target {
+        let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let caller = get_process(caller_pid).ok_or(SyscallError::ESRCH)?;
+        let (caller_pgid, owning_ns) = {
+            let p = caller.lock();
+            (
+                p.thread_group.pgid(),
+                crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+            )
+        };
+        let global_pgid = if local_pgid == 0 {
+            caller_pgid
+        } else {
+            match owning_ns {
+                Some(ns) => crate::pid_namespace::resolve_pid_in_namespace(&ns, local_pgid)
+                    .ok_or(SyscallError::ECHILD)?,
+                None => local_pgid,
+            }
+        };
+        target = WaitTarget::Pgid(global_pgid);
+    }
 
     let write_siginfo = |pid: ProcessId, uid: u32, code: i32, status: i32| {
         copy_to_user(infop, &waitid_encode_siginfo(pid, uid, code, status))
     };
 
-    // Resolved while the zombie is still selected but before it is unlinked:
-    // after cleanup_zombie the PCB is gone and si_uid would be unrecoverable.
+    // Resolved while the child is still selected and before cleanup_zombie runs.
     let publish = |outcome: &WaitOutcome| -> Result<(), SyscallError> {
         if infop.is_null() {
             // Linux accepts a NULL infop and reports only via the return value.
@@ -3744,17 +4305,11 @@ pub(super) fn sys_waitid(
             .map(|p| p.lock().shared_credentials())
             .and_then(|creds| creds.try_read().map(|c| c.uid))
             .unwrap_or(0);
-        // si_status carries the raw exit code, NOT the packed wstatus: with
-        // si_code == CLD_EXITED, userspace reads it directly as the exit status.
-        write_siginfo(outcome.view_pid, uid, CLD_EXITED, outcome.exit_code & 0xff)
+        let (si_code, si_status) = outcome.event.encode_waitid_code_status();
+        write_siginfo(outcome.view_pid, uid, si_code, si_status)
     };
 
-    match wait_reap_core(
-        target,
-        options & WNOHANG != 0,
-        options & WNOWAIT != 0,
-        publish,
-    )? {
+    match wait_reap_core_opts(target, opts, publish, None)? {
         Some(_) => Ok(0),
         None => {
             // WNOHANG, nothing ready: zeroed siginfo so si_pid == 0.
@@ -3766,10 +4321,9 @@ pub(super) fn sys_waitid(
     }
 }
 
-/// ST-K3-WAITID hosted oracle: executes the production `waitid(2)` argument
-/// contract and `siginfo_t` encoder on the host target. The reap/unlink,
-/// blocking and WNOWAIT-then-reap legs need live process state and a user
-/// address space, so they run only in the guest runtime gate.
+/// ST-K3-WAITID + N2.5 hosted oracle: executes the production `waitid(2)`,
+/// `setpgid(2)`, `ThreadGroup` job-control ledger, and `ConsoleTty` state
+/// machines on the host target.
 #[cfg(all(test, feature = "host_harness", not(target_os = "none")))]
 mod st_k3_waitid_oracle_tests {
     use super::*;
@@ -3778,16 +4332,23 @@ mod st_k3_waitid_oracle_tests {
     fn waitid_selectors_resolve_or_fail_closed() {
         assert!(matches!(
             waitid_validate_args(P_ALL, 0, WEXITED),
-            Ok(WaitTarget::Any)
+            Ok((WaitTarget::Any, _))
         ));
         assert!(matches!(
             waitid_validate_args(P_PID, 7, WEXITED),
-            Ok(WaitTarget::Pid(7))
+            Ok((WaitTarget::Pid(7), _))
         ));
-        // P_PGID has no process-group wait tracking behind it: refused, never
-        // silently widened to "any child".
-        assert_eq!(
+        // N2.5: P_PGID is now supported (0 = caller's PGID, >0 = explicit PGID, <0 = EINVAL).
+        assert!(matches!(
+            waitid_validate_args(P_PGID, 0, WEXITED),
+            Ok((WaitTarget::Pgid(0), _))
+        ));
+        assert!(matches!(
             waitid_validate_args(P_PGID, 7, WEXITED),
+            Ok((WaitTarget::Pgid(7), _))
+        ));
+        assert_eq!(
+            waitid_validate_args(P_PGID, -1, WEXITED),
             Err(SyscallError::EINVAL)
         );
         for bad_id in [0, -1] {
@@ -3804,26 +4365,177 @@ mod st_k3_waitid_oracle_tests {
 
     #[test]
     fn waitid_options_are_validated_before_any_state_change() {
-        // WEXITED is mandatory: a wait that can report nothing is a caller bug.
+        // At least one of WEXITED | WSTOPPED(WUNTRACED) | WCONTINUED is required.
         assert_eq!(waitid_validate_args(P_ALL, 0, 0), Err(SyscallError::EINVAL));
         assert_eq!(
             waitid_validate_args(P_ALL, 0, WNOHANG),
             Err(SyscallError::EINVAL)
         );
-        // Unsatisfiable rather than ignored: no stop/continue ledger exists, so
-        // honouring these would promise a notification that can never arrive.
-        for unsupported in [WUNTRACED, WCONTINUED] {
-            assert_eq!(
-                waitid_validate_args(P_ALL, 0, WEXITED | unsupported),
-                Err(SyscallError::EINVAL)
-            );
-        }
+        // N2.5: WSTOPPED (WUNTRACED) and WCONTINUED are valid alone or combined.
+        let (_, stop_opts) = waitid_validate_args(P_ALL, 0, WUNTRACED).unwrap();
+        assert!(stop_opts.stopped && !stop_opts.exited && !stop_opts.continued);
+        let (_, cont_opts) = waitid_validate_args(P_ALL, 0, WCONTINUED).unwrap();
+        assert!(cont_opts.continued && !cont_opts.exited && !cont_opts.stopped);
+        let (_, all_opts) = waitid_validate_args(
+            P_ALL,
+            0,
+            WEXITED | WUNTRACED | WCONTINUED | WNOHANG | WNOWAIT,
+        )
+        .unwrap();
+        assert!(
+            all_opts.exited
+                && all_opts.stopped
+                && all_opts.continued
+                && all_opts.nohang
+                && all_opts.nowait
+        );
         // Unknown bits are rejected, so future flags cannot be silently dropped.
         assert_eq!(
             waitid_validate_args(P_ALL, 0, WEXITED | 1 << 20),
             Err(SyscallError::EINVAL)
         );
-        assert!(waitid_validate_args(P_ALL, 0, WEXITED | WNOHANG | WNOWAIT).is_ok());
+    }
+
+    #[test]
+    fn n2_5_wstatus_and_waitid_job_control_encoding() {
+        assert_eq!(WaitEventKind::Exited(42).encode_wstatus(), 42 << 8);
+        assert_eq!(
+            WaitEventKind::Stopped(19).encode_wstatus(),
+            (19 << 8) | 0x7f
+        );
+        assert_eq!(WaitEventKind::Continued.encode_wstatus(), 0xffff);
+        assert_eq!(
+            WaitEventKind::Exited(42).encode_waitid_code_status(),
+            (CLD_EXITED, 42)
+        );
+        assert_eq!(
+            WaitEventKind::Stopped(20).encode_waitid_code_status(),
+            (CLD_STOPPED, 20)
+        );
+        assert_eq!(
+            WaitEventKind::Continued.encode_waitid_code_status(),
+            (CLD_CONTINUED, 18)
+        );
+    }
+
+    #[test]
+    fn n2_5_setpgid_posix_rules() {
+        // Self creating its own PGID succeeds when not a session leader.
+        assert!(validate_setpgid_rules(10, 1, 10, 1, 1, false, 10, true).is_ok());
+        // Session leader cannot change its own PGID -> EPERM.
+        assert_eq!(
+            validate_setpgid_rules(10, 10, 10, 1, 10, false, 20, true),
+            Err(SyscallError::EPERM)
+        );
+        // Non-child, non-self target -> ESRCH.
+        assert_eq!(
+            validate_setpgid_rules(10, 1, 99, 2, 1, false, 99, true),
+            Err(SyscallError::ESRCH)
+        );
+        // Child that already called execve -> EACCES.
+        assert_eq!(
+            validate_setpgid_rules(10, 1, 20, 10, 1, true, 20, true),
+            Err(SyscallError::EACCES)
+        );
+        // Child in another session -> EPERM.
+        assert_eq!(
+            validate_setpgid_rules(10, 1, 20, 10, 20, false, 10, true),
+            Err(SyscallError::EPERM)
+        );
+        // Moving into non-existent PGID in session -> EPERM.
+        assert_eq!(
+            validate_setpgid_rules(10, 1, 20, 10, 1, false, 777, false),
+            Err(SyscallError::EPERM)
+        );
+        // Moving un-exec'd child into existing PGID in same session succeeds.
+        assert!(validate_setpgid_rules(10, 1, 20, 10, 1, false, 10, true).is_ok());
+    }
+
+    #[test]
+    fn n2_5_thread_group_job_wait_ledger_and_ctty_state() {
+        let tg = crate::process::ThreadGroup::new();
+        tg.init_job_control(50);
+        assert_eq!(
+            (tg.pgid(), tg.sid(), tg.has_execed(), tg.has_ctty()),
+            (50, 50, false, false)
+        );
+
+        // Stop event reported once; peek preserves it for WNOWAIT.
+        tg.record_stop_event(19);
+        assert_eq!(tg.peek_stop_event(), Some(19));
+        assert!(!tg.peek_continue_event());
+        assert_eq!(tg.take_stop_event(), Some(19));
+        assert_eq!(tg.take_stop_event(), None);
+
+        // Continue cancels stale stop and reports once.
+        tg.record_stop_event(20);
+        tg.record_continue_event();
+        assert_eq!(tg.peek_stop_event(), None);
+        assert!(tg.peek_continue_event());
+        assert!(tg.take_continue_event());
+        assert!(!tg.take_continue_event());
+
+        // Inheritance on fork copies pgid/sid/ctty and clears execed/wait events.
+        tg.set_pgid(40);
+        tg.set_sid(30);
+        tg.set_has_ctty(true);
+        tg.mark_execed();
+        tg.record_stop_event(19);
+        let child_tg = crate::process::ThreadGroup::new();
+        child_tg.inherit_job_control(&tg);
+        assert_eq!(
+            (
+                child_tg.pgid(),
+                child_tg.sid(),
+                child_tg.has_ctty(),
+                child_tg.has_execed(),
+                child_tg.peek_stop_event()
+            ),
+            (40, 30, true, false, None)
+        );
+    }
+
+    #[test]
+    fn n2_5_console_tty_attach_fg_pgid_and_steal_rules() {
+        // Exercise console_tty transitions using an isolated high session ID.
+        let sid_a = 880_001;
+        let sid_b = 880_002;
+        let _ = crate::process::console_tty_release_session(sid_a);
+        let _ = crate::process::console_tty_release_session(sid_b);
+
+        // Steal (privileged) establishes sid_a as owner with fg_pgid = sid_a.
+        assert!(crate::process::console_tty_attach(sid_a, sid_a, true, true).is_ok());
+        assert_eq!(
+            crate::process::console_tty_get_fg_pgid(sid_a, true),
+            Ok(sid_a)
+        );
+        assert_eq!(
+            crate::process::console_tty_get_fg_pgid(sid_a, false),
+            Err(SyscallError::ENOTTY)
+        );
+        // Unprivileged foreign session cannot steal.
+        assert_eq!(
+            crate::process::console_tty_attach(sid_b, sid_b, true, false),
+            Err(SyscallError::EPERM)
+        );
+        assert_eq!(
+            crate::process::console_tty_get_fg_pgid(sid_b, true),
+            Err(SyscallError::ENOTTY)
+        );
+        // Foreground PGID update succeeds for owning session.
+        assert!(crate::process::console_tty_set_fg_pgid(sid_a, true, 880_010).is_ok());
+        assert_eq!(
+            crate::process::console_tty_get_fg_pgid(sid_a, true),
+            Ok(880_010)
+        );
+        assert_eq!(
+            crate::process::console_tty_release_session(sid_a),
+            Some(880_010)
+        );
+        assert_eq!(
+            crate::process::console_tty_get_sid(sid_a, true),
+            Err(SyscallError::ENOTTY)
+        );
     }
 
     #[test]

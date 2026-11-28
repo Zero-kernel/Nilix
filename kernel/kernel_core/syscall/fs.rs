@@ -1590,6 +1590,12 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
     const TIOCGWINSZ: u64 = 0x5413; // Get window size
     const TIOCSWINSZ: u64 = 0x5414; // Set window size
     const FIONREAD: u64 = 0x541B; // Bytes available to read
+                                  // N2.5: Controlling terminal & foreground process group job control ioctls.
+    const TIOCSCTTY: u64 = 0x540E; // Make controlling terminal
+    const TIOCGPGRP: u64 = 0x540F; // Get foreground process group
+    const TIOCSPGRP: u64 = 0x5410; // Set foreground process group
+    const TIOCNOTTY: u64 = 0x5422; // Give up controlling terminal
+    const TIOCGSID: u64 = 0x5429; // Get session ID of controlling terminal
 
     match cmd {
         TCGETS if console.is_some() => {
@@ -1653,6 +1659,130 @@ pub(super) fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
             };
             crate::usercopy::copy_to_user_safe(arg as *mut u8, bytes_slice)
                 .map_err(|_| SyscallError::EFAULT)?;
+            Ok(0)
+        }
+        TIOCSCTTY if console.is_some() => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let (tgid, sid, pgid, has_ctty) = {
+                let p = proc_arc.lock();
+                (
+                    p.tgid,
+                    p.thread_group.sid(),
+                    p.thread_group.pgid(),
+                    p.thread_group.has_ctty(),
+                )
+            };
+            // Must be a session leader.
+            if tgid != sid {
+                return Err(SyscallError::EPERM);
+            }
+            let steal = arg == 1;
+            let privileged =
+                current_has_cap_rights(cap::CapRights::ADMIN) || crate::current_is_host_root();
+            if has_ctty && crate::process::console_tty_get_sid(sid, true).is_ok() {
+                return Ok(0);
+            }
+            crate::process::console_tty_attach(sid, pgid, steal, privileged)?;
+            proc_arc.lock().thread_group.set_has_ctty(true);
+            Ok(0)
+        }
+        TIOCNOTTY if console.is_some() => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let (tgid, sid, has_ctty) = {
+                let p = proc_arc.lock();
+                (p.tgid, p.thread_group.sid(), p.thread_group.has_ctty())
+            };
+            // Verify this console is indeed the caller's controlling terminal.
+            let _ = crate::process::console_tty_get_sid(sid, has_ctty)?;
+            proc_arc.lock().thread_group.set_has_ctty(false);
+            if tgid == sid {
+                if let Some(old_fg) = crate::process::console_tty_release_session(sid) {
+                    // POSIX: notify former foreground process group with SIGHUP + SIGCONT.
+                    let _ = send_signal_to_pgid_kernel(old_fg, crate::signal::Signal::SIGHUP);
+                    let _ = send_signal_to_pgid_kernel(old_fg, crate::signal::Signal::SIGCONT);
+                }
+            }
+            Ok(0)
+        }
+        TIOCGPGRP if console.is_some() => {
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let (sid, has_ctty, owning_ns) = {
+                let p = proc_arc.lock();
+                (
+                    p.thread_group.sid(),
+                    p.thread_group.has_ctty(),
+                    crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+                )
+            };
+            let fg_global = crate::process::console_tty_get_fg_pgid(sid, has_ctty)?;
+            let fg_view = match owning_ns {
+                Some(ns) => ns.lookup_ns_pid(fg_global).unwrap_or(0) as i32,
+                None => fg_global as i32,
+            };
+            copy_to_user(arg as *mut u8, &fg_view.to_ne_bytes())?;
+            Ok(0)
+        }
+        TIOCSPGRP if console.is_some() => {
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            let mut raw = [0u8; 4];
+            copy_from_user(&mut raw, arg as *const u8)?;
+            let req_pgid = i32::from_ne_bytes(raw);
+            if req_pgid <= 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let (sid, has_ctty, owning_ns) = {
+                let p = proc_arc.lock();
+                (
+                    p.thread_group.sid(),
+                    p.thread_group.has_ctty(),
+                    crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+                )
+            };
+            // Verify caller has console ctty first.
+            let _ = crate::process::console_tty_get_sid(sid, has_ctty)?;
+            let target_global_pgid = match owning_ns {
+                Some(ns) => {
+                    crate::pid_namespace::resolve_pid_in_namespace(&ns, req_pgid as ProcessId)
+                        .ok_or(SyscallError::EPERM)?
+                }
+                None => req_pgid as ProcessId,
+            };
+            if !crate::process::pgid_exists_in_session(target_global_pgid, sid) {
+                return Err(SyscallError::EPERM);
+            }
+            crate::process::console_tty_set_fg_pgid(sid, has_ctty, target_global_pgid)?;
+            Ok(0)
+        }
+        TIOCGSID if console.is_some() => {
+            if arg == 0 {
+                return Err(SyscallError::EFAULT);
+            }
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let (sid, has_ctty, owning_ns) = {
+                let p = proc_arc.lock();
+                (
+                    p.thread_group.sid(),
+                    p.thread_group.has_ctty(),
+                    crate::pid_namespace::owning_namespace(&p.pid_ns_chain),
+                )
+            };
+            let tty_sid = crate::process::console_tty_get_sid(sid, has_ctty)?;
+            let view_sid = match owning_ns {
+                Some(ns) => ns.lookup_ns_pid(tty_sid).unwrap_or(0) as i32,
+                None => tty_sid as i32,
+            };
+            copy_to_user(arg as *mut u8, &view_sid.to_ne_bytes())?;
             Ok(0)
         }
         _ => {

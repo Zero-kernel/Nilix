@@ -2800,6 +2800,18 @@ pub struct ThreadGroup {
     /// G8 (review D3): members inside a group-wide wait for children; a
     /// report scans for sleeping members only while this is non-zero.
     child_waiters: AtomicUsize,
+    /// N2.5: Process group ID (global leader PID; 0 only before birth binding).
+    pgid: AtomicUsize,
+    /// N2.5: Session ID (global session leader PID; 0 only before birth binding).
+    sid: AtomicUsize,
+    /// N2.5: True once this process has called `execve(2)` (POSIX `setpgid` EACCES gate).
+    has_execed: AtomicBool,
+    /// N2.5: True while this process is attached to the console controlling terminal.
+    has_ctty: AtomicBool,
+    /// N2.5: Bit-packed unreported job-control wait events:
+    /// bits 0..8 = unreported stop signal (non-zero => WUNTRACED/WSTOPPED pending),
+    /// bit 8     = unreported SIGCONT resume (1 => WCONTINUED pending).
+    job_wait_state: core::sync::atomic::AtomicU32,
 }
 
 impl ThreadGroup {
@@ -2829,7 +2841,143 @@ impl ThreadGroup {
             live: AtomicUsize::new(1),
             child_events: AtomicU64::new(0),
             child_waiters: AtomicUsize::new(0),
+            pgid: AtomicUsize::new(0),
+            sid: AtomicUsize::new(0),
+            has_execed: AtomicBool::new(false),
+            has_ctty: AtomicBool::new(false),
+            job_wait_state: core::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    // ── N2.5: Process group, session, ctty, and job-control wait ledger ──
+
+    const JOB_WAIT_STOP_MASK: u32 = 0xFF;
+    const JOB_WAIT_CONTINUED_BIT: u32 = 1 << 8;
+
+    /// Initialize default PGID/SID to `tgid` if not yet bound (boot/init/standalone PCB).
+    #[inline]
+    pub(crate) fn init_job_control(&self, tgid: ProcessId) {
+        let _ = self
+            .pgid
+            .compare_exchange(0, tgid, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .sid
+            .compare_exchange(0, tgid, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// POSIX `fork(2)`: inherit parent's PGID, SID, and controlling-terminal
+    /// attachment; child starts with `has_execed == false` and no pending wait events.
+    pub(crate) fn inherit_job_control(&self, parent: &ThreadGroup) {
+        self.pgid.store(parent.pgid(), Ordering::Release);
+        self.sid.store(parent.sid(), Ordering::Release);
+        self.has_ctty.store(parent.has_ctty(), Ordering::Release);
+        self.has_execed.store(false, Ordering::Release);
+        self.job_wait_state.store(0, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn pgid(&self) -> ProcessId {
+        self.pgid.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_pgid(&self, pgid: ProcessId) {
+        self.pgid.store(pgid, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn sid(&self) -> ProcessId {
+        self.sid.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_sid(&self, sid: ProcessId) {
+        self.sid.store(sid, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn has_execed(&self) -> bool {
+        self.has_execed.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn mark_execed(&self) {
+        self.has_execed.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn has_ctty(&self) -> bool {
+        self.has_ctty.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_has_ctty(&self, attached: bool) {
+        self.has_ctty.store(attached, Ordering::Release);
+    }
+
+    /// Record an unreported job-control stop (cancels any stale continued flag).
+    #[inline]
+    pub fn record_stop_event(&self, stop_sig: u8) {
+        self.job_wait_state.store(
+            (stop_sig as u32) & Self::JOB_WAIT_STOP_MASK,
+            Ordering::Release,
+        );
+    }
+
+    /// Record an unreported job-control continuation (clears any stale stop flag).
+    #[inline]
+    pub fn record_continue_event(&self) {
+        self.job_wait_state
+            .store(Self::JOB_WAIT_CONTINUED_BIT, Ordering::Release);
+    }
+
+    /// Peek unreported stop signal without consuming it (`WNOWAIT`).
+    #[inline]
+    pub fn peek_stop_event(&self) -> Option<u8> {
+        let sig = (self.job_wait_state.load(Ordering::Acquire) & Self::JOB_WAIT_STOP_MASK) as u8;
+        (sig != 0).then_some(sig)
+    }
+
+    /// Atomically consume an unreported stop signal (returns `Some(sig)` to at most one waiter).
+    pub fn take_stop_event(&self) -> Option<u8> {
+        let mut cur = self.job_wait_state.load(Ordering::Acquire);
+        loop {
+            let sig = (cur & Self::JOB_WAIT_STOP_MASK) as u8;
+            if sig == 0 {
+                return None;
+            }
+            let next = cur & !Self::JOB_WAIT_STOP_MASK;
+            match self.job_wait_state.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(sig),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Peek unreported `WCONTINUED` event without consuming it (`WNOWAIT`).
+    #[inline]
+    pub fn peek_continue_event(&self) -> bool {
+        (self.job_wait_state.load(Ordering::Acquire) & Self::JOB_WAIT_CONTINUED_BIT) != 0
+    }
+
+    /// Atomically consume an unreported `WCONTINUED` event.
+    pub fn take_continue_event(&self) -> bool {
+        (self
+            .job_wait_state
+            .fetch_and(!Self::JOB_WAIT_CONTINUED_BIT, Ordering::AcqRel)
+            & Self::JOB_WAIT_CONTINUED_BIT)
+            != 0
+    }
+
+    /// Clear unreported stop/continue events (called on process exit).
+    #[inline]
+    pub fn clear_job_wait_events(&self) {
+        self.job_wait_state.store(0, Ordering::Release);
     }
 
     /// G8 (review D3): the child-report count a group-wide wait compares
@@ -4249,6 +4397,12 @@ impl Process {
 
         addr_of_mut!((*dst).cap_table).write(cap_table);
         addr_of_mut!((*dst).exit_code).write(None);
+        // N2.5: bind default PGID/SID to `pid` (fork overwrites with parent's PGID/SID).
+        thread_group.init_job_control(pid);
+        if pid == 1 {
+            thread_group.set_has_ctty(true);
+            console_tty_init_root_session(1);
+        }
         addr_of_mut!((*dst).thread_group).write(thread_group);
         addr_of_mut!((*dst).group_fatal).write(false);
         addr_of_mut!((*dst).group_live).write(true);
@@ -13110,6 +13264,12 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         if last_live {
             // N2.6b: Reclaim all interval timers and POSIX timers owned by this process.
             crate::time::cleanup_all_timers_for_process(tgid);
+            // N2.5: Clear unreported stop/continue events and release console ctty
+            // if the exiting process was the controlling session leader.
+            own_group.clear_job_wait_events();
+            if tgid == own_group.sid() {
+                console_tty_release_session(tgid);
+            }
             if tgid == pid {
                 handle_namespace_init_death(pid, &pid_ns_chain);
             } else {
@@ -13355,6 +13515,194 @@ fn notify_parent_of_group_exit(
         (false, None, false)
     };
     // GAP-5 G8 (review D3): any member of the parent's group may wait for it.
+    if let Some(group) = parent_group {
+        if !single_member {
+            wake_parent |= wake_group_child_waiters(&group, leader_pid);
+        }
+    }
+    if wake_parent {
+        let _ = crate::signal::kernel_kick_published();
+    }
+}
+
+// ============================================================================
+// N2.5: Console Controlling Terminal State & Parent Job-Control Notification
+// ============================================================================
+
+/// Console controlling terminal ownership (`TIOCSCTTY`/`TIOCGPGRP`/`TIOCSPGRP`/`TIOCNOTTY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConsoleTtyState {
+    /// Owning session leader global PID (`None` if detached).
+    pub(crate) session_sid: Option<ProcessId>,
+    /// Current foreground process group global PGID (`0` if none).
+    pub(crate) fg_pgid: ProcessId,
+}
+
+impl ConsoleTtyState {
+    const fn new() -> Self {
+        Self {
+            session_sid: None,
+            fg_pgid: 0,
+        }
+    }
+}
+
+static CONSOLE_TTY: Mutex<ConsoleTtyState> = Mutex::new(ConsoleTtyState::new());
+
+/// Seed PID 1's initial session as the default console controlling terminal if
+/// no session owns it yet.
+pub(crate) fn console_tty_init_root_session(sid: ProcessId) {
+    let mut tty = CONSOLE_TTY.lock();
+    if tty.session_sid.is_none() {
+        tty.session_sid = Some(sid);
+        tty.fg_pgid = sid;
+    }
+}
+
+/// Release the console controlling terminal when its owning session leader exits.
+pub(crate) fn console_tty_release_session(sid: ProcessId) -> Option<ProcessId> {
+    let mut tty = CONSOLE_TTY.lock();
+    if tty.session_sid == Some(sid) {
+        let old_fg = tty.fg_pgid;
+        tty.session_sid = None;
+        tty.fg_pgid = 0;
+        return (old_fg != 0).then_some(old_fg);
+    }
+    None
+}
+
+/// Pure `TIOCSCTTY` transition helper.
+pub(crate) fn console_tty_attach(
+    sid: ProcessId,
+    pgid: ProcessId,
+    steal: bool,
+    is_privileged: bool,
+) -> Result<(), crate::syscall::SyscallError> {
+    let mut tty = CONSOLE_TTY.lock();
+    match tty.session_sid {
+        None => {
+            tty.session_sid = Some(sid);
+            tty.fg_pgid = pgid;
+            Ok(())
+        }
+        Some(owner) if owner == sid => Ok(()),
+        Some(_) if steal && is_privileged => {
+            tty.session_sid = Some(sid);
+            tty.fg_pgid = pgid;
+            Ok(())
+        }
+        Some(_) => Err(crate::syscall::SyscallError::EPERM),
+    }
+}
+
+/// Query foreground PGID for a caller attached to the console controlling terminal.
+pub(crate) fn console_tty_get_fg_pgid(
+    caller_sid: ProcessId,
+    has_ctty: bool,
+) -> Result<ProcessId, crate::syscall::SyscallError> {
+    if !has_ctty {
+        return Err(crate::syscall::SyscallError::ENOTTY);
+    }
+    let tty = CONSOLE_TTY.lock();
+    if tty.session_sid != Some(caller_sid) {
+        return Err(crate::syscall::SyscallError::ENOTTY);
+    }
+    Ok(tty.fg_pgid)
+}
+
+/// Update foreground PGID for a caller attached to the console controlling terminal.
+pub(crate) fn console_tty_set_fg_pgid(
+    caller_sid: ProcessId,
+    has_ctty: bool,
+    new_fg_pgid: ProcessId,
+) -> Result<(), crate::syscall::SyscallError> {
+    if !has_ctty {
+        return Err(crate::syscall::SyscallError::ENOTTY);
+    }
+    let mut tty = CONSOLE_TTY.lock();
+    if tty.session_sid != Some(caller_sid) {
+        return Err(crate::syscall::SyscallError::ENOTTY);
+    }
+    tty.fg_pgid = new_fg_pgid;
+    Ok(())
+}
+
+/// Query owning session ID for a caller attached to the console controlling terminal.
+pub(crate) fn console_tty_get_sid(
+    caller_sid: ProcessId,
+    has_ctty: bool,
+) -> Result<ProcessId, crate::syscall::SyscallError> {
+    if !has_ctty {
+        return Err(crate::syscall::SyscallError::ENOTTY);
+    }
+    let tty = CONSOLE_TTY.lock();
+    if tty.session_sid != Some(caller_sid) {
+        return Err(crate::syscall::SyscallError::ENOTTY);
+    }
+    Ok(caller_sid)
+}
+
+/// Check whether at least one live (non-zombie, non-terminated) process in
+/// session `sid` currently belongs to process group `pgid`.
+pub(crate) fn pgid_exists_in_session(pgid: ProcessId, sid: ProcessId) -> bool {
+    let table = PROCESS_TABLE.lock();
+    for slot in table.iter() {
+        let Some(arc) = slot else { continue };
+        let proc = arc.lock();
+        if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+            continue;
+        }
+        if proc.thread_group.sid() == sid && proc.thread_group.pgid() == pgid {
+            return true;
+        }
+    }
+    false
+}
+
+/// N2.5: Notify the parent of `child_pid` that the child stopped (`stopped == true`)
+/// or continued (`stopped == false`).
+///
+/// Honors `SA_NOCLDSTOP` on the parent's `SIGCHLD` disposition (suppresses the
+/// `SIGCHLD` signal itself while still advancing `child_events` and waking any
+/// parent blocked in `wait4`/`waitid` with `WUNTRACED`/`WCONTINUED`).
+pub(crate) fn notify_parent_of_job_control_event(child_pid: ProcessId, _stopped: bool) {
+    let (leader_pid, parent_pid, parent_arc) = {
+        let table = PROCESS_TABLE.lock();
+        let Some(child_arc) = table.get(child_pid).and_then(Option::as_ref) else {
+            return;
+        };
+        let (tgid, ppid) = {
+            let child = child_arc.lock();
+            (child.tgid, child.ppid)
+        };
+        if ppid == 0 {
+            return;
+        }
+        let parent_arc = table.get(ppid).and_then(Option::as_ref).map(Arc::clone);
+        (tgid, ppid, parent_arc)
+    };
+
+    let send_sigchld = parent_arc.as_ref().is_some_and(|p| {
+        let sigactions = Arc::clone(&p.lock().sigactions);
+        let chld = sigactions.get((crate::signal::Signal::SIGCHLD.as_u8() - 1) as usize);
+        (chld.flags & crate::signal::SA_NOCLDSTOP) == 0
+    });
+    if send_sigchld {
+        let _ = crate::signal::send_signal_kernel(parent_pid, crate::signal::Signal::SIGCHLD);
+    }
+
+    let (mut wake_parent, parent_group, single_member) = if let Some(parent) = parent_arc {
+        let mut parent_proc = parent.lock();
+        let (woke, group, single) = notify_parent_pcb_for_child_exit(
+            &mut parent_proc,
+            leader_pid,
+            crate::get_ticks(),
+            false,
+        );
+        (woke, Some(group), single)
+    } else {
+        (false, None, false)
+    };
     if let Some(group) = parent_group {
         if !single_member {
             wake_parent |= wake_group_child_waiters(&group, leader_pid);

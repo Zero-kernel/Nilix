@@ -149,13 +149,13 @@ impl Signal {
 
     /// Get raw signal number
     #[inline]
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         self.0
     }
 
     /// Get signal number as i32 (for syscall compatibility)
     #[inline]
-    pub fn as_i32(self) -> i32 {
+    pub const fn as_i32(self) -> i32 {
         self.0 as i32
     }
 
@@ -1754,6 +1754,8 @@ fn send_signal_inner(
     // GAP-5 slice 4 G7: a stop applied here (false) or a SIGCONT (true) is
     // carried to the rest of the thread group after the lock is released.
     let mut group_job_control: Option<bool> = None;
+    // N2.5: notify parent of job-control stop (Some(true)) or continue (Some(false)).
+    let mut job_control_notify_stopped: Option<bool> = None;
     // GAP-5 G7 (review D3): a process-directed signal the selected member
     // cannot take now is offered to another member after the lock is released.
     let mut retarget_group: Option<Arc<process::ThreadGroup>> = None;
@@ -1906,7 +1908,9 @@ fn send_signal_inner(
                     // RF178-35 FIX: a lock-serialized fatal publication wins over
                     // a later stop and cannot be stranded again.
                     if process::try_mark_job_control_stopped_locked(&mut proc) {
+                        proc.thread_group.record_stop_event(signal.as_u8());
                         group_job_control = Some(false);
+                        job_control_notify_stopped = Some(true);
                         if process::current_pid() == Some(pid) {
                             needs_reschedule = true;
                         }
@@ -1923,7 +1927,12 @@ fn send_signal_inner(
             },
         }
         if signal.is_continue() {
+            let was_stopped = proc.stopped || proc.state == ProcessState::Stopped;
             needs_kick |= process::resume_job_control_locked(&mut proc, pid, target_generation);
+            if was_stopped {
+                proc.thread_group.record_continue_event();
+                job_control_notify_stopped = Some(false);
+            }
             group_job_control = Some(true);
         }
         // GAP-5 G7 (review D3): the selection read this member's mask without
@@ -1952,6 +1961,11 @@ fn send_signal_inner(
     // below parks this task. No lock is held here.
     if let Some(resume) = group_job_control {
         needs_kick |= process::propagate_group_job_control(pid, resume);
+    }
+
+    // N2.5: notify parent of WUNTRACED / WCONTINUED transition (respects SA_NOCLDSTOP).
+    if let Some(stopped) = job_control_notify_stopped {
+        process::notify_parent_of_job_control_event(pid, stopped);
     }
 
     // H.0.7 FIX: Cross-CPU-safe fatal signal termination.
