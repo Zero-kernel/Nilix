@@ -15606,6 +15606,13 @@ impl FileSystem for Ext2Fs {
             return Err(FsError::NotSupported);
         }
         let src_inode = fs.load_inode(source_ino)?;
+        // Ext4 `auto_da_alloc` crash-safety contract: serialize with and flush
+        // any buffered dirty writes on the renamed source file BEFORE committing
+        // the rename transaction so `open(tmp) -> write -> close -> rename`
+        // never exposes a zero-length or partially written target on crash.
+        if src_inode.is_file_inner() {
+            let _ = src_inode.flush_dirty_to_disk_with_fs(&fs)?;
+        }
         let parent_ino = old_parent_ext2.ino;
         let mut scratch = Ext2MutationScratch::try_new_admitted(fs.block_size)?;
         let block_size_us = fs.block_size as usize;
@@ -18689,5 +18696,59 @@ mod ext2_fastpath_tests {
         assert_eq!(rbuf, p0);
         assert_eq!(file.read_at(BLK as u64, &mut rbuf), Ok(BLK));
         assert_eq!(rbuf, p1);
+    }
+
+    #[test]
+    fn buffered_write_close_rename_flushes_before_publish() {
+        let _serial = crate::HEAP_TEST_LOCK.lock();
+        mm::publish_heap_budgets();
+        let dev = Arc::try_new(CoalescingCrashDevice::new(synthetic_4k_ext3_image())).unwrap();
+        let fs = Ext2Fs::mount(dev.clone()).unwrap();
+        let root = fs.root_inode();
+        let topo = crate::topology::write();
+        let creds = topo.setup(0, 0);
+
+        // Simulate `open(tmp) -> write(4096 + 192) -> close -> rename(tmp, final)`
+        // without an explicit fsync(), matching nilix_syz_executor / atomic save.
+        let tmp = fs
+            .create(&root, "result.tmp", FileMode::regular(0o600), &creds)
+            .unwrap();
+        let tmp_ino = tmp.ino();
+        let mut payload = [0u8; BLK + 192];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        assert_eq!(tmp.write_buffered_at(0, &payload), Ok(payload.len()));
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 2);
+        drop(tmp);
+
+        fs.rename(
+            &root,
+            "result.tmp",
+            &root,
+            "result.bin",
+            true,
+            tmp_ino,
+            None,
+            &creds,
+        )
+        .unwrap();
+        assert_eq!(fs.dirty_pages_total.load(Ordering::Acquire), 0);
+
+        // Immediate power loss right after rename() must recover the full file.
+        let snap = dev.durable_snapshot();
+        let rec_dev = Arc::try_new(CoalescingCrashDevice::new(snap)).unwrap();
+        let rec_fs = Ext2Fs::mount(rec_dev).unwrap();
+        let rec_root = rec_fs.root_inode();
+        let rec_file = rec_fs.lookup(&rec_root, "result.bin").unwrap();
+        assert_eq!(rec_file.stat().unwrap().size, payload.len() as u64);
+        let rec_ext2 = rec_file.as_any().downcast_ref::<Ext2Inode>().unwrap();
+        let b0 = rec_ext2.raw.read().block[0];
+        let b1 = rec_ext2.raw.read().block[1];
+        let mut blk = [0u8; BLK];
+        assert_eq!(rec_fs.read_block(b0, &mut blk), Ok(()));
+        assert_eq!(&blk[..], &payload[..BLK]);
+        assert_eq!(rec_fs.read_block(b1, &mut blk), Ok(()));
+        assert_eq!(&blk[..192], &payload[BLK..]);
     }
 }

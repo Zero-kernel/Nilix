@@ -803,6 +803,7 @@ pub fn register_syscall_callbacks() {
         vfs_sync_callback,
         vfs_sync_file_range_callback,
     );
+    kernel_core::syscall::register_vfs_shutdown_sync_callback(vfs_shutdown_sync_callback);
     kernel_core::register_vfs_pread_callback(vfs_pread_callback); // R173-07 proper fix
     kernel_core::register_vfs_pwrite_callback(vfs_pwrite_callback); // R173-07 proper fix
     kernel_core::syscall::register_vfs_symlink_callback(vfs_symlink_callback); // M0-6 SLICE 3
@@ -1384,6 +1385,29 @@ fn vfs_sync_callback() -> Result<(), SyscallError> {
         return Err(SyscallError::EIO);
     }
     Ok(())
+}
+
+/// Best-effort flush of every mounted filesystem across all live mount
+/// namespaces during PID 1 shutdown so buffered writes (e.g. ext2 writeback)
+/// reach durable media before the guest halts.
+fn vfs_shutdown_sync_callback() {
+    let Ok(filesystems) = VFS.all_mounted_filesystems() else {
+        return;
+    };
+    for filesystem in filesystems.iter() {
+        match filesystem.sync() {
+            Ok(()) | Err(FsError::NotSupported) => {}
+            Err(error) => {
+                klog!(
+                    Warn,
+                    "shutdown sync: {} fs {} failed: {:?}",
+                    filesystem.fs_type(),
+                    filesystem.fs_id(),
+                    error
+                );
+            }
+        }
+    }
 }
 
 const SYNC_FILE_RANGE_VALID_FLAGS: u32 = 1 | 2 | 4; // WAIT_BEFORE | WRITE | WAIT_AFTER

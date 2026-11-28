@@ -13093,6 +13093,10 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     // local guard/Arc drops. This is not a scheduler-retirement or global
     // quiescence claim; the host retains a tail window and final diagnostics.
     if pid == 1 {
+        // Flush any buffered filesystem writes (e.g. ext2 writeback cache)
+        // before emitting CI-EXIT so clean guest shutdown persists all writes
+        // to durable media before the host terminates QEMU or inspects disk.
+        crate::syscall::invoke_vfs_shutdown_sync();
         if teardown_completed {
             klog_always!("CI-EXIT pid=1 code={} stage=teardown-complete", exit_code);
         }
