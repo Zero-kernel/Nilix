@@ -74,13 +74,8 @@ const AP_STACK_PAGES: usize = 4;
 /// Total size of each AP's kernel stack (16KB)
 const AP_STACK_SIZE: usize = AP_STACK_PAGES * 4096;
 
-/// Physical memory offset for high-half kernel mapping
-const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_ffff_8000_0000;
-
-/// Maximum physical address covered by the high-half direct map. F9: the
-/// direct map is 1 GiB (PDPT[510] only); the old 4 GiB bound let addresses in
-/// [1 GiB, 4 GiB) compute unmapped virtual addresses.
-const MAX_PHYS_MAPPED: u64 = 1 << 30;
+/// Physical memory offset for high-half linear direct map (`PML4[273]`).
+const PHYSICAL_MEMORY_OFFSET: u64 = mm::PHYSICAL_MEMORY_OFFSET;
 
 /// Start of BIOS RSDP search region
 const RSDP_SEARCH_START: u64 = 0xE0000;
@@ -716,23 +711,31 @@ fn make_trampoline_executable() {
 
         let trampoline_pt_idx = (TRAMPOLINE_PHYS / 0x1000) as usize; // 0x8000 / 4096 = 8
 
-        // Step 1 (U55-6): Strip WRITABLE (keep NO_EXECUTE) on the high-half
-        // direct-map alias (PML4[511]/PDPT[510]/PD[0] PTE[8]) BEFORE granting
-        // execute on PML4[0], and flush TLB so no stale writable mapping exists.
-        let hi_pd = recursive_pd(511, 510);
-        let hi_pd_entry = &hi_pd[0];
-        if hi_pd_entry.is_unused() || hi_pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            panic!(
-                "U55-6: high-half PD[0] missing or 2 MiB huge; refusing writable alias on SMP trampoline"
-            );
-        }
-        let hi_pt = recursive_pt(511, 510, 0);
-        let hi_pte = &mut hi_pt[trampoline_pt_idx];
-        if !hi_pte.is_unused() {
-            let mut hi_flags = hi_pte.flags();
-            hi_flags.remove(PageTableFlags::WRITABLE);
-            hi_flags.insert(PageTableFlags::NO_EXECUTE);
-            hi_pte.set_addr(hi_pte.addr(), hi_flags);
+        // Step 1 (U55-6 / N3.1a): Strip WRITABLE (keep NO_EXECUTE) on BOTH
+        // high-half aliases of `TRAMPOLINE_PHYS` — `PML4[511]/PDPT[510]/PD[0]`
+        // (kernel image alias) and `PML4[273]/PDPT[0]/PD[0]` (linear direct map)
+        // BEFORE granting execute on PML4[0], and flush TLB so no stale writable
+        // mapping exists anywhere.
+        for &(pml4_idx, pdpt_idx, label) in &[
+            (511usize, 510usize, "PML4[511]/PDPT[510]"),
+            (mm::DIRECT_MAP_PML4_INDEX, 0usize, "PML4[273]/PDPT[0]"),
+        ] {
+            let hi_pd = recursive_pd(pml4_idx, pdpt_idx);
+            let hi_pd_entry = &hi_pd[0];
+            if hi_pd_entry.is_unused() || hi_pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                panic!(
+                    "U55-6: {} PD[0] missing or 2 MiB huge; refusing writable alias on SMP trampoline",
+                    label
+                );
+            }
+            let hi_pt = recursive_pt(pml4_idx, pdpt_idx, 0);
+            let hi_pte = &mut hi_pt[trampoline_pt_idx];
+            if !hi_pte.is_unused() {
+                let mut hi_flags = hi_pte.flags();
+                hi_flags.remove(PageTableFlags::WRITABLE);
+                hi_flags.insert(PageTableFlags::NO_EXECUTE);
+                hi_pte.set_addr(hi_pte.addr(), hi_flags);
+            }
         }
         mm::tlb_shootdown::flush_all_local();
 
@@ -1680,61 +1683,34 @@ fn acknowledge_process_deferred_work() {
 // Stack Allocation
 // ============================================================================
 
-/// Allocate a stack for an AP.
+/// Allocate a stack for an AP inside the KPTI entry-island window (`PML4[511]/PDPT[510]`).
 ///
 /// Returns the virtual address of the stack top (highest address).
 fn alloc_ap_stack() -> u64 {
-    // R70-5 FIX: AP stack must be in low memory (<4GB) because the high-half
-    // direct map only covers the first MAX_PHYS_MAPPED bytes. If the buddy
-    // allocator returns a frame above 4GB, the computed virtual address
-    // would be unmapped, causing #PF → #DF when the AP handles interrupts.
-    //
-    // Try multiple allocations to find a low-memory frame.
-    const MAX_ALLOC_ATTEMPTS: usize = 16;
+    // N3.1a (#67): AP bootstrap/idle stacks MUST reside inside the KPTI entry
+    // island (`PML4[511]/PDPT[510]`, `KERNEL_VIRT_BASE + [0, 1 GiB)`) because
+    // an AP executes `mov cr3, user_cr3` during Ring-3 transitions while the
+    // general linear direct map (`PML4[273]`) is unmapped in user KPTI roots.
+    let frame = mm::buddy_allocator::alloc_physical_pages_below(
+        AP_STACK_PAGES,
+        mm::DEFAULT_DIRECT_MAP_LIMIT,
+    )
+    .expect("[SMP] Failed to allocate AP stack inside KPTI entry-island window (<1 GiB)");
 
-    for attempt in 0..MAX_ALLOC_ATTEMPTS {
-        let frame = mm::buddy_allocator::alloc_physical_pages(AP_STACK_PAGES)
-            .expect("[SMP] Failed to allocate AP stack");
+    let phys = frame.start_address().as_u64();
+    assert!(
+        phys.checked_add(AP_STACK_SIZE as u64)
+            .is_some_and(|end| end <= mm::DEFAULT_DIRECT_MAP_LIMIT),
+        "[SMP] AP stack frame outside <1 GiB KPTI entry-island window"
+    );
 
-        let phys = frame.start_address().as_u64();
-
-        // Check if frame is within direct-mapped range
-        if phys + AP_STACK_SIZE as u64 <= MAX_PHYS_MAPPED {
-            let virt = PHYSICAL_MEMORY_OFFSET + phys;
-
-            // Zero the stack for security
-            unsafe {
-                ptr::write_bytes(virt as *mut u8, 0, AP_STACK_SIZE);
-            }
-
-            // Return stack top (highest address), 16-byte aligned
-            return (virt + AP_STACK_SIZE as u64) & !0xFu64;
-        }
-
-        // Frame is above 4GB - cannot use for AP stack
-        // Free it and try again (buddy allocator may give different frame)
-        unsafe {
-            mm::buddy_allocator::free_physical_pages(frame, AP_STACK_PAGES);
-        }
-
-        if attempt > 0 {
-            // R130-5 FIX: Gate physical address behind kprintln! (debug-only)
-            // to comply with kptr-safety policy. The raw physical frame address
-            // leaks physical memory layout in release builds.
-            kprintln!(
-                "[SMP] AP stack allocation attempt {} got high frame, retrying...",
-                attempt + 1
-            );
-        }
+    let virt = mm::KERNEL_VIRT_BASE + phys;
+    unsafe {
+        ptr::write_bytes(virt as *mut u8, 0, AP_STACK_SIZE);
     }
 
-    // All attempts returned high memory - this is a configuration issue
-    // (system has very little RAM below 4GB)
-    panic!(
-        "[SMP] Cannot allocate AP stack in low memory (<4GB) after {} attempts. \
-            System may have insufficient low memory.",
-        MAX_ALLOC_ATTEMPTS
-    );
+    // Return stack top (highest address), 16-byte aligned
+    (virt + AP_STACK_SIZE as u64) & !0xFu64
 }
 
 // ============================================================================

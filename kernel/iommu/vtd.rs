@@ -462,9 +462,11 @@ impl ContextTable {
 // Memory Safety Limits
 // ============================================================================
 
-/// Maximum physical address reachable via the direct map (1 GB).
-/// Frames above this cannot be safely accessed via phys_to_virt.
-const MAX_DIRECT_MAP_PHYS: u64 = 1 << 30;
+/// Maximum physical address reachable via the kernel direct map.
+#[inline]
+fn max_direct_map_phys() -> u64 {
+    mm::direct_map_limit()
+}
 
 // ============================================================================
 // VT-d Error Types
@@ -1074,7 +1076,7 @@ fn iotlb_retirement_scope(registry_complete: bool, domain_attached: bool) -> Iot
 
 #[inline]
 fn valid_context_table_phys(phys: u64) -> bool {
-    phys != 0 && phys < MAX_DIRECT_MAP_PHYS
+    phys != 0 && phys < max_direct_map_phys()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1356,7 +1358,7 @@ impl VtdUnit {
         let frame =
             buddy_allocator::alloc_physical_pages(2).ok_or(VtdError::InterruptRemapAllocFailed)?;
         let phys = frame.start_address().as_u64();
-        if phys == 0 || phys > MAX_DIRECT_MAP_PHYS - 2 * QI_QUEUE_BYTES as u64 {
+        if phys == 0 || phys > max_direct_map_phys() - 2 * QI_QUEUE_BYTES as u64 {
             buddy_allocator::free_physical_pages(frame, 2);
             return Err(VtdError::InterruptRemapAllocFailed);
         }
@@ -1725,7 +1727,7 @@ impl VtdUnit {
         let current = self.root_table_phys.load(Ordering::Acquire);
         if current != 0 {
             // Validate existing root table is within direct map
-            if current >= MAX_DIRECT_MAP_PHYS {
+            if current >= max_direct_map_phys() {
                 return Err(VtdError::RootTableAllocFailed);
             }
             return Ok(());
@@ -1737,7 +1739,7 @@ impl VtdUnit {
         let phys = frame.start_address().as_u64();
 
         // Validate frame is within direct map range
-        if phys >= MAX_DIRECT_MAP_PHYS {
+        if phys >= max_direct_map_phys() {
             buddy_allocator::free_physical_pages(frame, 1);
             return Err(VtdError::RootTableAllocFailed);
         }
@@ -1758,7 +1760,7 @@ impl VtdUnit {
                 // Another CPU installed a table; free our redundant allocation
                 buddy_allocator::free_physical_pages(frame, 1);
                 // Validate the table installed by the other CPU
-                if existing >= MAX_DIRECT_MAP_PHYS {
+                if existing >= max_direct_map_phys() {
                     Err(VtdError::RootTableAllocFailed)
                 } else {
                     Ok(())
@@ -1789,7 +1791,7 @@ impl VtdUnit {
         if root_phys == 0 {
             return Err(IommuError::NotInitialized);
         }
-        if root_phys >= MAX_DIRECT_MAP_PHYS {
+        if root_phys >= max_direct_map_phys() {
             return Err(IommuError::HardwareInitFailed);
         }
 
@@ -2037,7 +2039,7 @@ impl VtdUnit {
                     // Domain has no page table - fail closed
                     return Err(IommuError::NotInitialized);
                 }
-                if slpt >= MAX_DIRECT_MAP_PHYS {
+                if slpt >= max_direct_map_phys() {
                     return Err(IommuError::HardwareInitFailed);
                 }
                 ContextEntry::new_translated(domain.id(), slpt, domain.address_width())
@@ -2175,7 +2177,7 @@ impl VtdUnit {
             // Locate and validate the hardware context before the point of no
             // return. Structural inconsistency is itself ambiguous and poisonable.
             let root_phys = self.root_table_phys.load(Ordering::Acquire);
-            if root_phys == 0 || root_phys >= MAX_DIRECT_MAP_PHYS {
+            if root_phys == 0 || root_phys >= max_direct_map_phys() {
                 self.poison_attachment(source_id, domain_id, ContextDisposition::PresentOrUnknown);
                 return Err(IommuError::HardwareInitFailed);
             }
@@ -2329,7 +2331,7 @@ impl VtdUnit {
     /// Returns the hardware DID when a present entry was retired.
     fn clear_context_for_source_locked(&self, source_id: u16) -> IommuResult<Option<DomainId>> {
         let root_phys = self.root_table_phys.load(Ordering::Acquire);
-        if root_phys == 0 || root_phys >= MAX_DIRECT_MAP_PHYS {
+        if root_phys == 0 || root_phys >= max_direct_map_phys() {
             return Err(IommuError::HardwareInitFailed);
         }
         let root_virt = phys_to_virt(PhysAddr::new(root_phys));
@@ -2364,7 +2366,7 @@ impl VtdUnit {
     /// required by the caller before the revocation is complete.
     fn clear_root_for_source_bus_locked(&self, source_id: u16) -> IommuResult<()> {
         let root_phys = self.root_table_phys.load(Ordering::Acquire);
-        if root_phys == 0 || root_phys >= MAX_DIRECT_MAP_PHYS {
+        if root_phys == 0 || root_phys >= max_direct_map_phys() {
             return Err(IommuError::HardwareInitFailed);
         }
         let root_virt = phys_to_virt(PhysAddr::new(root_phys));
@@ -2447,7 +2449,7 @@ impl VtdUnit {
         }
         let mut registry = self.attached_devices.lock();
         let root_phys = self.root_table_phys.load(Ordering::Acquire);
-        if root_phys == 0 || root_phys >= MAX_DIRECT_MAP_PHYS {
+        if root_phys == 0 || root_phys >= max_direct_map_phys() {
             registry.mark_incomplete();
             self.cache_poisoned.store(true, Ordering::Release);
             return Err(IommuError::HardwareInitFailed);
@@ -2735,7 +2737,7 @@ impl VtdUnit {
         // Ensure root table is allocated and valid
         self.init_root_table()?;
         let root_phys = self.root_table_phys.load(Ordering::Acquire);
-        if root_phys == 0 || root_phys >= MAX_DIRECT_MAP_PHYS {
+        if root_phys == 0 || root_phys >= max_direct_map_phys() {
             return Err(VtdError::RootTableAllocFailed);
         }
 
@@ -3483,7 +3485,7 @@ mod tests {
     fn rf180_context_table_pointer_rejects_null_and_out_of_window() {
         assert!(!valid_context_table_phys(0));
         assert!(valid_context_table_phys(0x1000));
-        assert!(!valid_context_table_phys(MAX_DIRECT_MAP_PHYS));
+        assert!(!valid_context_table_phys(max_direct_map_phys()));
         assert!(!valid_context_table_phys(u64::MAX - 0xfff));
     }
 

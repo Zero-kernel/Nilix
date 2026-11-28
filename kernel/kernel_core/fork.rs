@@ -2612,17 +2612,11 @@ impl PhysicalPageRefCount {
 
     #[inline]
     fn slot(phys_addr: usize) -> Option<&'static AtomicU32> {
-        let (base, page_count) = mm::memory::managed_physical_page_window()?;
         if phys_addr & 0xfff != 0 {
             return None;
         }
-        let offset = (phys_addr as u64).checked_sub(base)?;
-        let index = usize::try_from(offset / 4096).ok()?;
-        if index >= page_count {
-            return None;
-        }
-        // RF178-31: index into the boot-reserved frame-backed table.
-        mm::memory::cow_refcount_slot(index)
+        // RF178-31 / N3.1a: O(zones) lookup into boot-reserved frame-backed tables.
+        mm::memory::cow_refcount_slot_for_phys(phys_addr as u64)
     }
 
     /// Atomically add this fork's exact mapping delta to one frame.

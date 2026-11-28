@@ -38,10 +38,7 @@ use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::memory::FrameAllocator;
-use crate::page_table::{with_kernel_manager, PHYSICAL_MEMORY_OFFSET};
-
-/// Physical bytes the high-half direct map covers.
-const DIRECT_MAP_LIMIT: u64 = 1 << 30;
+use crate::page_table::{direct_map_limit, with_kernel_manager, PHYSICAL_MEMORY_OFFSET};
 
 /// One-page transient window, in PML4[511]/PDPT[511] beside the HPET
 /// (`0xffff_ffff_fed0_0000`) and LAPIC (`0xffff_ffff_fee0_0000`) windows, and
@@ -132,7 +129,7 @@ pub fn read_firmware_bytes(phys: u64, len: usize) -> Option<&'static [u8]> {
         return None;
     }
     let end = phys.checked_add(u64::try_from(len).ok()?)?;
-    if end <= DIRECT_MAP_LIMIT {
+    if end <= direct_map_limit() {
         // R191-4: no firmware-range check here (see the module documentation).
         let virt = (PHYSICAL_MEMORY_OFFSET + phys) as *const u8;
         // SAFETY: the range lies inside the always-present direct map.

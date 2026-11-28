@@ -52,9 +52,11 @@ pub const MAX_ADDR_WIDTH: u8 = 48;
 /// VT-d uses bit 7 as the PS flag for 2MB/1GB pages in non-leaf entries.
 const SL_PTE_SUPERPAGE: u64 = 1 << 7;
 
-/// Maximum physical address reachable via the direct map (1 GB).
-/// Frames above this cannot be safely accessed via phys_to_virt.
-const MAX_DIRECT_MAP_PHYS: u64 = 1 << 30; // 1 GB
+/// Maximum physical address reachable via the kernel direct map.
+#[inline]
+fn max_direct_map_phys() -> u64 {
+    mm::direct_map_limit()
+}
 
 // ============================================================================
 // Types
@@ -573,7 +575,7 @@ impl Domain {
         // R80-1 FIX: Verify frame is within direct map range
         // The direct map only covers physical addresses 0-1GB
         let phys_addr = frame.start_address().as_u64();
-        if phys_addr >= MAX_DIRECT_MAP_PHYS {
+        if phys_addr >= max_direct_map_phys() {
             // Frame is outside direct map - cannot safely access it
             // Free it and fail (this should rarely happen with proper mm setup)
             buddy_allocator::free_physical_pages(frame, 1);
@@ -603,7 +605,8 @@ impl Domain {
         // direct-map reference in a release kernel.  Keep the panic path
         // allocation-free and fail closed before `phys_to_virt` executes.
         let end = phys.checked_add(IOMMU_PAGE_SIZE as u64).unwrap_or(u64::MAX);
-        if phys >= MAX_DIRECT_MAP_PHYS || end > MAX_DIRECT_MAP_PHYS || phys & 0xfff != 0 {
+        let limit = max_direct_map_phys();
+        if phys >= limit || end > limit || phys & 0xfff != 0 {
             panic!("IOMMU page-table physical address outside direct map");
         }
         let virt = phys_to_virt(PhysAddr::new(phys));
@@ -1049,7 +1052,7 @@ impl Domain {
     /// - `page_table_lock` must be held
     /// - `table_phys` must point to a valid page table frame within direct map
     unsafe fn free_page_table_tree(table_phys: u64, level: usize) {
-        if table_phys == 0 || table_phys >= MAX_DIRECT_MAP_PHYS {
+        if table_phys == 0 || table_phys >= max_direct_map_phys() {
             return;
         }
 

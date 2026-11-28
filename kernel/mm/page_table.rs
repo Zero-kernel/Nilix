@@ -16,13 +16,45 @@ use x86_64::{
     PhysAddr, VirtAddr,
 };
 
-/// 物理内存高半区偏移（bootloader 映射 0xffffffff80000000 -> 0）
-/// 覆盖物理地址 0-1GB
-pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_ffff_8000_0000;
+/// Kernel image high-half virtual base (`PML4[511]/PDPT[510]`, maps 0..1 GiB
+/// for kernel `.text`/`.rodata`/`.data`/`.bss`, early heap, and low boot alias).
+pub const KERNEL_VIRT_BASE: u64 = 0xffff_ffff_8000_0000;
 
-/// VGA text buffer (phys 0xB8000) high-half alias
+/// N3.1a (#67): Dedicated high-half linear physical direct map (`PML4[273]`),
+/// decoupled from the 1 GiB kernel image slot so physical RAM above 1 GiB is
+/// directly addressable without colliding with `PML4[511]` MMIO or KPTI entry islands.
+pub const DIRECT_MAP_PML4_INDEX: usize = 273;
+pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_8880_0000_0000;
+
+/// Default/fallback direct-map physical ceiling before BootInfo publication (1 GiB).
+pub const DEFAULT_DIRECT_MAP_LIMIT: u64 = 1 << 30;
+/// Maximum physical address mapped into `PML4[273]` (64 GiB).
+pub const MAX_DIRECT_MAP_LIMIT: u64 = 64 * (1 << 30);
+
+/// Runtime physical upper bound (exclusive) covered by `PML4[273]` (`>= 1 GiB`).
+static DIRECT_MAP_LIMIT_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_DIRECT_MAP_LIMIT);
+
+/// Publish the bootloader-established physical limit for `PML4[273]`.
+pub fn set_direct_map_limit(limit: u64) {
+    assert!(
+        limit >= DEFAULT_DIRECT_MAP_LIMIT
+            && limit <= MAX_DIRECT_MAP_LIMIT
+            && limit % DEFAULT_DIRECT_MAP_LIMIT == 0,
+        "N3.1a: invalid direct_map_limit 0x{:x}",
+        limit
+    );
+    DIRECT_MAP_LIMIT_BYTES.store(limit, Ordering::Release);
+}
+
+/// Exclusive physical upper bound currently covered by `PHYSICAL_MEMORY_OFFSET`.
+#[inline]
+pub fn direct_map_limit() -> u64 {
+    DIRECT_MAP_LIMIT_BYTES.load(Ordering::Acquire)
+}
+
+/// VGA text buffer (phys 0xB8000) high-half alias in `PML4[511]/PDPT[510]`.
 pub const VGA_PHYS_ADDR: u64 = 0x000b_8000;
-pub const VGA_VIRT_ADDR: u64 = PHYSICAL_MEMORY_OFFSET + VGA_PHYS_ADDR;
+pub const VGA_VIRT_ADDR: u64 = KERNEL_VIRT_BASE + VGA_PHYS_ADDR;
 
 /// Local APIC MMIO window (4 KiB at phys 0xFEE0_0000) dedicated high-half alias
 pub const APIC_PHYS_ADDR: u64 = 0xfee0_0000;
@@ -32,11 +64,12 @@ pub const APIC_VIRT_ADDR: u64 = 0xffff_ffff_fee0_0000; // PML4[511] unused slot
 /// LEAD-KSTACK-WINDOW-1: the per-PID kernel-stack region, PML4[511]
 /// PDPT[506..=507]: `[KSTACK_REGION_BASE, KSTACK_REGION_END)`. The fixed
 /// high-half windows (MMIO, framebuffer, boot and per-CPU stacks, kernel image,
-/// heap and direct map, HPET, APIC, firmware) all start at or above
+/// early heap, HPET, APIC, firmware) all start at or above
 /// `KSTACK_REGION_END` (PDPT[508] onwards); each asserts it where it is defined.
 pub const KSTACK_REGION_BASE: u64 = 0xffff_fffe_8000_0000;
 pub const KSTACK_REGION_END: u64 = 0xffff_ffff_0000_0000;
-const _: () = assert!(KSTACK_REGION_END <= PHYSICAL_MEMORY_OFFSET);
+const _: () = assert!(PHYSICAL_MEMORY_OFFSET + MAX_DIRECT_MAP_LIMIT <= KSTACK_REGION_BASE);
+const _: () = assert!(KSTACK_REGION_END <= KERNEL_VIRT_BASE);
 const _: () = assert!(KSTACK_REGION_END <= APIC_VIRT_ADDR);
 
 /// Issue #109 §1.1: Cache-line-isolated page-table lock slot.
@@ -553,20 +586,47 @@ fn get_phys_offset() -> VirtAddr {
     VirtAddr::new(PHYSICAL_MEMORY_OFFSET)
 }
 
-/// 将物理地址转换为可访问的虚拟地址（通过高半区直映）
+/// 将物理地址转换为可访问的虚拟地址（通过高半区直映 `PML4[273]`）
 ///
 /// # Safety
 ///
-/// 调用者必须确保物理地址在 0-1GB 范围内（高半区直映覆盖的范围）
-/// 超出此范围的物理地址将导致无效的虚拟地址
+/// 调用者必须确保物理地址在 `[0, direct_map_limit())` 范围内。
 #[inline]
 pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
     VirtAddr::new(phys.as_u64() + PHYSICAL_MEMORY_OFFSET)
 }
 
-/// Physical memory the [`PHYSICAL_MEMORY_OFFSET`] direct map covers (the
-/// bootloader allocates every page-table frame below it).
-const DIRECT_MAP_LIMIT: u64 = 1 << 30;
+/// Checked physical-to-virtual conversion bounded by `direct_map_limit()`.
+#[inline]
+pub fn try_phys_to_virt(phys: PhysAddr, len: u64) -> Option<VirtAddr> {
+    let start = phys.as_u64();
+    let end = start.checked_add(len)?;
+    if end > direct_map_limit() {
+        return None;
+    }
+    let virt = start.checked_add(PHYSICAL_MEMORY_OFFSET)?;
+    VirtAddr::try_new(virt).ok()
+}
+
+/// Checked virtual-to-physical conversion for addresses inside `PML4[273]`
+/// (`[PHYSICAL_MEMORY_OFFSET, PHYSICAL_MEMORY_OFFSET + direct_map_limit())`).
+#[inline]
+pub fn virt_to_phys_direct(virt: VirtAddr, len: u64) -> Option<PhysAddr> {
+    if len == 0 {
+        return None;
+    }
+    let v = virt.as_u64();
+    let phys = v.checked_sub(PHYSICAL_MEMORY_OFFSET)?;
+    let end = phys.checked_add(len)?;
+    if end > direct_map_limit() {
+        return None;
+    }
+    PhysAddr::try_new(phys).ok()
+}
+
+/// Default physical direct-map limit used in unit tests that do not boot via BootInfo.
+#[cfg(test)]
+const DIRECT_MAP_LIMIT: u64 = DEFAULT_DIRECT_MAP_LIMIT;
 
 #[path = "mmio_access.rs"]
 mod mmio_access;
@@ -680,7 +740,7 @@ where
 /// map at `phys_offset`; `None` (fail closed) for a frame outside the direct map.
 #[inline]
 fn read_offset_map_entry(phys_offset: u64, table: u64, index: usize) -> Option<u64> {
-    if table >= DIRECT_MAP_LIMIT || index >= 512 {
+    if table >= direct_map_limit() || index >= 512 {
         return None;
     }
     let entry = (phys_offset
@@ -720,7 +780,8 @@ fn kpti_root_pair() -> Option<(u64, u64)> {
     if seq & 1 != 0 || pcpu.kpti_seq.load(Ordering::Acquire) != seq {
         return None;
     }
-    let usable = |root: u64| root != 0 && root < DIRECT_MAP_LIMIT;
+    let limit = direct_map_limit();
+    let usable = |root: u64| root != 0 && root < limit;
     (usable(kernel) && usable(user) && kernel != user).then_some((kernel, user))
 }
 
@@ -3014,7 +3075,7 @@ pub enum ReplacePageError {
 
 /// A page-table frame must be nonzero and wholly reachable by the direct map.
 pub fn page_table_frame_address_valid(addr: u64) -> bool {
-    addr != 0 && addr & 0xfff == 0 && addr < DIRECT_MAP_LIMIT
+    addr != 0 && addr & 0xfff == 0 && addr < direct_map_limit()
 }
 
 fn replace_present_leaf(
@@ -4974,5 +5035,27 @@ mod tests {
         assert!(arena.tables[5][0].is_unused());
         // Supervisor leaf must remain untouched (R192-2).
         assert_eq!(arena.tables[5][1].addr(), PhysAddr::new(0x14_0000));
+    }
+
+    #[test]
+    fn n3_1a_direct_map_helpers_enforce_limit_and_separate_kernel_base() {
+        assert_eq!(PHYSICAL_MEMORY_OFFSET, 0xffff_8880_0000_0000);
+        assert_eq!(KERNEL_VIRT_BASE, 0xffff_ffff_8000_0000);
+        assert_ne!(PHYSICAL_MEMORY_OFFSET, KERNEL_VIRT_BASE);
+        let limit = direct_map_limit();
+        assert!(limit >= DEFAULT_DIRECT_MAP_LIMIT);
+
+        let phys = PhysAddr::new(0x0020_0000);
+        let virt = try_phys_to_virt(phys, 4096).expect("within direct map");
+        assert_eq!(virt.as_u64(), PHYSICAL_MEMORY_OFFSET + 0x0020_0000);
+        assert_eq!(virt_to_phys_direct(virt, 4096), Some(phys));
+
+        // Reject zero-length, beyond-limit, and PML4[511] kernel-image addresses.
+        assert_eq!(virt_to_phys_direct(virt, 0), None);
+        assert_eq!(try_phys_to_virt(PhysAddr::new(limit), 4096), None);
+        assert_eq!(
+            virt_to_phys_direct(VirtAddr::new(KERNEL_VIRT_BASE + 0x1000), 4096),
+            None
+        );
     }
 }

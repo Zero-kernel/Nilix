@@ -1,5 +1,8 @@
-use crate::buddy_allocator;
-use crate::page_table::PHYSICAL_MEMORY_OFFSET;
+use crate::buddy_allocator::{self, MAX_BUDDY_ZONES};
+use crate::page_table::{
+    direct_map_limit, set_direct_map_limit, DEFAULT_DIRECT_MAP_LIMIT, KERNEL_VIRT_BASE,
+    PHYSICAL_MEMORY_OFFSET,
+};
 use alloc::boxed::Box;
 use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::hint::spin_loop;
@@ -84,6 +87,10 @@ pub struct BootInfo {
     /// RF180-32: placement provenance flags, appended after the v1 layout so a
     /// v2 kernel can inspect the stable `version` offset before trusting them.
     pub kaslr_flags: u64,
+    /// N3.1a (#67): virtual base of the linear physical direct map (`PML4[273]`).
+    pub direct_map_base: u64,
+    /// N3.1a (#67): exclusive upper physical bound covered by `PML4[273]`.
+    pub direct_map_limit: u64,
 }
 
 /// Validate that a firmware-provided framebuffer range is wholly contained in
@@ -209,7 +216,7 @@ const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 
 /// R167-C: BootInfo ABI version shared with the bootloader mirror. Bump on any
 /// layout change to `BootInfo`.
-const BOOT_INFO_VERSION: u64 = 2;
+const BOOT_INFO_VERSION: u64 = 3;
 
 fn require_boot_info_version(version: u64) {
     assert_eq!(
@@ -397,17 +404,33 @@ const FALLBACK_PHYS_MEM_SIZE: usize = 64 * 1024 * 1024;
 // (NOT the 1 MiB heap), published once, and never grown after the first PTE
 // mutation.
 
-/// Published after the buddy allocator has accepted its one contiguous window.
+/// Published after the buddy allocator has accepted its physical zones.
 /// Readers load the page count with Acquire before using the base.
 static MANAGED_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 static MANAGED_PHYS_PAGES: AtomicUsize = AtomicUsize::new(0);
+static MANAGED_PHYS_TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
 
-/// RF178-31: virtual address of the boot-reserved `[AtomicU32; managed_pages]`
-/// table (direct-map of permanently reserved physical frames). Zero until
-/// `publish_cow_refcount_table` runs exactly once during MM init.
-static COW_REFCOUNT_TABLE_VIRT: AtomicUsize = AtomicUsize::new(0);
-/// Length of the published table in entries (== managed page count).
-static COW_REFCOUNT_TABLE_LEN: AtomicUsize = AtomicUsize::new(0);
+/// N3.1a (#67): per-zone COW refcount table descriptor (boot-reserved physical
+/// frames mapped via `PML4[273]`). Published once before AP bring-up.
+struct CowZoneEntry {
+    base: AtomicU64,
+    pages: AtomicUsize,
+    virt: AtomicUsize,
+}
+
+impl CowZoneEntry {
+    const fn empty() -> Self {
+        Self {
+            base: AtomicU64::new(0),
+            pages: AtomicUsize::new(0),
+            virt: AtomicUsize::new(0),
+        }
+    }
+}
+
+static COW_ZONES: [CowZoneEntry; MAX_BUDDY_ZONES] =
+    [const { CowZoneEntry::empty() }; MAX_BUDDY_ZONES];
+static COW_ZONE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// 页大小
 const PAGE_SIZE: u64 = 0x1000;
@@ -415,9 +438,8 @@ const PAGE_SIZE: u64 = 0x1000;
 const MIN_USABLE_REGION: u64 = 2 * 1024 * 1024;
 /// 跳过低于 1MB 的区域（保护 BIOS/VGA 等）
 const MIN_SAFE_ADDRESS: u64 = 0x100000;
-/// 高半区直映上限（Bootloader 映射了物理 0-1GB 到 0xffffffff80000000-...）
-/// 只能使用此范围内的物理内存（超出范围将不可访问）
-const HIGH_HALF_MAP_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
+/// Kernel image / early-heap high-half window (`PML4[511]/PDPT[510]`, 0..1 GiB).
+const KERNEL_IMAGE_WINDOW_LIMIT: u64 = DEFAULT_DIRECT_MAP_LIMIT;
 
 // ============================================================================
 // 初始化函数
@@ -433,6 +455,13 @@ const HIGH_HALF_MAP_LIMIT: u64 = 1024 * 1024 * 1024; // 1GB
 /// ensuring the chosen address falls within EFI_CONVENTIONAL_MEMORY regions.
 pub fn init_with_bootinfo(boot_info: &BootInfo) {
     require_boot_info_version(boot_info.version);
+    assert_eq!(
+        boot_info.direct_map_base, PHYSICAL_MEMORY_OFFSET,
+        "N3.1a: bootloader direct_map_base mismatch"
+    );
+    set_direct_map_limit(boot_info.direct_map_limit);
+    let dm_limit = direct_map_limit();
+
     // F9 (review D4): remember which physical ranges hold firmware tables, so
     // ACPI reads above the direct map are confined to them.
     record_firmware_ranges(boot_info);
@@ -460,9 +489,6 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (false, true) => " (static, validated)",
         (false, false) => " (static)",
     };
-    // R148-8 FIX: Gate raw address logging behind debug_assertions to prevent
-    // KASLR bypass via heap base address leak in Performance profile (where
-    // KptrGuard is disabled).
     #[cfg(debug_assertions)]
     klog!(
         Info,
@@ -479,96 +505,116 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         status
     );
 
-    // 从 BootInfo 解析内存映射
-    let (pmm_base, pmm_size) = select_region_from_bootinfo(boot_info).unwrap_or_else(|| {
+    // N3.1a (#67): Discover up to MAX_BUDDY_ZONES disjoint EFI_CONVENTIONAL_MEMORY
+    // regions across the full linear direct map (0..dm_limit), spanning both low
+    // RAM (<3 GiB) and high RAM (>=4 GiB) without wasting metadata on PCI holes.
+    let (mut regions, mut region_count) = select_regions_from_bootinfo(boot_info, dm_limit);
+    if region_count == 0 {
         klog!(
             Warn,
             "  Warning: BootInfo memory map unavailable, using fallback region"
         );
-        (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
-    });
+        regions[0] = (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE);
+        region_count = 1;
+    }
 
-    // R167-B/C: build the buddy allocator's permanent reservation set instead of
-    // R166's "carve the larger half" heuristic. The buddy now manages the FULL
-    // selected region minus precise per-page holes, reclaiming the memory the
-    // carve discarded. The heap reservation preserves R166's core guarantee — the
-    // KASLR-randomized linked-list heap and the buddy frame allocator never share
-    // a physical frame (which previously let the buddy hand out a live heap frame
-    // whose DMA/page-zeroing consumer corrupted the TIMER_CBS buffer → RIP=0).
-    let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
-    let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
-    let reserved_count = build_buddy_reservations(
-        boot_info,
-        pmm_base,
-        pmm_size,
-        heap_phys,
-        &mut reserved_ranges,
-    );
+    // Early 2 MiB heap lives inside PML4[511]/PDPT[510] (KERNEL_VIRT_BASE).
+    let heap_phys = (heap_base as u64).wrapping_sub(KERNEL_VIRT_BASE);
 
-    // RF178-31 / R180-29: reserve exact-sized COW refcount metadata from the
-    // discovered physical window (not the 1 MiB heap). Placement is computed
-    // against the COMPLETE boot reservation set before the metadata is zeroed,
-    // including framebuffer, kernel image, and non-conventional UEFI ranges.
-    let (meta_phys, meta_bytes) =
-        place_cow_refcount_metadata(pmm_base, pmm_size, &reserved_ranges[..reserved_count]);
-    let reserved_count =
-        push_cow_metadata_reservation(&mut reserved_ranges, reserved_count, meta_phys, meta_bytes);
-    // GAP-6 F8: the buddy allocator's own metadata also comes from reserved
-    // frames, placed against the set that now includes the COW table.
-    let (buddy_meta_phys, buddy_meta_bytes) =
-        place_buddy_metadata(pmm_base, pmm_size, &reserved_ranges[..reserved_count]);
-    let reserved_count = push_boot_metadata_reservation(
-        &mut reserved_ranges,
-        reserved_count,
-        buddy_meta_phys,
-        buddy_meta_bytes,
-        BUDDY_METADATA_LABEL,
-    );
-    let reserved_ranges = &reserved_ranges[..reserved_count];
+    let mut zone_allocators: [Option<buddy_allocator::BuddyAllocator>; MAX_BUDDY_ZONES] =
+        [const { None }; MAX_BUDDY_ZONES];
+    let mut published_zones = 0usize;
+    let mut total_managed_bytes: u64 = 0;
 
-    // R148-8 FIX: Physical memory region bounds also leak information.
-    #[cfg(debug_assertions)]
-    klog!(
-        Info,
-        "  Physical memory region: 0x{:x} - 0x{:x} ({} MB)",
-        pmm_base,
-        pmm_base + pmm_size as u64,
-        pmm_size / (1024 * 1024)
-    );
-    #[cfg(not(debug_assertions))]
-    klog!(
-        Info,
-        "  Physical memory region: {} MB",
-        pmm_size / (1024 * 1024)
-    );
-    klog!(
-        Info,
-        "  COW refcount metadata: {} KB (boot-reserved frames)",
-        meta_bytes / 1024
-    );
-    klog!(
-        Info,
-        "  Buddy allocator metadata: {} KB (boot-reserved frames)",
-        buddy_meta_bytes / 1024
-    );
+    for &(zone_base, zone_size) in &regions[..region_count] {
+        let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
+        let reserved_count = build_buddy_reservations(
+            boot_info,
+            zone_base,
+            zone_size,
+            heap_phys,
+            &mut reserved_ranges,
+        );
 
-    // 初始化 Buddy 物理页分配器
-    // SAFETY: placed inside the managed window, reserved above, used only here.
-    let buddy_storage = unsafe { boot_metadata_storage(buddy_meta_phys, buddy_meta_bytes) };
-    buddy_allocator::init_buddy_allocator_in(
-        PhysAddr::new(pmm_base),
-        pmm_size,
-        reserved_ranges,
-        buddy_storage,
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "buddy allocator metadata initialization failed before publication: {:?}",
-            error
+        let (meta_phys, meta_bytes) =
+            place_cow_refcount_metadata(zone_base, zone_size, &reserved_ranges[..reserved_count]);
+        let reserved_count = push_cow_metadata_reservation(
+            &mut reserved_ranges,
+            reserved_count,
+            meta_phys,
+            meta_bytes,
+        );
+        let (buddy_meta_phys, buddy_meta_bytes) =
+            place_buddy_metadata(zone_base, zone_size, &reserved_ranges[..reserved_count]);
+        let reserved_count = push_boot_metadata_reservation(
+            &mut reserved_ranges,
+            reserved_count,
+            buddy_meta_phys,
+            buddy_meta_bytes,
+            BUDDY_METADATA_LABEL,
+        );
+        let reserved_slice = &reserved_ranges[..reserved_count];
+
+        #[cfg(debug_assertions)]
+        klog!(
+            Info,
+            "  Zone {}: 0x{:x} - 0x{:x} ({} MB, COW {} KB, buddy {} KB)",
+            published_zones,
+            zone_base,
+            zone_base + zone_size as u64,
+            zone_size / (1024 * 1024),
+            meta_bytes / 1024,
+            buddy_meta_bytes / 1024
+        );
+        #[cfg(not(debug_assertions))]
+        klog!(
+            Info,
+            "  Zone {}: {} MB (COW {} KB, buddy {} KB)",
+            published_zones,
+            zone_size / (1024 * 1024),
+            meta_bytes / 1024,
+            buddy_meta_bytes / 1024
+        );
+
+        // SAFETY: placed inside this zone, reserved above, used only here.
+        let buddy_storage = unsafe { boot_metadata_storage(buddy_meta_phys, buddy_meta_bytes) };
+        let allocator = buddy_allocator::BuddyAllocator::new_with_reservations_in(
+            PhysAddr::new(zone_base),
+            zone_size,
+            reserved_slice,
+            buddy_storage,
         )
-    });
-    publish_cow_refcount_table(meta_phys, pmm_size / PAGE_SIZE as usize);
-    publish_managed_phys_window(pmm_base, pmm_size);
+        .unwrap_or_else(|error| {
+            panic!(
+                "buddy allocator zone {} initialization failed before publication: {:?}",
+                published_zones, error
+            )
+        });
+
+        let zone_pages = zone_size / PAGE_SIZE as usize;
+        stage_cow_refcount_zone(published_zones, zone_base, meta_phys, zone_pages);
+        zone_allocators[published_zones] = Some(allocator);
+        published_zones += 1;
+        total_managed_bytes = total_managed_bytes.saturating_add(zone_size as u64);
+    }
+
+    buddy_allocator::init_buddy_allocator_zones(&mut zone_allocators[..published_zones])
+        .unwrap_or_else(|error| {
+            panic!("buddy allocator multi-zone publication failed: {:?}", error)
+        });
+    publish_cow_zones(published_zones);
+    publish_managed_phys_windows(
+        regions[0].0,
+        regions[0].1,
+        (total_managed_bytes / PAGE_SIZE) as usize,
+    );
+
+    klog_always!(
+        "N3.1a: Direct map 0..{} GiB, managed {} zone(s), total {} MB",
+        dm_limit / (1024 * 1024 * 1024),
+        published_zones,
+        total_managed_bytes / (1024 * 1024)
+    );
 
     // 运行自测（可选）
     #[cfg(debug_assertions)]
@@ -616,7 +662,7 @@ pub fn init() {
     // exclusion as the BootInfo path, but via reservation so the full fallback
     // region minus the heap hole is managed). No UEFI map here, so the heap is
     // the only non-metadata reservation.
-    let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
+    let heap_phys = (heap_base as u64).wrapping_sub(KERNEL_VIRT_BASE);
     let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
     reserved_ranges[0] = (heap_phys, HEAP_SIZE as u64);
     let (meta_phys, meta_bytes) = place_cow_refcount_metadata(
@@ -653,8 +699,14 @@ pub fn init() {
             error
         )
     });
-    publish_cow_refcount_table(meta_phys, FALLBACK_PHYS_MEM_SIZE / PAGE_SIZE as usize);
-    publish_managed_phys_window(FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE);
+    let fallback_pages = FALLBACK_PHYS_MEM_SIZE / PAGE_SIZE as usize;
+    stage_cow_refcount_zone(0, FALLBACK_PHYS_MEM_START, meta_phys, fallback_pages);
+    publish_cow_zones(1);
+    publish_managed_phys_windows(
+        FALLBACK_PHYS_MEM_START,
+        FALLBACK_PHYS_MEM_SIZE,
+        fallback_pages,
+    );
 
     // 运行自测（可选）
     #[cfg(debug_assertions)]
@@ -772,8 +824,8 @@ fn select_heap_base_from_bootinfo(boot_info: &BootInfo) -> Option<(usize, bool)>
         let slot_idx = (start_slot + offset) % (slot_count + 1);
         let heap_base = HEAP_DEFAULT_BASE + slot_idx * HEAP_ALIGNMENT;
 
-        // Convert virtual address to physical (bootloader maps phys 0-1GB to 0xffffffff80000000)
-        let phys_base = heap_base as u64 - PHYSICAL_MEMORY_OFFSET;
+        // Convert virtual address to physical (early heap lives in PML4[511]/PDPT[510])
+        let phys_base = heap_base as u64 - KERNEL_VIRT_BASE;
 
         if heap_range_usable(phys_base, HEAP_SIZE, map_info) {
             let randomized = rand_slot.is_some();
@@ -788,7 +840,7 @@ fn select_heap_base_from_bootinfo(boot_info: &BootInfo) -> Option<(usize, bool)>
 /// Check if a candidate heap physical range is entirely within usable UEFI memory.
 ///
 /// A range is usable if:
-/// 1. It's within the bootloader's direct-map limit (1GB)
+/// 1. It's within the kernel image high-half window (1 GiB, `PML4[511]/PDPT[510]`)
 /// 2. It's above MIN_SAFE_ADDRESS (1MB, protecting legacy hardware)
 /// 3. It's fully contained within an EFI_CONVENTIONAL_MEMORY region (R167-A:
 ///    Boot-Services regions are no longer treated as usable)
@@ -800,8 +852,8 @@ fn heap_range_usable(phys_base: u64, len: usize, map_info: &MemoryMapInfo) -> bo
         return false;
     };
 
-    // Must be within bootloader's direct-map range
-    if phys_end > HIGH_HALF_MAP_LIMIT {
+    // Must be within PML4[511]/PDPT[510] early-heap window
+    if phys_end > KERNEL_IMAGE_WINDOW_LIMIT {
         return false;
     }
 
@@ -922,67 +974,162 @@ fn record_firmware_ranges(boot_info: &BootInfo) {
     }
 }
 
-/// 从 BootInfo 选择最大的可用内存区域
+/// N3.1a (#67): Discover up to `MAX_BUDDY_ZONES` disjoint `EFI_CONVENTIONAL_MEMORY`
+/// regions inside `[MIN_SAFE_ADDRESS, map_limit)`.
 ///
-/// 遍历 UEFI 内存映射，找到最大的 EfiConventionalMemory 区域
-fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
+/// Adjacent conventional descriptors are merged before ranking so contiguous RAM
+/// stays in one buddy zone; the largest `MAX_BUDDY_ZONES` regions >= `MIN_USABLE_REGION`
+/// are returned sorted by ascending physical address (Zone 0 = low RAM `<3 GiB`,
+/// Zone 1+ = high RAM `>=4 GiB` across the PCI MMIO hole). Allocation-free.
+fn select_regions_from_bootinfo(
+    boot_info: &BootInfo,
+    map_limit: u64,
+) -> ([(u64, usize); MAX_BUDDY_ZONES], usize) {
+    let mut out = [(0u64, 0usize); MAX_BUDDY_ZONES];
     let map_info = &boot_info.memory_map;
+    let Some(desc_count) = validate_memory_map(map_info) else {
+        return (out, 0);
+    };
 
-    // 验证内存映射有效性
-    let desc_count = validate_memory_map(map_info)?;
-    let mut best: Option<(u64, u64)> = None;
-    let mut total_conventional: u64 = 0;
+    const MAX_CANDIDATE_SPANS: usize = 128;
+    let mut spans = [(0u64, 0u64); MAX_CANDIDATE_SPANS];
+    let mut span_count = 0usize;
 
     klog_always!("  Scanning UEFI memory map ({} descriptors)...", desc_count);
 
     for i in 0..desc_count {
-        let offset = i.checked_mul(map_info.descriptor_size)?;
-        let addr = map_info.buffer.checked_add(offset as u64)?;
-        let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
+        let Some(offset) = i.checked_mul(map_info.descriptor_size) else {
+            break;
+        };
+        let Some(addr) = map_info.buffer.checked_add(offset as u64) else {
+            break;
+        };
+        // SAFETY: validate_memory_map proved every descriptor prefix fits.
+        let desc = unsafe { core::ptr::read_unaligned(addr as *const EfiMemoryDescriptor) };
 
-        // R167-A: 只接纳 EFI_CONVENTIONAL_MEMORY 作为 buddy 分配器内存。
-        // Boot-Services Code/Data 在 ExitBootServices 后名义上可用，但固件常在
-        // 其中保留运行期数据，交给 buddy 会破坏存活固件内存——故不再接纳。
+        // R167-A: Only EFI_CONVENTIONAL_MEMORY is admitted to the buddy frame allocator.
         if desc.typ != EFI_CONVENTIONAL_MEMORY || desc.page_count == 0 {
             continue;
         }
 
-        let start = align_up(desc.phys_start, PAGE_SIZE);
+        let raw_start = align_up(desc.phys_start, PAGE_SIZE);
         let raw_length = desc.page_count.saturating_mul(PAGE_SIZE);
-        let usable_length = raw_length.saturating_sub(start.saturating_sub(desc.phys_start));
-
-        // 跳过超出高半区直映范围的区域（>1GB）
-        if start >= HIGH_HALF_MAP_LIMIT {
+        let usable_length = raw_length.saturating_sub(raw_start.saturating_sub(desc.phys_start));
+        let start = raw_start.max(MIN_SAFE_ADDRESS);
+        if start >= map_limit {
+            continue;
+        }
+        let end = raw_start.saturating_add(usable_length).min(map_limit);
+        let end = align_down(end, PAGE_SIZE);
+        if end <= start {
             continue;
         }
 
-        // 如果区域跨越 1GB 边界，截断到 1GB
-        let end = start.saturating_add(usable_length);
-        let clamped_end = end.min(HIGH_HALF_MAP_LIMIT);
-        let clamped_length = clamped_end.saturating_sub(start);
+        // Insert into sorted-by-start span list and merge adjacent/overlapping spans.
+        let mut insert_at = span_count;
+        for idx in 0..span_count {
+            if start < spans[idx].0 {
+                insert_at = idx;
+                break;
+            }
+        }
+        if span_count < MAX_CANDIDATE_SPANS {
+            let mut j = span_count;
+            while j > insert_at {
+                spans[j] = spans[j - 1];
+                j -= 1;
+            }
+            spans[insert_at] = (start, end);
+            span_count += 1;
+            // Coalesce adjacent/overlapping spans in-place.
+            let mut write = 0usize;
+            for read in 1..span_count {
+                if spans[read].0 <= spans[write].1 {
+                    if spans[read].1 > spans[write].1 {
+                        spans[write].1 = spans[read].1;
+                    }
+                } else {
+                    write += 1;
+                    spans[write] = spans[read];
+                }
+            }
+            span_count = write + 1;
+        } else {
+            // Table full: try merging into an existing adjacent span or replace smallest.
+            let mut merged = false;
+            for idx in 0..span_count {
+                if start <= spans[idx].1 && end >= spans[idx].0 {
+                    spans[idx].0 = spans[idx].0.min(start);
+                    spans[idx].1 = spans[idx].1.max(end);
+                    merged = true;
+                    break;
+                }
+            }
+            if !merged {
+                let len = end - start;
+                let mut smallest = 0usize;
+                for idx in 1..span_count {
+                    if (spans[idx].1 - spans[idx].0) < (spans[smallest].1 - spans[smallest].0) {
+                        smallest = idx;
+                    }
+                }
+                if len > (spans[smallest].1 - spans[smallest].0) {
+                    spans[smallest] = (start, end);
+                }
+            }
+        }
+    }
 
-        // 跳过太小或地址太低的区域
-        if clamped_length < MIN_USABLE_REGION || start < MIN_SAFE_ADDRESS {
+    // Filter to spans >= MIN_USABLE_REGION and keep the largest MAX_BUDDY_ZONES.
+    let mut selected = [(0u64, 0u64); MAX_BUDDY_ZONES];
+    let mut selected_count = 0usize;
+    let mut total_conventional: u64 = 0;
+
+    for &(start, end) in &spans[..span_count] {
+        let len = end.saturating_sub(start);
+        if len < MIN_USABLE_REGION {
             continue;
         }
-
-        total_conventional += clamped_length;
-
-        // 记录最大区域
-        if best.is_none_or(|(_, size)| clamped_length > size) {
-            best = Some((start, clamped_length));
+        total_conventional = total_conventional.saturating_add(len);
+        if selected_count < MAX_BUDDY_ZONES {
+            selected[selected_count] = (start, len);
+            selected_count += 1;
+        } else {
+            let mut smallest = 0usize;
+            for idx in 1..selected_count {
+                if selected[idx].1 < selected[smallest].1 {
+                    smallest = idx;
+                }
+            }
+            if len > selected[smallest].1 {
+                selected[smallest] = (start, len);
+            }
         }
+    }
+
+    // Sort selected zones by ascending physical base so Zone 0 is low RAM.
+    for i in 1..selected_count {
+        let key = selected[i];
+        let mut j = i;
+        while j > 0 && selected[j - 1].0 > key.0 {
+            selected[j] = selected[j - 1];
+            j -= 1;
+        }
+        selected[j] = key;
+    }
+
+    for i in 0..selected_count {
+        out[i] = (selected[i].0, selected[i].1 as usize);
     }
 
     klog!(
         Info,
-        "  Total usable memory: {} MB",
-        total_conventional / (1024 * 1024)
+        "  Total usable memory: {} MB across {} zone(s)",
+        total_conventional / (1024 * 1024),
+        selected_count
     );
 
-    // RF178-31: manage the full discovered conventional window up to the
-    // architectural high-half direct-map limit only. No artificial RAM cap.
-    best.map(|(base, size)| (base, size as usize))
+    (out, selected_count)
 }
 
 /// Bytes required for an O(1) AtomicU32 COW table covering `managed_pages`.
@@ -1211,7 +1358,7 @@ unsafe fn boot_metadata_storage(phys: u64, bytes: usize) -> &'static mut [u8] {
     );
     assert!(
         phys.checked_add(bytes as u64)
-            .is_some_and(|end| end <= HIGH_HALF_MAP_LIMIT),
+            .is_some_and(|end| end <= direct_map_limit()),
         "boot metadata must lie inside the high-half direct map"
     );
     let virt = phys
@@ -1222,14 +1369,17 @@ unsafe fn boot_metadata_storage(phys: u64, bytes: usize) -> &'static mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(virt as *mut u8, bytes) }
 }
 
-/// Zero and publish the boot-reserved COW refcount table via the direct map.
+/// Zero and stage one zone's boot-reserved COW refcount table via `PML4[273]`.
 ///
-/// # Safety contract
-///
-/// `meta_phys` must be page-aligned, permanently reserved out of the buddy free
-/// pool, and fully covered by the high-half direct map. Called exactly once,
-/// single-threaded, before any AP is launched and before any fork/COW path runs.
-fn publish_cow_refcount_table(meta_phys: u64, managed_pages: usize) {
+/// Called single-threaded during boot before [`publish_cow_zones`] releases
+/// `COW_ZONE_COUNT`.
+fn stage_cow_refcount_zone(zone_idx: usize, zone_base: u64, meta_phys: u64, managed_pages: usize) {
+    assert!(zone_idx < MAX_BUDDY_ZONES, "COW zone index out of range");
+    assert_eq!(
+        zone_base % PAGE_SIZE,
+        0,
+        "COW zone physical base must be page aligned"
+    );
     assert_eq!(
         meta_phys % PAGE_SIZE,
         0,
@@ -1237,68 +1387,91 @@ fn publish_cow_refcount_table(meta_phys: u64, managed_pages: usize) {
     );
     assert!(managed_pages > 0, "managed page count must be non-zero");
     assert_eq!(
-        COW_REFCOUNT_TABLE_LEN.load(Ordering::Acquire),
+        COW_ZONE_COUNT.load(Ordering::Acquire),
         0,
-        "COW refcount table must be published exactly once"
+        "COW refcount tables must be staged before publication"
     );
 
     let meta_bytes = cow_refcount_table_bytes(managed_pages);
+    assert!(
+        meta_phys
+            .checked_add(meta_bytes as u64)
+            .is_some_and(|end| end <= direct_map_limit()),
+        "COW metadata must lie inside the high-half direct map"
+    );
     let virt = meta_phys
         .checked_add(PHYSICAL_MEMORY_OFFSET)
         .expect("COW metadata direct-map address overflow");
     let ptr = virt as *mut u8;
 
-    // SAFETY: meta_phys is inside the managed window which is clamped to the
-    // high-half direct map; the frames are permanently reserved and not yet
-    // used by any other subsystem.
+    // SAFETY: meta_phys is permanently reserved inside the direct-mapped zone
+    // and exclusively owned during single-threaded early boot.
     unsafe {
         core::ptr::write_bytes(ptr, 0, meta_bytes);
     }
 
-    // Publish base first, then length with Release. Readers Acquire-load length
-    // and only then read the base; if length != 0 they observe this base.
-    COW_REFCOUNT_TABLE_VIRT.store(virt as usize, Ordering::Release);
-    COW_REFCOUNT_TABLE_LEN.store(managed_pages, Ordering::Release);
+    COW_ZONES[zone_idx].base.store(zone_base, Ordering::Relaxed);
+    COW_ZONES[zone_idx]
+        .pages
+        .store(managed_pages, Ordering::Relaxed);
+    COW_ZONES[zone_idx]
+        .virt
+        .store(virt as usize, Ordering::Relaxed);
 
     klog!(
         Info,
-        "  COW refcount table published: {} entries ({} KB)",
+        "  COW refcount table zone {} staged: {} entries ({} KB)",
+        zone_idx,
         managed_pages,
         meta_bytes / 1024
     );
 }
 
-/// Publish the exact physical-page index domain used by the buddy allocator.
-fn publish_managed_phys_window(base: u64, size: usize) {
+/// Publish all staged COW refcount zones atomically with Release ordering.
+fn publish_cow_zones(zone_count: usize) {
+    assert!(
+        zone_count > 0 && zone_count <= MAX_BUDDY_ZONES,
+        "invalid COW zone count"
+    );
     assert_eq!(
-        base % PAGE_SIZE,
+        COW_ZONE_COUNT.load(Ordering::Acquire),
+        0,
+        "COW refcount tables must be published exactly once"
+    );
+    COW_ZONE_COUNT.store(zone_count, Ordering::Release);
+}
+
+/// Publish the managed physical page windows (Zone 0 + aggregate total).
+fn publish_managed_phys_windows(zone0_base: u64, zone0_size: usize, total_pages: usize) {
+    assert_eq!(
+        zone0_base % PAGE_SIZE,
         0,
         "managed physical base must be page aligned"
     );
     assert_eq!(
-        size % PAGE_SIZE as usize,
+        zone0_size % PAGE_SIZE as usize,
         0,
         "managed physical size must be page aligned"
     );
-    // RF178-31: only the architectural direct-map limit bounds the window.
-    assert!(size > 0 && (size as u64) <= HIGH_HALF_MAP_LIMIT);
+    assert!(zone0_size > 0 && (zone0_size as u64) <= direct_map_limit());
+    assert!(total_pages >= zone0_size / PAGE_SIZE as usize);
     assert_eq!(
         MANAGED_PHYS_PAGES.load(Ordering::Acquire),
         0,
         "managed physical window must be published exactly once"
     );
-    // Metadata table must already cover the full window (same page count).
     assert_eq!(
-        COW_REFCOUNT_TABLE_LEN.load(Ordering::Acquire),
-        size / PAGE_SIZE as usize,
-        "COW refcount table length must match managed page count"
+        COW_ZONES[0].pages.load(Ordering::Acquire),
+        zone0_size / PAGE_SIZE as usize,
+        "COW refcount zone 0 length must match managed zone 0 page count"
     );
 
-    MANAGED_PHYS_BASE.store(base, Ordering::Relaxed);
-    MANAGED_PHYS_PAGES.store(size / PAGE_SIZE as usize, Ordering::Release);
+    MANAGED_PHYS_BASE.store(zone0_base, Ordering::Relaxed);
+    MANAGED_PHYS_TOTAL_PAGES.store(total_pages, Ordering::Relaxed);
+    MANAGED_PHYS_PAGES.store(zone0_size / PAGE_SIZE as usize, Ordering::Release);
 }
 
-/// Return the buddy-owned physical page window after initialization.
+/// Return Zone 0's buddy-owned physical page window after initialization.
 #[inline]
 pub fn managed_physical_page_window() -> Option<(u64, usize)> {
     let page_count = MANAGED_PHYS_PAGES.load(Ordering::Acquire);
@@ -1308,24 +1481,64 @@ pub fn managed_physical_page_window() -> Option<(u64, usize)> {
     Some((MANAGED_PHYS_BASE.load(Ordering::Relaxed), page_count))
 }
 
-/// RF178-31: return the boot-reserved COW refcount slot for a managed page index.
-///
-/// Returns `None` when the table is unpublished or `index` is out of range.
-/// The table lives in permanently reserved physical frames (not the heap); every
-/// access is O(1) and allocation-free.
+/// Total physical pages managed across all published buddy zones.
+#[inline]
+pub fn managed_physical_total_pages() -> usize {
+    if MANAGED_PHYS_PAGES.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    MANAGED_PHYS_TOTAL_PAGES.load(Ordering::Relaxed)
+}
+
+/// Number of published physical memory zones.
+#[inline]
+pub fn managed_physical_zone_count() -> usize {
+    COW_ZONE_COUNT.load(Ordering::Acquire)
+}
+
+/// RF178-31: return the boot-reserved COW refcount slot for a Zone-0 page index.
 #[inline]
 pub fn cow_refcount_slot(index: usize) -> Option<&'static core::sync::atomic::AtomicU32> {
-    let len = COW_REFCOUNT_TABLE_LEN.load(Ordering::Acquire);
+    if COW_ZONE_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let len = COW_ZONES[0].pages.load(Ordering::Relaxed);
     if len == 0 || index >= len {
         return None;
     }
-    let base = COW_REFCOUNT_TABLE_VIRT.load(Ordering::Relaxed);
+    let base = COW_ZONES[0].virt.load(Ordering::Relaxed);
     if base == 0 {
         return None;
     }
     // SAFETY: base/len published once after zeroing reserved frames; index < len.
     let slot = unsafe { &*(base as *const core::sync::atomic::AtomicU32).add(index) };
     Some(slot)
+}
+
+/// N3.1a (#67): O(zones) lock-free lookup of the COW refcount slot for any
+/// managed physical page address across all published zones.
+#[inline]
+pub fn cow_refcount_slot_for_phys(phys: u64) -> Option<&'static core::sync::atomic::AtomicU32> {
+    if phys & (PAGE_SIZE - 1) != 0 {
+        return None;
+    }
+    let count = COW_ZONE_COUNT.load(Ordering::Acquire);
+    for z in 0..count {
+        let zone_base = COW_ZONES[z].base.load(Ordering::Relaxed);
+        let len = COW_ZONES[z].pages.load(Ordering::Relaxed);
+        if phys >= zone_base {
+            let idx = ((phys - zone_base) / PAGE_SIZE) as usize;
+            if idx < len {
+                let virt = COW_ZONES[z].virt.load(Ordering::Relaxed);
+                if virt == 0 {
+                    return None;
+                }
+                // SAFETY: staged and zeroed before `COW_ZONE_COUNT` Release; idx < len.
+                return Some(unsafe { &*(virt as *const core::sync::atomic::AtomicU32).add(idx) });
+            }
+        }
+    }
+    None
 }
 
 /// R167-C: Bounded accumulator for the buddy allocator's physical reservation
@@ -1777,6 +1990,8 @@ mod tests {
             kernel_phys_size: 0x1_0000,
             version: BOOT_INFO_VERSION,
             kaslr_flags: 0,
+            direct_map_base: PHYSICAL_MEMORY_OFFSET,
+            direct_map_limit: DEFAULT_DIRECT_MAP_LIMIT,
         };
 
         let heap_phys = BASE + 0x20_0000;
@@ -1915,5 +2130,58 @@ mod tests {
             ..valid
         };
         assert!(!validate_framebuffer_region(&outside, &map));
+    }
+
+    #[test]
+    fn n3_1a_select_regions_merges_adjacent_and_spans_pci_hole_above_1gib() {
+        let gib = 1024u64 * 1024 * 1024;
+        // Simulated 4 GiB Q35 UEFI map:
+        // - two adjacent conventional spans in low RAM (16 MiB..1 GiB + 1 GiB..3 GiB)
+        // - 3 GiB..4 GiB PCI MMIO hole (not conventional)
+        // - 4 GiB..5 GiB high RAM
+        let descriptors = [
+            descriptor(
+                EFI_CONVENTIONAL_MEMORY,
+                0x0100_0000,
+                (gib - 0x0100_0000) / PAGE_SIZE,
+            ),
+            descriptor(EFI_CONVENTIONAL_MEMORY, gib, (2 * gib) / PAGE_SIZE),
+            descriptor(11, 3 * gib, gib / PAGE_SIZE), // MMIO hole
+            descriptor(EFI_CONVENTIONAL_MEMORY, 4 * gib, gib / PAGE_SIZE),
+        ];
+        let boot_info = BootInfo {
+            memory_map: MemoryMapInfo {
+                buffer: descriptors.as_ptr() as u64,
+                size: core::mem::size_of_val(&descriptors),
+                descriptor_size: core::mem::size_of::<EfiMemoryDescriptor>(),
+                descriptor_version: 1,
+            },
+            framebuffer: FramebufferInfo {
+                base: 0,
+                size: 0,
+                width: 0,
+                height: 0,
+                stride: 0,
+                pixel_format: PixelFormat::Unknown,
+            },
+            kaslr_slide: 0,
+            rsdp_address: 0,
+            cmdline_len: 0,
+            cmdline: [0; 256],
+            kernel_phys_base: 0x10_0000,
+            kernel_phys_size: 0x40_0000,
+            version: BOOT_INFO_VERSION,
+            kaslr_flags: 0,
+            direct_map_base: PHYSICAL_MEMORY_OFFSET,
+            direct_map_limit: 5 * gib,
+        };
+
+        let (regions, count) = select_regions_from_bootinfo(&boot_info, 5 * gib);
+        assert_eq!(
+            count, 2,
+            "expected merged low RAM zone + high RAM zone across PCI hole"
+        );
+        assert_eq!(regions[0], (0x0100_0000, (3 * gib - 0x0100_0000) as usize));
+        assert_eq!(regions[1], (4 * gib, gib as usize));
     }
 }

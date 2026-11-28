@@ -17,7 +17,7 @@ where
 {
     let mut table = root;
     for (level, shift) in [(4, 39), (3, 30), (2, 21), (1, 12)] {
-        if table & 0xfff != 0 || table >= DIRECT_MAP_LIMIT {
+        if table & 0xfff != 0 || table >= direct_map_limit() {
             return Err(MmioAccessError::InvalidTable);
         }
         let raw =
@@ -118,7 +118,7 @@ pub unsafe fn with_kernel_mmio_mapping<T>(
 mod tests {
     use super::*;
 
-    const VA: u64 = PHYSICAL_MEMORY_OFFSET + 0x1000_1000;
+    const VA: u64 = KERNEL_VIRT_BASE + 0x1000_1000;
     const PA: u64 = 0x1000_1000;
     const RW: u64 = PageTableFlags::PRESENT.bits() | PageTableFlags::WRITABLE.bits();
 

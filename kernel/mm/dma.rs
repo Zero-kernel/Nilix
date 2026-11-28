@@ -75,12 +75,11 @@ pub type DomainId = u16;
 /// DMA page size (4KiB, matching x86_64 page size).
 pub const DMA_PAGE_SIZE: usize = 4096;
 
-/// Maximum physical address reachable via the kernel direct-map (1 GiB).
-///
-/// The kernel's high-half direct map (PHYSICAL_MEMORY_OFFSET) only covers
-/// physical addresses 0-1GiB. Allocations beyond this range cannot be accessed
-/// by the CPU via `phys_to_virt`, so we reject them.
-const MAX_DIRECT_MAP_PHYS: u64 = 1 << 30; // 1 GiB
+/// Maximum physical address reachable via the kernel direct-map.
+#[inline]
+fn max_direct_map_phys() -> u64 {
+    crate::page_table::direct_map_limit()
+}
 
 // ============================================================================
 // Error Types
@@ -579,7 +578,7 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
     let end = phys
         .checked_add(alloc_bytes as u64 - 1)
         .ok_or(DmaError::InvalidSize)?;
-    if end >= MAX_DIRECT_MAP_PHYS {
+    if end >= max_direct_map_phys() {
         // Allocation landed outside direct-map window - free and fail.
         buddy_allocator::free_physical_pages(frame, pages);
         return Err(DmaError::OutOfDirectMapRange);

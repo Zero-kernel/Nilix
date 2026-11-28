@@ -74,7 +74,8 @@ pub use heap_budget::{
     TRANSIENT_PEAK_BYTES,
 };
 pub use memory::{
-    emergency_heap_base, emergency_heap_free_bytes, heap_free_bytes, heap_peak_used_bytes,
+    cow_refcount_slot_for_phys, emergency_heap_base, emergency_heap_free_bytes, heap_free_bytes,
+    heap_peak_used_bytes, managed_physical_total_pages, managed_physical_zone_count,
     run_emergency_heap_self_test, validate_framebuffer_region, BootInfo, EmergencyAllocator,
     FrameAllocator, MemoryMapInfo, EMERGENCY_HEAP_SIZE_BYTES, NORMAL_HEAP_SIZE_BYTES,
 };
@@ -93,11 +94,12 @@ pub use page_cache::{
     PAGE_SIZE, PRESSURE_HANDLER,
 };
 pub use page_table::{
-    as_pt_lock_shard, checked_physical_range, map_mmio, phys_to_virt, pt_lock_owner_cpu,
-    register_boot_root, unmap_mmio, with_as_pt_lock, with_current_manager, with_kernel_manager,
-    with_kernel_pt_lock, BatchMapUserError, MapError, PageTableManager, UnmapError,
-    UpdateFlagsError, AS_PT_LOCK_SHARDS, KSTACK_REGION_BASE, KSTACK_REGION_END,
-    PHYSICAL_MEMORY_OFFSET,
+    as_pt_lock_shard, checked_physical_range, direct_map_limit, map_mmio, phys_to_virt,
+    pt_lock_owner_cpu, register_boot_root, try_phys_to_virt, unmap_mmio, virt_to_phys_direct,
+    with_as_pt_lock, with_current_manager, with_kernel_manager, with_kernel_pt_lock,
+    BatchMapUserError, MapError, PageTableManager, UnmapError, UpdateFlagsError, AS_PT_LOCK_SHARDS,
+    DEFAULT_DIRECT_MAP_LIMIT, DIRECT_MAP_PML4_INDEX, KERNEL_VIRT_BASE, KSTACK_REGION_BASE,
+    KSTACK_REGION_END, MAX_DIRECT_MAP_LIMIT, PHYSICAL_MEMORY_OFFSET,
 };
 pub use tlb_shootdown::{
     flush_all_address_spaces, flush_current_as_all, flush_current_as_page, flush_current_as_range,
