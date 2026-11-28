@@ -193,7 +193,7 @@ run_suite compliance 1 0 \
     --target x86_64-unknown-linux-gnu \
     --lib --locked
 
-run_suite seccomp 16 0 \
+run_suite seccomp 20 0 \
     --manifest-path kernel/seccomp/Cargo.toml \
     --target x86_64-unknown-linux-gnu \
     --features mm/host_harness \
