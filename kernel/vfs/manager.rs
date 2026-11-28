@@ -1395,7 +1395,7 @@ fn vfs_shutdown_sync_callback() {
         return;
     };
     for filesystem in filesystems.iter() {
-        match filesystem.sync() {
+        match filesystem.shutdown_sync() {
             Ok(()) | Err(FsError::NotSupported) => {}
             Err(error) => {
                 klog!(

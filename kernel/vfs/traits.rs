@@ -183,6 +183,15 @@ pub trait FileSystem: Send + Sync {
         Err(FsError::NotSupported)
     }
 
+    /// Clean-shutdown / unmount durability hook.
+    ///
+    /// Defaults to `sync()`. Journaled filesystems override this to checkpoint
+    /// any pending delayed journal epoch cleanly before halt/unmount so the
+    /// on-disk journal is left idle (`s_start == 0`).
+    fn shutdown_sync(&self) -> Result<(), FsError> {
+        self.sync()
+    }
+
     /// ST-K4: report a latched I/O failure without touching the device.
     fn check_io_health(&self) -> Result<(), FsError> {
         Ok(())
