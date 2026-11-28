@@ -37,6 +37,8 @@ pub mod memory;
 pub mod oom_killer;
 pub mod page_cache;
 pub mod page_table;
+/// N3.1b (`HEAP-SCALE`, #67): buddy-backed slab + large-page kernel heap allocator.
+pub mod slab;
 pub mod tlb_shootdown;
 
 pub use admitted::{
@@ -53,9 +55,9 @@ pub use capabilities::{
 };
 pub use firmware::read_firmware_bytes;
 pub use heap_admission::{
-    allocation_charge_bytes, arc_charge_bytes, check_coexistence,
+    admission_scale, allocation_charge_bytes, arc_charge_bytes, check_coexistence,
     class_snapshot as heap_class_snapshot, run_heap_admission_boundary_self_test,
-    run_heap_admission_self_test, snapshot as heap_admission_snapshot,
+    run_heap_admission_self_test, runtime_admitted_heap_bytes, snapshot as heap_admission_snapshot,
     try_reserve as try_reserve_heap, vec_charge_bytes, vec_growth_charge_bytes, CoexistenceVerdict,
     HeapAdmissionError, HeapAdmissionSnapshot, HeapCharge, HeapClass, HeapReservation,
     NsBudgetError, NsBudgetLease, NsBudgetSnapshot, NsByteBudget, ADMITTED_HEAP_BYTES,
@@ -66,18 +68,21 @@ pub use heap_admission::{
 pub use heap_budget::{
     budget_bytes, general_residual_bytes, hard_floor_bytes, hard_floors_sum_bytes,
     is_published as heap_budgets_published, publish_and_assert as publish_heap_budgets,
-    reserved_headroom_bytes, run_heap_budget_self_test, snapshot as heap_budget_snapshot,
-    transient_peak_bytes, transient_peak_holders, HeapBudgetId, HeapBudgetSnapshot,
-    TransientPeakGuard, AUDIT_RING_HARD_BYTES, CONNTRACK_HARD_BYTES, EXEC_IMAGE_PEAK_BYTES,
-    EXEC_TRANSACTION_PEAK_BYTES, FUTEX_HARD_BYTES, HARD_FLOORS_SUM_BYTES, HARD_FLOOR_BYTES,
-    HARD_FLOOR_COUNT, HARD_FLOOR_NAMES, PAGE_CACHE_META_HARD_BYTES, RESERVED_HEADROOM_BYTES,
-    TRANSIENT_PEAK_BYTES,
+    reserved_headroom_bytes, run_heap_budget_self_test, runtime_general_residual_bytes,
+    snapshot as heap_budget_snapshot, transient_peak_bytes, transient_peak_holders, HeapBudgetId,
+    HeapBudgetSnapshot, TransientPeakGuard, AUDIT_RING_HARD_BYTES, CONNTRACK_HARD_BYTES,
+    EXEC_IMAGE_PEAK_BYTES, EXEC_TRANSACTION_PEAK_BYTES, FUTEX_HARD_BYTES, HARD_FLOORS_SUM_BYTES,
+    HARD_FLOOR_BYTES, HARD_FLOOR_COUNT, HARD_FLOOR_NAMES, PAGE_CACHE_META_HARD_BYTES,
+    RESERVED_HEADROOM_BYTES, TRANSIENT_PEAK_BYTES,
 };
 pub use memory::{
-    cow_refcount_slot_for_phys, emergency_heap_base, emergency_heap_free_bytes, heap_free_bytes,
-    heap_peak_used_bytes, managed_physical_total_pages, managed_physical_zone_count,
-    run_emergency_heap_self_test, validate_framebuffer_region, BootInfo, EmergencyAllocator,
-    FrameAllocator, MemoryMapInfo, EMERGENCY_HEAP_SIZE_BYTES, NORMAL_HEAP_SIZE_BYTES,
+    compute_heap_scale_for_ram, cow_refcount_slot_for_phys, emergency_heap_base,
+    emergency_heap_free_bytes, heap_free_bytes, heap_peak_used_bytes, heap_scale_factor,
+    heap_used_bytes, managed_physical_total_pages, managed_physical_zone_count,
+    reclaim_slab_caches, run_emergency_heap_self_test, runtime_heap_size_bytes,
+    runtime_normal_heap_size_bytes, slab_stats, validate_framebuffer_region, BootInfo,
+    EmergencyAllocator, FrameAllocator, MemoryMapInfo, EMERGENCY_HEAP_SIZE_BYTES, MAX_HEAP_SCALE,
+    MAX_RUNTIME_HEAP_SIZE_BYTES, NORMAL_HEAP_SIZE_BYTES,
 };
 pub use oom_killer::{
     get_stats as get_oom_stats, on_allocation_failure as oom_allocation_failed,
@@ -101,6 +106,7 @@ pub use page_table::{
     DEFAULT_DIRECT_MAP_LIMIT, DIRECT_MAP_PML4_INDEX, KERNEL_VIRT_BASE, KSTACK_REGION_BASE,
     KSTACK_REGION_END, MAX_DIRECT_MAP_LIMIT, PHYSICAL_MEMORY_OFFSET,
 };
+pub use slab::SlabStats;
 pub use tlb_shootdown::{
     flush_all_address_spaces, flush_current_as_all, flush_current_as_page, flush_current_as_range,
     force_init_tlb_shootdown_locals, get_stats as get_tlb_stats,

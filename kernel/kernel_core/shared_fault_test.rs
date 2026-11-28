@@ -84,9 +84,13 @@ pub fn command(op: u64, a: u64, b: u64, pid: usize, root: usize) -> Result<u64, 
     match op {
         0 => Ok(cpu_local::online_cpu_mask()),
         17 => Ok(cpu_local::current_cpu_id() as u64),
-        // Both terms are kernel-stack frames that are, by design, not in the
-        // buddy allocator; the guest adds the sum to its free-page count.
-        6 => Ok(KERNEL_STACK_TABLES.load(Ordering::Acquire) + crate::kstack_flush::pending_pages()),
+        // Kernel-stack tables, deferred kstack flush frames, and buddy-backed
+        // kernel slab pages (N3.1b) are, by design, held outside the buddy
+        // free list; adding them lets the guest verify exact user/shared-anon
+        // frame conservation with zero tolerance.
+        6 => Ok(KERNEL_STACK_TABLES.load(Ordering::Acquire)
+            + crate::kstack_flush::pending_pages()
+            + mm::slab::backing_pages() as u64),
         7 => {
             if root == 0 || a == 0 || a > POP_MAX_PAGES || b > 1 {
                 return Err(());

@@ -27,7 +27,7 @@ pub(super) fn prepare(probe: OpenFaultProbe) -> Result<PreparedFileHandle, FsErr
         return PreparedFileHandle::try_new();
     }
     let baseline = resources();
-    let limit = mm::HeapClass::Vfs.limit_bytes();
+    let limit = mm::HeapClass::Vfs.runtime_limit_bytes();
     let headroom = limit.checked_sub(baseline.0 + baseline.1).unwrap();
     let pressure = mm::try_reserve_heap(mm::HeapClass::Vfs, headroom)
         .expect("VFS probe must reserve remaining class budget");
