@@ -1044,6 +1044,9 @@ impl PerCpuData {
     /// `true` if the owner was cleared, `false` if it was already different.
     #[inline]
     pub fn clear_fpu_owner_if(&self, pid: usize) -> bool {
+        if self.fpu_owner.load(Ordering::Acquire) != pid {
+            return false;
+        }
         self.fpu_owner
             .compare_exchange(pid, NO_FPU_OWNER, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -1892,7 +1895,13 @@ pub fn mark_cpu_online_with_id(cpu_id: usize) {
 /// This function iterates all CPU slots and uses compare-exchange to
 /// atomically clear any slot that matches the given PID.
 pub fn clear_fpu_owner_all_cpus(pid: usize) {
-    for cpu_id in 0..MAX_CPUS {
+    let mut mask = online_cpu_mask();
+    if mask == 0 {
+        mask = 1;
+    }
+    while mask != 0 {
+        let cpu_id = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
         if let Some(per_cpu) = PER_CPU_DATA.get_cpu(cpu_id) {
             per_cpu.clear_fpu_owner_if(pid);
         }

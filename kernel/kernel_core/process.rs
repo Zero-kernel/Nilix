@@ -1,5 +1,5 @@
 use crate::fork::PAGE_REF_COUNT;
-use crate::owner_lock::OwnerCpuMutex;
+use crate::owner_lock::{OwnerCpuMutex, OwnerCpuRwLock};
 use crate::signal::PendingSignals;
 use crate::signal::{SigAction, NSIG};
 use crate::syscall::{SyscallError, VfsStat};
@@ -5676,8 +5676,8 @@ fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup
 /// 使用 Option<Arc<Mutex<Process>>> 以支持 PID 作为直接索引。
 /// 索引 0 保留为空（PID 从 1 开始），实际进程存储在其 PID 对应的索引位置。
 lazy_static::lazy_static! {
-    pub static ref PROCESS_TABLE: OwnerCpuMutex<AdmittedVec<Option<ProcessArc>>> =
-        OwnerCpuMutex::new(AdmittedVec::new(HeapClass::CoreProcess));
+    pub static ref PROCESS_TABLE: OwnerCpuRwLock<AdmittedVec<Option<ProcessArc>>> =
+        OwnerCpuRwLock::new(AdmittedVec::new(HeapClass::CoreProcess));
     /// H.3 KPTI: Per-CPU CR3 update callback (bridges kernel_core → arch)
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
     static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
@@ -5795,7 +5795,7 @@ pub fn run_process_registry_txn_self_test() {
     const OTHER_SPACE: usize = 0x0E11_5000;
     let before = mm::heap_class_snapshot(HeapClass::CoreProcess);
     {
-        let table = OwnerCpuMutex::new(AdmittedVec::<Option<ProcessArc>>::new(
+        let table = OwnerCpuRwLock::new(AdmittedVec::<Option<ProcessArc>>::new(
             HeapClass::CoreProcess,
         ));
         {
@@ -6544,7 +6544,7 @@ fn create_process_arc_inner<N: IntoProcessNameSnapshot>(
     let mut flushed_pending_stacks = false;
     let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
-            let table = PROCESS_TABLE.lock();
+            let table = PROCESS_TABLE.read();
             // GAP-6: leave the reuse window only after a window's worth of
             // candidates were busy with deferred stack reclamation.
             let extend = stack_retries >= PID_REUSE_WINDOW;
@@ -6785,7 +6785,7 @@ pub fn create_process_in_namespace<N: IntoProcessNameSnapshot>(
     let mut flushed_pending_stacks = false;
     let (pid, stack_base, stack_top, stack_phys, stack_rcu) = loop {
         let pid = {
-            let table = PROCESS_TABLE.lock();
+            let table = PROCESS_TABLE.read();
             // GAP-6: leave the reuse window only after a window's worth of
             // candidates were busy with deferred stack reclamation.
             let extend = stack_retries >= PID_REUSE_WINDOW;
@@ -8205,7 +8205,7 @@ impl<'t> ProcessRegistryTxn<'t> {
 /// acquires the table guard in THIS frame (drops strictly after every process guard
 /// — borrow-checker enforced), builds the txn over a reborrow, runs `f`.
 fn with_registry_txn_on<T>(
-    table: &OwnerCpuMutex<AdmittedVec<Option<ProcessArc>>>,
+    table: &OwnerCpuRwLock<AdmittedVec<Option<ProcessArc>>>,
     f: impl FnOnce(&ProcessRegistryTxn<'_>) -> Result<T, RegistryTxnError>,
 ) -> Result<T, RegistryTxnError> {
     let guard = table.try_lock().ok_or(RegistryTxnError::Contention)?;
@@ -10448,9 +10448,25 @@ pub struct CgroupGovernanceAuth {
 }
 
 pub fn current_cgroup_governance_auth(rights: cap::CapRights) -> Option<CgroupGovernanceAuth> {
+    current_cgroup_governance_auth_with_proc(rights, None)
+}
+
+pub fn current_cgroup_governance_auth_with_proc(
+    rights: cap::CapRights,
+    cached_proc: Option<&ProcessArc>,
+) -> Option<CgroupGovernanceAuth> {
     let pid = current_pid()?;
-    let (ns_euid, ns_egid, has_cap_rights, user_ns) = {
-        let table = PROCESS_TABLE.lock();
+    let (ns_euid, ns_egid, has_cap_rights, user_ns) = if let Some(proc_arc) = cached_proc {
+        let proc = proc_arc.lock();
+        let creds = proc.credentials.try_read()?;
+        let ns_euid = creds.euid;
+        let ns_egid = creds.egid;
+        drop(creds);
+        let has_cap_rights = proc.cap_table.has_rights(rights);
+        let user_ns = proc.user_ns.clone();
+        (ns_euid, ns_egid, has_cap_rights, user_ns)
+    } else {
+        let table = PROCESS_TABLE.read();
         let proc = table.get(pid)?.as_ref()?.lock();
         let creds = proc.credentials.try_read()?;
         let ns_euid = creds.euid;
@@ -11219,7 +11235,7 @@ pub fn sync_kpti_cr3() {
 /// # Returns
 /// 如果进程存在，返回进程的 Arc 引用；否则返回 None
 pub fn get_process(pid: ProcessId) -> Option<ProcessArc> {
-    let table = PROCESS_TABLE.lock();
+    let table = PROCESS_TABLE.read();
     table.get(pid).and_then(|slot| slot.clone())
 }
 
@@ -11241,7 +11257,7 @@ pub fn get_process(pid: ProcessId) -> Option<ProcessArc> {
 /// Only clones an `Arc` under the (briefly held) lock — no allocation — so it is
 /// safe on the IRQ tick path.
 pub fn try_get_process(pid: ProcessId) -> Option<Option<ProcessArc>> {
-    let table = PROCESS_TABLE.try_lock()?;
+    let table = PROCESS_TABLE.try_read()?;
     Some(table.get(pid).and_then(|slot| slot.clone()))
 }
 
@@ -13564,7 +13580,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             // A single-task process is its own last member and is reported here,
             // as before (R160-16 SIGCHLD plus the parent wake).
             let report = {
-                let _table = PROCESS_TABLE.lock();
+                let _table = PROCESS_TABLE.read();
                 group.members() == 1 && group.claim_parent_notification()
             };
             if report {
@@ -13725,6 +13741,9 @@ impl ConsoleTtyState {
 }
 
 static CONSOLE_TTY: Mutex<ConsoleTtyState> = Mutex::new(ConsoleTtyState::new());
+/// Lock-free mirror of `CONSOLE_TTY.session_sid` (`0` = `None`) so routine
+/// process exits avoid acquiring the global `CONSOLE_TTY` spinlock.
+static CONSOLE_TTY_SESSION_SID: AtomicUsize = AtomicUsize::new(0);
 
 /// Seed PID 1's initial session as the default console controlling terminal if
 /// no session owns it yet.
@@ -13733,16 +13752,21 @@ pub(crate) fn console_tty_init_root_session(sid: ProcessId) {
     if tty.session_sid.is_none() {
         tty.session_sid = Some(sid);
         tty.fg_pgid = sid;
+        CONSOLE_TTY_SESSION_SID.store(sid, Ordering::Release);
     }
 }
 
 /// Release the console controlling terminal when its owning session leader exits.
 pub(crate) fn console_tty_release_session(sid: ProcessId) -> Option<ProcessId> {
+    if CONSOLE_TTY_SESSION_SID.load(Ordering::Acquire) != sid {
+        return None;
+    }
     let mut tty = CONSOLE_TTY.lock();
     if tty.session_sid == Some(sid) {
         let old_fg = tty.fg_pgid;
         tty.session_sid = None;
         tty.fg_pgid = 0;
+        CONSOLE_TTY_SESSION_SID.store(0, Ordering::Release);
         return (old_fg != 0).then_some(old_fg);
     }
     None
@@ -13760,12 +13784,14 @@ pub(crate) fn console_tty_attach(
         None => {
             tty.session_sid = Some(sid);
             tty.fg_pgid = pgid;
+            CONSOLE_TTY_SESSION_SID.store(sid, Ordering::Release);
             Ok(())
         }
         Some(owner) if owner == sid => Ok(()),
         Some(_) if steal && is_privileged => {
             tty.session_sid = Some(sid);
             tty.fg_pgid = pgid;
+            CONSOLE_TTY_SESSION_SID.store(sid, Ordering::Release);
             Ok(())
         }
         Some(_) => Err(crate::syscall::SyscallError::EPERM),
@@ -14787,90 +14813,90 @@ pub fn cleanup_zombie(pid: ProcessId) {
     let (reap_info, retired_process_table) = {
         let mut table = PROCESS_TABLE.lock();
 
-        // Phase 1a: Check process state
-        let (memory_space, mm_sole_owner, is_zombie) = {
-            if let Some(slot) = table.get(pid) {
-                if let Some(process) = slot {
-                    let proc = process.lock();
-                    // R169-9: only a torn-down Zombie (teardown_done published) is
-                    // reapable — block the IRQ-deferred early-reap before teardown.
-                    // GAP-5 slice 4 G1: a group leader also waits for its last
-                    // thread to be reaped (members counts the table, under it).
-                    if proc.state == ProcessState::Zombie
-                        && proc.teardown_done.load(Ordering::Acquire)
-                        && !proc.on_cpu.load(Ordering::Acquire)
-                        && !proc.switch_reap_pending.load(Ordering::Acquire)
-                        && (proc.tgid != pid || proc.thread_group.members() == 1)
-                    {
-                        // Every CLONE_VM sharer clones `proc.mm` alongside copying
-                        // `memory_space`. A strong count of 1 while holding the
-                        // zombie's lock proves no other task shares this address
-                        // space, avoiding an O(PROCESS_TABLE) scan + PCB locking.
-                        (proc.memory_space, Arc::strong_count(&proc.mm) == 1, true)
-                    } else {
-                        (0, false, false)
-                    }
-                } else {
-                    (0, false, false)
-                }
-            } else {
-                (0, false, false)
-            }
-        };
-
-        let result = if !is_zombie {
-            None
-        } else {
-            // Phase 1b: Check if other processes still reference this address space.
-            //
-            // R136-1 FIX: Zombies are intentionally INCLUDED here (only Terminated
-            // excluded). A Zombie retains `memory_space` until reaped, so we must
-            // keep the address space alive if any other Zombie (or live process)
-            // still references it. This is consistent with the updated
-            // `address_space_share_count()` which also counts zombies.
-            // (Must be done under PROCESS_TABLE lock since we iterate the table.)
-            let keep_address_space = if memory_space == 0 || mm_sole_owner {
-                false
-            } else {
-                table.iter().enumerate().any(|(idx, other_slot)| {
-                    if idx == pid {
-                        return false;
-                    }
-                    if let Some(other_proc_arc) = other_slot {
-                        let other = other_proc_arc.lock();
-                        other.memory_space == memory_space
-                            && other.state != ProcessState::Terminated
-                    } else {
-                        false
-                    }
-                })
-            };
-
-            // Phase 1c: Detach the Arc<Mutex<Process>> from the table and mark Terminated.
-            // `slot.take()` atomically removes the process from the table, ensuring
-            // no concurrent code path can find it by PID while we clean up.
-            if let Some(slot) = table.get_mut(pid) {
-                if let Some(process) = slot.take() {
-                    let mut proc = process.lock();
-                    // Re-validate state + teardown completion (defensive against
-                    // concurrent modification). R169-9: a Zombie whose teardown has
-                    // not been published is NOT reapable — restore the slot below.
-                    if proc.state == ProcessState::Zombie
-                        && proc.teardown_done.load(Ordering::Acquire)
-                    {
+        // Phase 1a+1c fast path: when `memory_space == 0` or `Arc::strong_count(&proc.mm) == 1`
+        // (100% of standalone `fork()` children), no other task can share this address
+        // space, so we detach and mark `Terminated` in ONE `child.lock()` instead of
+        // unlocking and re-locking the zombie PCB.
+        let mut need_shared_scan = false;
+        let mut shared_memory_space = 0usize;
+        let fast_result = if let Some(slot) = table.get_mut(pid) {
+            if let Some(process) = slot.as_ref() {
+                let mut proc = process.lock();
+                if proc.state == ProcessState::Zombie
+                    && proc.teardown_done.load(Ordering::Acquire)
+                    && !proc.on_cpu.load(Ordering::Acquire)
+                    && !proc.switch_reap_pending.load(Ordering::Acquire)
+                    && (proc.tgid != pid || proc.thread_group.members() == 1)
+                {
+                    let mm_sole_owner = Arc::strong_count(&proc.mm) == 1;
+                    if proc.memory_space == 0 || mm_sole_owner {
                         proc.state = ProcessState::Terminated;
-                        // Capture IDs needed for Phase 2 callbacks before dropping the lock.
-                        // RF178-33 / P1-B: generation must ride with the reaped PID so the
-                        // scheduler cleanup callback cannot purge a recycled-PID successor.
                         let reaped_pid = proc.pid;
                         let reaped_generation = proc.generation;
                         let tgid = proc.tgid;
                         let ipc_ns_id = proc.ipc_ns.id();
                         let cpuset_id = proc.cpuset_id;
                         let group = Arc::clone(&proc.thread_group);
-                        // RF180-3: reserve the numeric PID before PROCESS_TABLE
-                        // becomes observable as empty.  Phase 2 clears it only
-                        // after all raw-PID cleanup and scheduler removal finish.
+                        begin_reaping_identity(reaped_pid, tgid);
+                        drop(proc);
+                        let detached = slot.take().expect("zombie slot occupied under write lock");
+                        Some((
+                            detached,
+                            false,
+                            reaped_pid,
+                            reaped_generation,
+                            tgid,
+                            ipc_ns_id,
+                            cpuset_id,
+                            group,
+                        ))
+                    } else {
+                        need_shared_scan = true;
+                        shared_memory_space = proc.memory_space;
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let result = if fast_result.is_some() || !need_shared_scan {
+            fast_result
+        } else {
+            // Phase 1b (CLONE_VM shared address space): check if any other non-Terminated
+            // process in PROCESS_TABLE still references `shared_memory_space`.
+            let keep_address_space = table.iter().enumerate().any(|(idx, other_slot)| {
+                if idx == pid {
+                    return false;
+                }
+                if let Some(other_proc_arc) = other_slot {
+                    let other = other_proc_arc.lock();
+                    other.memory_space == shared_memory_space
+                        && other.state != ProcessState::Terminated
+                } else {
+                    false
+                }
+            });
+
+            // Phase 1c: Detach the Arc<OwnerCpuMutex<Process>> from the table and mark Terminated.
+            if let Some(slot) = table.get_mut(pid) {
+                if let Some(process) = slot.take() {
+                    let mut proc = process.lock();
+                    if proc.state == ProcessState::Zombie
+                        && proc.teardown_done.load(Ordering::Acquire)
+                    {
+                        proc.state = ProcessState::Terminated;
+                        let reaped_pid = proc.pid;
+                        let reaped_generation = proc.generation;
+                        let tgid = proc.tgid;
+                        let ipc_ns_id = proc.ipc_ns.id();
+                        let cpuset_id = proc.cpuset_id;
+                        let group = Arc::clone(&proc.thread_group);
                         begin_reaping_identity(reaped_pid, tgid);
                         drop(proc);
                         Some((
@@ -14884,7 +14910,6 @@ pub fn cleanup_zombie(pid: ProcessId) {
                             group,
                         ))
                     } else {
-                        // Not a zombie anymore (concurrent state change); restore the slot
                         drop(proc);
                         *slot = Some(process);
                         None

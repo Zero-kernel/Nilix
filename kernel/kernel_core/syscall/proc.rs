@@ -2724,33 +2724,50 @@ where
                     && child.tgid == want
                     && child.thread_group.members() == 1
                 {
-                    Some(WaitOutcome {
+                    if !nowait
+                        && child
+                            .wait_claimed
+                            .compare_exchange(
+                                false,
+                                true,
+                                core::sync::atomic::Ordering::AcqRel,
+                                core::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_err()
+                    {
+                        return None;
+                    }
+                    let outcome = WaitOutcome {
                         global_pid: want,
                         view_pid: want,
                         event: WaitEventKind::Exited(child.exit_code.unwrap_or(0)),
-                    })
+                    };
+                    drop(child);
+                    Some((child_proc, outcome))
                 } else {
                     None
                 }
             });
-            if let Some(outcome) = direct_zombie {
-                if nowait || crate::process::claim_wait_reap(want) {
-                    if let Err(e) = publish(&outcome) {
-                        if !nowait {
-                            crate::process::release_wait_reap(want);
-                        }
-                        return Err(e);
+            if let Some((child_proc, outcome)) = direct_zombie {
+                if let Err(e) = publish(&outcome) {
+                    if !nowait {
+                        child_proc
+                            .lock()
+                            .wait_claimed
+                            .store(false, core::sync::atomic::Ordering::Release);
                     }
-                    if nowait {
-                        return Ok(Some(outcome));
-                    }
-                    {
-                        let mut proc = parent.lock();
-                        proc.children.retain(|&c| c != want);
-                    }
-                    cleanup_zombie(want);
+                    return Err(e);
+                }
+                if nowait {
                     return Ok(Some(outcome));
                 }
+                drop(child_proc);
+                {
+                    let mut proc = parent.lock();
+                    proc.children.retain(|&c| c != want);
+                }
+                cleanup_zombie(want);
+                return Ok(Some(outcome));
             }
         }
         FastWaitCheck::SlowPath => {}

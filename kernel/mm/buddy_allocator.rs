@@ -1837,6 +1837,19 @@ impl BuddyZoneSet {
             fragmentation,
         })
     }
+
+    fn free_and_total_pages(&self) -> Option<(usize, usize)> {
+        if self.len == 0 {
+            return None;
+        }
+        let mut free_pages = 0usize;
+        let mut total_pages = 0usize;
+        for z in self.zones[..self.len].iter().flatten() {
+            free_pages = free_pages.saturating_add(z.free_pages);
+            total_pages = total_pages.saturating_add(z.total_pages);
+        }
+        Some((free_pages, total_pages))
+    }
 }
 
 /// Self-contained Multi-Zone Buddy + Per-CPU Page Cache pool (Issue #109 §1.3, N3.1a #67).
@@ -2805,6 +2818,23 @@ impl PcpBuddyPool {
         Some(s)
     }
 
+    /// Fast capacity check for lazy `mmap` overcommit admission without running
+    /// `calculate_fragmentation()` or scanning all 64 PCP slots when the global
+    /// buddy zones already have at least `required` free pages.
+    fn has_at_least_free_pages(&self, required: usize) -> bool {
+        let guard = self.buddy.lock();
+        let Some((free_pages, total_pages)) = guard.free_and_total_pages() else {
+            return true;
+        };
+        if free_pages >= required {
+            return true;
+        }
+        let total_free = free_pages
+            .saturating_add(self.total_cached_pages())
+            .min(total_pages);
+        total_free >= required
+    }
+
     fn pcp_stats(&self) -> PcpStats {
         let mut hits = 0u64;
         let mut frees_cached = 0u64;
@@ -3336,6 +3366,12 @@ pub fn pcp_stats() -> PcpStats {
 /// 获取分配器统计信息
 pub fn get_allocator_stats() -> Option<AllocatorStats> {
     GLOBAL_BUDDY.stats()
+}
+
+/// Fast exact check whether at least `required` order-0 pages are currently free
+/// (skips fragmentation float math and 64-CPU PCP scans in the common case).
+pub fn has_at_least_free_pages(required: usize) -> bool {
+    GLOBAL_BUDDY.has_at_least_free_pages(required)
 }
 
 // 测试代码已移除（no_std环境不支持标准测试框架）

@@ -742,8 +742,7 @@ impl WaitQueue {
             {
                 return;
             }
-            lazy_tlb.enter_before_halt(snapshot);
-            kernel_core::wait_kick::halt_blocked_wait(snapshot);
+            kernel_core::wait_kick::halt_blocked_wait_with_lazy_tlb(snapshot, &mut lazy_tlb);
         }
     }
 

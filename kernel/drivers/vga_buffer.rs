@@ -170,9 +170,9 @@ const SERIAL_LSR_TEMT: u8 = 0x40;
 /// 16550A hardware TX FIFO depth (enabled via FCR = 0xC7).
 const SERIAL_TX_FIFO_DEPTH: usize = 16;
 
-/// Max bytes drained per IRQ4 invocation (4 × 16-byte FIFO fills, checking
-/// `LSR_THRE` before each fill). On real 16550A hardware `THRE` clears after
-/// one 16-byte fill; under QEMU this keeps each IRQ-masked hold tiny (~200 µs).
+/// Max bytes drained per IRQ4 invocation (4 × 16-byte FIFO `rep outsb` fills,
+/// checking `LSR_THRE` before each fill). On real 16550A hardware `THRE` clears
+/// after one 16-byte fill; under QEMU this keeps each IRQ-masked hold tiny.
 const SERIAL_TX_IRQ_MAX_BURST: usize = 64;
 
 /// Maximum consecutive full IRQ4 bursts (8 × 64 = 512 bytes) before deferring
@@ -196,9 +196,9 @@ const TERMINAL_TEMT_SPINS: usize = 200_000;
 #[cfg(test)]
 const TERMINAL_TEMT_SPINS: usize = 16;
 
-/// Asynchronous TX ring buffer capacity (power of two). Holds 16 KiB (~65
+/// Asynchronous TX ring buffer capacity (power of two). Holds 64 KiB (~150+
 /// stress rounds) before falling back to FIFO-ready synchronous backpressure.
-const SERIAL_TX_BUF_CAP: usize = 16 * 1024;
+const SERIAL_TX_BUF_CAP: usize = 64 * 1024;
 const SERIAL_TX_BUF_MASK: usize = SERIAL_TX_BUF_CAP - 1;
 
 /// 向串口写入一个字节
@@ -214,6 +214,27 @@ unsafe fn serial_outb(port: u16, val: u8) {
     );
 }
 
+/// Write a contiguous FIFO batch (`<= 16` bytes) to COM1 using x86-64 `rep outsb`,
+/// collapsing up to 16 KVM PIO exits into a single string-PIO exit while preserving
+/// exact 8-bit 16550A THR port-write semantics.
+///
+/// No `nomem`: the port writes stay strictly ordered between lock acquire/release.
+#[cfg(not(test))]
+#[inline]
+unsafe fn serial_outsb(port: u16, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    core::arch::asm!(
+        "cld",
+        "rep outsb",
+        in("dx") port,
+        inout("rsi") bytes.as_ptr() => _,
+        inout("rcx") bytes.len() => _,
+        options(nostack),
+    );
+}
+
 // Hosted tests cannot execute `out`; they record the bytes instead.
 #[cfg(test)]
 unsafe fn serial_outb(_port: u16, val: u8) {
@@ -221,6 +242,14 @@ unsafe fn serial_outb(_port: u16, val: u8) {
     let inject_owner = tests::OUTB_LOCK_RING_FOR_OWNER.swap(NO_SERIAL_OWNER, Ordering::SeqCst);
     if inject_owner != NO_SERIAL_OWNER {
         SERIAL_OWNER_CPU.store(inject_owner, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+#[inline]
+unsafe fn serial_outsb(port: u16, bytes: &[u8]) {
+    for &byte in bytes {
+        serial_outb(port, byte);
     }
 }
 
@@ -977,9 +1006,7 @@ fn drain_ring_under_uart_blocking(owner: usize, limit: usize, force_on_not_ready
         if batch_len == 0 {
             break;
         }
-        for &byte in &batch_buf[..batch_len] {
-            unsafe { serial_outb(SERIAL_PORT, byte) };
-        }
+        unsafe { serial_outsb(SERIAL_PORT, &batch_buf[..batch_len]) };
         drained += batch_len;
         if !ready {
             // Bounded timeout fallback submits at most one FIFO batch per hold.
@@ -1102,13 +1129,11 @@ pub fn serial_tx_irq_drain(yield_to_lapic: bool) {
             finalized = true;
             break;
         }
-        // Release `SERIAL_OWNER_CPU` BEFORE `serial_outb()` so AP producers can
+        // Release `SERIAL_OWNER_CPU` BEFORE `serial_outsb()` so AP producers can
         // push into the RAM ring concurrently while COM1 port I/O runs.
         SERIAL_OWNER_CPU.store(NO_SERIAL_OWNER, Ordering::Release);
 
-        for &byte in &batch_buf[..batch_len] {
-            unsafe { serial_outb(SERIAL_PORT, byte) };
-        }
+        unsafe { serial_outsb(SERIAL_PORT, &batch_buf[..batch_len]) };
         drained += batch_len;
     }
 

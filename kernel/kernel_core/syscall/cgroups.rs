@@ -343,9 +343,15 @@ pub(super) fn cgroup_is_descendant_of(target_id: u64, ancestor_id: u64) -> bool 
 ///
 /// R180-3 FIX: delegated managers must own **both** source and destination
 /// (shared with cgroupfs via `cgroup::authorize_cgroup_migrate`).
-pub(super) fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
+pub(super) fn sys_cgroup_attach(
+    cgroup_id: u64,
+    entry_proc: Option<&crate::process::ProcessArc>,
+) -> Result<usize, SyscallError> {
     let pid = crate::process::current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = crate::process::get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let process = match entry_proc {
+        Some(proc_arc) => proc_arc.clone(),
+        None => crate::process::get_process(pid).ok_or(SyscallError::ESRCH)?,
+    };
 
     let (old_cgroup_id, memory_space, mm_sole_owner) = {
         let proc = process.lock();
@@ -357,10 +363,13 @@ pub(super) fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     };
 
     // R133-1 + R134-2 FIX: Snapshot host-mapped root, CAP_ADMIN, and host euid
-    // in a single PROCESS_TABLE + PCB hold (falls back fail-closed if creds are
-    // transiently busy).
+    // in a single PCB hold reusing `entry_proc` (falls back fail-closed if creds
+    // are transiently busy).
     let (is_root, has_cap_admin, host_euid) =
-        match crate::process::current_cgroup_governance_auth(cap::CapRights::ADMIN) {
+        match crate::process::current_cgroup_governance_auth_with_proc(
+            cap::CapRights::ADMIN,
+            Some(&process),
+        ) {
             Some(auth) => (auth.is_host_root, auth.has_cap_rights, auth.host_euid),
             None => (false, false, None),
         };
@@ -552,14 +561,16 @@ pub(super) fn sys_cgroup_set_limit(
     cgroup_id: u64,
     limit_type: u32,
     value: u64,
+    entry_proc: Option<&crate::process::ProcessArc>,
 ) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for setting limits
     // P1-3: Delegated owners may set limits bounded by parent ceilings
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-    // Single PROCESS_TABLE + PCB snapshot avoids 4 separate lock roundtrips
+    // Single PCB snapshot reusing `entry_proc` avoids PROCESS_TABLE roundtrips
     // and redundant Credentials Vec clones on the cgroup control hot path.
-    let auth = crate::process::current_cgroup_governance_auth(cap::CapRights::ADMIN)
-        .ok_or(SyscallError::ESRCH)?;
+    let auth =
+        crate::process::current_cgroup_governance_auth_with_proc(cap::CapRights::ADMIN, entry_proc)
+            .ok_or(SyscallError::ESRCH)?;
     let has_cap_admin = auth.has_cap_rights;
     let is_host_root = auth.is_host_root;
 
@@ -693,8 +704,9 @@ pub(super) fn sys_cgroup_set_limit(
 pub(super) fn sys_cgroup_get_stats(
     cgroup_id: u64,
     buf: *mut CgroupStatsBuf,
+    entry_proc: Option<&crate::process::ProcessArc>,
 ) -> Result<usize, SyscallError> {
-    cgroup_stats_collect_and_copy(cgroup_id, buf, CGROUP_STATS_V1_SIZE)?;
+    cgroup_stats_collect_and_copy(cgroup_id, buf, CGROUP_STATS_V1_SIZE, entry_proc)?;
     Ok(0)
 }
 
@@ -715,9 +727,10 @@ pub(super) fn sys_cgroup_get_stats2(
     cgroup_id: u64,
     buf: *mut CgroupStatsBuf,
     buf_len: usize,
+    entry_proc: Option<&crate::process::ProcessArc>,
 ) -> Result<usize, SyscallError> {
     let copy_len = buf_len.min(core::mem::size_of::<CgroupStatsBuf>());
-    cgroup_stats_collect_and_copy(cgroup_id, buf, copy_len)?;
+    cgroup_stats_collect_and_copy(cgroup_id, buf, copy_len, entry_proc)?;
     Ok(copy_len)
 }
 
@@ -731,6 +744,7 @@ pub(super) fn cgroup_stats_collect_and_copy(
     cgroup_id: u64,
     buf: *mut CgroupStatsBuf,
     copy_len: usize,
+    entry_proc: Option<&crate::process::ProcessArc>,
 ) -> Result<(), SyscallError> {
     if buf.is_null() {
         return Err(SyscallError::EFAULT);
@@ -743,8 +757,9 @@ pub(super) fn cgroup_stats_collect_and_copy(
 
     // P1-3: Stats access should respect delegation boundaries.
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-    let auth = crate::process::current_cgroup_governance_auth(cap::CapRights::ADMIN)
-        .ok_or(SyscallError::ESRCH)?;
+    let auth =
+        crate::process::current_cgroup_governance_auth_with_proc(cap::CapRights::ADMIN, entry_proc)
+            .ok_or(SyscallError::ESRCH)?;
     if !auth.is_host_root && !auth.has_cap_rights && !is_cgroup_delegated_to_caller(cgroup_id) {
         return Err(SyscallError::EPERM);
     }

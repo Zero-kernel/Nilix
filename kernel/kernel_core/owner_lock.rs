@@ -20,7 +20,7 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 const NO_OWNER: usize = usize::MAX;
 
@@ -29,13 +29,23 @@ const NO_OWNER: usize = usize::MAX;
 #[cfg(target_os = "none")]
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 
-/// This CPU's owner token: the address of its `SYSCALL_PERCPU` slot. Kernel
-/// context has it in `IA32_GS_BASE`. An exception or IRQ taken from Ring 3
-/// runs before any SWAPGS, with the user's base there and the slot in
-/// `IA32_KERNEL_GS_BASE`. Both read 0 before the CPU installs its slot, which
-/// is before any shared-anonymous fault can run on it.
+/// Fast Ring-0 owner token: this CPU's logical ID via Issue #109 §2.1 GS-base
+/// single-instruction fast path (`gs:[80]`), avoiding `rdmsr(IA32_GS_BASE)` on
+/// every `OwnerCpuMutex::lock()` / `try_lock()`.
 #[inline]
-fn cpu_token() -> usize {
+fn cpu_token_ring0() -> usize {
+    cpu_local::current_cpu_id()
+}
+
+/// Exception-safe owner token for `held_by_current_cpu()`.
+///
+/// Kernel context already has the `SYSCALL_PERCPU` slot in `IA32_GS_BASE` so
+/// `cpu_local::current_cpu_id()` resolves directly. An exception or IRQ taken
+/// from Ring 3 before `SWAPGS` has the user GS base in `IA32_GS_BASE` and the
+/// `SYSCALL_PERCPU` slot in `IA32_KERNEL_GS_BASE`, so we decode
+/// `encoded_cpu_id` (`GS_CPU_ID_OFFSET`) from `IA32_KERNEL_GS_BASE` directly.
+#[inline]
+fn cpu_token_exception() -> usize {
     #[cfg(target_os = "none")]
     {
         use x86_64::registers::model_specific::Msr;
@@ -44,15 +54,21 @@ fn cpu_token() -> usize {
         unsafe {
             let gs = Msr::new(0xC000_0101).read();
             if gs >= KERNEL_HALF {
-                gs as usize
+                cpu_local::current_cpu_id()
             } else {
-                Msr::new(0xC000_0102).read() as usize
+                let kgs = Msr::new(0xC000_0102).read();
+                if kgs >= KERNEL_HALF {
+                    let encoded = core::ptr::read_volatile(
+                        (kgs as usize + cpu_local::GS_CPU_ID_OFFSET) as *const u64,
+                    );
+                    if encoded > 0 && (encoded as usize) <= cpu_local::max_cpus() {
+                        return (encoded - 1) as usize;
+                    }
+                }
+                cpu_local::current_cpu_id()
             }
         }
     }
-    // Hosted tests run as an ordinary process, where `rdmsr` faults. They can
-    // reach these locks through any dependent crate, whichever harness feature
-    // that crate enables, so the target decides rather than a feature.
     #[cfg(not(target_os = "none"))]
     {
         cpu_local::current_cpu_id()
@@ -125,7 +141,7 @@ impl<T: ?Sized> OwnerCpuMutex<T> {
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                self.owner.store(cpu_token(), Ordering::Release);
+                self.owner.store(cpu_token_ring0(), Ordering::Release);
                 return OwnerCpuMutexGuard { lock: self };
             }
             while self.locked.load(Ordering::Relaxed) {
@@ -141,7 +157,7 @@ impl<T: ?Sized> OwnerCpuMutex<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            self.owner.store(cpu_token(), Ordering::Release);
+            self.owner.store(cpu_token_ring0(), Ordering::Release);
             Some(OwnerCpuMutexGuard { lock: self })
         } else {
             None
@@ -154,7 +170,7 @@ impl<T: ?Sized> OwnerCpuMutex<T> {
     pub fn held_by_current_cpu(&self) -> bool {
         match self.owner.load(Ordering::Acquire) {
             NO_OWNER => false,
-            owner => owner == cpu_token(),
+            owner => owner == cpu_token_exception(),
         }
     }
 
@@ -209,6 +225,305 @@ impl<T: ?Sized> DerefMut for OwnerCpuMutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: Guard holds exclusive access to `self.lock.data`.
         unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+/// Cache-line-isolated per-CPU reader state for [`OwnerCpuRwLock`].
+///
+/// Keeping each CPU's reader counters on its own 64-byte cache line prevents
+/// cross-CPU cache-line bouncing on concurrent read-only `PROCESS_TABLE`
+/// lookups (every syscall entry, scheduler switch, waitpid check, and cgroup
+/// stat read).
+///
+/// `count` tracks speculative + admitted readers for the Dekker handshake with
+/// writers; `admitted` tracks only guards that already passed `!writer_active`
+/// (decremented before `count` on `Drop`), so a bare-metal nested/IRQ reader
+/// can bypass a waiting writer iff an outer guard on the same CPU is genuinely
+/// admitted and never when a speculative `read()` races an active writer.
+#[repr(align(64))]
+struct AlignedReaderSlot {
+    count: AtomicU32,
+    admitted: AtomicU32,
+}
+
+impl AlignedReaderSlot {
+    const fn new() -> Self {
+        Self {
+            count: AtomicU32::new(0),
+            admitted: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Per-CPU big-reader spinlock (`brlock`) with writer-CPU ownership tracking.
+///
+/// - **Readers (`read` / `try_read`)**: disable preemption on bare metal so the
+///   task stays pinned to one CPU for the duration of the guard, increment only
+///   this CPU's cache-line-aligned counter with `SeqCst`, and verify
+///   `!writer_active`. Zero cross-CPU bus traffic while no writer is active.
+/// - **Writers (`lock` / `try_lock`)**: acquire the inner [`OwnerCpuMutex<()>`],
+///   publish `writer_active = true` with `SeqCst` (preventing reader starvation
+///   of writers), and drain every online CPU's reader counter to 0.
+/// - **Exception re-entry (`held_by_current_cpu`)**: reports `true` whenever
+///   this CPU holds either the write lock or an active read guard.
+pub struct OwnerCpuRwLock<T: ?Sized> {
+    writer_lock: OwnerCpuMutex<()>,
+    writer_active: AtomicBool,
+    readers: [AlignedReaderSlot; cpu_local::max_cpus()],
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: Synchronizes shared `&T` access across concurrent readers and
+// exclusive `&mut T` access for a single writer via Dekker `SeqCst` ordering.
+unsafe impl<T: ?Sized + Send + Sync> Send for OwnerCpuRwLock<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for OwnerCpuRwLock<T> {}
+
+pub struct OwnerCpuRwReadGuard<'a, T: ?Sized + 'a> {
+    lock: &'a OwnerCpuRwLock<T>,
+    cpu: usize,
+}
+
+impl<T: ?Sized> !Send for OwnerCpuRwReadGuard<'_, T> {}
+unsafe impl<T: ?Sized + Sync> Sync for OwnerCpuRwReadGuard<'_, T> {}
+
+pub struct OwnerCpuRwWriteGuard<'a, T: ?Sized + 'a> {
+    lock: &'a OwnerCpuRwLock<T>,
+    _writer_guard: OwnerCpuMutexGuard<'a, ()>,
+}
+
+impl<T: ?Sized> !Send for OwnerCpuRwWriteGuard<'_, T> {}
+unsafe impl<T: ?Sized + Sync> Sync for OwnerCpuRwWriteGuard<'_, T> {}
+
+#[inline]
+fn rwlock_reader_cpu() -> usize {
+    let cpu = cpu_token_ring0();
+    if cpu < cpu_local::max_cpus() {
+        cpu
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn rwlock_drain_mask() -> u64 {
+    let online = cpu_local::online_cpu_mask();
+    let self_bit = 1u64 << rwlock_reader_cpu();
+    if online == 0 {
+        1u64 | self_bit
+    } else {
+        online | self_bit
+    }
+}
+
+impl<T> OwnerCpuRwLock<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            writer_lock: OwnerCpuMutex::new(()),
+            writer_active: AtomicBool::new(false),
+            readers: [const { AlignedReaderSlot::new() }; cpu_local::max_cpus()],
+            data: UnsafeCell::new(value),
+        }
+    }
+}
+
+impl<T: ?Sized> OwnerCpuRwLock<T> {
+    /// Acquire a shared read guard (local cache-line only when uncontended).
+    #[inline]
+    pub fn read(&self) -> OwnerCpuRwReadGuard<'_, T> {
+        #[cfg(target_os = "none")]
+        cpu_local::current_cpu().preempt_disable();
+
+        let cpu = rwlock_reader_cpu();
+        // On bare metal with preemption disabled, `admitted != 0` proves an
+        // outer guard on this exact CPU already passed `!writer_active` and
+        // holds `count >= 1`, so no writer can be in the critical section.
+        // Bypassing `writer_active` here prevents outer-read -> waiting-writer
+        // -> nested-read deadlock. Hosted builds share logical CPU 0 across
+        // threads and always use the full Dekker handshake below.
+        #[cfg(target_os = "none")]
+        if self.readers[cpu].admitted.load(Ordering::Acquire) != 0 {
+            // Bounded by nested read depth on one CPU; paired 1:1 with Drop. lint-fetch-add: allow
+            self.readers[cpu].count.fetch_add(1, Ordering::AcqRel);
+            // Bounded by nested read depth on one CPU; paired 1:1 with Drop. lint-fetch-add: allow
+            self.readers[cpu].admitted.fetch_add(1, Ordering::Release);
+            return OwnerCpuRwReadGuard { lock: self, cpu };
+        }
+
+        loop {
+            while self.writer_active.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            // Dekker store-load ordering: SeqCst increment before SeqCst load of
+            // writer_active. Bounded by active read depth; paired 1:1 with Drop.
+            // lint-fetch-add: allow
+            self.readers[cpu].count.fetch_add(1, Ordering::SeqCst);
+            if !self.writer_active.load(Ordering::SeqCst) {
+                // Bounded by active read depth; paired 1:1 with Drop. lint-fetch-add: allow
+                self.readers[cpu].admitted.fetch_add(1, Ordering::Release);
+                return OwnerCpuRwReadGuard { lock: self, cpu };
+            }
+            self.readers[cpu].count.fetch_sub(1, Ordering::Release);
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Non-blocking shared read guard acquisition for IRQ / timer contexts.
+    #[inline]
+    pub fn try_read(&self) -> Option<OwnerCpuRwReadGuard<'_, T>> {
+        #[cfg(target_os = "none")]
+        cpu_local::current_cpu().preempt_disable();
+
+        let cpu = rwlock_reader_cpu();
+        #[cfg(target_os = "none")]
+        if self.readers[cpu].admitted.load(Ordering::Acquire) != 0 {
+            // Bounded by nested read depth on one CPU; paired 1:1 with Drop. lint-fetch-add: allow
+            self.readers[cpu].count.fetch_add(1, Ordering::AcqRel);
+            // Bounded by nested read depth on one CPU; paired 1:1 with Drop. lint-fetch-add: allow
+            self.readers[cpu].admitted.fetch_add(1, Ordering::Release);
+            return Some(OwnerCpuRwReadGuard { lock: self, cpu });
+        }
+
+        if self.writer_active.load(Ordering::Acquire) {
+            #[cfg(target_os = "none")]
+            cpu_local::current_cpu().preempt_enable();
+            return None;
+        }
+        // Dekker store-load ordering. Bounded by active read depth; paired 1:1
+        // with Drop. lint-fetch-add: allow
+        self.readers[cpu].count.fetch_add(1, Ordering::SeqCst);
+        if !self.writer_active.load(Ordering::SeqCst) {
+            // Bounded by active read depth; paired 1:1 with Drop. lint-fetch-add: allow
+            self.readers[cpu].admitted.fetch_add(1, Ordering::Release);
+            return Some(OwnerCpuRwReadGuard { lock: self, cpu });
+        }
+        self.readers[cpu].count.fetch_sub(1, Ordering::Release);
+        #[cfg(target_os = "none")]
+        cpu_local::current_cpu().preempt_enable();
+        None
+    }
+
+    /// Acquire the exclusive write guard (keeps `.lock()` naming for mutators).
+    #[inline]
+    pub fn lock(&self) -> OwnerCpuRwWriteGuard<'_, T> {
+        let writer_guard = self.writer_lock.lock();
+        // Dekker store-load ordering: publish writer_active before scanning readers.
+        self.writer_active.store(true, Ordering::SeqCst);
+        let mut mask = rwlock_drain_mask();
+        while mask != 0 {
+            let cpu = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            while self.readers[cpu].count.load(Ordering::SeqCst) != 0 {
+                core::hint::spin_loop();
+            }
+        }
+        OwnerCpuRwWriteGuard {
+            lock: self,
+            _writer_guard: writer_guard,
+        }
+    }
+
+    /// Non-blocking exclusive write guard acquisition.
+    #[inline]
+    pub fn try_lock(&self) -> Option<OwnerCpuRwWriteGuard<'_, T>> {
+        let writer_guard = self.writer_lock.try_lock()?;
+        self.writer_active.store(true, Ordering::SeqCst);
+        let mut mask = rwlock_drain_mask();
+        while mask != 0 {
+            let cpu = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if self.readers[cpu].count.load(Ordering::SeqCst) != 0 {
+                self.writer_active.store(false, Ordering::Release);
+                drop(writer_guard);
+                return None;
+            }
+        }
+        Some(OwnerCpuRwWriteGuard {
+            lock: self,
+            _writer_guard: writer_guard,
+        })
+    }
+
+    /// Whether the calling CPU currently holds either the write lock or an
+    /// admitted read guard.
+    #[inline]
+    pub fn held_by_current_cpu(&self) -> bool {
+        if self.writer_lock.held_by_current_cpu() {
+            return true;
+        }
+        let cpu = cpu_token_exception();
+        cpu < self.readers.len() && self.readers[cpu].admitted.load(Ordering::Acquire) != 0
+    }
+}
+
+impl<T: ?Sized> Drop for OwnerCpuRwReadGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        // Clear `admitted` BEFORE releasing `count` so an interrupting IRQ
+        // cannot treat a departing guard as admitted after `count` reaches 0.
+        self.lock.readers[self.cpu]
+            .admitted
+            .fetch_sub(1, Ordering::Release);
+        self.lock.readers[self.cpu]
+            .count
+            .fetch_sub(1, Ordering::Release);
+        #[cfg(target_os = "none")]
+        cpu_local::current_cpu().preempt_enable();
+    }
+}
+
+impl<T: ?Sized> Deref for OwnerCpuRwReadGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: Read guard guarantees no writer holds exclusive access.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for OwnerCpuRwWriteGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        // Clear writer_active before `_writer_guard` releases `writer_lock`.
+        self.lock.writer_active.store(false, Ordering::Release);
+    }
+}
+
+impl<T: ?Sized> Deref for OwnerCpuRwWriteGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: Write guard guarantees exclusive access to `self.lock.data`.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for OwnerCpuRwWriteGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: Write guard guarantees exclusive access to `self.lock.data`.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+/// Common exception-context re-entry query shared by [`OwnerCpuMutex`] and
+/// [`OwnerCpuRwLock`].
+pub trait OwnerCpuLock {
+    fn held_by_current_cpu(&self) -> bool;
+}
+
+impl<T: ?Sized> OwnerCpuLock for OwnerCpuMutex<T> {
+    #[inline]
+    fn held_by_current_cpu(&self) -> bool {
+        OwnerCpuMutex::held_by_current_cpu(self)
+    }
+}
+
+impl<T: ?Sized> OwnerCpuLock for OwnerCpuRwLock<T> {
+    #[inline]
+    fn held_by_current_cpu(&self) -> bool {
+        OwnerCpuRwLock::held_by_current_cpu(self)
     }
 }
 
@@ -272,5 +587,29 @@ mod tests {
             assert!(!mutex.held_by_current_cpu());
             assert_eq!(mutex.lock()[3], 99);
         }
+    }
+
+    #[test]
+    fn owner_cpu_rwlock_tracks_readers_writers_and_reentry() {
+        let lock = OwnerCpuRwLock::new(10u32);
+        assert!(!lock.held_by_current_cpu());
+        {
+            let r1 = lock.read();
+            let r2 = lock.try_read().expect("concurrent readers allowed");
+            assert_eq!(*r1, 10);
+            assert_eq!(*r2, 10);
+            assert!(lock.held_by_current_cpu());
+            assert!(lock.try_lock().is_none());
+        }
+        assert!(!lock.held_by_current_cpu());
+        {
+            let mut w = lock.lock();
+            *w = 42;
+            assert!(lock.held_by_current_cpu());
+            assert!(lock.try_read().is_none());
+            assert!(lock.try_lock().is_none());
+        }
+        assert!(!lock.held_by_current_cpu());
+        assert_eq!(*lock.read(), 42);
     }
 }

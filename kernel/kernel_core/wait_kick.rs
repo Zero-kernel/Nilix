@@ -46,7 +46,57 @@
 //! the kernel implements with `cli` / `sti; hlt` and the model with a
 //! simulated CPU.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// Minimum non-zero adaptive pre-halt poll window in TSC cycles (~8–10 us).
+pub const HALT_POLL_MIN_CYCLES: u64 = 24_000;
+/// Maximum adaptive pre-halt poll window in TSC cycles (~120–150 us, below
+/// Linux's 200 us KVM `haltpoll` default so long waits halt promptly).
+pub const HALT_POLL_MAX_CYCLES: u64 = 360_000;
+/// Hard iteration bound on `pause` spins so non-KVM / slow-TSC environments
+/// never over-spin regardless of TSC calibration.
+const HALT_POLL_MAX_ITERS: u32 = 4_096;
+const HALT_POLL_GROW_FACTOR: u64 = 2;
+const HALT_POLL_SHRINK_DIV: u64 = 2;
+
+/// Update a CPU's adaptive pre-halt poll cycle budget (Linux KVM `haltpoll`
+/// policy):
+/// - On a poll hit, keep the current budget (or grow if the wake landed in the
+///   upper half of the window).
+/// - On a real halt whose total wait (`polled + halted`) stayed below
+///   [`HALT_POLL_MAX_CYCLES`], grow from `0 -> HALT_POLL_MIN_CYCLES` or double
+///   up to `HALT_POLL_MAX_CYCLES`.
+/// - On a long wait (`>= HALT_POLL_MAX_CYCLES`), halve and snap to `0` once
+///   below `HALT_POLL_MIN_CYCLES` so idle CPUs pay zero polling overhead.
+#[inline]
+pub fn next_halt_poll_budget(current_budget: u64, poll_hit: bool, observed_cycles: u64) -> u64 {
+    if poll_hit {
+        if current_budget == 0 {
+            HALT_POLL_MIN_CYCLES
+        } else if observed_cycles.saturating_mul(2) >= current_budget {
+            current_budget
+                .saturating_mul(HALT_POLL_GROW_FACTOR)
+                .min(HALT_POLL_MAX_CYCLES)
+        } else {
+            current_budget
+        }
+    } else if observed_cycles < HALT_POLL_MAX_CYCLES {
+        if current_budget < HALT_POLL_MIN_CYCLES {
+            HALT_POLL_MIN_CYCLES
+        } else {
+            current_budget
+                .saturating_mul(HALT_POLL_GROW_FACTOR)
+                .min(HALT_POLL_MAX_CYCLES)
+        }
+    } else {
+        let shrunk = current_budget / HALT_POLL_SHRINK_DIV;
+        if shrunk < HALT_POLL_MIN_CYCLES {
+            0
+        } else {
+            shrunk
+        }
+    }
+}
 
 /// One value on its own cache line: every waker of a queue's tasks writes
 /// that queue's sequence, and each CPU writes its own masks and counters.
@@ -122,6 +172,11 @@ pub enum HaltOutcome {
 pub struct WaitKicks<const CPUS: usize> {
     ready_seq: [Line<AtomicU64>; CPUS],
     halted: [Line<AtomicBool>; CPUS],
+    /// Nested count of tasks on this CPU currently in bounded pre-halt poll.
+    /// Advisory only (`is_halted_hint`); never triggers IPI kicks.
+    polling_depth: [Line<AtomicUsize>; CPUS],
+    /// Adaptive per-CPU pre-halt poll budget in TSC cycles (`0` at boot).
+    poll_budget: [Line<AtomicU64>; CPUS],
     pending: [Line<AtomicU64>; CPUS],
     published: [Line<AtomicU64>; CPUS],
     /// Halts of each CPU that an interrupt ended, at every site.
@@ -135,6 +190,8 @@ impl<const CPUS: usize> WaitKicks<CPUS> {
         Self {
             ready_seq: [const { Line(AtomicU64::new(0)) }; CPUS],
             halted: [const { Line(AtomicBool::new(false)) }; CPUS],
+            polling_depth: [const { Line(AtomicUsize::new(0)) }; CPUS],
+            poll_budget: [const { Line(AtomicU64::new(0)) }; CPUS],
             pending: [const { Line(AtomicU64::new(0)) }; CPUS],
             published: [const { Line(AtomicU64::new(0)) }; CPUS],
             exits: [const { Line(AtomicU64::new(0)) }; CPUS],
@@ -204,11 +261,61 @@ impl<const CPUS: usize> WaitKicks<CPUS> {
     /// Advisory halt-state read for wake-affine / new-work CPU placement.
     /// Uses `Acquire` rather than `SeqCst`; correctness never depends on it
     /// (the Dekker handshake in `publish` / `halt_sequence` stays `SeqCst`).
+    /// Includes CPUs in bounded pre-halt polling so new/woken work still
+    /// spreads onto waiting CPUs without waiting for `hlt`.
     #[inline]
     pub fn is_halted_hint(&self, cpu: usize) -> bool {
         self.halted
             .get(cpu)
             .is_some_and(|halted| halted.0.load(Ordering::Acquire))
+            || self
+                .polling_depth
+                .get(cpu)
+                .is_some_and(|depth| depth.0.load(Ordering::Acquire) != 0)
+    }
+
+    #[inline]
+    pub fn enter_polling(&self, cpu: usize) {
+        if let Some(depth) = self.polling_depth.get(cpu) {
+            // Bounded by live tasks; paired 1:1 with leave_polling. lint-fetch-add: allow
+            depth.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn leave_polling(&self, cpu: usize) {
+        if let Some(depth) = self.polling_depth.get(cpu) {
+            depth.0.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn poll_budget(&self, cpu: usize) -> u64 {
+        self.poll_budget
+            .get(cpu)
+            .map_or(0, |budget| budget.0.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn record_poll_hit(&self, cpu: usize, elapsed_cycles: u64) {
+        if let Some(slot) = self.poll_budget.get(cpu) {
+            let cur = slot.0.load(Ordering::Relaxed);
+            let next = next_halt_poll_budget(cur, true, elapsed_cycles);
+            if next != cur {
+                slot.0.store(next, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn record_halt_duration(&self, cpu: usize, total_cycles: u64) {
+        if let Some(slot) = self.poll_budget.get(cpu) {
+            let cur = slot.0.load(Ordering::Relaxed);
+            let next = next_halt_poll_budget(cur, false, total_cycles);
+            if next != cur {
+                slot.0.store(next, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The kicks CPU `this` recorded; its published mask is cleared too.
@@ -698,6 +805,119 @@ impl<F: FnMut() -> bool> HaltOps for KernelHalt<F> {
     }
 }
 
+struct PollDepthGuard(usize);
+
+impl PollDepthGuard {
+    #[inline]
+    fn enter(cpu: usize) -> Self {
+        KICKS.enter_polling(cpu);
+        Self(cpu)
+    }
+}
+
+impl Drop for PollDepthGuard {
+    #[inline]
+    fn drop(&mut self) {
+        KICKS.leave_polling(self.0);
+    }
+}
+
+/// Bounded adaptive pre-halt polling (SMP, IF=1).
+///
+/// Spins with `pause` for at most `budget` TSC cycles (and `HALT_POLL_MAX_ITERS`
+/// iterations) watching `ready_seq` and `work_pending`. Returns `Some(outcome)`
+/// on an early wake so the caller avoids `KVM_EXIT_HLT` and `BOOT_CR3`
+/// switching; returns `None` if the window expires so the caller falls through
+/// to the exact `cli` / `mark_halted` / `sti; hlt` Dekker handshake.
+#[inline]
+fn poll_before_halt(
+    snap: WaitSnapshot,
+    budget: u64,
+    work_pending: &mut impl FnMut() -> bool,
+) -> Option<HaltOutcome> {
+    if !KICKS.seq_unchanged(snap.cpu, snap.seq) {
+        return Some(HaltOutcome::SeqMoved);
+    }
+    if work_pending() {
+        return Some(HaltOutcome::WorkPending);
+    }
+    let _polling = PollDepthGuard::enter(snap.cpu);
+    let start = crate::time::read_tsc();
+    for _ in 0..HALT_POLL_MAX_ITERS {
+        core::hint::spin_loop();
+        if cpu_local::current_cpu_id() != snap.cpu {
+            return Some(HaltOutcome::SeqMoved);
+        }
+        if !KICKS.seq_unchanged(snap.cpu, snap.seq) {
+            let elapsed = crate::time::read_tsc().saturating_sub(start);
+            KICKS.record_poll_hit(snap.cpu, elapsed);
+            return Some(HaltOutcome::SeqMoved);
+        }
+        if work_pending() {
+            let elapsed = crate::time::read_tsc().saturating_sub(start);
+            KICKS.record_poll_hit(snap.cpu, elapsed);
+            return Some(HaltOutcome::WorkPending);
+        }
+        if crate::time::read_tsc().saturating_sub(start) >= budget {
+            break;
+        }
+    }
+    None
+}
+
+fn halt_until_event_inner(
+    snap: WaitSnapshot,
+    site: HaltSite,
+    mut lazy_tlb: Option<&mut BlockedWaitLazyTlb>,
+    mut work_pending: impl FnMut() -> bool,
+) -> HaltOutcome {
+    if cfg!(not(target_os = "none")) || !x86_64::instructions::interrupts::are_enabled() {
+        return HaltOutcome::WorkPending;
+    }
+    // A switch is the only way to change CPU, and none can happen between
+    // this check and the halt.
+    if cpu_local::current_cpu_id() != snap.cpu {
+        return HaltOutcome::SeqMoved;
+    }
+
+    let smp = cpu_local::online_cpu_mask().count_ones() > 1;
+    let mut polled_budget = 0u64;
+    if smp {
+        let budget = KICKS.poll_budget(snap.cpu);
+        if budget != 0 {
+            polled_budget = budget;
+            if let Some(outcome) = poll_before_halt(snap, budget, &mut work_pending) {
+                if site == HaltSite::Wait && outcome == HaltOutcome::SeqMoved {
+                    KICKS.count(snap.cpu, |c| &c.seq_aborts);
+                }
+                return outcome;
+            }
+            if cpu_local::current_cpu_id() != snap.cpu {
+                return HaltOutcome::SeqMoved;
+            }
+        }
+    }
+
+    if let Some(guard) = lazy_tlb.as_mut() {
+        guard.enter_before_halt(snap);
+    }
+
+    let before_hlt = if smp { crate::time::read_tsc() } else { 0 };
+    let outcome = halt_sequence(&KICKS, snap.cpu, snap.seq, &mut KernelHalt { work_pending });
+    if smp && outcome == HaltOutcome::Halted {
+        let halt_cycles = crate::time::read_tsc().saturating_sub(before_hlt);
+        KICKS.record_halt_duration(snap.cpu, polled_budget.saturating_add(halt_cycles));
+    }
+    if site == HaltSite::Wait {
+        match outcome {
+            HaltOutcome::Halted => KICKS.count(snap.cpu, |c| &c.halts),
+            HaltOutcome::SeqMoved => KICKS.count(snap.cpu, |c| &c.seq_aborts),
+            HaltOutcome::WorkPending => {}
+        }
+    }
+    outcome
+}
+
 /// Halt this CPU until an interrupt, unless something was published for its
 /// queue since `snap` or `work_pending` (read with interrupts masked) is
 /// true. Returns at once if interrupts are masked on entry or the caller has
@@ -708,23 +928,7 @@ pub fn halt_until_event(
     site: HaltSite,
     work_pending: impl FnMut() -> bool,
 ) -> HaltOutcome {
-    if cfg!(not(target_os = "none")) || !x86_64::instructions::interrupts::are_enabled() {
-        return HaltOutcome::WorkPending;
-    }
-    // A switch is the only way to change CPU, and none can happen between
-    // this check and the halt.
-    if cpu_local::current_cpu_id() != snap.cpu {
-        return HaltOutcome::SeqMoved;
-    }
-    let outcome = halt_sequence(&KICKS, snap.cpu, snap.seq, &mut KernelHalt { work_pending });
-    if site == HaltSite::Wait {
-        match outcome {
-            HaltOutcome::Halted => KICKS.count(snap.cpu, |c| &c.halts),
-            HaltOutcome::SeqMoved => KICKS.count(snap.cpu, |c| &c.seq_aborts),
-            HaltOutcome::WorkPending => {}
-        }
-    }
-    outcome
+    halt_until_event_inner(snap, site, None, work_pending)
 }
 
 /// Operations backing [`BlockedWaitLazyTlbState`]; mocked in hosted tests.
@@ -864,16 +1068,25 @@ impl BlockedWaitLazyTlb {
 /// not while a reschedule is requested or a drain the waiter may depend on is
 /// flagged (`run_blocked_wait_drains`).
 ///
-/// Parks this CPU on `BOOT_CR3` while halted if no outer [`BlockedWaitLazyTlb`]
-/// guard has already done so, removing the halted waiter from targeted TLB
-/// shootdowns and restoring its user CR3 before returning to callers that may
-/// copy out to user memory (such as `waitpid`).
+/// Uses an outer [`BlockedWaitLazyTlb`] guard when provided so `BOOT_CR3`
+/// parking is deferred until after any short adaptive pre-halt poll expires,
+/// and stays parked across repeated halts in a multi-iteration wait loop.
+pub fn halt_blocked_wait_with_lazy_tlb(
+    snap: WaitSnapshot,
+    lazy_tlb: &mut BlockedWaitLazyTlb,
+) -> HaltOutcome {
+    halt_until_event_inner(snap, HaltSite::Wait, Some(lazy_tlb), || {
+        cpu_local::current_cpu().need_resched.load(Ordering::SeqCst)
+            || crate::process::blocked_wait_work_pending()
+    })
+}
+
+/// The halt of a blocked wait (`waitpid` loops without an outer
+/// [`BlockedWaitLazyTlb`]): runs adaptive pre-halt polling first, and only
+/// switches to `BOOT_CR3` if the poll expires and the CPU enters `hlt`.
 pub fn halt_blocked_wait(snap: WaitSnapshot) -> HaltOutcome {
     let mut lazy_tlb = crate::process::current_pid().map(BlockedWaitLazyTlb::new);
-    if let Some(guard) = lazy_tlb.as_mut() {
-        guard.enter_before_halt(snap);
-    }
-    halt_until_event(snap, HaltSite::Wait, || {
+    halt_until_event_inner(snap, HaltSite::Wait, lazy_tlb.as_mut(), || {
         cpu_local::current_cpu().need_resched.load(Ordering::SeqCst)
             || crate::process::blocked_wait_work_pending()
     })
@@ -1898,5 +2111,62 @@ mod tests {
         assert!(!guard.is_entered());
         guard.restore();
         assert_eq!(guard.ops.restores, 0);
+    }
+
+    #[test]
+    fn wait_kick_halt_poll_budget_adapts_and_decays_to_zero() {
+        // Boot starts at 0 and stays 0 on long tick halts.
+        assert_eq!(next_halt_poll_budget(0, false, HALT_POLL_MAX_CYCLES), 0);
+        assert_eq!(
+            next_halt_poll_budget(0, false, HALT_POLL_MAX_CYCLES * 10),
+            0
+        );
+
+        // Short halts grow exponentially from MIN up to MAX.
+        let b1 = next_halt_poll_budget(0, false, 10_000);
+        assert_eq!(b1, HALT_POLL_MIN_CYCLES);
+        let b2 = next_halt_poll_budget(b1, false, 30_000);
+        assert_eq!(b2, HALT_POLL_MIN_CYCLES * 2);
+        let b_max = next_halt_poll_budget(HALT_POLL_MAX_CYCLES, false, 50_000);
+        assert_eq!(b_max, HALT_POLL_MAX_CYCLES);
+
+        // Early poll hit preserves budget; late poll hit nudges upward.
+        assert_eq!(next_halt_poll_budget(b2, true, 1_000), b2);
+        assert_eq!(next_halt_poll_budget(b2, true, b2 - 1), b2 * 2);
+
+        // Long halts decay cleanly back to 0 so idle CPUs do not spin.
+        let mut b = HALT_POLL_MAX_CYCLES;
+        for _ in 0..8 {
+            b = next_halt_poll_budget(b, false, HALT_POLL_MAX_CYCLES);
+        }
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn wait_kick_polling_depth_updates_halted_hint_only() {
+        let kicks = WaitKicks::<4>::new();
+        assert!(!kicks.is_halted(1));
+        assert!(!kicks.is_halted_hint(1));
+
+        kicks.enter_polling(1);
+        assert!(
+            !kicks.is_halted(1),
+            "polling must not set Dekker halted flag"
+        );
+        assert!(kicks.is_halted_hint(1));
+
+        // Nested enter/leave (e.g. migration race) preserves non-zero count.
+        kicks.enter_polling(1);
+        kicks.leave_polling(1);
+        assert!(kicks.is_halted_hint(1));
+        kicks.leave_polling(1);
+        assert!(!kicks.is_halted_hint(1));
+
+        // Publish while polling must not queue an IPI kick.
+        kicks.enter_polling(2);
+        kicks.publish(0, 2);
+        assert_eq!(kicks.ready_seq(2), 1);
+        assert_eq!(kicks.take_pending(0), 0);
+        kicks.leave_polling(2);
     }
 }

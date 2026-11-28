@@ -867,13 +867,7 @@ fn fork_prepare_child_state(
         // Re-check every transient at the actual snapshot point.  The early
         // check rejects quickly; this one prevents a CLONE_VM sibling from
         // opening a prepare window before the metadata/charge snapshot.
-        if parent_mm
-            .mmap_regions
-            .values()
-            .any(|entry: &crate::syscall::MmapEntry| entry.has_transient())
-            || parent_mm.brk_in_progress
-            || parent_mm.stack_grow_in_progress
-        {
+        if parent_mm.brk_in_progress || parent_mm.stack_grow_in_progress {
             return Err(ForkError::MmapTransientState);
         }
         debug_assert!(
@@ -881,8 +875,12 @@ fn fork_prepare_child_state(
             "fork snapshot must own the shared-MM reservation"
         );
 
+        let mut charge_bytes = 0u64;
         for (&base, entry) in parent_mm.mmap_regions.iter() {
             let entry: &crate::syscall::MmapEntry = entry;
+            if entry.has_transient() {
+                return Err(ForkError::MmapTransientState);
+            }
             if entry.is_shared() {
                 let end = base
                     .checked_add(crate::syscall::mmap_region_len(*entry))
@@ -890,13 +888,7 @@ fn fork_prepare_child_state(
                 shared_ranges
                     .try_push((base, end))
                     .map_err(|_| ForkError::MemoryAllocationFailed)?;
-            }
-        }
-
-        let mut charge_bytes = 0u64;
-        for (_base, entry) in parent_mm.mmap_regions.iter() {
-            let entry: &crate::syscall::MmapEntry = entry;
-            if !entry.is_prot_none() && !entry.is_shared() {
+            } else if !entry.is_prot_none() {
                 charge_bytes =
                     charge_bytes.saturating_add(crate::syscall::mmap_region_len(*entry) as u64);
             }
@@ -1502,9 +1494,7 @@ pub unsafe fn copy_page_table_cow_with_shared(
         if plan.write_protected_count == 0 {
             // No parent hardware permission narrowed.
         } else if plan.write_protected_count <= COW_MAX_TARGETED_FLUSH_PAGES {
-            for &va in &plan.write_protected_addrs[..plan.write_protected_count] {
-                mm::flush_current_as_page(va);
-            }
+            mm::flush_current_as_pages(&plan.write_protected_addrs[..plan.write_protected_count]);
         } else {
             mm::flush_current_as_all();
         }
@@ -1875,8 +1865,8 @@ impl SharedFaultLock {
 
 /// A failed fault-path try-lock is ordinary contention, unless this CPU is the
 /// holder: the interrupted context cannot release it before the fault returns.
-fn shared_fault_contended<T: ?Sized>(
-    lock: &crate::owner_lock::OwnerCpuMutex<T>,
+fn shared_fault_contended(
+    lock: &impl crate::owner_lock::OwnerCpuLock,
     which: SharedFaultLock,
 ) -> SharedFaultResult {
     if lock.held_by_current_cpu() {
@@ -1990,7 +1980,7 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
 
     let Some(process_arc) = crate::process::try_get_process(pid) else {
         return shared_fault_contended(
-            &crate::process::PROCESS_TABLE,
+            &*crate::process::PROCESS_TABLE,
             SharedFaultLock::ProcessTable,
         );
     };
@@ -1998,7 +1988,7 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
         return SharedFaultResult::NotShared;
     };
     let Some(proc) = process_arc.try_lock() else {
-        return shared_fault_contended(&process_arc, SharedFaultLock::Pcb);
+        return shared_fault_contended(&*process_arc, SharedFaultLock::Pcb);
     };
     if proc.pid != pid {
         return SharedFaultResult::NotShared;
@@ -2022,7 +2012,7 @@ pub unsafe fn handle_shared_page_fault(pid: ProcessId, fault_addr: usize) -> Sha
         return SharedFaultResult::NotShared;
     }
     let Some(mut mm_state) = proc.mm.try_lock() else {
-        return shared_fault_contended(&proc.mm, SharedFaultLock::MmState);
+        return shared_fault_contended(&*proc.mm, SharedFaultLock::MmState);
     };
 
     let page_base = fault_addr & !0xfff;
@@ -2269,7 +2259,7 @@ pub unsafe fn handle_private_anon_page_fault(
 
     let Some(process_arc) = crate::process::try_get_process(pid) else {
         return shared_fault_contended(
-            &crate::process::PROCESS_TABLE,
+            &*crate::process::PROCESS_TABLE,
             SharedFaultLock::ProcessTable,
         );
     };
@@ -2277,7 +2267,7 @@ pub unsafe fn handle_private_anon_page_fault(
         return SharedFaultResult::NotShared;
     };
     let Some(proc) = process_arc.try_lock() else {
-        return shared_fault_contended(&process_arc, SharedFaultLock::Pcb);
+        return shared_fault_contended(&*process_arc, SharedFaultLock::Pcb);
     };
     if proc.pid != pid {
         return SharedFaultResult::NotShared;
@@ -2293,7 +2283,7 @@ pub unsafe fn handle_private_anon_page_fault(
         return SharedFaultResult::NotShared;
     }
     let Some(mut mm_state) = proc.mm.try_lock() else {
-        return shared_fault_contended(&proc.mm, SharedFaultLock::MmState);
+        return shared_fault_contended(&*proc.mm, SharedFaultLock::MmState);
     };
 
     let page_base = fault_addr & !0xfff;

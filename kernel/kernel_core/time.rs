@@ -465,6 +465,7 @@ impl TimerRegistry {
     }
 
     fn publish_next_expiry(&self) {
+        ACTIVE_TIMERS.store(self.itimers.len() + self.posix.len(), Ordering::Release);
         let min_ns = self.recompute_next_expiry();
         NEXT_TIMER_EXPIRY_NS.store(min_ns, Ordering::Release);
         if min_ns != u64::MAX && monotonic_ns() >= min_ns {
@@ -473,6 +474,7 @@ impl TimerRegistry {
     }
 }
 
+static ACTIVE_TIMERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static TIMER_REGISTRY: Mutex<TimerRegistry> = Mutex::new(TimerRegistry::new());
 
 /// Compute `(interval_ns, remaining_ns)` for a timer at monotonic time `now_ns`.
@@ -600,6 +602,7 @@ pub(crate) fn create_posix_timer(
         interval_ns: 0,
         overrun: 0,
     });
+    ACTIVE_TIMERS.store(reg.itimers.len() + reg.posix.len(), Ordering::Release);
     Ok(id)
 }
 
@@ -679,6 +682,9 @@ pub(crate) fn delete_posix_timer(
 /// POSIX `execve(2)`: delete all POSIX `timer_create` timers owned by `tgid`
 /// while preserving `ITIMER_REAL` (`alarm`/`setitimer`).
 pub(crate) fn cleanup_posix_timers_for_exec(tgid: crate::process::ProcessId) {
+    if ACTIVE_TIMERS.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let mut reg = TIMER_REGISTRY.lock();
     let before = reg.posix.len();
     reg.posix.retain(|e| e.tgid != tgid);
@@ -690,6 +696,9 @@ pub(crate) fn cleanup_posix_timers_for_exec(tgid: crate::process::ProcessId) {
 /// Process exit (last live thread of `tgid`): reclaim both `ITIMER_REAL` and
 /// all POSIX timers owned by `tgid`.
 pub(crate) fn cleanup_all_timers_for_process(tgid: crate::process::ProcessId) {
+    if ACTIVE_TIMERS.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let mut reg = TIMER_REGISTRY.lock();
     let before_i = reg.itimers.len();
     let before_p = reg.posix.len();

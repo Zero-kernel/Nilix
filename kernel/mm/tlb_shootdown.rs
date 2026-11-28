@@ -1461,6 +1461,50 @@ pub fn flush_current_as_page(addr: VirtAddr) {
     flush_current_as_range(addr, 4096);
 }
 
+/// Flush a small batch of non-contiguous user pages in the current address
+/// space with ONE `collect_target_cpus()` scan instead of one per page.
+///
+/// On single-threaded `fork()` (where no remote CPU runs the parent's CR3),
+/// this cuts `N` cross-CPU `SeqCst` CR3-table scans down to 1 and runs only
+/// local `invlpg`s. When any remote CPU shares the current CR3 (multi-threaded
+/// `CLONE_VM` parent), falls back to a single batched `flush_current_as_all()`
+/// so each remote target receives at most 1 shootdown IPI instead of `N`.
+pub fn flush_current_as_pages(addrs: &[VirtAddr]) {
+    if addrs.is_empty() {
+        return;
+    }
+    if addrs.len() == 1 {
+        flush_current_as_page(addrs[0]);
+        return;
+    }
+    assert_single_core_mode();
+
+    for &va in addrs {
+        if range_touches_kernel_half(va, PAGE_SIZE as usize) {
+            flush_all_address_spaces();
+            return;
+        }
+    }
+
+    let _pin = ShootdownCpuPin::new();
+    let target_cr3 = canonical_shootdown_cr3(_pin.cpu_id());
+    let targets = collect_target_cpus(target_cr3);
+    if targets.is_empty() {
+        for &va in addrs {
+            let aligned = VirtAddr::new(va.as_u64() & !(PAGE_SIZE - 1));
+            tlb::flush(aligned);
+        }
+        STATS_RANGE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        STATS_PAGES_FLUSHED.fetch_add(addrs.len() as u64, Ordering::Relaxed);
+        return;
+    }
+
+    // Remote CPUs share this CR3: one full-AS shootdown sends 1 IPI per target
+    // CPU instead of `addrs.len()` separate range shootdowns.
+    drop(_pin);
+    flush_current_as_all();
+}
+
 /// Get TLB shootdown statistics.
 ///
 /// Returns a snapshot of the current statistics. Thread-safe due to atomic loads.
