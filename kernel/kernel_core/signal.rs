@@ -1469,6 +1469,26 @@ pub fn send_signal_kernel(pid: ProcessId, signal: Signal) -> Result<SignalAction
     send_process_signal(pid, signal, false, None, false)
 }
 
+/// N2.6b: Kernel-authoritative process-directed signal with explicit `SigInfo`
+/// (e.g. `ITIMER_REAL` / POSIX `timer_create(SIGEV_SIGNAL)` with `SI_TIMER`).
+pub fn send_signal_kernel_with_info(
+    pid: ProcessId,
+    signal: Signal,
+    info: SigInfo,
+) -> Result<SignalAction, SignalError> {
+    send_process_signal(pid, signal, false, Some(info), false)
+}
+
+/// N2.6b: Kernel-authoritative thread-directed signal with explicit `SigInfo`
+/// (e.g. POSIX `timer_create(SIGEV_THREAD_ID)` with `SI_TIMER`).
+pub fn send_signal_kernel_thread_with_info(
+    tid: ProcessId,
+    signal: Signal,
+    info: SigInfo,
+) -> Result<SignalAction, SignalError> {
+    send_signal_inner(tid, signal, false, SignalScope::Thread, Some(info), false)
+}
+
 /// GAP-5 G7: where a generated signal is queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SignalScope {

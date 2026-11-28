@@ -280,6 +280,10 @@ define_syscall_table! {
         (32,  SYS_DUP,                Dup,               "dup",                strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (33,  SYS_DUP2,               Dup2,              "dup2",               strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (35,  SYS_NANOSLEEP,          Nanosleep,         "nanosleep",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        // Interval timers & alarm (N2.6b)
+        (36,  SYS_GETITIMER,          Getitimer,         "getitimer",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (37,  SYS_ALARM,              Alarm,             "alarm",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (38,  SYS_SETITIMER,          Setitimer,         "setitimer",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (39,  SYS_GETPID,             Getpid,            "getpid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         // Sockets (Linux x86_64 ABI)
         (41,  SYS_SOCKET,             Socket,            "socket",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
@@ -354,7 +358,15 @@ define_syscall_table! {
         (204, SYS_SCHED_GETAFFINITY,  SchedGetaffinity,  "sched_getaffinity",  strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (217, SYS_GETDENTS64,         Getdents64,        "getdents64",         strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_RPATH),         reason: ""),
         (218, SYS_SET_TID_ADDRESS,    SetTidAddress,     "set_tid_address",    strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_THREAD),        reason: ""),
+        // POSIX timers & clocks (N2.6b)
+        (222, SYS_TIMER_CREATE,       TimerCreate,       "timer_create",       strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (223, SYS_TIMER_SETTIME,      TimerSettime,      "timer_settime",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (224, SYS_TIMER_GETTIME,      TimerGettime,      "timer_gettime",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (225, SYS_TIMER_GETOVERRUN,   TimerGetoverrun,   "timer_getoverrun",   strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (226, SYS_TIMER_DELETE,       TimerDelete,       "timer_delete",       strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (228, SYS_CLOCK_GETTIME,      ClockGettime,      "clock_gettime",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_TIME),          reason: ""),
+        (229, SYS_CLOCK_GETRES,       ClockGetres,       "clock_getres",       strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_TIME),          reason: ""),
+        (230, SYS_CLOCK_NANOSLEEP,    ClockNanosleep,    "clock_nanosleep",    strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (231, SYS_EXIT_GROUP,         ExitGroup,         "exit_group",         strict: true,  drop_proc: true,  status: Dispatched,            pledge: PledgePolicy::Always,                    reason: ""),
         (234, SYS_TGKILL,             Tgkill,            "tgkill",             strict: false, drop_proc: true,  status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (247, SYS_WAITID,             Waitid,            "waitid",             strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_PROC),          reason: ""),

@@ -2,13 +2,40 @@
 //!
 //! 提供基于时钟中断的时间戳支持
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use spin::{Mutex, Once};
 
 /// 全局时钟计数器（每次时钟中断递增）
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// 系统启动时间的 TSC 值（用于更精确的时间测量）
 static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// N2.6b: Optional high-resolution monotonic nanosecond clock callback
+/// (registered by `arch::hpet` when a 64-bit HPET counter is present).
+type MonotonicNsProvider = fn() -> Option<u64>;
+static MONOTONIC_NS_PROVIDER: Once<MonotonicNsProvider> = Once::new();
+
+/// Effective high-resolution clock period in nanoseconds (defaults to 1 ms
+/// PIT tick resolution until HPET registers its finer period).
+static HIGHRES_RESOLUTION_NS: AtomicU64 = AtomicU64::new(1_000_000);
+
+/// Monotonicity floor: guarantees `monotonic_ns()` never regresses across CPUs
+/// or across provider activation.
+static LAST_MONOTONIC_NS: AtomicU64 = AtomicU64::new(0);
+
+/// N2.6b: Offset added to `monotonic_ns()` to produce Unix epoch nanoseconds
+/// for `CLOCK_REALTIME` / `gettimeofday` (seeded from CMOS RTC at boot).
+static WALL_CLOCK_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+
+/// N2.6b: Earliest armed process timer (ITIMER_REAL or POSIX timer) expiry in
+/// monotonic nanoseconds (`u64::MAX` when no timers are armed).
+static NEXT_TIMER_EXPIRY_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// N2.6b: Set from `on_timer_tick()` when `monotonic_ns() >= NEXT_TIMER_EXPIRY_NS`;
+/// drained in safe process context by `drain_deferred_process_timers()`.
+static PROCESS_TIMER_DEFERRED: AtomicBool = AtomicBool::new(false);
 
 /// Last TIME_WAIT sweep timestamp (ms)
 static LAST_TIME_WAIT_SWEEP: AtomicU64 = AtomicU64::new(0);
@@ -57,12 +84,77 @@ pub fn init() {
     BOOT_TSC.store(tsc, Ordering::SeqCst);
 }
 
+/// N2.6b: Register a lock-free high-resolution monotonic nanosecond clock source
+/// (e.g. 64-bit HPET main counter) and its effective resolution in nanoseconds.
+pub fn register_monotonic_ns_provider(provider: MonotonicNsProvider, resolution_ns: u64) {
+    let clamped_res = resolution_ns.max(1);
+    HIGHRES_RESOLUTION_NS.store(clamped_res, Ordering::Release);
+    MONOTONIC_NS_PROVIDER.call_once(|| provider);
+    // Advance floor so monotonic_ns() stays smooth after registration.
+    let _ = monotonic_ns();
+}
+
+/// N2.6b: Seed the wall-clock offset for `CLOCK_REALTIME` / `gettimeofday`
+/// from the boot-time CMOS RTC reading (UTC Unix epoch seconds).
+pub fn set_wall_clock_epoch_secs(unix_secs: u64) {
+    let epoch_ns = unix_secs.saturating_mul(1_000_000_000);
+    let mono = monotonic_ns();
+    WALL_CLOCK_OFFSET_NS.store(epoch_ns.saturating_sub(mono), Ordering::Release);
+}
+
+/// N2.6b: Current wall-clock offset (`realtime_ns - monotonic_ns`).
+#[inline]
+pub fn wall_clock_offset_ns() -> u64 {
+    WALL_CLOCK_OFFSET_NS.load(Ordering::Acquire)
+}
+
+/// N2.6b: Current monotonic uptime in nanoseconds.
+///
+/// Uses the registered 64-bit HPET provider when available, falling back to
+/// `get_ticks() * 1_000_000`. Enforces strict cross-CPU monotonicity via
+/// `fetch_max`.
+#[inline]
+pub fn monotonic_ns() -> u64 {
+    let raw = MONOTONIC_NS_PROVIDER
+        .get()
+        .and_then(|f| f())
+        .unwrap_or_else(|| get_ticks().saturating_mul(1_000_000));
+    let prev = LAST_MONOTONIC_NS.fetch_max(raw, Ordering::AcqRel);
+    raw.max(prev)
+}
+
+/// N2.6b: Current wall-clock Unix epoch time in nanoseconds (`CLOCK_REALTIME`).
+#[inline]
+pub fn realtime_ns() -> u64 {
+    WALL_CLOCK_OFFSET_NS
+        .load(Ordering::Acquire)
+        .saturating_add(monotonic_ns())
+}
+
+/// N2.6b: Effective clock resolution in nanoseconds for `clock_getres(2)`.
+#[inline]
+pub fn clock_resolution_ns(coarse: bool) -> u64 {
+    if coarse {
+        1_000_000
+    } else {
+        HIGHRES_RESOLUTION_NS.load(Ordering::Acquire).max(1)
+    }
+}
+
 /// 时钟中断处理 - 递增时钟计数器
 ///
 /// 应由定时器中断处理程序调用
 #[inline]
 pub fn on_timer_tick() {
     let current = TICK_COUNT.fetch_add(1, Ordering::SeqCst) + 1; // lint-fetch-add: allow (monotonic counter)
+
+    // N2.6b: Lock-free single-load check for expired process itimers / POSIX timers.
+    // Delivery runs in safe process context via `drain_deferred_process_timers()`.
+    let next_exp = NEXT_TIMER_EXPIRY_NS.load(Ordering::Acquire);
+    if next_exp != u64::MAX && monotonic_ns() >= next_exp {
+        PROCESS_TIMER_DEFERRED.store(true, Ordering::Release);
+        crate::request_resched_from_irq();
+    }
 
     // R53-3 FIX: Drive TCP timers at two frequencies:
     // - Fast timer (200ms): Data/FIN retransmission checks
@@ -257,4 +349,497 @@ pub fn drain_deferred_tcp_timers() {
 /// poll asserts. Uses the same process-context clock as the TCP drain.
 pub fn poll_net_rx_ingress() {
     let _ = net::rx_ingress_poll_throttled(current_timestamp_ms());
+}
+
+// ============================================================================
+// N2.6b: Bounded Process Interval Timers (`ITIMER_REAL`/`alarm`) & POSIX Timers
+// ============================================================================
+//
+// Stored out-of-line in a global lock-protected registry keyed by `tgid` so
+// `Process` and `ThreadGroup` incur ZERO per-PCB memory overhead. IRQ context
+// never acquires `TIMER_REGISTRY`; it only reads `NEXT_TIMER_EXPIRY_NS` and
+// sets `PROCESS_TIMER_DEFERRED` for process-context delivery.
+
+/// Maximum number of active POSIX `timer_create` timers per process (thread group).
+pub const MAX_POSIX_TIMERS_PER_PROCESS: usize = 32;
+/// Global safety cap on `ITIMER_REAL` entries to prevent unbounded kernel heap growth.
+const MAX_GLOBAL_ITIMERS: usize = 512;
+/// Maximum expired timers dispatched per single deferred-drain pass (stack-allocated).
+const TIMER_DRAIN_BATCH: usize = 16;
+
+/// How a POSIX timer notifies its owning process/thread on expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PosixTimerNotify {
+    /// `SIGEV_NONE`: record expiry/overrun without sending a signal.
+    None,
+    /// `SIGEV_SIGNAL`: process-directed signal to `tgid`.
+    Signal {
+        sig: crate::signal::Signal,
+        sival: u64,
+    },
+    /// `SIGEV_THREAD_ID`: thread-directed signal to specific `tid` in `tgid`.
+    ThreadSignal {
+        tid: crate::process::ProcessId,
+        sig: crate::signal::Signal,
+        sival: u64,
+    },
+}
+
+/// Clock base recorded for a POSIX timer (`timer_create`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerClock {
+    Realtime,
+    Monotonic,
+    Boottime,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealITimerEntry {
+    tgid: crate::process::ProcessId,
+    /// Armed monotonic deadline in ns (`None` when disarmed).
+    expiry_ns: Option<u64>,
+    /// Periodic reload interval in ns (`0` for one-shot).
+    interval_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PosixTimerEntry {
+    tgid: crate::process::ProcessId,
+    timer_id: i32,
+    clock: TimerClock,
+    notify: PosixTimerNotify,
+    /// Armed monotonic deadline in ns (`None` when disarmed).
+    expiry_ns: Option<u64>,
+    /// Periodic reload interval in ns (`0` for one-shot).
+    interval_ns: u64,
+    /// Overrun count from the most recent expiration.
+    overrun: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimerFireEvent {
+    Process {
+        tgid: crate::process::ProcessId,
+        sig: crate::signal::Signal,
+        info: crate::signal::SigInfo,
+    },
+    Thread {
+        tid: crate::process::ProcessId,
+        sig: crate::signal::Signal,
+        info: crate::signal::SigInfo,
+    },
+}
+
+struct TimerRegistry {
+    itimers: Vec<RealITimerEntry>,
+    posix: Vec<PosixTimerEntry>,
+    next_timer_id: i32,
+}
+
+impl TimerRegistry {
+    const fn new() -> Self {
+        Self {
+            itimers: Vec::new(),
+            posix: Vec::new(),
+            next_timer_id: 1,
+        }
+    }
+
+    fn recompute_next_expiry(&self) -> u64 {
+        let mut min_ns = u64::MAX;
+        for t in &self.itimers {
+            if let Some(exp) = t.expiry_ns {
+                if exp < min_ns {
+                    min_ns = exp;
+                }
+            }
+        }
+        for t in &self.posix {
+            if let Some(exp) = t.expiry_ns {
+                if exp < min_ns {
+                    min_ns = exp;
+                }
+            }
+        }
+        min_ns
+    }
+
+    fn publish_next_expiry(&self) {
+        let min_ns = self.recompute_next_expiry();
+        NEXT_TIMER_EXPIRY_NS.store(min_ns, Ordering::Release);
+        if min_ns != u64::MAX && monotonic_ns() >= min_ns {
+            PROCESS_TIMER_DEFERRED.store(true, Ordering::Release);
+        }
+    }
+}
+
+static TIMER_REGISTRY: Mutex<TimerRegistry> = Mutex::new(TimerRegistry::new());
+
+/// Compute `(interval_ns, remaining_ns)` for a timer at monotonic time `now_ns`.
+#[inline]
+fn remaining_pair(expiry_ns: Option<u64>, interval_ns: u64, now_ns: u64) -> (u64, u64) {
+    match expiry_ns {
+        Some(exp) => (interval_ns, exp.saturating_sub(now_ns).max(1)),
+        None => (interval_ns, 0),
+    }
+}
+
+/// Convert a `(value_ns, interval_ns, abstime, clock)` request into an armed
+/// monotonic deadline (`None` when `value_ns == 0`).
+#[inline]
+pub(crate) fn compute_timer_deadline_ns(
+    value_ns: u64,
+    abstime: bool,
+    clock: TimerClock,
+    now_mono_ns: u64,
+    wall_offset_ns: u64,
+) -> Option<u64> {
+    if value_ns == 0 {
+        return None;
+    }
+    if abstime {
+        let target_mono = match clock {
+            TimerClock::Realtime => value_ns.saturating_sub(wall_offset_ns),
+            TimerClock::Monotonic | TimerClock::Boottime => value_ns,
+        };
+        Some(target_mono)
+    } else {
+        Some(now_mono_ns.saturating_add(value_ns))
+    }
+}
+
+/// Read the current `ITIMER_REAL` `(interval_ns, remaining_ns)` for `tgid`.
+pub(crate) fn get_real_itimer(tgid: crate::process::ProcessId) -> (u64, u64) {
+    let now = monotonic_ns();
+    let reg = TIMER_REGISTRY.lock();
+    match reg.itimers.iter().find(|e| e.tgid == tgid) {
+        Some(e) => remaining_pair(e.expiry_ns, e.interval_ns, now),
+        None => (0, 0),
+    }
+}
+
+/// Set `ITIMER_REAL` for `tgid` to `(interval_ns, value_ns)` (`value_ns == 0` disarms).
+/// Returns the previous `(interval_ns, remaining_ns)`.
+pub(crate) fn set_real_itimer(
+    tgid: crate::process::ProcessId,
+    interval_ns: u64,
+    value_ns: u64,
+) -> Result<(u64, u64), crate::syscall::SyscallError> {
+    let now = monotonic_ns();
+    let new_expiry = if value_ns == 0 {
+        None
+    } else {
+        Some(now.saturating_add(value_ns))
+    };
+    let mut reg = TIMER_REGISTRY.lock();
+    let prev = if let Some(pos) = reg.itimers.iter().position(|e| e.tgid == tgid) {
+        let old = remaining_pair(
+            reg.itimers[pos].expiry_ns,
+            reg.itimers[pos].interval_ns,
+            now,
+        );
+        if new_expiry.is_none() {
+            reg.itimers.swap_remove(pos);
+        } else {
+            reg.itimers[pos].expiry_ns = new_expiry;
+            reg.itimers[pos].interval_ns = interval_ns;
+        }
+        old
+    } else {
+        if let Some(exp) = new_expiry {
+            if reg.itimers.len() >= MAX_GLOBAL_ITIMERS {
+                return Err(crate::syscall::SyscallError::ENOMEM);
+            }
+            reg.itimers
+                .try_reserve(1)
+                .map_err(|_| crate::syscall::SyscallError::ENOMEM)?;
+            reg.itimers.push(RealITimerEntry {
+                tgid,
+                expiry_ns: Some(exp),
+                interval_ns,
+            });
+        }
+        (0, 0)
+    };
+    reg.publish_next_expiry();
+    Ok(prev)
+}
+
+/// Create a POSIX per-process timer owned by `tgid` and return its `timer_id`.
+pub(crate) fn create_posix_timer(
+    tgid: crate::process::ProcessId,
+    clock: TimerClock,
+    notify_opt: Option<PosixTimerNotify>,
+) -> Result<i32, crate::syscall::SyscallError> {
+    let mut reg = TIMER_REGISTRY.lock();
+    let owned = reg.posix.iter().filter(|e| e.tgid == tgid).count();
+    if owned >= MAX_POSIX_TIMERS_PER_PROCESS {
+        return Err(crate::syscall::SyscallError::EAGAIN);
+    }
+    reg.posix
+        .try_reserve(1)
+        .map_err(|_| crate::syscall::SyscallError::ENOMEM)?;
+
+    // Allocate a unique positive timer_id not currently held by `tgid`.
+    let mut id = reg.next_timer_id.max(1);
+    while reg.posix.iter().any(|e| e.tgid == tgid && e.timer_id == id) {
+        id = id.checked_add(1).unwrap_or(1);
+    }
+    reg.next_timer_id = id.checked_add(1).unwrap_or(1);
+
+    let notify = notify_opt.unwrap_or(PosixTimerNotify::Signal {
+        sig: crate::signal::Signal::SIGALRM,
+        sival: id as u64,
+    });
+    reg.posix.push(PosixTimerEntry {
+        tgid,
+        timer_id: id,
+        clock,
+        notify,
+        expiry_ns: None,
+        interval_ns: 0,
+        overrun: 0,
+    });
+    Ok(id)
+}
+
+/// Arm or disarm a POSIX timer owned by `tgid`. Returns previous `(interval_ns, remaining_ns)`.
+pub(crate) fn settime_posix_timer(
+    tgid: crate::process::ProcessId,
+    timer_id: i32,
+    abstime: bool,
+    interval_ns: u64,
+    value_ns: u64,
+) -> Result<(u64, u64), crate::syscall::SyscallError> {
+    let now = monotonic_ns();
+    let offset = wall_clock_offset_ns();
+    let mut reg = TIMER_REGISTRY.lock();
+    let entry = reg
+        .posix
+        .iter_mut()
+        .find(|e| e.tgid == tgid && e.timer_id == timer_id)
+        .ok_or(crate::syscall::SyscallError::EINVAL)?;
+    let prev = remaining_pair(entry.expiry_ns, entry.interval_ns, now);
+    entry.expiry_ns = compute_timer_deadline_ns(value_ns, abstime, entry.clock, now, offset);
+    entry.interval_ns = if entry.expiry_ns.is_some() {
+        interval_ns
+    } else {
+        0
+    };
+    entry.overrun = 0;
+    reg.publish_next_expiry();
+    Ok(prev)
+}
+
+/// Query `(interval_ns, remaining_ns)` of a POSIX timer owned by `tgid`.
+pub(crate) fn gettime_posix_timer(
+    tgid: crate::process::ProcessId,
+    timer_id: i32,
+) -> Result<(u64, u64), crate::syscall::SyscallError> {
+    let now = monotonic_ns();
+    let reg = TIMER_REGISTRY.lock();
+    let entry = reg
+        .posix
+        .iter()
+        .find(|e| e.tgid == tgid && e.timer_id == timer_id)
+        .ok_or(crate::syscall::SyscallError::EINVAL)?;
+    Ok(remaining_pair(entry.expiry_ns, entry.interval_ns, now))
+}
+
+/// Query the overrun count of a POSIX timer owned by `tgid`.
+pub(crate) fn getoverrun_posix_timer(
+    tgid: crate::process::ProcessId,
+    timer_id: i32,
+) -> Result<i32, crate::syscall::SyscallError> {
+    let reg = TIMER_REGISTRY.lock();
+    let entry = reg
+        .posix
+        .iter()
+        .find(|e| e.tgid == tgid && e.timer_id == timer_id)
+        .ok_or(crate::syscall::SyscallError::EINVAL)?;
+    Ok(entry.overrun)
+}
+
+/// Delete a POSIX timer owned by `tgid`.
+pub(crate) fn delete_posix_timer(
+    tgid: crate::process::ProcessId,
+    timer_id: i32,
+) -> Result<(), crate::syscall::SyscallError> {
+    let mut reg = TIMER_REGISTRY.lock();
+    let pos = reg
+        .posix
+        .iter()
+        .position(|e| e.tgid == tgid && e.timer_id == timer_id)
+        .ok_or(crate::syscall::SyscallError::EINVAL)?;
+    reg.posix.swap_remove(pos);
+    reg.publish_next_expiry();
+    Ok(())
+}
+
+/// POSIX `execve(2)`: delete all POSIX `timer_create` timers owned by `tgid`
+/// while preserving `ITIMER_REAL` (`alarm`/`setitimer`).
+pub(crate) fn cleanup_posix_timers_for_exec(tgid: crate::process::ProcessId) {
+    let mut reg = TIMER_REGISTRY.lock();
+    let before = reg.posix.len();
+    reg.posix.retain(|e| e.tgid != tgid);
+    if reg.posix.len() != before {
+        reg.publish_next_expiry();
+    }
+}
+
+/// Process exit (last live thread of `tgid`): reclaim both `ITIMER_REAL` and
+/// all POSIX timers owned by `tgid`.
+pub(crate) fn cleanup_all_timers_for_process(tgid: crate::process::ProcessId) {
+    let mut reg = TIMER_REGISTRY.lock();
+    let before_i = reg.itimers.len();
+    let before_p = reg.posix.len();
+    reg.itimers.retain(|e| e.tgid != tgid);
+    reg.posix.retain(|e| e.tgid != tgid);
+    if reg.itimers.len() != before_i || reg.posix.len() != before_p {
+        reg.publish_next_expiry();
+    }
+}
+
+/// Advance a single expired timer entry at `now_ns`, returning `(next_expiry, overrun)`.
+#[inline]
+pub(crate) fn advance_expired_timer(
+    expiry_ns: u64,
+    interval_ns: u64,
+    now_ns: u64,
+) -> (Option<u64>, i32) {
+    if interval_ns == 0 {
+        (None, 0)
+    } else {
+        let elapsed = now_ns.saturating_sub(expiry_ns);
+        let missed = elapsed / interval_ns;
+        let overrun = missed.min(i32::MAX as u64) as i32;
+        let next = expiry_ns.saturating_add(missed.saturating_add(1).saturating_mul(interval_ns));
+        (Some(next), overrun)
+    }
+}
+
+/// Process-context drain of expired `ITIMER_REAL` and POSIX timers.
+///
+/// Called from `scheduler_hook::process_deferred_work()` right next to
+/// `drain_deferred_tcp_timers()`. Never allocates on the heap and always drops
+/// `TIMER_REGISTRY` before delivering signals.
+pub fn drain_deferred_process_timers() {
+    if !PROCESS_TIMER_DEFERRED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let now = monotonic_ns();
+    let mut batch: [Option<TimerFireEvent>; TIMER_DRAIN_BATCH] = [None; TIMER_DRAIN_BATCH];
+    let mut count = 0usize;
+    let mut more_pending = false;
+
+    {
+        let mut reg = TIMER_REGISTRY.lock();
+
+        // 1. Scan ITIMER_REAL entries (removing disarmed one-shots).
+        let mut idx = 0usize;
+        while idx < reg.itimers.len() {
+            let Some(exp) = reg.itimers[idx].expiry_ns else {
+                reg.itimers.swap_remove(idx);
+                continue;
+            };
+            if now < exp {
+                idx += 1;
+                continue;
+            }
+            if count >= TIMER_DRAIN_BATCH {
+                more_pending = true;
+                break;
+            }
+            let tgid = reg.itimers[idx].tgid;
+            let interval_ns = reg.itimers[idx].interval_ns;
+            let (next_exp, _overrun) = advance_expired_timer(exp, interval_ns, now);
+            batch[count] = Some(TimerFireEvent::Process {
+                tgid,
+                sig: crate::signal::Signal::SIGALRM,
+                info: crate::signal::SigInfo::from_sender(
+                    crate::signal::Signal::SIGALRM,
+                    crate::signal::SI_KERNEL,
+                    0,
+                    0,
+                ),
+            });
+            count += 1;
+            if let Some(next) = next_exp {
+                reg.itimers[idx].expiry_ns = Some(next);
+                idx += 1;
+            } else {
+                reg.itimers.swap_remove(idx);
+            }
+        }
+
+        // 2. Scan POSIX timers.
+        for t in reg.posix.iter_mut() {
+            let Some(exp) = t.expiry_ns else {
+                continue;
+            };
+            if now < exp {
+                continue;
+            }
+            if count >= TIMER_DRAIN_BATCH {
+                more_pending = true;
+                break;
+            }
+            let (next_exp, overrun) = advance_expired_timer(exp, t.interval_ns, now);
+            t.expiry_ns = next_exp;
+            t.overrun = overrun;
+            match t.notify {
+                PosixTimerNotify::None => {}
+                PosixTimerNotify::Signal { sig, sival } => {
+                    batch[count] = Some(TimerFireEvent::Process {
+                        tgid: t.tgid,
+                        sig,
+                        info: crate::signal::SigInfo {
+                            signo: sig.as_i32(),
+                            errno: 0,
+                            code: crate::signal::SI_TIMER,
+                            pid: t.timer_id,
+                            uid: overrun as u32,
+                            value: sival,
+                        },
+                    });
+                    count += 1;
+                }
+                PosixTimerNotify::ThreadSignal { tid, sig, sival } => {
+                    batch[count] = Some(TimerFireEvent::Thread {
+                        tid,
+                        sig,
+                        info: crate::signal::SigInfo {
+                            signo: sig.as_i32(),
+                            errno: 0,
+                            code: crate::signal::SI_TIMER,
+                            pid: t.timer_id,
+                            uid: overrun as u32,
+                            value: sival,
+                        },
+                    });
+                    count += 1;
+                }
+            }
+        }
+
+        let min_ns = reg.recompute_next_expiry();
+        NEXT_TIMER_EXPIRY_NS.store(min_ns, Ordering::Release);
+        if more_pending {
+            PROCESS_TIMER_DEFERRED.store(true, Ordering::Release);
+        }
+    }
+
+    // Deliver all due signals outside `TIMER_REGISTRY`.
+    for slot in batch.iter().take(count) {
+        if let Some(event) = *slot {
+            match event {
+                TimerFireEvent::Process { tgid, sig, info } => {
+                    let _ = crate::signal::send_signal_kernel_with_info(tgid, sig, info);
+                }
+                TimerFireEvent::Thread { tid, sig, info } => {
+                    let _ = crate::signal::send_signal_kernel_thread_with_info(tid, sig, info);
+                }
+            }
+        }
+    }
 }

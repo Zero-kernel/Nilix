@@ -13108,6 +13108,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // last live member exits, under the group id (an init is always a group
         // leader), never when the first of several threads does.
         if last_live {
+            // N2.6b: Reclaim all interval timers and POSIX timers owned by this process.
+            crate::time::cleanup_all_timers_for_process(tgid);
             if tgid == pid {
                 handle_namespace_init_death(pid, &pid_ns_chain);
             } else {

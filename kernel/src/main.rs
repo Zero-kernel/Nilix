@@ -914,6 +914,12 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
                     info.comparator_count,
                     info.counter_64bit
                 );
+                if let Some(res_ns) = arch::hpet::resolution_ns() {
+                    kernel_core::time::register_monotonic_ns_provider(
+                        arch::hpet::elapsed_ns,
+                        res_ns,
+                    );
+                }
             }
             Err(e) => {
                 klog_always!(
@@ -921,6 +927,14 @@ extern "C" fn kernel_main(boot_info_ptr: u64) -> ! {
                     e
                 );
             }
+        }
+        // N2.6b: Seed CLOCK_REALTIME wall-clock offset from MC146818 CMOS RTC.
+        if let Some(epoch_secs) = arch::hpet::read_cmos_rtc_unix_secs() {
+            kernel_core::time::set_wall_clock_epoch_secs(epoch_secs);
+            klog_always!(
+                "      ✓ CMOS RTC wall clock seeded (epoch={} s)",
+                epoch_secs
+            );
         }
 
         // Calibrate LAPIC timer using HPET (preferred) or PIT channel 2 as reference

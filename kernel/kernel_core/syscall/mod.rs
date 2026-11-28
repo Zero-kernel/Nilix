@@ -855,8 +855,34 @@ pub fn syscall_dispatcher(
 
             // 时间相关
             Sc::Nanosleep => sys_nanosleep(arg0 as *const TimeSpec, arg1 as *mut TimeSpec),
+            Sc::Getitimer => sys_getitimer(arg0 as i32, arg1 as *mut ITimerVal),
+            Sc::Alarm => sys_alarm(arg0 as u32),
+            Sc::Setitimer => sys_setitimer(
+                arg0 as i32,
+                arg1 as *const ITimerVal,
+                arg2 as *mut ITimerVal,
+            ),
             Sc::Gettimeofday => sys_gettimeofday(arg0 as *mut TimeVal, arg1 as usize),
+            Sc::TimerCreate => {
+                sys_timer_create(arg0 as i32, arg1 as *const SigEvent, arg2 as *mut i32)
+            }
+            Sc::TimerSettime => sys_timer_settime(
+                arg0 as i32,
+                arg1 as i32,
+                arg2 as *const ITimerSpec,
+                arg3 as *mut ITimerSpec,
+            ),
+            Sc::TimerGettime => sys_timer_gettime(arg0 as i32, arg1 as *mut ITimerSpec),
+            Sc::TimerGetoverrun => sys_timer_getoverrun(arg0 as i32),
+            Sc::TimerDelete => sys_timer_delete(arg0 as i32),
             Sc::ClockGettime => sys_clock_gettime(arg0 as i32, arg1 as *mut TimeSpec),
+            Sc::ClockGetres => sys_clock_getres(arg0 as i32, arg1 as *mut TimeSpec),
+            Sc::ClockNanosleep => sys_clock_nanosleep(
+                arg0 as i32,
+                arg1 as i32,
+                arg2 as *const TimeSpec,
+                arg3 as *mut TimeSpec,
+            ),
 
             // 系统信息
             Sc::Uname => sys_uname(arg0 as *mut UtsName),

@@ -904,6 +904,7 @@ pub(super) fn exec_from_bytes(
         cloexec_cgroup_id,
         cloexec_closed,
         old_shared_regions,
+        exec_tgid,
     ) = {
         let mut proc = process.lock();
 
@@ -1199,6 +1200,7 @@ pub(super) fn exec_from_bytes(
         proc.poll_restore_blocked = None;
         // N2.6a: POSIX/Linux execve(2) disables any established alternate signal stack.
         proc.sigaltstack = crate::signal::SigAltStack::disabled();
+        let exec_tgid = proc.tgid;
         // Robust-list registration is address-space-local. Clear the old
         // image's pointer before publishing the replacement so exit cleanup
         // cannot dereference stale or newly-reused virtual memory.
@@ -1223,8 +1225,13 @@ pub(super) fn exec_from_bytes(
             cloexec_cgroup_id,
             cloexec_closed,
             old_shared_regions,
+            exec_tgid,
         )
     };
+
+    // N2.6b: POSIX execve(2) deletes POSIX timer_create timers while preserving
+    // ITIMER_REAL / alarm. Run outside the Process lock.
+    crate::time::cleanup_posix_timers_for_exec(exec_tgid);
 
     // R169-4 FIX (HIGH, lock inversion): Drop the closed CLOEXEC
     // FileDescriptors and uncharge the per-cgroup FD budget OUTSIDE the Process
