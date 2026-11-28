@@ -1709,7 +1709,51 @@ extern "C" fn page_fault_handler(stack_frame: &mut InterruptStackFrameValue, raw
                         pid
                     );
                 }
-                kernel_core::fork::SharedFaultResult::NotShared => {}
+                kernel_core::fork::SharedFaultResult::NotShared => {
+                    // Demand-install an unfaulted lazy private-anonymous page
+                    // (`MAP_PRIVATE | MAP_ANONYMOUS` without `MAP_POPULATE`) for
+                    // Ring-3 accesses and guarded usercopy probes.
+                    let allow_private_demand = error_code.contains(PageFaultErrorCode::USER_MODE)
+                        || kernel_core::usercopy::is_in_usercopy();
+                    if allow_private_demand {
+                        match unsafe {
+                            kernel_core::fork::handle_private_anon_page_fault(
+                                pid,
+                                fault_addr,
+                                error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+                                error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH),
+                            )
+                        } {
+                            kernel_core::fork::SharedFaultResult::Handled => return,
+                            kernel_core::fork::SharedFaultResult::Busy => {
+                                assert_ne!(
+                                    mm::pt_lock_owner_cpu(),
+                                    Some(cpu_local::current_cpu_id()),
+                                    "same-CPU PT_LOCK reentry during private anon fault"
+                                );
+                                mm::tlb_shootdown::drain_from_fault();
+                                return;
+                            }
+                            kernel_core::fork::SharedFaultResult::Reentry(lock) => {
+                                panic!(
+                                    "same-CPU {} reentry during private anon fault at {:#x} (pid {})",
+                                    lock.name(),
+                                    fault_addr,
+                                    pid
+                                );
+                            }
+                            kernel_core::fork::SharedFaultResult::NotShared => {}
+                            kernel_core::fork::SharedFaultResult::Fatal(reason) => {
+                                klog_force!(
+                                    "MM: private anon fault resolution failed at {:#x} (pid {}): {:?}",
+                                    fault_addr,
+                                    pid,
+                                    reason
+                                );
+                            }
+                        }
+                    }
+                }
                 kernel_core::fork::SharedFaultResult::Fatal(reason) => {
                     klog_force!(
                         "ST-K2: shared fault resolution failed at {:#x} (pid {}): {:?}",

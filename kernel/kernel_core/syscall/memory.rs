@@ -186,6 +186,66 @@ mod r192_res_2_mremap_tests {
             }
         }
     }
+
+    #[test]
+    fn lazy_anon_mmap_entry_flag_invariants() {
+        use super::{
+            mmap_prot_to_flags, validate_mmap_flags, MmapEntry, MmapShape, MAP_ANONYMOUS,
+            MAP_FIXED_NOREPLACE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MMAP_REGION_FLAG_LAZY_ANON,
+            MMAP_REGION_FLAG_PENDING_MAP, MMAP_REGION_FLAG_UNFAULTED, PROT_READ, PROT_WRITE,
+        };
+        assert_eq!(
+            validate_mmap_flags(MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE),
+            Ok(MmapShape {
+                shared: false,
+                exact: false,
+                populate: true,
+            })
+        );
+        assert_eq!(
+            validate_mmap_flags(MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_POPULATE),
+            Ok(MmapShape {
+                shared: false,
+                exact: true,
+                populate: true,
+            })
+        );
+        assert!(validate_mmap_flags(MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE).is_err());
+
+        let mut entry = MmapEntry::from_len_flags(
+            0x20_0000,
+            mmap_prot_to_flags(PROT_READ | PROT_WRITE)
+                | MMAP_REGION_FLAG_LAZY_ANON
+                | MMAP_REGION_FLAG_UNFAULTED,
+        );
+        assert!(entry.is_lazy_anon());
+        assert!(entry.is_unfaulted());
+        assert!(entry.prot_read() && entry.prot_write() && !entry.prot_exec());
+        assert_eq!(entry.perms(), *b"rw-p");
+
+        // mprotect Path C display-bit update preserves LAZY_ANON | UNFAULTED.
+        entry.rewrite_prot_bits(mmap_prot_to_flags(PROT_READ));
+        assert!(entry.is_lazy_anon());
+        assert!(entry.is_unfaulted());
+        assert!(entry.prot_read() && !entry.prot_write());
+
+        // fork_stripped preserves LAZY_ANON | UNFAULTED while clearing transients.
+        let transient =
+            MmapEntry::from_len_flags(entry.len(), entry.flags() | MMAP_REGION_FLAG_PENDING_MAP);
+        let stripped = transient.fork_stripped();
+        assert!(!stripped.has_transient());
+        assert!(stripped.is_lazy_anon() && stripped.is_unfaulted());
+
+        // First page fault clears UNFAULTED while keeping LAZY_ANON.
+        entry.clear_unfaulted();
+        assert!(entry.is_lazy_anon());
+        assert!(!entry.is_unfaulted());
+
+        // Demotion to PROT_NONE clears both LAZY_ANON and UNFAULTED.
+        let none = MmapEntry::prot_none(entry.len());
+        assert!(none.is_prot_none());
+        assert!(!none.is_lazy_anon() && !none.is_unfaulted());
+    }
 }
 
 #[cfg(test)]
@@ -653,6 +713,7 @@ pub(super) const MAP_SHARED: i32 = 0x01;
 pub(super) const MAP_PRIVATE: i32 = 0x02;
 pub(super) const MAP_FIXED: i32 = 0x10;
 pub(super) const MAP_ANONYMOUS: i32 = 0x20;
+pub(super) const MAP_POPULATE: i32 = 0x8000;
 pub(super) const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
 pub(super) const MAP_SHARED_VALIDATE: i32 = 0x03;
 pub(super) const SUPPORTED_MMAP_FLAGS: i32 = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -664,19 +725,24 @@ pub(super) struct MmapShape {
     pub(super) shared: bool,
     /// `MAP_FIXED_NOREPLACE`: exactly at `addr`, or fail.
     pub(super) exact: bool,
+    /// `MAP_POPULATE`: eagerly back private anonymous pages before returning.
+    pub(super) populate: bool,
 }
 
 #[inline]
 pub(super) fn validate_mmap_flags(flags: i32) -> Result<MmapShape, SyscallError> {
     let exact = flags & MAP_FIXED_NOREPLACE != 0;
-    match flags & !MAP_FIXED_NOREPLACE {
+    let populate = flags & MAP_POPULATE != 0;
+    match flags & !(MAP_FIXED_NOREPLACE | MAP_POPULATE) {
         SUPPORTED_MMAP_FLAGS => Ok(MmapShape {
             shared: false,
             exact,
+            populate,
         }),
-        SUPPORTED_SHARED_MMAP_FLAGS => Ok(MmapShape {
+        SUPPORTED_SHARED_MMAP_FLAGS if !populate => Ok(MmapShape {
             shared: true,
             exact,
+            populate: false,
         }),
         _ => Err(SyscallError::EOPNOTSUPP),
     }
@@ -686,19 +752,41 @@ pub(super) fn validate_mmap_flags(flags: i32) -> Result<MmapShape, SyscallError>
 /// The production path invokes the same validator after the LSM hook, before
 /// any address-space state is changed.
 pub fn run_mmap_flags_self_test() {
-    for (flags, shared, exact) in [
-        (MAP_PRIVATE | MAP_ANONYMOUS, false, false),
-        (MAP_SHARED | MAP_ANONYMOUS, true, false),
+    for (flags, shared, exact, populate) in [
+        (MAP_PRIVATE | MAP_ANONYMOUS, false, false, false),
+        (
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+            false,
+            false,
+            true,
+        ),
+        (MAP_SHARED | MAP_ANONYMOUS, true, false, false),
         (
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
             false,
             true,
+            false,
         ),
-        (MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, true, true),
+        (
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_POPULATE,
+            false,
+            true,
+            true,
+        ),
+        (
+            MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+            true,
+            true,
+            false,
+        ),
     ] {
         assert_eq!(
             validate_mmap_flags(flags),
-            Ok(MmapShape { shared, exact }),
+            Ok(MmapShape {
+                shared,
+                exact,
+                populate,
+            }),
             "supported mmap flags: {flags:#x}"
         );
     }
@@ -1027,7 +1115,7 @@ pub(super) fn page_align_up(addr: usize) -> usize {
 //
 // R122-1: Made pub(crate) so fork.rs can check for transient state.
 pub(crate) const MMAP_REGION_FLAG_MASK: usize = 0xfff;
-pub(super) const MMAP_REGION_FLAG_PENDING_MAP: usize = 1 << 0;
+pub(crate) const MMAP_REGION_FLAG_PENDING_MAP: usize = 1 << 0;
 pub(super) const MMAP_REGION_FLAG_PENDING_UNMAP: usize = 1 << 1;
 // R123-1 FIX: Committed flag indicating PROT_NONE reservation (no frames/charge).
 // R124-1 FIX: Made pub(crate) so process exit/exec cleanup can skip uncharge for PROT_NONE.
@@ -1042,6 +1130,17 @@ pub const MMAP_REGION_FLAG_PROT_EXEC: usize = 1 << 5;
 /// ST-K2-P2: committed shared-anonymous mapping.  Bit 7 is outside the
 /// existing transient/protection flags and is preserved across fork.
 pub(crate) const MMAP_REGION_FLAG_SHARED: usize = 1 << 7;
+/// Lazy private-anonymous demand-paged mapping (`MAP_PRIVATE | MAP_ANONYMOUS`
+/// without `MAP_POPULATE`). Absent leaf PTEs inside this VMA are materialized
+/// on first access by `handle_private_anon_page_fault`. Preserved across fork
+/// and `mprotect` Path C; cleared on `real -> PROT_NONE` demotion.
+pub(crate) const MMAP_REGION_FLAG_LAZY_ANON: usize = 1 << 8;
+/// Fast-path proof bit: set on a fresh lazy private-anonymous VMA before any
+/// page has ever been faulted in or eagerly populated. Cleared under `MmState`
+/// lock BEFORE inserting the first PTE (or before growing via `mremap`), so
+/// `sys_munmap` can safely skip `PT_LOCK` / page-table walk / TLB shootdown
+/// whenever this bit is still set.
+pub(crate) const MMAP_REGION_FLAG_UNFAULTED: usize = 1 << 9;
 /// R149-6 / R168-1 FIX: Transient ownership token for an mprotect operation
 /// that drops the MmState lock for page-table work. Path A (PROT_NONE → real)
 /// holds it while allocating + mapping frames; Path B (real → PROT_NONE) holds
@@ -1143,6 +1242,21 @@ impl MmapEntry {
     #[inline]
     pub const fn is_shared(self) -> bool {
         self.0 & MMAP_REGION_FLAG_SHARED != 0
+    }
+
+    #[inline]
+    pub const fn is_lazy_anon(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_LAZY_ANON != 0
+    }
+
+    #[inline]
+    pub const fn is_unfaulted(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_UNFAULTED != 0
+    }
+
+    #[inline]
+    pub fn clear_unfaulted(&mut self) {
+        self.0 &= !MMAP_REGION_FLAG_UNFAULTED;
     }
 
     /// 4-char Linux-style "rwxp"/"rwxs" permission string for /proc/[pid]/maps.
@@ -3842,8 +3956,54 @@ pub(super) fn sys_mmap(
         };
 
         // ST-K2-P2: shared mappings reserve only bounded region metadata here;
-        // their DATA charge is taken by the first page fault.  Private mappings
-        // retain the eager whole-range charge.
+        // their DATA charge is taken by the first page fault. Private mappings
+        // retain the eager whole-range cgroup charge so memory.max / OOM / exact
+        // return-to-baseline accounting remain unchanged, while default
+        // `MAP_PRIVATE | MAP_ANONYMOUS` (without `MAP_POPULATE`) defers physical
+        // frame allocation and PTE installation to first page fault.
+        let is_lazy_private = !is_prot_none && !is_shared && !shape.populate;
+        if is_lazy_private {
+            let pages = length_aligned / 0x1000;
+            if mm::buddy_allocator::get_allocator_stats()
+                .is_some_and(|stats| pages > stats.free_pages)
+            {
+                return Err(SyscallError::ENOMEM);
+            }
+            mm.reserve_shared_fault_pt(Some((base, length_aligned)))
+                .map_err(|_| SyscallError::ENOMEM)?;
+            if let Err(_charge_err) =
+                cgroup::try_charge_memory(proc.cgroup_id, length_aligned as u64)
+            {
+                mm.reclaim_empty_shared_fault_pt_capacity();
+                #[cfg(debug_assertions)]
+                kprintln!(
+                    "[ST-K3] mmap ENOMEM site=E2 stage=cgroup_charge cgroup={} len={} err={:?}",
+                    proc.cgroup_id,
+                    length_aligned,
+                    _charge_err
+                );
+                return Err(SyscallError::ENOMEM);
+            }
+            let prot_flags = mmap_prot_to_flags(prot);
+            let committed_entry = MmapEntry::from_len_flags(
+                length_aligned,
+                prot_flags | MMAP_REGION_FLAG_LAZY_ANON | MMAP_REGION_FLAG_UNFAULTED,
+            );
+            debug_validate_mmap_entry(committed_entry);
+            if mm.mmap_regions.try_insert(base, committed_entry).is_err() {
+                cgroup::uncharge_memory(proc.cgroup_id, length_aligned as u64);
+                mm.reclaim_empty_shared_fault_pt_capacity();
+                return Err(SyscallError::ENOMEM);
+            }
+            mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(length_aligned as u64);
+            if mm.next_mmap_addr < end {
+                mm.next_mmap_addr = end;
+            }
+            drop(mm);
+            drop(proc);
+            return Ok(base);
+        }
+
         let shared_region = if is_shared {
             let region = crate::fork::SharedAnonRegion::try_new(base, length_aligned, prot)
                 .map_err(|_| SyscallError::ENOMEM)?;
@@ -4289,6 +4449,25 @@ pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             return Err(SyscallError::EPERM);
         }
 
+        // Fast path for untouched lazy private-anonymous mappings: UNFAULTED is
+        // cleared under `MmState` lock BEFORE inserting any PTE (or growing via
+        // mremap), so zero leaf PTEs and zero PT frames exist for this VMA.
+        // Removing and uncharging here skips PT_LOCK, page-table walk, and TLB
+        // shootdown completely while remaining linearizable with concurrent #PF.
+        if (committed_flags & MMAP_REGION_FLAG_UNFAULTED) != 0
+            && (committed_flags & (MMAP_REGION_FLAG_PROT_NONE | MMAP_REGION_FLAG_SHARED)) == 0
+        {
+            let was_present = mm.mmap_regions.remove(&addr).is_some();
+            if was_present {
+                mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(recorded_length as u64);
+                cgroup::uncharge_memory(proc.cgroup_id, length_aligned as u64);
+            }
+            mm.reclaim_empty_shared_fault_pt_capacity();
+            drop(mm);
+            drop(proc);
+            return Ok(0);
+        }
+
         // Mark as pending-unmap so concurrent mmap/munmap can't race the PT ops.
         // Preserve committed per-region flags (e.g. PROT_NONE) through the operation.
         // next-phase #11: `addr` is the region being unmapped (already present),
@@ -4325,6 +4504,7 @@ pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         (
             UnmappedFrameBuf,
             alloc::vec::Vec<x86_64::structures::paging::PhysFrame>,
+            usize,
         ),
         SyscallError,
     > = unsafe {
@@ -4334,6 +4514,7 @@ pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 (
                     UnmappedFrameBuf,
                     alloc::vec::Vec<x86_64::structures::paging::PhysFrame>,
+                    usize,
                 ),
                 SyscallError,
             > {
@@ -4353,11 +4534,13 @@ pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 }
 
                 let mut removed_leaf = false;
+                let mut removed_leaf_count = 0usize;
                 manager.unmap_user_range_no_flush(
                     VirtAddr::new(addr as u64),
                     length_aligned,
                     |page, frame| {
                         removed_leaf = true;
+                        removed_leaf_count += 1;
                         if unmapped.inline_len < UNMAP_INLINE_CAP {
                             unmapped.inline[unmapped.inline_len] = frame;
                             unmapped.inline_len += 1;
@@ -4401,12 +4584,12 @@ pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                     crate::fork::shared_fault_test::after_unmap_flush(pid, addr);
                 }
 
-                Ok((unmapped, table_frames))
+                Ok((unmapped, table_frames, removed_leaf_count))
             },
         )
     };
 
-    let (unmapped_frames, table_frames) = match unmap_result {
+    let (unmapped_frames, table_frames, removed_leaf_count) = match unmap_result {
         Ok(pair) => pair,
         Err(e) => {
             // Roll back the PENDING_UNMAP marker so the region remains usable.
@@ -4501,6 +4684,11 @@ pub(super) fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             && (committed_flags & (MMAP_REGION_FLAG_PROT_NONE | MMAP_REGION_FLAG_SHARED)) == 0
         {
             mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(recorded_length as u64);
+            if (committed_flags & MMAP_REGION_FLAG_LAZY_ANON) != 0 && removed_leaf_count > 0 {
+                mm.lazy_anon_resident_bytes = mm
+                    .lazy_anon_resident_bytes
+                    .saturating_sub((removed_leaf_count as u64).saturating_mul(0x1000));
+            }
             cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
         }
 
@@ -4758,6 +4946,17 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult 
         mm.mmap_regions
             .try_reserve(2)
             .map_err(|_| SyscallError::ENOMEM)?;
+        // Splitting up to two boundary lazy VMAs can create up to 2 extra
+        // boundary PT/PD/PDPT overlaps (6 ledger slots); reserve BEFORE splits
+        // so concurrent CLONE_VM page faults retain guaranteed ledger capacity.
+        if mm
+            .mmap_regions
+            .values()
+            .any(|e| e.is_lazy_anon() && !e.is_prot_none() && !e.is_shared())
+        {
+            mm.reserve_shared_fault_pt_extra(None, 6)
+                .map_err(|_| SyscallError::ENOMEM)?;
+        }
 
         // Split preceding region whose tail extends into [addr, end).
         // next-phase #11: `preceding` was copied into an owned Option above, so
@@ -5186,16 +5385,17 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult 
             // `PAGE_REF_COUNT.release` so a concurrent process on another PT lock
             // shard cannot observe refcount 2->1 and perform an in-place writable
             // CoW upgrade (or frame reuse) while a sibling CPU still holds a stale TLB.
-            unsafe {
+            let removed_leaf_count = unsafe {
                 use mm::memory::FrameAllocator;
 
-                with_current_manager(VirtAddr::new(0), |manager| {
+                with_current_manager(VirtAddr::new(0), |manager| -> usize {
                     use alloc::vec::Vec;
                     use x86_64::structures::paging::PhysFrame;
 
                     let mut frame_alloc = FrameAllocator::new();
                     let mut unmapped_frames: Vec<PhysFrame> = Vec::new();
                     let _ = unmapped_frames.try_reserve(region_len / 0x1000);
+                    let mut removed_count = 0usize;
 
                     for offset in (0..region_len).step_by(0x1000) {
                         let page =
@@ -5210,6 +5410,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult 
                         };
 
                         if let Some(frame) = frame_opt {
+                            removed_count += 1;
                             if unmapped_frames.try_reserve(1).is_ok() {
                                 unmapped_frames.push(frame);
                             } else {
@@ -5233,6 +5434,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult 
                             }
                         }
                     }
+                    removed_count
                 })
             };
 
@@ -5257,6 +5459,12 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult 
                         if let Some(slot) = mm.mmap_regions.get_mut(&region_base) {
                             *slot = MmapEntry::prot_none(live_len);
                         }
+                        if old.is_lazy_anon() && removed_leaf_count > 0 {
+                            mm.lazy_anon_resident_bytes = mm
+                                .lazy_anon_resident_bytes
+                                .saturating_sub((removed_leaf_count as u64).saturating_mul(0x1000));
+                        }
+                        mm.reclaim_empty_shared_fault_pt_capacity();
                         mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(live_len as u64);
                         Some((proc.cgroup_id, live_len))
                     }
@@ -5893,15 +6101,39 @@ pub(super) fn sys_mremap(
                 return Err(SyscallError::ENOMEM);
             }
 
+            // If growing/relocating a lazy private-anonymous VMA, run the
+            // physical-RAM precheck for the grown tail and reserve demand-fault
+            // PT ledger capacity for the destination range before committing.
+            if (committed_flags & MMAP_REGION_FLAG_LAZY_ANON) != 0 && !prot_none {
+                let tail_pages = tail_len / 0x1000;
+                if mm::buddy_allocator::get_allocator_stats()
+                    .is_some_and(|stats| tail_pages > stats.free_pages)
+                {
+                    return Err(SyscallError::ENOMEM);
+                }
+                mm.reserve_shared_fault_pt(Some((new_base, new_len)))
+                    .map_err(|_| SyscallError::ENOMEM)?;
+            }
+
             // Reserve the growth window BEFORE claiming the source, so a
             // concurrent mmap cannot take it during Phase 2.  `reserved_base`
             // is always a new key here (a growth tail, or a relocation
             // destination), so this is the fallible insert.
+            // Preserve LAZY_ANON on lazy growth reservations so concurrent
+            // Phase-2 OOM snapshots do not count unpopulated tail bytes as RSS
+            // (while cgroup accounting still counts them via `mremap_uncharged_reserve`).
+            let is_lazy_grow = (committed_flags & MMAP_REGION_FLAG_LAZY_ANON) != 0;
+            let reserve_flags = MMAP_REGION_FLAG_PENDING_MAP
+                | if is_lazy_grow {
+                    MMAP_REGION_FLAG_LAZY_ANON
+                } else {
+                    0
+                };
             if mm
                 .mmap_regions
                 .try_insert(
                     reserved_base,
-                    MmapEntry::from_len_flags(reserved_len, MMAP_REGION_FLAG_PENDING_MAP),
+                    MmapEntry::from_len_flags(reserved_len, reserve_flags),
                 )
                 .is_err()
             {
@@ -5939,6 +6171,11 @@ pub(super) fn sys_mremap(
             mm.mremap_uncharged_reserve_bytes = mm
                 .mremap_uncharged_reserve_bytes
                 .saturating_add(uncharged_reserve as u64);
+            if is_lazy_grow {
+                mm.mremap_lazy_uncharged_reserve_bytes = mm
+                    .mremap_lazy_uncharged_reserve_bytes
+                    .saturating_add(uncharged_reserve as u64);
+            }
 
             let moved = new_base != old_base;
             let mut next_advanced = false;
@@ -5995,7 +6232,8 @@ pub(super) fn sys_mremap(
     //
     // A PROT_NONE reservation owns no frames, so growing it extends the VA
     // record only, exactly as sys_mmap's PROT_NONE arm creates no page tables.
-    let tail_pages = if prot_none {
+    let is_lazy_anon = (tx.committed_flags & MMAP_REGION_FLAG_LAZY_ANON) != 0;
+    let tail_pages = if prot_none || is_lazy_anon {
         0
     } else {
         // GUARD: only a grow has a tail.  A shrink would underflow
@@ -6068,10 +6306,10 @@ pub(super) fn sys_mremap(
             let hold = unsafe {
                 with_current_manager(
                     VirtAddr::new(0),
-                    |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                    |manager| -> Result<(vec::Vec<PhysFrame>, usize), SyscallError> {
                         #[cfg(feature = "syscall_test")]
                         let hold_start = crate::time::read_tsc();
-                        let result = (|| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                        let result = (|| -> Result<(vec::Vec<PhysFrame>, usize), SyscallError> {
                             // ---- Step 1: install the relocated pages. ----
                             //
                             // Relocate: reuse each source frame verbatim, flags
@@ -6086,6 +6324,8 @@ pub(super) fn sys_mremap(
                                     &mut stage.tables,
                                     &mut frame_alloc.pt_frames,
                                 );
+                                let is_lazy_anon =
+                                    (tx.committed_flags & MMAP_REGION_FLAG_LAZY_ANON) != 0;
                                 for offset in (0..tx.old_len).step_by(0x1000) {
                                     let src_page =
                                     Page::<x86_64::structures::paging::Size4KiB>::containing_address(
@@ -6098,12 +6338,16 @@ pub(super) fn sys_mremap(
                                     let Some((phys, leaf_flags)) =
                                         manager.translate_with_flags(src_page.start_address())
                                     else {
+                                        if is_lazy_anon {
+                                            // Unfaulted lazy page: remains unfaulted at dst_page.
+                                            continue;
+                                        }
                                         // The VMA and the page table disagree about a
                                         // page inside the mapping.
                                         mremap_rollback_install(
                                             manager,
                                             tx.new_base,
-                                            installed,
+                                            offset / 0x1000,
                                             tx.old_len,
                                             carried,
                                         );
@@ -6118,12 +6362,13 @@ pub(super) fn sys_mremap(
                                         mremap_rollback_install(
                                             manager,
                                             tx.new_base,
-                                            installed,
+                                            offset / 0x1000,
                                             tx.old_len,
                                             carried,
                                         );
                                         return Err(SyscallError::ENOMEM);
                                     }
+                                    let _ = &mut installed;
                                     installed += 1;
                                 }
                             }
@@ -6138,9 +6383,7 @@ pub(super) fn sys_mremap(
                             // here.
                             let mut removed_leaf = false;
                             // Counts every leaf the sweep reclaimed, present or not,
-                            // so the PROT_NONE premise below is checked against
-                            // real evidence.
-                            #[cfg(debug_assertions)]
+                            // for both the PROT_NONE assertion and lazy-anon RSS debit.
                             let mut removed_frames: usize = 0;
 
                             if removed_len != 0 {
@@ -6160,10 +6403,7 @@ pub(super) fn sys_mremap(
 
                                     if let Some(frame) = frame_opt {
                                         removed_leaf = true;
-                                        #[cfg(debug_assertions)]
-                                        {
-                                            removed_frames += 1;
-                                        }
+                                        removed_frames += 1;
                                         // LEAD-MREMAP-RELOC-UAF-1 FIX: a RELOCATED
                                         // frame's reference moved to the destination
                                         // PTE in step 1; it is neither released nor
@@ -6263,7 +6503,12 @@ pub(super) fn sys_mremap(
                                 "PROT_NONE reservation owned {removed_frames} leaf frame(s)"
                             );
 
-                            Ok(core::mem::take(&mut stage.reclaimed))
+                            let shrunk_leaf_count = if !tx.moved && tx.new_len < tx.old_len {
+                                removed_frames
+                            } else {
+                                0
+                            };
+                            Ok((core::mem::take(&mut stage.reclaimed), shrunk_leaf_count))
                         })();
                         #[cfg(feature = "syscall_test")]
                         {
@@ -6295,9 +6540,10 @@ pub(super) fn sys_mremap(
                 );
             }
             match hold {
-                Ok(reclaimed_tables) => Ok(MremapPhase2 {
+                Ok((reclaimed_tables, shrunk_leaf_count)) => Ok(MremapPhase2 {
                     new_pt_frames: populator.into_commit(),
                     reclaimed_tables,
+                    shrunk_leaf_count,
                 }),
                 Err(error) => {
                     // The relocation failed after the tail was populated:
@@ -6339,6 +6585,11 @@ pub(super) fn sys_mremap(
                 mm.mremap_uncharged_reserve_bytes = mm
                     .mremap_uncharged_reserve_bytes
                     .saturating_sub(tx.uncharged_reserve as u64);
+                if is_lazy_anon {
+                    mm.mremap_lazy_uncharged_reserve_bytes = mm
+                        .mremap_lazy_uncharged_reserve_bytes
+                        .saturating_sub(tx.uncharged_reserve as u64);
+                }
                 if !prot_none && tx.new_len > tx.old_len {
                     cgroup::uncharge_memory(proc.cgroup_id, (tx.new_len - tx.old_len) as u64);
                 }
@@ -6386,7 +6637,14 @@ pub(super) fn sys_mremap(
         let mut mm = mm_arc.lock();
         let cgroup_id = proc.cgroup_id;
 
-        let committed = MmapEntry::from_len_flags(tx.new_len, tx.committed_flags);
+        // An eager grow populated its tail; a lazy grow keeps its tail lazy
+        // (preserving UNFAULTED when the base mapping was untouched).
+        let final_flags = if !is_lazy_anon && tx.new_len > tx.old_len && !prot_none {
+            tx.committed_flags & !MMAP_REGION_FLAG_UNFAULTED
+        } else {
+            tx.committed_flags
+        };
+        let committed = MmapEntry::from_len_flags(tx.new_len, final_flags);
         debug_validate_mmap_entry(committed);
         // LEAD-MREMAP-MIGRATE-1: the committed entry counts exactly the charged
         // bytes again, so the lane goes in this section, before the inserts
@@ -6395,6 +6653,11 @@ pub(super) fn sys_mremap(
         mm.mremap_uncharged_reserve_bytes = mm
             .mremap_uncharged_reserve_bytes
             .saturating_sub(tx.uncharged_reserve as u64);
+        if is_lazy_anon {
+            mm.mremap_lazy_uncharged_reserve_bytes = mm
+                .mremap_lazy_uncharged_reserve_bytes
+                .saturating_sub(tx.uncharged_reserve as u64);
+        }
 
         // Both arms below replace a key that Phase 1 already inserted, so they
         // cannot allocate and cannot fail.  ST-K3 Phase D style: the tag exists
@@ -6432,6 +6695,11 @@ pub(super) fn sys_mremap(
                 }
                 Some((false, bytes)) => {
                     mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(bytes as u64);
+                    if is_lazy_anon && phase2.shrunk_leaf_count > 0 {
+                        mm.lazy_anon_resident_bytes = mm.lazy_anon_resident_bytes.saturating_sub(
+                            (phase2.shrunk_leaf_count as u64).saturating_mul(0x1000),
+                        );
+                    }
                     cgroup::uncharge_memory(cgroup_id, bytes as u64);
                 }
             }
@@ -6527,4 +6795,6 @@ pub(super) struct MremapPhase2 {
     pub(super) new_pt_frames: vec::Vec<x86_64::structures::paging::PhysFrame>,
     /// Intermediate tables this call emptied (freed after the ledger removal).
     pub(super) reclaimed_tables: vec::Vec<x86_64::structures::paging::PhysFrame>,
+    /// Present leaf pages unmapped by an in-place shrink (for lazy-anon RSS).
+    pub(super) shrunk_leaf_count: usize,
 }

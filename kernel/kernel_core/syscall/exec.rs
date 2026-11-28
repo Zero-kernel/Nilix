@@ -1118,6 +1118,7 @@ pub(super) fn exec_from_bytes(
             // R131-6 FIX: Reset per-task charge counter — the old image's charges
             // were fully uncharged above; new ELF image starts with a clean slate.
             mm.vm_charged_bytes = 0;
+            mm.lazy_anon_resident_bytes = 0;
             mm.brk_pending_growth = 0; // R144-1 FIX: Clear pending brk growth on exec
                                        // R165-1 FIX: clear any brk reservation on exec image replacement.
                                        // exec already rejects multithreaded/shared-VM callers, so no sibling
@@ -1135,6 +1136,7 @@ pub(super) fn exec_from_bytes(
             mm.stack_grow_in_progress = false;
             mm.mprotect_pending_bytes = 0; // R147-1 FIX: Clear pending mprotect charges on exec
             mm.mremap_uncharged_reserve_bytes = 0; // LEAD-MREMAP-MIGRATE-1: no mremap survives exec
+            mm.mremap_lazy_uncharged_reserve_bytes = 0;
             mm.exec_pending_bytes = 0; // R149-3 FIX: Charge now reflected in elf_charged_bytes
                                        // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
                                        // so that process exit and subsequent exec can uncharge them. The old

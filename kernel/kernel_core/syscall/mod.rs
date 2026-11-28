@@ -143,8 +143,9 @@ pub use memory::{arm_populate_fault_probe, POPULATE_FAULT_PROBE_PAGES};
 pub(crate) use memory::{
     copy_to_user, debug_validate_mmap_entry, decide_mremap_placement, mmap_region_len,
     mremap_byte_delta, mremap_tail_len, mremap_uncharged_reserve, EagerPopulator, FailedPopulate,
-    MremapPlacement, RecordingFrameAllocator, MMAP_REGION_FLAG_MASK, MMAP_REGION_FLAG_PROT_NONE,
-    MMAP_REGION_FLAG_SHARED, MMAP_REGION_FLAG_TRANSIENT_MASK,
+    MremapPlacement, RecordingFrameAllocator, MMAP_REGION_FLAG_LAZY_ANON, MMAP_REGION_FLAG_MASK,
+    MMAP_REGION_FLAG_PENDING_MAP, MMAP_REGION_FLAG_PROT_NONE, MMAP_REGION_FLAG_SHARED,
+    MMAP_REGION_FLAG_TRANSIENT_MASK, MMAP_REGION_FLAG_UNFAULTED,
 };
 pub use memory::{
     mmap_flags_to_perms, run_cow_mprotect_self_test, run_mmap_flags_self_test,
