@@ -208,6 +208,13 @@ pub fn drain_requested_soft_progress() {
     }
     assert_kernel_entry_state();
 
+    // Opportunistic 60 Hz framebuffer flush for coalesced scroll frames.
+    // Running here covers both syscall-return / idle loops (`reschedule_if_needed`)
+    // and timer-IRQ return to syscall-free Ring-3 code (`returning_to_user`), with
+    // IF=1, irq_count=0, and no kernel locks held. On contention `FB_DIRTY` stays
+    // set so the next timer tick retries.
+    drivers::framebuffer::flush_if_due();
+
     // Fast path: skip `try_enter_soft_progress()` atomic RMW when nothing is pending.
     if !IRQ_SOFT_PROGRESS_PENDING.load(Ordering::Acquire) {
         return;

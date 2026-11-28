@@ -5,7 +5,7 @@
 
 use core::fmt;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 /// Physical memory offset for high-half mapping
@@ -18,6 +18,51 @@ const BG_COLOR: u32 = 0x00000000; // Black background
 /// Character cell dimensions (8x16 font)
 const CHAR_WIDTH: usize = 8;
 const CHAR_HEIGHT: usize = 16;
+
+/// Bounded shadow text-cell grid covering up to 2048x2048 pixels (256x128 chars),
+/// including 800x600, 1024x768, 1280x800, 1600x1200, and 1920x1080 GOP modes.
+/// Eliminates MMIO VRAM readback during scrolling (`ptr::copy` on uncacheable
+/// VRAM) while remaining completely static (zero heap allocation).
+const MAX_CELL_ROWS: usize = 128;
+const MAX_CELL_COLS: usize = 256;
+
+/// Minimum TSC interval between full-screen scroll flushes (~16 ms / 60 Hz at
+/// 2.4 GHz). Rapid scrolling coalesces in the RAM cell ring buffer instead of
+/// copying megabytes of MMIO VRAM on every newline; `flush_if_due()` and
+/// `flush_now()` ensure the final visible frame is always presented promptly.
+const SCROLL_FLUSH_MIN_TSC: u64 = 40_000_000;
+
+#[inline]
+fn encode_pixel(color: u32, format: PixelFormat) -> u32 {
+    match format {
+        PixelFormat::Rgb => {
+            let r = (color >> 16) & 0xFF;
+            let g = (color >> 8) & 0xFF;
+            let b = color & 0xFF;
+            (r << 16) | (g << 8) | b
+        }
+        PixelFormat::Bgr => {
+            let r = (color >> 16) & 0xFF;
+            let g = (color >> 8) & 0xFF;
+            let b = color & 0xFF;
+            (b << 16) | (g << 8) | r
+        }
+        PixelFormat::Unknown => color,
+    }
+}
+
+#[inline]
+fn read_tsc() -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        // SAFETY: RDTSC has no memory or privilege effect in Ring 0.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
+}
 
 /// Pixel format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,11 +109,25 @@ pub struct FramebufferWriter {
     fg_color: u32,
     /// Background color (ARGB)
     bg_color: u32,
+    /// Pre-encoded foreground pixel value for `pixel_format`
+    fg_pixel: u32,
+    /// Pre-encoded background pixel value for `pixel_format`
+    bg_pixel: u32,
     /// Whether framebuffer is initialized
     initialized: bool,
     /// R24-8 fix: Validated framebuffer size in bytes
     /// All pixel writes must stay within this bound
     fb_size: usize,
+    /// Logical text-cell ring buffer (O(1) scroll without MMIO VRAM reads)
+    cells: [[u8; MAX_CELL_COLS]; MAX_CELL_ROWS],
+    /// Cells currently presented in VRAM (used to diff on coalesced scroll flush)
+    presented: [[u8; MAX_CELL_COLS]; MAX_CELL_ROWS],
+    /// Ring-buffer index corresponding to logical screen row 0
+    top_row: usize,
+    /// True when one or more scrolls have occurred since the last VRAM sync
+    scroll_pending: bool,
+    /// TSC timestamp of the last full VRAM sync
+    last_flush_tsc: u64,
 }
 
 impl Default for FramebufferWriter {
@@ -92,8 +151,15 @@ impl FramebufferWriter {
             max_row: 0,
             fg_color: FG_COLOR,
             bg_color: BG_COLOR,
+            fg_pixel: FG_COLOR,
+            bg_pixel: BG_COLOR,
             initialized: false,
             fb_size: 0,
+            cells: [[b' '; MAX_CELL_COLS]; MAX_CELL_ROWS],
+            presented: [[b' '; MAX_CELL_COLS]; MAX_CELL_ROWS],
+            top_row: 0,
+            scroll_pending: false,
+            last_flush_tsc: 0,
         }
     }
 
@@ -147,10 +213,15 @@ impl FramebufferWriter {
         // IMPORTANT: UEFI GOP stride is in PIXELS, convert to BYTES (4 bytes per pixel)
         self.stride = info.stride * 4;
         self.pixel_format = info.pixel_format;
-        self.max_col = (info.width as usize) / CHAR_WIDTH;
-        self.max_row = (info.height as usize) / CHAR_HEIGHT;
+        self.fg_pixel = encode_pixel(self.fg_color, self.pixel_format);
+        self.bg_pixel = encode_pixel(self.bg_color, self.pixel_format);
+        self.max_col = ((info.width as usize) / CHAR_WIDTH).min(MAX_CELL_COLS);
+        self.max_row = ((info.height as usize) / CHAR_HEIGHT).min(MAX_CELL_ROWS);
         self.col = 0;
         self.row = 0;
+        self.top_row = 0;
+        self.scroll_pending = false;
+        self.last_flush_tsc = read_tsc();
         self.initialized = true;
         // R24-8 fix: Store validated framebuffer size for bounds checking
         self.fb_size = info.size;
@@ -172,76 +243,60 @@ impl FramebufferWriter {
         self.initialized
     }
 
-    /// Write a single pixel
     #[inline]
-    fn put_pixel(&mut self, x: u32, y: u32, color: u32) {
-        if !self.initialized || x >= self.width || y >= self.height {
-            return;
-        }
-
-        let offset = (y as u64 * self.stride as u64 + x as u64 * 4) as usize;
-
-        // R24-8 fix: Check that write stays within validated framebuffer bounds
-        // This prevents out-of-bounds writes if GOP info has incorrect stride
-        if offset.saturating_add(4) > self.fb_size {
-            return;
-        }
-
-        let pixel_addr = self.fb_base + offset as u64;
-
-        // Convert color based on pixel format
-        let pixel_value = match self.pixel_format {
-            PixelFormat::Rgb => {
-                // ARGB -> RGB (swap R and B)
-                let r = (color >> 16) & 0xFF;
-                let g = (color >> 8) & 0xFF;
-                let b = color & 0xFF;
-                (r << 16) | (g << 8) | b
-            }
-            PixelFormat::Bgr => {
-                // ARGB -> BGR (keep as is, B is already in low byte)
-                let r = (color >> 16) & 0xFF;
-                let g = (color >> 8) & 0xFF;
-                let b = color & 0xFF;
-                (b << 16) | (g << 8) | r
-            }
-            PixelFormat::Unknown => color,
-        };
-
-        unsafe {
-            ptr::write_volatile(pixel_addr as *mut u32, pixel_value);
+    fn logical_to_ring_row(&self, logical_row: usize) -> usize {
+        if self.max_row == 0 {
+            0
+        } else {
+            (self.top_row + logical_row) % self.max_row
         }
     }
 
-    /// Draw a character at the specified character position
-    fn draw_char(&mut self, c: char, char_col: usize, char_row: usize) {
-        let px = (char_col * CHAR_WIDTH) as u32;
-        let py = (char_row * CHAR_HEIGHT) as u32;
+    /// Draw a single character directly to VRAM using write-only 32-bit stores
+    /// (zero MMIO reads, single up-front bounds check per glyph).
+    fn draw_char(&self, c: char, char_col: usize, char_row: usize) {
+        if !self.initialized || char_col >= self.max_col || char_row >= self.max_row {
+            return;
+        }
+        let stride = self.stride as usize;
+        let base_offset = (char_row * CHAR_HEIGHT)
+            .saturating_mul(stride)
+            .saturating_add(char_col * CHAR_WIDTH * 4);
+        let last_row_end = base_offset
+            .saturating_add((CHAR_HEIGHT - 1).saturating_mul(stride))
+            .saturating_add(CHAR_WIDTH * 4);
+        // R24-8 fix: verify entire 8x16 glyph stays within validated framebuffer bounds.
+        if last_row_end > self.fb_size {
+            return;
+        }
 
-        // Get font bitmap for this character
+        let fg = self.fg_pixel;
+        let bg = self.bg_pixel;
+        let mut row_addr = self.fb_base + base_offset as u64;
+
+        if c == ' ' {
+            for _ in 0..CHAR_HEIGHT {
+                let row_ptr = row_addr as *mut u32;
+                unsafe {
+                    for col in 0..CHAR_WIDTH {
+                        ptr::write_volatile(row_ptr.add(col), bg);
+                    }
+                }
+                row_addr += stride as u64;
+            }
+            return;
+        }
+
         let bitmap = get_font_bitmap(c);
-
-        for (row, &bits) in bitmap.iter().enumerate() {
-            for col in 0..CHAR_WIDTH {
-                let color = if (bits >> (7 - col)) & 1 == 1 {
-                    self.fg_color
-                } else {
-                    self.bg_color
-                };
-                self.put_pixel(px + col as u32, py + row as u32, color);
+        for &bits in bitmap.iter() {
+            let row_ptr = row_addr as *mut u32;
+            unsafe {
+                for col in 0..CHAR_WIDTH {
+                    let pixel = if (bits >> (7 - col)) & 1 != 0 { fg } else { bg };
+                    ptr::write_volatile(row_ptr.add(col), pixel);
+                }
             }
-        }
-    }
-
-    /// Clear a character cell
-    fn clear_char(&mut self, char_col: usize, char_row: usize) {
-        let px = (char_col * CHAR_WIDTH) as u32;
-        let py = (char_row * CHAR_HEIGHT) as u32;
-
-        for row in 0..CHAR_HEIGHT {
-            for col in 0..CHAR_WIDTH {
-                self.put_pixel(px + col as u32, py + row as u32, self.bg_color);
-            }
+            row_addr += stride as u64;
         }
     }
 
@@ -256,16 +311,7 @@ impl FramebufferWriter {
 
         // R24-8 fix: Clamp to validated framebuffer size
         let safe_bytes = total_bytes.min(self.fb_size);
-
-        let pixel_value = match self.pixel_format {
-            PixelFormat::Bgr => {
-                let r = (self.bg_color >> 16) & 0xFF;
-                let g = (self.bg_color >> 8) & 0xFF;
-                let b = self.bg_color & 0xFF;
-                (b << 16) | (g << 8) | r
-            }
-            _ => self.bg_color,
-        };
+        let pixel_value = self.bg_pixel;
 
         // Fill 4 bytes at a time
         let ptr = self.fb_base as *mut u32;
@@ -276,77 +322,88 @@ impl FramebufferWriter {
             }
         }
 
+        for r in 0..self.max_row {
+            self.cells[r][..self.max_col].fill(b' ');
+            self.presented[r][..self.max_col].fill(b' ');
+        }
         self.col = 0;
         self.row = 0;
+        self.top_row = 0;
+        self.scroll_pending = false;
+        let now = read_tsc();
+        self.last_flush_tsc = now;
+        LAST_FLUSH_TSC.store(now, Ordering::Relaxed);
+        FB_DIRTY.store(false, Ordering::Release);
     }
 
-    /// Scroll screen up by one line
+    /// Scroll screen up by one line in O(max_col) RAM without any MMIO VRAM reads.
+    /// The actual VRAM redraw is coalesced via `flush_dirty_vram()`.
     fn scroll_up(&mut self) {
-        if !self.initialized {
+        if !self.initialized || self.max_row == 0 || self.max_col == 0 {
             return;
         }
+        if self.max_row > 1 {
+            self.top_row = (self.top_row + 1) % self.max_row;
+        }
+        let bottom_ring_row = self.logical_to_ring_row(self.max_row - 1);
+        self.cells[bottom_ring_row][..self.max_col].fill(b' ');
+        self.scroll_pending = true;
+        FB_DIRTY.store(true, Ordering::Release);
+    }
 
-        // Copy each line up
-        let line_bytes = self.stride as usize * CHAR_HEIGHT;
-        let src_start = self.fb_base + line_bytes as u64;
-        let dst_start = self.fb_base;
-
-        // R24-8 fix: Validate that operations stay within framebuffer bounds.
-        // The copy reads rows 1..max_row and the clear writes row max_row - 1,
-        // so max_row lines are touched (a relocated console maps exactly the
-        // drawn region, stride x height).
-        let total_needed = self.max_row.saturating_mul(line_bytes);
-        if self.max_row == 0 || total_needed > self.fb_size {
-            // Framebuffer too small for scroll operation, skip
+    /// Synchronize any pending scrolled shadow cells to VRAM using diffed
+    /// write-only glyph blits (zero MMIO reads, skipping unchanged cells).
+    fn flush_dirty_vram(&mut self, now_tsc: u64) {
+        if !self.initialized || !self.scroll_pending {
             return;
         }
-
-        // Copy line by line to handle overlapping regions
-        for row in 0..(self.max_row - 1) {
-            let src = src_start + (row * line_bytes) as u64;
-            let dst = dst_start + (row * line_bytes) as u64;
-
-            // R24-8 fix: Check bounds for each line copy
-            let dst_offset = row * line_bytes;
-            let src_offset = dst_offset.saturating_add(line_bytes);
-            if src_offset.saturating_add(line_bytes) > self.fb_size {
-                break;
-            }
-
-            unsafe {
-                ptr::copy(src as *const u8, dst as *mut u8, line_bytes);
+        for logical_row in 0..self.max_row {
+            let ring_row = self.logical_to_ring_row(logical_row);
+            for col in 0..self.max_col {
+                let ch = self.cells[ring_row][col];
+                if self.presented[logical_row][col] != ch {
+                    self.draw_char(ch as char, col, logical_row);
+                    self.presented[logical_row][col] = ch;
+                }
             }
         }
+        self.scroll_pending = false;
+        self.last_flush_tsc = now_tsc;
+        LAST_FLUSH_TSC.store(now_tsc, Ordering::Relaxed);
+        FB_DIRTY.store(false, Ordering::Release);
+    }
 
-        // Clear the last line
-        let last_line_offset = (self.max_row - 1) * line_bytes;
-        if last_line_offset.saturating_add(line_bytes) > self.fb_size {
+    #[inline]
+    fn write_cell(&mut self, ch: u8, col: usize, row: usize) {
+        if col >= self.max_col || row >= self.max_row {
             return;
         }
-
-        let last_line_start = self.fb_base + last_line_offset as u64;
-        let pixel_value = match self.pixel_format {
-            PixelFormat::Bgr => {
-                let r = (self.bg_color >> 16) & 0xFF;
-                let g = (self.bg_color >> 8) & 0xFF;
-                let b = self.bg_color & 0xFF;
-                (b << 16) | (g << 8) | r
+        let ring_row = self.logical_to_ring_row(row);
+        self.cells[ring_row][col] = ch;
+        if !self.scroll_pending {
+            if self.presented[row][col] != ch {
+                self.draw_char(ch as char, col, row);
+                self.presented[row][col] = ch;
             }
-            _ => self.bg_color,
-        };
+        }
+    }
 
-        let ptr = last_line_start as *mut u32;
-        let count = line_bytes / 4;
-        for i in 0..count {
-            unsafe {
-                ptr::write_volatile(ptr.add(i), pixel_value);
-            }
+    #[inline]
+    fn scroll_flush_due(&self, now_tsc: u64) -> bool {
+        #[cfg(target_os = "none")]
+        {
+            now_tsc.wrapping_sub(self.last_flush_tsc) >= SCROLL_FLUSH_MIN_TSC
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = now_tsc;
+            true
         }
     }
 
     /// Write a single byte
     pub fn write_byte(&mut self, byte: u8) {
-        if !self.initialized {
+        if !self.initialized || self.max_row == 0 || self.max_col == 0 {
             return;
         }
 
@@ -366,7 +423,7 @@ impl FramebufferWriter {
                 // Tab: advance to next 8-character boundary
                 let next = (self.col + 8) & !7;
                 for _ in self.col..next.min(self.max_col) {
-                    self.clear_char(self.col, self.row);
+                    self.write_cell(b' ', self.col, self.row);
                     self.col += 1;
                 }
                 if self.col >= self.max_col {
@@ -382,7 +439,7 @@ impl FramebufferWriter {
                 // Backspace
                 if self.col > 0 {
                     self.col -= 1;
-                    self.clear_char(self.col, self.row);
+                    self.write_cell(b' ', self.col, self.row);
                 }
             }
             byte => {
@@ -396,11 +453,11 @@ impl FramebufferWriter {
                     }
                 }
                 let c = if (0x20..0x7f).contains(&byte) {
-                    byte as char
+                    byte
                 } else {
-                    '?' // Replace unprintable with '?'
+                    b'?' // Replace unprintable with '?'
                 };
-                self.draw_char(c, self.col, self.row);
+                self.write_cell(c, self.col, self.row);
                 self.col += 1;
             }
         }
@@ -430,6 +487,10 @@ pub static WRITER: Mutex<FramebufferWriter> = Mutex::new(FramebufferWriter::new(
 /// R190-7 FIX: lock-free mirror of `WRITER.initialized`, so every print no
 /// longer takes the writer lock just to choose a backend.
 static FB_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Lock-free mirror of `WRITER.scroll_pending` for cheap 60 Hz tail flushes.
+static FB_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Lock-free mirror of `WRITER.last_flush_tsc`.
+static LAST_FLUSH_TSC: AtomicU64 = AtomicU64::new(0);
 
 /// Framebuffer physical base address (for security module to query)
 static mut FRAMEBUFFER_PHYS_BASE: u64 = 0;
@@ -484,8 +545,11 @@ pub fn get_drawn_region() -> Option<(u64, usize)> {
 /// the display of a boot whose firmware handed over a framebuffer.
 pub fn disable() {
     crate::vga_buffer::with_display(|| {
-        WRITER.lock().initialized = false;
+        let mut writer = WRITER.lock();
+        writer.initialized = false;
+        writer.scroll_pending = false;
         FB_INITIALIZED.store(false, Ordering::Release);
+        FB_DIRTY.store(false, Ordering::Release);
     });
 }
 
@@ -507,8 +571,60 @@ pub fn is_initialized() -> bool {
 /// Render formatted text. The caller holds the display (`with_display`).
 pub(crate) fn write_args(args: fmt::Arguments) {
     use core::fmt::Write;
+    let mut writer = WRITER.lock();
     // A formatting error must not panic while the display is held.
-    let _ = WRITER.lock().write_fmt(args);
+    let _ = writer.write_fmt(args);
+    if writer.scroll_pending {
+        let now = read_tsc();
+        if writer.scroll_flush_due(now) {
+            writer.flush_dirty_vram(now);
+        }
+    }
+}
+
+/// Non-blocking 60 Hz flush of any coalesced scroll updates (safe for process-
+/// context tail hooks: one Relaxed load when clean, never spins on contention).
+#[inline]
+pub fn flush_if_due() {
+    if !FB_DIRTY.load(Ordering::Relaxed) || !FB_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = read_tsc();
+    if now.wrapping_sub(LAST_FLUSH_TSC.load(Ordering::Relaxed)) < SCROLL_FLUSH_MIN_TSC {
+        return;
+    }
+    let _ = crate::vga_buffer::try_with_display(|| {
+        if let Some(mut writer) = WRITER.try_lock() {
+            if writer.scroll_pending && writer.scroll_flush_due(now) {
+                writer.flush_dirty_vram(now);
+            }
+        }
+    });
+}
+
+/// Synchronously flush any pending framebuffer scroll updates (used on clean
+/// shutdown / PID 1 exit).
+pub fn flush_now() {
+    if !FB_DIRTY.load(Ordering::Acquire) || !FB_INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = crate::vga_buffer::with_display(|| {
+        let mut writer = WRITER.lock();
+        writer.flush_dirty_vram(read_tsc());
+    });
+}
+
+/// Best-effort non-blocking framebuffer flush for panic paths (never spins if
+/// another CPU or interrupted context holds the display lock).
+pub(crate) fn flush_for_panic() {
+    if !FB_DIRTY.load(Ordering::Acquire) || !FB_INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = crate::vga_buffer::try_with_display(|| {
+        if let Some(mut writer) = WRITER.try_lock() {
+            writer.flush_dirty_vram(read_tsc());
+        }
+    });
 }
 
 // ============================================================================
@@ -1004,3 +1120,92 @@ static FONT_8X16: [[u8; 16]; 95] = [
         0x00,
     ],
 ];
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use std::boxed::Box;
+    use std::vec;
+
+    #[test]
+    fn shadow_ring_scroll_and_diff_flush_renders_exact_pixels() {
+        // 4 columns x 3 rows => 32 x 48 pixels (RGB).
+        let width = 32u32;
+        let height = 48u32;
+        let stride = width;
+        let mut vram = vec![0u32; (stride * height) as usize];
+
+        let mut writer = Box::new(FramebufferWriter::new());
+        writer.fb_base = vram.as_mut_ptr() as u64;
+        writer.width = width;
+        writer.height = height;
+        writer.stride = stride * 4;
+        writer.pixel_format = PixelFormat::Rgb;
+        writer.fg_pixel = encode_pixel(FG_COLOR, PixelFormat::Rgb);
+        writer.bg_pixel = encode_pixel(BG_COLOR, PixelFormat::Rgb);
+        writer.max_col = (width as usize) / CHAR_WIDTH;
+        writer.max_row = (height as usize) / CHAR_HEIGHT;
+        writer.fb_size = vram.len() * 4;
+        writer.initialized = true;
+        writer.clear_screen();
+
+        // Write 4 lines into a 3-row viewport: triggers 2 coalesced scrolls
+        // without touching VRAM until flush_dirty_vram().
+        writer.write_string("AA\nBB\nCC\nDD");
+        assert!(
+            writer.scroll_pending,
+            "scrolling must defer VRAM redraw into the shadow cell ring"
+        );
+        // Logical visible rows after scrolling twice: row 0 = "CC", row 1 = "DD", row 2 = "  ".
+        // Wait: "AA\n" -> row 1; "BB\n" -> row 2; "CC\n" -> scrolls once (row 0="BB", row 1="CC", row 2="");
+        // then "DD" lands on row 2 => visible rows are ["BB  ", "CC  ", "DD  "].
+        let r0 = writer.logical_to_ring_row(0);
+        let r1 = writer.logical_to_ring_row(1);
+        let r2 = writer.logical_to_ring_row(2);
+        assert_eq!(&writer.cells[r0][..4], b"BB  ");
+        assert_eq!(&writer.cells[r1][..4], b"CC  ");
+        assert_eq!(&writer.cells[r2][..4], b"DD  ");
+
+        // Flush diff into mock VRAM and verify exact glyph pixels for row 0 ('B')
+        // and row 2 ('D'), and clean blank pixels for col 2..4.
+        writer.flush_dirty_vram(SCROLL_FLUSH_MIN_TSC);
+        assert!(!writer.scroll_pending);
+        assert_eq!(&writer.presented[0][..4], b"BB  ");
+        assert_eq!(&writer.presented[1][..4], b"CC  ");
+        assert_eq!(&writer.presented[2][..4], b"DD  ");
+
+        let check_glyph = |ch: char, char_col: usize, char_row: usize| {
+            let bitmap = get_font_bitmap(ch);
+            for (gy, &bits) in bitmap.iter().enumerate() {
+                for gx in 0..CHAR_WIDTH {
+                    let px = char_col * CHAR_WIDTH + gx;
+                    let py = char_row * CHAR_HEIGHT + gy;
+                    let expected = if (bits >> (7 - gx)) & 1 != 0 {
+                        writer.fg_pixel
+                    } else {
+                        writer.bg_pixel
+                    };
+                    assert_eq!(
+                        vram[py * (stride as usize) + px],
+                        expected,
+                        "pixel mismatch for '{}' at cell ({},{}) offset ({},{})",
+                        ch,
+                        char_col,
+                        char_row,
+                        gx,
+                        gy
+                    );
+                }
+            }
+        };
+        check_glyph('B', 0, 0);
+        check_glyph('B', 1, 0);
+        check_glyph(' ', 2, 0);
+        check_glyph('C', 0, 1);
+        check_glyph('D', 0, 2);
+        check_glyph('D', 1, 2);
+        check_glyph(' ', 2, 2);
+    }
+}

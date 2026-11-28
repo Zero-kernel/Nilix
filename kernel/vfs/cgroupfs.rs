@@ -873,8 +873,17 @@ impl CgroupCtrlInode {
                 // fail-closed try_lock re-count under the held Process lock
                 // below (mirrors the R180-3 preflight-auth + under-lock
                 // re-auth shape).
-                let memory_space = proc.lock().memory_space;
-                if memory_space != 0 && process::address_space_share_count(memory_space) > 1 {
+                let (memory_space, mm_sole_owner) = {
+                    let guard = proc.lock();
+                    (
+                        guard.memory_space,
+                        alloc::sync::Arc::strong_count(&guard.mm) == 1,
+                    )
+                };
+                if memory_space != 0
+                    && !mm_sole_owner
+                    && process::address_space_share_count(memory_space) > 1
+                {
                     return Err(FsError::Busy);
                 }
 
@@ -913,7 +922,7 @@ impl CgroupCtrlInode {
                         // rejects immediately; transient lock contention drops `guard`
                         // and performs bounded spin-only backoff (never yielding, since
                         // `FileHandle::write` holds `offset.lock()` across `write_at`).
-                        if memory_space != 0 {
+                        if memory_space != 0 && alloc::sync::Arc::strong_count(&guard.mm) > 1 {
                             match process::try_address_space_share_count_holding(memory_space, pid)
                             {
                                 Some(count) if count <= 1 => break guard,

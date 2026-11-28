@@ -7891,12 +7891,31 @@ where
 }
 
 /// Production entry point for [`lock_for_exclusive_address_space_with`] using
-/// [`try_address_space_share_count_holding`] and [`cgroup_migrate_contention_backoff`].
+/// an O(1) sole-owner `Arc::strong_count(&proc.mm) == 1` fast path before
+/// falling back to [`try_address_space_share_count_holding`] and
+/// [`cgroup_migrate_contention_backoff`].
+///
+/// Every `CLONE_VM` sharer clones `proc.mm` alongside copying `memory_space`
+/// (the same invariant relied on by `cleanup_zombie()`). Observing
+/// `Arc::strong_count(&proc.mm) == 1` while holding `proc.lock()` therefore
+/// proves no other live task or zombie shares `proc.memory_space`, avoiding
+/// O(PROCESS_TABLE) scans and foreign PCB `try_lock` contention on single-owner
+/// migrations. Any transient or permanent extra `mm` reference conservatively
+/// falls through to the existing fail-closed table recount.
 pub fn lock_for_exclusive_address_space<'a>(
     process: &'a ProcessArc,
     pid: ProcessId,
     expected_memory_space: usize,
 ) -> Result<crate::owner_lock::OwnerCpuMutexGuard<'a, Process>, ExclusiveAddressSpaceError> {
+    {
+        let proc = process.lock();
+        if proc.memory_space != expected_memory_space {
+            return Err(ExclusiveAddressSpaceError::MemorySpaceChanged);
+        }
+        if expected_memory_space == 0 || Arc::strong_count(&proc.mm) == 1 {
+            return Ok(proc);
+        }
+    }
     lock_for_exclusive_address_space_with(
         process,
         expected_memory_space,
@@ -15023,7 +15042,7 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
                 // If memory_space was already zeroed by the caller (to prevent
                 // freeing a shared CLONE_VM address space), keep_address_space is
                 // irrelevant since free_process_resources won't touch it.
-                let keep_address_space = if memory_space == 0 {
+                let keep_address_space = if memory_space == 0 || Arc::strong_count(&proc.mm) == 1 {
                     false
                 } else {
                     table.iter().enumerate().any(|(idx, other_slot)| {
@@ -16703,11 +16722,13 @@ mod exit_klog_policy_tests {
 #[cfg(test)]
 mod exclusive_address_space_retry_tests {
     use super::{
-        lock_for_exclusive_address_space_with, ExclusiveAddressSpaceError, Process,
-        CGROUP_MIGRATE_SHARE_RETRIES,
+        lock_for_exclusive_address_space, lock_for_exclusive_address_space_with,
+        ExclusiveAddressSpaceError, Process, ProcessNameSnapshot, CGROUP_MIGRATE_SHARE_RETRIES,
+        PROCESS_TABLE,
     };
     use crate::owner_lock::OwnerCpuMutex;
     use alloc::string::String;
+    use alloc::sync::Arc;
 
     fn test_process(memory_space: usize) -> OwnerCpuMutex<Process> {
         let mut p = Process::new(10, 1, String::from("cg-test"), 10);
@@ -16821,6 +16842,55 @@ mod exclusive_address_space_retry_tests {
         assert_eq!(res.err(), Some(ExclusiveAddressSpaceError::Contended));
         assert_eq!(recount_calls, CGROUP_MIGRATE_SHARE_RETRIES);
         assert_eq!(backoff_calls, CGROUP_MIGRATE_SHARE_RETRIES - 1);
+    }
+
+    #[test]
+    fn sole_owner_mm_fast_path_succeeds_in_o1_even_when_process_table_is_locked() {
+        let process =
+            Process::try_new_pcb(9101, 1, ProcessNameSnapshot::from_parts("cg-sole", ""), 10)
+                .expect("PCB allocation must succeed in hosted test");
+        process.lock().memory_space = 0x6000_0000;
+
+        // Hold PROCESS_TABLE across the call: any O(N) table fallback would
+        // deadlock or fail try_lock, proving the O(1) `Arc::strong_count(&proc.mm) == 1`
+        // fast path returns immediately without touching PROCESS_TABLE.
+        let _table_guard = PROCESS_TABLE.lock();
+        let guard = lock_for_exclusive_address_space(&process, 9101, 0x6000_0000)
+            .expect("sole-owner mm must succeed via O(1) fast path");
+        assert_eq!(guard.memory_space, 0x6000_0000);
+        drop(guard);
+
+        let changed = lock_for_exclusive_address_space(&process, 9101, 0x6000_1000);
+        assert_eq!(
+            changed.err(),
+            Some(ExclusiveAddressSpaceError::MemorySpaceChanged)
+        );
+    }
+
+    #[test]
+    fn shared_mm_bypasses_o1_fast_path_and_falls_back_to_table_recount() {
+        let process = Process::try_new_pcb(
+            9102,
+            1,
+            ProcessNameSnapshot::from_parts("cg-shared", ""),
+            10,
+        )
+        .expect("PCB allocation must succeed in hosted test");
+        let extra_mm_ref = {
+            let mut proc = process.lock();
+            proc.memory_space = 0x7000_0000;
+            Arc::clone(&proc.mm)
+        };
+        assert_eq!(Arc::strong_count(&extra_mm_ref), 2);
+
+        // Hold PROCESS_TABLE while `Arc::strong_count(&proc.mm) > 1`:
+        // the O(1) fast path MUST NOT fire, so the fallback recount observes
+        // table contention and fails closed with `Contended`.
+        let _table_guard = PROCESS_TABLE.lock();
+        let res = lock_for_exclusive_address_space(&process, 9102, 0x7000_0000);
+        assert_eq!(res.err(), Some(ExclusiveAddressSpaceError::Contended));
+        drop(_table_guard);
+        drop(extra_mm_ref);
     }
 }
 
