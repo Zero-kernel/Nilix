@@ -112,3 +112,28 @@ jobs:
       - run: python3 -I scripts/ci/ci_report.py --aggregate
         env:
           CI_JOB_RESULTS: ${{ toJSON(needs) }}
+
+  # N2.2 (#66): diagnostic external conformance suite (musl libc-test).
+  # Placed outside `needs: [lane]` until N2 completes.
+  conformance:
+    name: Extended / ${{ matrix.os }} / conformance (diagnostic)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-kernel
+        with:
+          qemu: 'true'
+          cache-key: extended-${{ matrix.os }}-conformance
+      - run: bash scripts/ci/entrypoint.sh conformance
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: extended-${{ matrix.os }}-conformance
+          path: target/ci/
+          if-no-files-found: error

@@ -1,0 +1,3 @@
+# Conformance pass-list removals for libc-test (N2.2, #66).
+# Format: <case_name> | <reason>
+regression_pthread_cond_wait-cancel_ignored | nondeterministic 30ms pthread_cancel/CLOCK_REALTIME race on 1-vCPU TCG (re-enable under N2.6)

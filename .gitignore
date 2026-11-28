@@ -32,6 +32,7 @@ userspace/clippy-userspace-target
 /fuzz/evidence/
 /fuzz/artifacts/*.log
 /hosted-subcrate-review-target/
+/esp-conformance/
 
 #no_need
 *.backup

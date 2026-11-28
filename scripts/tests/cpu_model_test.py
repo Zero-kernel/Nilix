@@ -24,6 +24,7 @@ LAUNCHERS = {
     'scripts/gates/boot/musl_check.sh': 1,
     'scripts/gates/boot/smp_test.sh': 1,
     'scripts/gates/boot/smp_test_4core.sh': 1,
+    'scripts/gates/conformance/conformance_gate.py': 1,
     'scripts/gates/performance/perf_regression_test.sh': 1,
     'scripts/gates/qemu/fuzz_runner_test.sh': 1,
     'scripts/gates/qemu/iommu_device_probe.py': 1,

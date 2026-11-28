@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm test-strict test-strict-smp4 boot-check musl-check test-smp test-smp-4core test-smp-extended test-smp-32core stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug ensure-ext3-image clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint-fallible lint-fallible-selftest abi-check lint test test-hosted-subcrates test-ext3 test-ring3-mm test-strict test-strict-smp4 boot-check musl-check test-smp test-smp-4core test-smp-extended test-smp-32core stress-test-selftest stress-test stress-test-extended build-stress-runner build-stress run-stress build-conformance-runner build-conformance conformance-libc-test test-perf test-security-mitigations test-melting test-comprehensive test-quick fmt fmt-check clippy hooks afl-seeds afl-fuzz afl-fuzz-parallel afl-triage build-fuzz-runner run-fuzz-runner build-kcov-runner build-kcov run-kcov test-kcov build-syz-fuzzer build-syz-executor run-syz-fuzz test-syz
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -35,6 +35,11 @@ STRESS_ESP := esp-stress
 STRESS_ESP_DIR := $(CURDIR)/$(STRESS_ESP)/EFI/BOOT
 STRESS_RUNNER_USER := userspace/stress_runner.elf
 STRESS_RUNNER_EMBEDDED := kernel/src/stress_runner.elf
+CONFORMANCE_TARGET_DIR := kernel-target/conformance
+CONFORMANCE_KERNEL := $(CONFORMANCE_TARGET_DIR)/x86_64-unknown-none/release/kernel
+CONFORMANCE_ESP := esp-conformance
+CONFORMANCE_ESP_DIR := $(CURDIR)/$(CONFORMANCE_ESP)/EFI/BOOT
+CONFORMANCE_RUNNER_ELF := $(CURDIR)/target/conformance/conformance_runner.elf
 KCOV_TARGET_DIR := kernel-target/kcov
 KCOV_KERNEL := $(KCOV_TARGET_DIR)/x86_64-unknown-none/release/kernel
 KCOV_ESP := esp-kcov
@@ -272,6 +277,49 @@ run-stress: QEMU_ESP := $(STRESS_ESP)
 run-stress: build-stress ensure-ext3-image
 	@echo "=== Starting configured combined Ring-3 stress profile ==="
 	@STRESS_PROFILES=combined STRESS_PROFILE_LIMIT=1 bash scripts/gates/stress/stress_test.sh "$(STRESS_ESP)"
+
+# N2.2 (#66): isolated external conformance runner (libc-test / LTP).
+build-conformance-runner:
+	@echo "=== Building static musl conformance runner ==="
+	mkdir -p target/conformance
+	musl-gcc -std=c11 -static -no-pie -O2 -Wall -Wextra -Werror \
+		-o "$(CONFORMANCE_RUNNER_ELF)" userspace/conformance_runner.c
+	@echo "Conformance runner SHA-256: $$(sha256sum "$(CONFORMANCE_RUNNER_ELF)" | awk '{print $$1}')"
+	@readelf -h "$(CONFORMANCE_RUNNER_ELF)" | grep "Entry\|Type"
+
+build-conformance: build-conformance-runner
+	@echo "=== Building bootloader for conformance runner ==="
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
+
+	@echo "=== Building isolated conformance kernel ==="
+	cd kernel && \
+	CARGO_TARGET_DIR=../$(CONFORMANCE_TARGET_DIR) \
+	ZERO_OS_CONFORMANCE_RUNNER_ELF="$(CONFORMANCE_RUNNER_ELF)" \
+	RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features conformance_runner
+
+	@echo "=== Preparing isolated conformance ESP ==="
+	mkdir -p "$(CONFORMANCE_ESP_DIR)"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi "$(CONFORMANCE_ESP_DIR)/BOOTX64.EFI"
+	cp "$(CONFORMANCE_KERNEL)" "$(CONFORMANCE_ESP)/kernel.elf"
+	@cmp -s "$(CONFORMANCE_KERNEL)" "$(CONFORMANCE_ESP)/kernel.elf"
+	@echo "Conformance kernel SHA-256: $$(sha256sum "$(CONFORMANCE_ESP)/kernel.elf" | awk '{print $$1}')"
+
+conformance-libc-test: build-conformance
+	@echo "=== Building musl libc-test suite and ext3 disk image ==="
+	bash scripts/conformance/build_libc_test.sh target/conformance
+	bash scripts/conformance/make_image.sh \
+		target/conformance/build/libc-test/bin \
+		target/conformance/build/libc-test/manifest.txt \
+		target/conformance/libc-test.img
+	@echo "=== Running musl libc-test conformance gate ==="
+	OVMF_PATH="$(OVMF_PATH)" python3 scripts/gates/conformance/conformance_gate.py \
+		--suite libc-test \
+		--esp "$(CONFORMANCE_ESP)" \
+		--disk target/conformance/libc-test.img \
+		--manifest target/conformance/build/libc-test/manifest.txt \
+		--passlist scripts/conformance/libc-test.pass
 
 # Compatibility alias for the deterministic KCOV guest executor build.
 build-fuzz-runner: build-kcov
