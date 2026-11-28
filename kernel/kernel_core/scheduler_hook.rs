@@ -389,6 +389,9 @@ fn reschedule_if_needed_inner(post_drain: Option<fn()>, forced_origin: Option<Re
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     crate::time::drain_deferred_tcp_timers();
 
+    // N2.6b: Deliver expired process itimers and POSIX timers in safe context.
+    crate::time::drain_deferred_process_timers();
+
     // D3-NETNS-DATAPLANE RX-INGRESS: bounded bring-up RX poll beside the TCP
     // drain. Self-throttled inside the net crate (quiesce flag + ~10ms CAS
     // window + non-reentrant guard); the ready gate above guarantees

@@ -298,6 +298,182 @@ pub fn frequency_hz() -> Option<u64> {
     HPET_STATE.get().map(|info| info.frequency_hz)
 }
 
+/// N2.6b: Read monotonic nanoseconds elapsed since HPET initialization.
+///
+/// Only uses 64-bit HPET counters so counter wraparound (~40,000+ years at
+/// 14.318 MHz) cannot regress monotonic time. Returns `None` if HPET is
+/// unavailable or 32-bit-only (caller falls back to 1 kHz tick time).
+#[inline]
+pub fn elapsed_ns() -> Option<u64> {
+    let info = HPET_STATE.get()?;
+    if !info.counter_64bit || info.period_fs == 0 {
+        return None;
+    }
+    let counter = read_main_counter()?;
+    // counter * period_fs / 1_000_000 (1 ns = 10^6 fs).
+    Some(((counter as u128).saturating_mul(info.period_fs as u128) / 1_000_000) as u64)
+}
+
+/// N2.6b: Effective HPET clock resolution in nanoseconds (at least 1 ns).
+#[inline]
+pub fn resolution_ns() -> Option<u64> {
+    let info = HPET_STATE.get()?;
+    if !info.counter_64bit || info.period_fs == 0 {
+        return None;
+    }
+    Some((info.period_fs / 1_000_000).max(1))
+}
+
+// ============================================================================
+// N2.6b: MC146818 CMOS RTC Wall-Clock Reader (x86_64 ports 0x70 / 0x71)
+// ============================================================================
+
+/// Convert a Gregorian calendar UTC date/time to Unix epoch seconds (1970-01-01).
+/// Pure, no-I/O implementation using Howard Hinnant's civil-days algorithm.
+pub fn civil_to_unix_secs(
+    year: i64,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+) -> Option<u64> {
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let m = month as i64;
+    let d = day as i64;
+    let y = year - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = m + if m > 2 { -3 } else { 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days_since_epoch = era * 146097 + doe - 719468;
+    if days_since_epoch < 0 {
+        return None;
+    }
+    let total_secs = (days_since_epoch as u64)
+        .checked_mul(86_400)?
+        .checked_add((hour as u64) * 3_600)?
+        .checked_add((minute as u64) * 60)?
+        .checked_add(second as u64)?;
+    Some(total_secs)
+}
+
+#[inline]
+fn bcd_to_bin(v: u8) -> Option<u8> {
+    let lo = v & 0x0F;
+    let hi = (v >> 4) & 0x0F;
+    if lo > 9 || hi > 9 {
+        return None;
+    }
+    Some(hi * 10 + lo)
+}
+
+/// Decode raw MC146818 CMOS RTC registers into Unix epoch seconds.
+pub fn decode_cmos_rtc_fields(
+    mut sec: u8,
+    mut min: u8,
+    mut hour: u8,
+    mut day: u8,
+    mut month: u8,
+    mut year: u8,
+    mut century: u8,
+    status_b: u8,
+) -> Option<u64> {
+    let is_binary = (status_b & 0x04) != 0;
+    let is_24h = (status_b & 0x02) != 0;
+    let pm = !is_24h && (hour & 0x80) != 0;
+    hour &= 0x7F;
+
+    if !is_binary {
+        sec = bcd_to_bin(sec)?;
+        min = bcd_to_bin(min)?;
+        hour = bcd_to_bin(hour)?;
+        day = bcd_to_bin(day)?;
+        month = bcd_to_bin(month)?;
+        year = bcd_to_bin(year)?;
+        if century != 0 {
+            century = bcd_to_bin(century).unwrap_or(0);
+        }
+    }
+
+    if !is_24h {
+        if hour == 12 {
+            hour = if pm { 12 } else { 0 };
+        } else if pm {
+            hour = hour.checked_add(12)?;
+        }
+    }
+
+    let full_year = if (19..=99).contains(&century) {
+        (century as i64) * 100 + (year as i64)
+    } else {
+        2000 + (year as i64)
+    };
+    civil_to_unix_secs(full_year, month, day, hour, min, sec)
+}
+
+/// Read the x86 MC146818 CMOS RTC at boot and return UTC Unix epoch seconds.
+///
+/// Bounded retry loop waits for UIP (Update-In-Progress) to clear and requires
+/// two identical consecutive reads to avoid mid-second rollover corruption.
+/// Returns `None` if the RTC is absent or reports invalid/uninitialized fields.
+#[cfg(target_arch = "x86_64")]
+pub fn read_cmos_rtc_unix_secs() -> Option<u64> {
+    use x86_64::instructions::port::Port;
+
+    let read_reg = |reg: u8| -> u8 {
+        // SAFETY: MC146818 CMOS index (0x70) / data (0x71) ports, ring 0 only.
+        unsafe {
+            let mut idx: Port<u8> = Port::new(0x70);
+            let mut data: Port<u8> = Port::new(0x71);
+            idx.write(reg & 0x7F);
+            data.read()
+        }
+    };
+
+    let sample = || -> Option<[u8; 8]> {
+        for _ in 0..10_000 {
+            if (read_reg(0x0A) & 0x80) == 0 {
+                return Some([
+                    read_reg(0x00),
+                    read_reg(0x02),
+                    read_reg(0x04),
+                    read_reg(0x07),
+                    read_reg(0x08),
+                    read_reg(0x09),
+                    read_reg(0x32),
+                    read_reg(0x0B),
+                ]);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    };
+
+    for _ in 0..8 {
+        let a = sample()?;
+        let b = sample()?;
+        if a == b {
+            return decode_cmos_rtc_fields(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn read_cmos_rtc_unix_secs() -> Option<u64> {
+    None
+}
+
 // ============================================================================
 // Internal Implementation
 // ============================================================================
@@ -462,4 +638,59 @@ unsafe fn read_reg64(base_virt: u64, offset: usize) -> u64 {
 unsafe fn write_reg64(base_virt: u64, offset: usize, value: u64) {
     let addr = (base_virt + offset as u64) as *mut u64;
     write_volatile(addr, value);
+}
+
+#[cfg(test)]
+mod n2_6b_rtc_tests {
+    use super::*;
+
+    #[test]
+    fn n2_6b_civil_to_unix_secs_epoch_and_leap_years() {
+        assert_eq!(civil_to_unix_secs(1970, 1, 1, 0, 0, 0), Some(0));
+        assert_eq!(
+            civil_to_unix_secs(2000, 2, 29, 12, 30, 45),
+            Some(951_827_445)
+        );
+        assert_eq!(civil_to_unix_secs(2024, 3, 1, 0, 0, 0), Some(1_709_251_200));
+        assert_eq!(
+            civil_to_unix_secs(2026, 11, 28, 4, 0, 0),
+            Some(1_795_838_400)
+        );
+        // Invalid bounds fail closed.
+        assert_eq!(civil_to_unix_secs(1969, 12, 31, 23, 59, 59), None);
+        assert_eq!(civil_to_unix_secs(2026, 13, 1, 0, 0, 0), None);
+        assert_eq!(civil_to_unix_secs(2026, 1, 1, 24, 0, 0), None);
+    }
+
+    #[test]
+    fn n2_6b_decode_cmos_rtc_bcd_binary_and_12h() {
+        // BCD + 24h (status_b = 0x02): 2026-11-28 04:00:00 UTC
+        assert_eq!(
+            decode_cmos_rtc_fields(0x00, 0x00, 0x04, 0x28, 0x11, 0x26, 0x20, 0x02),
+            Some(1_795_838_400)
+        );
+        // Binary + 24h (status_b = 0x06), century = 0 defaults to 20xx
+        assert_eq!(
+            decode_cmos_rtc_fields(0, 0, 4, 28, 11, 26, 0, 0x06),
+            Some(1_795_838_400)
+        );
+        // Binary + 12h PM (status_b = 0x04): 12:00 PM -> 12:00, 1:00 PM -> 13:00, 12:00 AM -> 00:00
+        assert_eq!(
+            decode_cmos_rtc_fields(0, 0, 12 | 0x80, 1, 1, 70, 19, 0x04),
+            Some(12 * 3600)
+        );
+        assert_eq!(
+            decode_cmos_rtc_fields(0, 0, 1 | 0x80, 1, 1, 70, 19, 0x04),
+            Some(13 * 3600)
+        );
+        assert_eq!(
+            decode_cmos_rtc_fields(0, 0, 12, 1, 1, 70, 19, 0x04),
+            Some(0)
+        );
+        // Malformed BCD digit rejected.
+        assert_eq!(
+            decode_cmos_rtc_fields(0x0A, 0x00, 0x04, 0x28, 0x11, 0x26, 0x20, 0x02),
+            None
+        );
+    }
 }

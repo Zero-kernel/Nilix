@@ -489,10 +489,19 @@ pub(super) fn sys_futex(
         Some(match timeout_kind {
             FutexTimeoutKind::Relative => timeout_ns,
             // A deadline already passed becomes 0, which times out at once
-            // (after the value check, as on Linux). CLOCK_REALTIME and
-            // CLOCK_MONOTONIC read the same tick here.
-            FutexTimeoutKind::Absolute => timeout_ns
-                .saturating_sub(crate::time::current_timestamp_ms().saturating_mul(1_000_000)),
+            // (after the value check, as on Linux). N2.6b: honor
+            // FUTEX_CLOCK_REALTIME (and FUTEX_LOCK_PI which is always realtime)
+            // against wall-clock `realtime_ns()`, and monotonic ops against
+            // `monotonic_ns()`.
+            FutexTimeoutKind::Absolute => {
+                let use_realtime = (linux_op & 256) != 0 || (linux_op & !(128 | 256)) == 6;
+                let now_ns = if use_realtime {
+                    crate::time::realtime_ns()
+                } else {
+                    crate::time::monotonic_ns()
+                };
+                timeout_ns.saturating_sub(now_ns)
+            }
         })
     } else {
         None

@@ -417,6 +417,31 @@ STRUCT_REFS = {
         c_type="stack_t", c_include="signal.h",
         c_fields=[("ss_sp", 0), ("ss_flags", 8), ("ss_size", 16)],
     ),
+    "ITimerVal": dict(
+        src="syscall_abi", layer=LINUX_UAPI,
+        cite="uapi/linux/time.h struct itimerval (x86-64, 32B)",
+        fields=[("it_interval_sec", 0, 8), ("it_interval_usec", 8, 8),
+                ("it_value_sec", 16, 8), ("it_value_usec", 24, 8)], size=32,
+        c_type="struct itimerval", c_include="sys/time.h",
+        c_fields=[("it_interval", 0), ("it_value", 16)],
+    ),
+    "ITimerSpec": dict(
+        src="syscall_abi", layer=LINUX_UAPI,
+        cite="uapi/linux/time.h struct itimerspec (x86-64, 32B)",
+        fields=[("it_interval_sec", 0, 8), ("it_interval_nsec", 8, 8),
+                ("it_value_sec", 16, 8), ("it_value_nsec", 24, 8)], size=32,
+        c_type="struct itimerspec", c_include="time.h",
+        c_fields=[("it_interval", 0), ("it_value", 16)],
+    ),
+    "SigEvent": dict(
+        src="syscall_abi", layer=LINUX_UAPI,
+        cite="uapi/asm-generic/siginfo.h struct sigevent (x86-64, 64B)",
+        fields=[("sigev_value", 0, 8), ("sigev_signo", 8, 4),
+                ("sigev_notify", 12, 4), ("sigev_notify_tid", 16, 4),
+                ("_pad", 20, 44)], size=64,
+        c_type="struct sigevent", c_include="signal.h",
+        c_fields=[("sigev_value", 0), ("sigev_signo", 8), ("sigev_notify", 12)],
+    ),
     "VfsStat": dict(
         # D2-ABI-STAT-LAYOUT RESOLVED (2026-07-24): converted from the former
         # 112-byte private layout to the Linux x86-64 struct stat wire layout.

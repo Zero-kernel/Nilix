@@ -127,6 +127,66 @@ pub(super) struct TimeSpec {
 // H.0.1-3: Compile-time ABI size assertion.
 const _: [(); 16] = [(); core::mem::size_of::<TimeSpec>()];
 
+/// struct itimerval (Linux x86_64 ABI, 32 bytes, N2.6b)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ITimerVal {
+    pub(super) it_interval_sec: i64,
+    pub(super) it_interval_usec: i64,
+    pub(super) it_value_sec: i64,
+    pub(super) it_value_usec: i64,
+}
+
+const _: [(); 32] = [(); core::mem::size_of::<ITimerVal>()];
+const _: [(); 8] = [(); core::mem::align_of::<ITimerVal>()];
+const _: [(); 0] = [(); core::mem::offset_of!(ITimerVal, it_interval_sec)];
+const _: [(); 16] = [(); core::mem::offset_of!(ITimerVal, it_value_sec)];
+
+/// struct itimerspec (Linux x86_64 ABI, 32 bytes, N2.6b)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ITimerSpec {
+    pub(super) it_interval_sec: i64,
+    pub(super) it_interval_nsec: i64,
+    pub(super) it_value_sec: i64,
+    pub(super) it_value_nsec: i64,
+}
+
+const _: [(); 32] = [(); core::mem::size_of::<ITimerSpec>()];
+const _: [(); 8] = [(); core::mem::align_of::<ITimerSpec>()];
+const _: [(); 0] = [(); core::mem::offset_of!(ITimerSpec, it_interval_sec)];
+const _: [(); 16] = [(); core::mem::offset_of!(ITimerSpec, it_value_sec)];
+
+/// struct sigevent (Linux x86_64 ABI, 64 bytes, N2.6b)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SigEvent {
+    pub(super) sigev_value: u64,
+    pub(super) sigev_signo: i32,
+    pub(super) sigev_notify: i32,
+    pub(super) sigev_notify_tid: i32,
+    pub(super) _pad: [u8; 44],
+}
+
+impl Default for SigEvent {
+    fn default() -> Self {
+        Self {
+            sigev_value: 0,
+            sigev_signo: 0,
+            sigev_notify: 0,
+            sigev_notify_tid: 0,
+            _pad: [0; 44],
+        }
+    }
+}
+
+const _: [(); 64] = [(); core::mem::size_of::<SigEvent>()];
+const _: [(); 8] = [(); core::mem::align_of::<SigEvent>()];
+const _: [(); 0] = [(); core::mem::offset_of!(SigEvent, sigev_value)];
+const _: [(); 8] = [(); core::mem::offset_of!(SigEvent, sigev_signo)];
+const _: [(); 12] = [(); core::mem::offset_of!(SigEvent, sigev_notify)];
+const _: [(); 16] = [(); core::mem::offset_of!(SigEvent, sigev_notify_tid)];
+
 /// struct utsname (Linux ABI, fixed-size strings)
 ///
 /// D2-ABI-STAT-LAYOUT (LOW leg): Linux `new_utsname` is 6 x [u8;65] = 390
