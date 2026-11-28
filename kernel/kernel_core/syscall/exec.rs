@@ -1197,6 +1197,8 @@ pub(super) fn exec_from_bytes(
         // M0-6 poll/select: a live ppoll/pselect6 mask stash cannot survive the
         // address-space replacement (the syscall that set it is being replaced).
         proc.poll_restore_blocked = None;
+        // N2.6a: POSIX/Linux execve(2) disables any established alternate signal stack.
+        proc.sigaltstack = crate::signal::SigAltStack::disabled();
         // Robust-list registration is address-space-local. Clear the old
         // image's pointer before publishing the replacement so exit cleanup
         // cannot dereference stale or newly-reused virtual memory.

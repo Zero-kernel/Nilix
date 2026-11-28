@@ -37,7 +37,7 @@ pub(super) enum KillTarget {
 }
 
 pub(super) fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
-    kill_common(pid, sig, KillTarget::Process)
+    kill_common(pid, sig, KillTarget::Process, None)
 }
 
 /// tkill(2). musl's raise() uses it with the caller's own tid.
@@ -45,7 +45,7 @@ pub(super) fn sys_tkill(tid: i32, sig: i32) -> SyscallResult {
     if tid <= 0 {
         return Err(SyscallError::EINVAL);
     }
-    kill_common(tid as ProcessId, sig, KillTarget::Thread)
+    kill_common(tid as ProcessId, sig, KillTarget::Thread, None)
 }
 
 /// tgkill(2).
@@ -57,14 +57,61 @@ pub(super) fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> SyscallResult {
         tid as ProcessId,
         sig,
         KillTarget::ThreadInGroup(tgid as ProcessId),
+        None,
     )
 }
 
-/// Shared authorization and delivery for kill, tkill and tgkill. Every check
-/// below (namespace translation, init protection, POSIX/user-namespace
-/// permission, LSM) applies to all three; only the final delivery differs.
-pub(super) fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> SyscallResult {
-    use crate::signal::{send_signal, send_signal_thread, signal_name, Signal};
+/// rt_sigqueueinfo(2) — queue a signal + siginfo_t payload to a thread group (129).
+pub(super) fn sys_rt_sigqueueinfo(tgid: i32, sig: i32, uinfo: *const u8) -> SyscallResult {
+    if uinfo.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let mut raw = [0u8; 128];
+    copy_from_user(&mut raw, uinfo)?;
+    if tgid <= 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let info = crate::signal::SigInfo::from_wire_bytes(sig, &raw);
+    kill_common(tgid as ProcessId, sig, KillTarget::Process, Some(info))
+}
+
+/// rt_tgsigqueueinfo(2) — queue a signal + siginfo_t payload to a specific thread (297).
+pub(super) fn sys_rt_tgsigqueueinfo(
+    tgid: i32,
+    tid: i32,
+    sig: i32,
+    uinfo: *const u8,
+) -> SyscallResult {
+    if uinfo.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let mut raw = [0u8; 128];
+    copy_from_user(&mut raw, uinfo)?;
+    if tgid <= 0 || tid <= 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let info = crate::signal::SigInfo::from_wire_bytes(sig, &raw);
+    kill_common(
+        tid as ProcessId,
+        sig,
+        KillTarget::ThreadInGroup(tgid as ProcessId),
+        Some(info),
+    )
+}
+
+/// Shared authorization and delivery for kill, tkill, tgkill, rt_sigqueueinfo,
+/// and rt_tgsigqueueinfo. Every check below (namespace translation, init
+/// protection, POSIX/user-namespace permission, LSM) applies uniformly.
+pub(super) fn kill_common(
+    pid: ProcessId,
+    sig: i32,
+    mode: KillTarget,
+    explicit_info: Option<crate::signal::SigInfo>,
+) -> SyscallResult {
+    use crate::signal::{
+        send_signal, send_signal_queueinfo, send_signal_tgsigqueueinfo, send_signal_thread,
+        signal_name, Signal,
+    };
 
     let self_global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
 
@@ -173,6 +220,14 @@ pub(super) fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> Syscall
         return Err(SyscallError::EPERM);
     }
 
+    // Linux rt_sigqueueinfo(2) / rt_tgsigqueueinfo(2) anti-spoofing rule:
+    // a caller may not send si_code >= 0 or SI_TKILL to another process.
+    if let Some(info) = explicit_info {
+        if self_tgid != target_tgid && (info.code >= 0 || info.code == crate::signal::SI_TKILL) {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
     // R161-2 FIX + R162-1-1 FIX: Invoke LSM hook_signal_send BEFORE sig==0
     // check so MAC policy can deny process existence probes across security
     // domains (matching Linux SELinux/AppArmor behavior).
@@ -198,10 +253,16 @@ pub(super) fn kill_common(pid: ProcessId, sig: i32, mode: KillTarget) -> Syscall
     let signal = Signal::from_raw(sig)?;
 
     // 发送信号 (using global PID)
-    let _action = match mode {
-        KillTarget::Process => send_signal(target_global_pid, signal)?,
-        KillTarget::Thread | KillTarget::ThreadInGroup(_) => {
+    let _action = match (mode, explicit_info) {
+        (KillTarget::Process, None) => send_signal(target_global_pid, signal)?,
+        (KillTarget::Process, Some(info)) => {
+            send_signal_queueinfo(target_global_pid, signal, info)?
+        }
+        (KillTarget::Thread | KillTarget::ThreadInGroup(_), None) => {
             send_signal_thread(target_global_pid, signal)?
+        }
+        (KillTarget::Thread | KillTarget::ThreadInGroup(_), Some(info)) => {
+            send_signal_tgsigqueueinfo(target_global_pid, signal, info)?
         }
     };
 
@@ -417,6 +478,370 @@ pub(super) fn sys_rt_sigaction(
         copy_to_user(oldact, &b)?;
     }
     Ok(0)
+}
+
+// ============================================================================
+// N2.6a: Extended POSIX / Linux RT signal syscalls
+// (`rt_sigpending`, `rt_sigsuspend`, `rt_sigtimedwait`, `sigaltstack`, `SA_RESTART`)
+// ============================================================================
+
+/// sys_rt_sigpending - examine pending signals for the calling thread/process (127).
+pub(super) fn sys_rt_sigpending(set: *mut u8, sigsetsize: usize) -> SyscallResult {
+    if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+    if set.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    verify_user_memory(set as *const u8, LINUX_KERNEL_SIGSET_SIZE, true)?;
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let pending = proc_arc.lock().pending_bits();
+    copy_to_user(set, &pending.to_ne_bytes())?;
+    Ok(0)
+}
+
+/// sys_rt_sigsuspend - atomically replace the signal mask and wait for a signal (130).
+///
+/// Reuses the `poll_restore_blocked` (TIF_RESTORE_SIGMASK) contract: the temporary
+/// mask stays active across the syscall-return safe point so the interrupting
+/// handler is delivered under it while `saved_blocked` records the caller's
+/// original mask (restored by `rt_sigreturn`). Always returns `EINTR` and is
+/// never restarted by `SA_RESTART`.
+pub(super) fn sys_rt_sigsuspend(unewset: *const u8, sigsetsize: usize) -> SyscallResult {
+    if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+    if unewset.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let mut b = [0u8; LINUX_KERNEL_SIGSET_SIZE];
+    copy_from_user(&mut b, unewset)?;
+    let temp_mask = u64::from_ne_bytes(b);
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    let (old_mask, retarget) = {
+        let mut p = proc_arc.lock();
+        let old = p.blocked;
+        p.blocked = crate::signal::apply_sigprocmask(old, SIG_SETMASK, temp_mask);
+        let retarget = p
+            .recalc_shared_signals(true)
+            .then(|| Arc::clone(&p.thread_group));
+        (old, retarget)
+    };
+    if let Some(group) = retarget {
+        crate::process::retarget_shared_signals(pid, &group);
+    }
+
+    loop {
+        if wait_should_abort(pid) || crate::signal::has_deliverable_signal(pid) {
+            break;
+        }
+        crate::reschedule_if_needed();
+        debug_assert!(
+            x86_64::instructions::interrupts::are_enabled(),
+            "rt_sigsuspend wait loop must hlt with IRQs enabled"
+        );
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    let retarget_after = {
+        let mut p = proc_arc.lock();
+        if crate::signal::has_deliverable_signal_locked(&p) {
+            p.poll_restore_blocked = Some(old_mask);
+            None
+        } else {
+            p.blocked = old_mask & !crate::signal::uncatchable_mask();
+            p.recalc_shared_signals(false)
+                .then(|| Arc::clone(&p.thread_group))
+        }
+    };
+    if let Some(group) = retarget_after {
+        crate::process::retarget_shared_signals(pid, &group);
+    }
+
+    Err(SyscallError::EINTR)
+}
+
+/// sys_rt_sigtimedwait - synchronously wait for and consume a queued signal (128).
+///
+/// Consumes any pending signal matching `*uthese` (even if blocked), writes its
+/// 128-byte `siginfo_t` to `uinfo` when non-null, and returns the signal number.
+/// Never restarted by `SA_RESTART`.
+pub(super) fn sys_rt_sigtimedwait(
+    uthese: *const u8,
+    uinfo: *mut u8,
+    uts: *const u8,
+    sigsetsize: usize,
+) -> SyscallResult {
+    if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+    if uthese.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let mut mask_bytes = [0u8; LINUX_KERNEL_SIGSET_SIZE];
+    copy_from_user(&mut mask_bytes, uthese)?;
+    // Linux do_sigtimedwait strips SIGKILL and SIGSTOP from the wait set.
+    let these = u64::from_ne_bytes(mask_bytes) & !crate::signal::uncatchable_mask();
+
+    if !uinfo.is_null() {
+        verify_user_memory(uinfo as *const u8, 128, true)?;
+    }
+
+    const NS_PER_MS: u64 = 1_000_000;
+    let timeout_ms: Option<u64> = if !uts.is_null() {
+        let mut ts = TimeSpec::default();
+        // lint-repr-c-copy: allow (no-padding: TimeSpec {i64,i64} = 16 bytes; user→kernel)
+        let ts_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut ts as *mut TimeSpec as *mut u8,
+                core::mem::size_of::<TimeSpec>(),
+            )
+        };
+        crate::usercopy::copy_from_user_safe(ts_bytes, uts).map_err(|_| SyscallError::EFAULT)?;
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return Err(SyscallError::EINVAL);
+        }
+        let total_ns = (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64);
+        let ms = if total_ns == 0 {
+            0
+        } else {
+            (total_ns / NS_PER_MS)
+                .saturating_add(if total_ns % NS_PER_MS != 0 { 1 } else { 0 })
+                .max(1)
+        };
+        Some(ms)
+    } else {
+        None
+    };
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let start = crate::time::get_ticks();
+
+    loop {
+        let outcome = {
+            let mut proc = proc_arc.lock();
+            if let Some((sig, info)) = proc.take_pending_for_sigwait(these) {
+                Ok(Some((sig, info)))
+            } else {
+                let actions = proc.sigactions.lock();
+                let other_deliverable = crate::signal::select_for_delivery(
+                    proc.wait_pending_bits() & !these & !crate::signal::uncatchable_mask(),
+                    proc.blocked,
+                    proc.in_signal_handler,
+                    &actions,
+                    crate::signal::DeliveryMode::AnyActionable,
+                )
+                .is_some();
+                if other_deliverable {
+                    Err(SyscallError::EINTR)
+                } else {
+                    Ok(None)
+                }
+            }
+        };
+
+        match outcome {
+            Ok(Some((sig, info))) => {
+                if !uinfo.is_null() {
+                    let mut wire = [0u8; 128];
+                    info.write_wire_bytes(&mut wire);
+                    copy_to_user(uinfo, &wire)?;
+                }
+                return Ok(sig.as_u8() as usize);
+            }
+            Err(e) => return Err(e),
+            Ok(None) => {}
+        }
+
+        if wait_should_abort(pid) {
+            return Err(SyscallError::EINTR);
+        }
+
+        match timeout_ms {
+            Some(0) => return Err(SyscallError::EAGAIN),
+            Some(t) if crate::time::get_ticks().saturating_sub(start) >= t => {
+                return Err(SyscallError::EAGAIN);
+            }
+            _ => {}
+        }
+
+        crate::reschedule_if_needed();
+        debug_assert!(
+            x86_64::instructions::interrupts::are_enabled(),
+            "rt_sigtimedwait wait loop must hlt with IRQs enabled"
+        );
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Pure validator/updater for `sigaltstack(2)` (unit-testable without a live PCB).
+pub(super) fn apply_sigaltstack_update(
+    current: crate::signal::SigAltStack,
+    user_rsp: u64,
+    new_req: Option<StackT>,
+) -> Result<(crate::signal::SigAltStack, StackT), SyscallError> {
+    use crate::signal::{SigAltStack, MINSIGSTKSZ, SS_DISABLE};
+
+    let on_stack = current.on_stack(user_rsp);
+    let (old_sp, old_flags, old_size) = current.as_stack_t_fields(user_rsp);
+    let old_stack = StackT {
+        ss_sp: old_sp,
+        ss_flags: old_flags as i32,
+        _pad: 0,
+        ss_size: old_size as usize,
+    };
+
+    let next = match new_req {
+        None => current,
+        Some(req) => {
+            if on_stack {
+                return Err(SyscallError::EPERM);
+            }
+            if req.ss_flags != 0 && req.ss_flags != SS_DISABLE as i32 {
+                return Err(SyscallError::EINVAL);
+            }
+            if req.ss_flags == SS_DISABLE as i32 {
+                SigAltStack::disabled()
+            } else {
+                if req.ss_size < MINSIGSTKSZ {
+                    return Err(SyscallError::ENOMEM);
+                }
+                let end = req
+                    .ss_sp
+                    .checked_add(req.ss_size as u64)
+                    .ok_or(SyscallError::EINVAL)?;
+                if req.ss_sp == 0
+                    || !crate::signal_frame::is_canonical_user_addr(req.ss_sp)
+                    || !crate::signal_frame::is_canonical_user_addr(end - 1)
+                {
+                    return Err(SyscallError::EINVAL);
+                }
+                SigAltStack {
+                    sp: req.ss_sp,
+                    size: req.ss_size as u64,
+                    flags: 0,
+                }
+            }
+        }
+    };
+
+    Ok((next, old_stack))
+}
+
+/// sys_sigaltstack - set and/or get alternate signal stack context (131).
+pub(super) fn sys_sigaltstack(ss: *const u8, old_ss: *mut u8) -> SyscallResult {
+    let new_req: Option<StackT> = if !ss.is_null() {
+        let mut req = StackT::default();
+        // lint-repr-c-copy: allow (StackT is 24-byte #[repr(C)] with explicit _pad; user→kernel)
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut req as *mut StackT as *mut u8,
+                core::mem::size_of::<StackT>(),
+            )
+        };
+        copy_from_user(bytes, ss)?;
+        Some(req)
+    } else {
+        None
+    };
+
+    if !old_ss.is_null() {
+        verify_user_memory(old_ss as *const u8, core::mem::size_of::<StackT>(), true)?;
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let user_rsp = with_current_syscall_frame(|f| f.rsp).unwrap_or(0);
+
+    let old_stack = {
+        let mut proc = proc_arc.lock();
+        let (next, old_stack) = apply_sigaltstack_update(proc.sigaltstack, user_rsp, new_req)?;
+        proc.sigaltstack = next;
+        old_stack
+    };
+
+    if !old_ss.is_null() {
+        // lint-repr-c-copy: allow (StackT is 24-byte #[repr(C)] with explicit _pad; kernel→user)
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &old_stack as *const StackT as *const u8,
+                core::mem::size_of::<StackT>(),
+            )
+        };
+        copy_to_user(old_ss, bytes)?;
+    }
+    Ok(0)
+}
+
+/// Pure Linux `signal(7)` restartability predicate for `SA_RESTART`.
+///
+/// Only blocking I/O, wait, socket accept/send/recv, and timeout-less
+/// `FUTEX_WAIT`/`FUTEX_WAIT_BITSET` restart when returning `EINTR` into an
+/// `SA_RESTART` handler. Time-bounded waits (`nanosleep`, `poll`, `ppoll`,
+/// `select`, `pselect6`, `rt_sigsuspend`, `rt_sigtimedwait`) and `connect`
+/// NEVER restart.
+#[inline]
+pub(super) fn is_restartable_syscall(syscall_num: u64, args: &[u64; 6]) -> bool {
+    use seccomp::syscall_table as st;
+    match syscall_num {
+        st::SYS_READ
+        | st::SYS_WRITE
+        | st::SYS_READV
+        | st::SYS_WRITEV
+        | st::SYS_WAIT4
+        | st::SYS_WAITID
+        | st::SYS_ACCEPT
+        | st::SYS_ACCEPT4
+        | st::SYS_SENDTO
+        | st::SYS_RECVFROM
+        | st::SYS_SENDMSG
+        | st::SYS_RECVMSG => true,
+        st::SYS_FUTEX => {
+            let op = (args[1] as u32) & 0x7f;
+            let timeout_ptr = args[3];
+            // FUTEX_WAIT (0) or FUTEX_WAIT_BITSET (9) with NULL timeout only.
+            (op == 0 || op == 9) && timeout_ptr == 0
+        }
+        _ => false,
+    }
+}
+
+/// Choose the target stack top, red-zone policy, and `SigframeStack` provenance
+/// for signal delivery, honoring `SA_ONSTACK` + `sigaltstack(2)`.
+#[inline]
+pub(super) fn choose_altstack_target(
+    interrupted_rsp: u64,
+    sa_flags: u64,
+    altstack: crate::signal::SigAltStack,
+) -> Option<(u64, bool, crate::signal_frame::SigframeStack)> {
+    if (sa_flags & crate::signal::SA_ONSTACK) == 0 || !altstack.is_enabled() {
+        return None;
+    }
+    let on_main = main_sigframe_stack(altstack.sp).is_some();
+    let stack = crate::signal_frame::SigframeStack::AltStack {
+        floor: altstack.sp,
+        on_main_stack: on_main,
+    };
+    if altstack.on_stack(interrupted_rsp) {
+        // Already running on the alternate signal stack: continue downward from
+        // the current RSP within the same altstack bounds (keep red zone).
+        Some((interrupted_rsp, true, stack))
+    } else {
+        // Switch onto the top of the alternate signal stack (no red zone above top).
+        altstack.top().map(|top| (top, false, stack))
+    }
 }
 
 /// sys_rt_sigreturn - restore the interrupted context after a handler returns (15).
@@ -799,11 +1224,14 @@ pub(super) enum SignalTailStep {
     /// Handler frame delivery (Phase 2/3) outside the PCB lock.
     Handler {
         sig: crate::signal::Signal,
+        siginfo: crate::signal::SigInfo,
+        altstack: crate::signal::SigAltStack,
         handler: u64,
         restorer: u64,
         sa_mask: u64,
         sa_flags: u64,
         old_blocked: u64,
+        uc_sigmask: u64,
         delivered_action: crate::signal::SigAction,
     },
 }
@@ -914,13 +1342,19 @@ pub(super) fn maybe_deliver_signal_phase1<'a>(
             // former `bit` local was folded into select_lowest_deliverable).
             let delivered_action = actions[(sig.as_u8() - 1) as usize];
             let restorer = delivered_action.restorer;
+            let siginfo = proc.peek_own_siginfo(sig);
+            let altstack = proc.sigaltstack;
+            let uc_sigmask = proc.poll_restore_blocked.unwrap_or(proc.blocked);
             SignalTailStep::Handler {
                 sig,
+                siginfo,
+                altstack,
                 handler,
                 restorer,
                 sa_mask: mask,
                 sa_flags: flags,
                 old_blocked: proc.blocked,
+                uc_sigmask,
                 delivered_action,
             }
         }
@@ -944,10 +1378,22 @@ pub(super) fn maybe_deliver_signal_phase1<'a>(
 pub(super) fn finish_signal_tail_step(
     pid: ProcessId,
     result: i64,
+    restart_nr: Option<u64>,
     proc_arc: crate::process::ProcessArc,
     step: SignalTailStep,
 ) {
-    let (sig, handler, restorer, sa_mask, sa_flags, old_blocked, delivered_action) = match step {
+    let (
+        sig,
+        siginfo,
+        altstack,
+        handler,
+        restorer,
+        sa_mask,
+        sa_flags,
+        old_blocked,
+        uc_sigmask,
+        delivered_action,
+    ) = match step {
         SignalTailStep::Done | SignalTailStep::ExecHandoff => return,
         SignalTailStep::Exit(exit_code) => {
             drop(proc_arc);
@@ -970,19 +1416,25 @@ pub(super) fn finish_signal_tail_step(
         }
         SignalTailStep::Handler {
             sig,
+            siginfo,
+            altstack,
             handler,
             restorer,
             sa_mask,
             sa_flags,
             old_blocked,
+            uc_sigmask,
             delivered_action,
         } => (
             sig,
+            siginfo,
+            altstack,
             handler,
             restorer,
             sa_mask,
             sa_flags,
             old_blocked,
+            uc_sigmask,
             delivered_action,
         ),
     };
@@ -991,9 +1443,22 @@ pub(super) fn finish_signal_tail_step(
     // D1RES-R1): snapshot the interrupted context + FXSAVE, build the sigframe, copy
     // it to the user stack.
     let snap = with_current_syscall_frame_mut(pid, |frame, fx| {
+        // N2.6a SA_RESTART: if a restartable syscall returned EINTR and this
+        // handler has SA_RESTART set, rewind RIP by the 2-byte `syscall` (0f 05)
+        // instruction and save the original syscall number into RAX so
+        // `rt_sigreturn` transparently re-executes the syscall with intact args.
+        let should_restart = restart_nr
+            .filter(|_| (sa_flags & crate::signal::SA_RESTART) != 0)
+            .filter(|_| {
+                frame.rcx >= 2 && crate::signal_frame::is_canonical_user_addr(frame.rcx - 2)
+            });
+        let (saved_rax, saved_rip) = match should_restart {
+            Some(nr) => (nr, frame.rcx - 2),
+            None => (result as u64, frame.rcx),
+        };
         // The SYSCALL path saved user RIP into RCX and user RFLAGS into R11.
         let ctx = crate::signal_frame::SavedUserContext {
-            rax: result as u64,
+            rax: saved_rax,
             rbx: frame.rbx,
             rcx: frame.rcx,
             rdx: frame.rdx,
@@ -1009,7 +1474,7 @@ pub(super) fn finish_signal_tail_step(
             r13: frame.r13,
             r14: frame.r14,
             r15: frame.r15,
-            rip: frame.rcx,    // user RIP
+            rip: saved_rip,    // user RIP (or rewound `syscall` for SA_RESTART)
             rflags: frame.r11, // user RFLAGS
         };
         let mut fxcopy = [0u8; 512];
@@ -1027,35 +1492,45 @@ pub(super) fn finish_signal_tail_step(
     };
     crate::signal_frame::sanitize_fxsave_for_export(&mut fxcopy);
 
-    // RF178-34 FIX: carry stack provenance through layout and backing. This
-    // prevents a low mmap-backed thread stack from entering main-stack growth.
-    let stack = match main_sigframe_stack(ctx.rsp) {
-        Some(main) => main,
-        None => {
-            let proc = proc_arc.lock();
-            let mm = proc.mm.lock();
-            locate_sigframe_vma(ctx.rsp, &mm.mmap_regions)
+    // N2.6a SA_ONSTACK + RF178-34 FIX: honor sigaltstack when SA_ONSTACK is set;
+    // otherwise carry normal stack provenance through layout and backing.
+    let (target_rsp, skip_red_zone, stack) =
+        if let Some(alt) = choose_altstack_target(ctx.rsp, sa_flags, altstack) {
+            alt
+        } else {
+            let s = match main_sigframe_stack(ctx.rsp) {
+                Some(main) => main,
+                None => {
+                    let proc = proc_arc.lock();
+                    let mm = proc.mm.lock();
+                    locate_sigframe_vma(ctx.rsp, &mm.mmap_regions)
+                }
+            };
+            (ctx.rsp, true, s)
+        };
+    let layout = match crate::signal_frame::compute_sigframe_layout_with_redzone(
+        target_rsp,
+        stack.layout_floor(target_rsp),
+        skip_red_zone,
+    ) {
+        Ok(l) => l,
+        // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
+        // GAP-5 review: no PCB reference may outlive the abandoned stack.
+        Err(_) => {
+            drop(proc_arc);
+            crate::process::terminate_group_self_and_halt(pid, 139)
         }
     };
-    let layout =
-        match crate::signal_frame::compute_sigframe_layout(ctx.rsp, stack.layout_floor(ctx.rsp)) {
-            Ok(l) => l,
-            // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
-            // GAP-5 review: no PCB reference may outlive the abandoned stack.
-            Err(_) => {
-                drop(proc_arc);
-                crate::process::terminate_group_self_and_halt(pid, 139)
-            }
-        };
     // D1RES-R1: heap-free staging — assembled in place into a kernel-stack buffer
-    // (assemble_sigframe zero-fills it; the zero fill is load-bearing). Removes the
-    // former fallible heap alloc + its OOM-kill-on-delivery leg from this path.
+    // (assemble_sigframe_full zero-fills it; the zero fill is load-bearing).
     let mut buf = [0u8; crate::signal_frame::SIGFRAME_SIZE];
-    if crate::signal_frame::assemble_sigframe(
+    if crate::signal_frame::assemble_sigframe_full(
         &layout,
         &ctx,
         &fxcopy,
-        sig.as_u8() as u32,
+        &siginfo,
+        altstack.as_stack_t_fields(ctx.rsp),
+        uc_sigmask,
         handler,
         restorer,
         &mut buf,
@@ -1314,7 +1789,7 @@ pub fn try_deliver_signal_on_irq_return(
     // again at commit below.  A concurrent state change therefore causes a
     // fail-closed defer; it can never redirect a stale handler or overwrite a
     // newer signal mask.
-    let (sig, sa, old_blocked, generation, stack, mm) = {
+    let (sig, siginfo, altstack, sa, old_blocked, generation, target_rsp, skip_red_zone, stack, mm) = {
         // RF178-35 FIX: fatal exit dominates handler delivery. This closes the
         // race after the timer's initial pending-exit transaction.
         if proc_guard
@@ -1364,19 +1839,32 @@ pub fn try_deliver_signal_on_irq_return(
         if !sa.is_handler() {
             return None;
         }
-        // GAP-5 G7: take a group-wide signal into this task's own set before
-        // the frame is built; another member that already took it delivers it.
-        if !proc_guard.claim_pending(sig) {
+        // GAP-5 G7 + N2.6a: IRQ-safe non-blocking claim of a group-wide signal.
+        if !proc_guard.try_claim_pending_irq(sig) {
             return None;
         }
-
-        let stack = resolve_sigframe_stack_irq(interrupted_rsp, &proc_guard);
+        let siginfo = proc_guard.peek_own_siginfo(sig);
+        let altstack = proc_guard.sigaltstack;
+        let (target_rsp, skip_red_zone, stack) =
+            if let Some(alt) = choose_altstack_target(interrupted_rsp, sa.flags, altstack) {
+                alt
+            } else {
+                (
+                    interrupted_rsp,
+                    true,
+                    resolve_sigframe_stack_irq(interrupted_rsp, &proc_guard),
+                )
+            };
         let mm = Arc::clone(&proc_guard.mm);
         (
             sig,
+            siginfo,
+            altstack,
             sa,
             proc_guard.blocked,
             proc_guard.generation,
+            target_rsp,
+            skip_red_zone,
             stack,
             mm,
         )
@@ -1422,10 +1910,11 @@ pub fn try_deliver_signal_on_irq_return(
         }
     };
 
-    // Compute the layout.
-    let layout = match crate::signal_frame::compute_sigframe_layout(
-        interrupted_rsp,
-        stack.layout_floor(interrupted_rsp),
+    // Compute the layout (honoring SA_ONSTACK + sigaltstack when active).
+    let layout = match crate::signal_frame::compute_sigframe_layout_with_redzone(
+        target_rsp,
+        stack.layout_floor(target_rsp),
+        skip_red_zone,
     ) {
         Ok(l) => l,
         Err(_) => return None, // Layout computation failed — defer.
@@ -1436,11 +1925,13 @@ pub fn try_deliver_signal_on_irq_return(
     // alloc performed while HOLDING the proc_arc try_lock guard (FIX A graph),
     // restoring the no-alloc-under-spinlock rule on this path.
     let mut frame_bytes = [0u8; crate::signal_frame::SIGFRAME_SIZE];
-    if crate::signal_frame::assemble_sigframe(
+    if crate::signal_frame::assemble_sigframe_full(
         &layout,
         &interrupted_ctx,
         fpu_state,
-        sig.as_u8() as u32,
+        &siginfo,
+        altstack.as_stack_t_fields(interrupted_rsp),
+        old_blocked,
         handler,
         restorer,
         &mut frame_bytes,
@@ -1507,7 +1998,13 @@ pub fn try_deliver_signal_on_irq_return(
         }
     };
     let index = (sig.as_u8() - 1) as usize;
-    let stack_still_matches = resolve_sigframe_stack_irq(interrupted_rsp, &proc) == stack;
+    let stack_still_matches = if let Some((_, _, alt_s)) =
+        choose_altstack_target(interrupted_rsp, sa_flags, proc.sigaltstack)
+    {
+        proc.sigaltstack == altstack && alt_s == stack
+    } else {
+        proc.sigaltstack == altstack && resolve_sigframe_stack_irq(interrupted_rsp, &proc) == stack
+    };
     // GAP-5: hold the table (try-locked; IRQ context) across the recheck and
     // the SA_RESETHAND commit so a sibling's rt_sigaction cannot interleave.
     let sigactions = Arc::clone(&proc.sigactions);
@@ -1561,4 +2058,402 @@ pub fn try_deliver_signal_on_irq_return(
 
     // Return the redirect target: (handler RIP, frame_base RSP, sanitized RFLAGS).
     Some((handler, frame_base, new_rflags))
+}
+
+#[cfg(test)]
+mod n2_6a_signal_tests {
+    use super::*;
+    use crate::signal::{
+        RtSigQueue, SigAltStack, SigInfo, Signal, MAX_QUEUED_RT_SIGNALS, MINSIGSTKSZ, SA_ONSTACK,
+        SI_QUEUE, SI_USER, SS_DISABLE, SS_ONSTACK,
+    };
+
+    #[test]
+    fn n2_6a_rt_sigqueue_fifo_and_bounded_capacity() {
+        let sig34 = Signal::from_raw(34).unwrap();
+        let sig35 = Signal::from_raw(35).unwrap();
+        assert!(sig34.is_realtime());
+        assert!(!Signal::SIGUSR1.is_realtime());
+
+        let mut q = RtSigQueue::new();
+        for i in 0..MAX_QUEUED_RT_SIGNALS {
+            let sig = if i % 2 == 0 { sig34 } else { sig35 };
+            let info = SigInfo {
+                signo: sig.as_i32(),
+                errno: 0,
+                code: SI_QUEUE,
+                pid: 42,
+                uid: 1000,
+                value: i as u64,
+            };
+            assert!(q.push(info).is_ok(), "slot {i} must fit");
+        }
+        // Bounded capacity: next push fails with Err(()) -> EAGAIN.
+        assert!(q.push(SigInfo::default_for(sig34)).is_err());
+
+        // Popping sig34 drains all even values in strict FIFO order without
+        // disturbing sig35 entries.
+        for expected in (0..MAX_QUEUED_RT_SIGNALS).step_by(2) {
+            assert_eq!(q.peek(sig34).map(|s| s.value), Some(expected as u64));
+            let popped = q.pop(sig34).expect("sig34 entry");
+            assert_eq!(popped.value, expected as u64);
+            assert_eq!(popped.code, SI_QUEUE);
+        }
+        assert!(!q.has_signal(sig34));
+        assert!(q.has_signal(sig35));
+
+        // remove_all clears all remaining sig35 entries.
+        q.remove_all(sig35);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn n2_6a_siginfo_wire_roundtrip_and_zero_padding() {
+        let info = SigInfo {
+            signo: 36,
+            errno: 7,
+            code: SI_QUEUE,
+            pid: 1234,
+            uid: 5678,
+            value: 0xDEAD_BEEF_CAFE_BABE,
+        };
+        let mut wire = [0xA5u8; 128];
+        info.write_wire_bytes(&mut wire);
+        assert_eq!(&wire[12..16], &[0, 0, 0, 0], "x86_64 pad0 must be zero");
+        assert!(wire[32..].iter().all(|&b| b == 0), "tail must be zero");
+
+        let parsed = SigInfo::from_wire_bytes(36, &wire);
+        assert_eq!(parsed, info);
+        // signo argument overrides wire si_signo (Linux rt_sigqueueinfo contract).
+        let overridden = SigInfo::from_wire_bytes(40, &wire);
+        assert_eq!(overridden.signo, 40);
+        assert_eq!(overridden.value, info.value);
+    }
+
+    #[test]
+    fn n2_6a_sigaltstack_validation_and_on_stack_eperm() {
+        let mut cur = SigAltStack::disabled();
+        let main_rsp = 0x7FFF_0000u64;
+
+        // Query disabled state.
+        let (next, old) = apply_sigaltstack_update(cur, main_rsp, None).unwrap();
+        assert_eq!(next, cur);
+        assert_eq!(old.ss_flags, SS_DISABLE as i32);
+        assert_eq!(old.ss_sp, 0);
+        assert_eq!(old.ss_size, 0);
+
+        // Reject too-small stack (< MINSIGSTKSZ) with ENOMEM.
+        assert_eq!(
+            apply_sigaltstack_update(
+                cur,
+                main_rsp,
+                Some(StackT {
+                    ss_sp: 0x20_0000,
+                    ss_flags: 0,
+                    _pad: 0,
+                    ss_size: MINSIGSTKSZ - 1,
+                })
+            ),
+            Err(SyscallError::ENOMEM)
+        );
+
+        // Reject SS_ONSTACK as an input flag with EINVAL.
+        assert_eq!(
+            apply_sigaltstack_update(
+                cur,
+                main_rsp,
+                Some(StackT {
+                    ss_sp: 0x20_0000,
+                    ss_flags: SS_ONSTACK as i32,
+                    _pad: 0,
+                    ss_size: MINSIGSTKSZ,
+                })
+            ),
+            Err(SyscallError::EINVAL)
+        );
+
+        // Reject kernel/non-canonical address with EINVAL.
+        assert_eq!(
+            apply_sigaltstack_update(
+                cur,
+                main_rsp,
+                Some(StackT {
+                    ss_sp: 0xFFFF_8000_0000_0000,
+                    ss_flags: 0,
+                    _pad: 0,
+                    ss_size: MINSIGSTKSZ,
+                })
+            ),
+            Err(SyscallError::EINVAL)
+        );
+
+        // Install valid alternate stack.
+        let (installed, _) = apply_sigaltstack_update(
+            cur,
+            main_rsp,
+            Some(StackT {
+                ss_sp: 0x30_0000,
+                ss_flags: 0,
+                _pad: 0,
+                ss_size: MINSIGSTKSZ * 2,
+            }),
+        )
+        .unwrap();
+        cur = installed;
+        assert!(cur.is_enabled());
+        assert!(!cur.on_stack(main_rsp));
+
+        // While executing inside the altstack, query reports SS_ONSTACK and
+        // any modification fails with EPERM.
+        let alt_rsp = 0x30_0000 + MINSIGSTKSZ as u64;
+        assert!(cur.on_stack(alt_rsp));
+        let (_, queried) = apply_sigaltstack_update(cur, alt_rsp, None).unwrap();
+        assert_eq!(queried.ss_flags, SS_ONSTACK as i32);
+        assert_eq!(queried.ss_sp, 0x30_0000);
+        assert_eq!(
+            apply_sigaltstack_update(
+                cur,
+                alt_rsp,
+                Some(StackT {
+                    ss_sp: 0,
+                    ss_flags: SS_DISABLE as i32,
+                    _pad: 0,
+                    ss_size: 0,
+                })
+            ),
+            Err(SyscallError::EPERM)
+        );
+
+        // Off-stack disable succeeds and returns prior active stack.
+        let (disabled, prev) = apply_sigaltstack_update(
+            cur,
+            main_rsp,
+            Some(StackT {
+                ss_sp: 0,
+                ss_flags: SS_DISABLE as i32,
+                _pad: 0,
+                ss_size: 0,
+            }),
+        )
+        .unwrap();
+        assert!(!disabled.is_enabled());
+        assert_eq!(prev.ss_sp, 0x30_0000);
+        assert_eq!(prev.ss_flags, 0);
+    }
+
+    #[test]
+    fn n2_6a_sa_onstack_layout_and_sigframe_full_fields() {
+        let alt = SigAltStack {
+            sp: 0x50_0000,
+            size: MINSIGSTKSZ as u64,
+            flags: 0,
+        };
+        let main_rsp = 0x7FFF_1000u64;
+
+        // Without SA_ONSTACK, altstack is not selected.
+        assert!(choose_altstack_target(main_rsp, 0, alt).is_none());
+
+        // With SA_ONSTACK from main stack, switches to altstack top without red zone.
+        let (target_rsp, skip_rz, stack) =
+            choose_altstack_target(main_rsp, SA_ONSTACK, alt).expect("altstack selected");
+        assert_eq!(target_rsp, 0x50_0000 + MINSIGSTKSZ as u64);
+        assert!(!skip_rz);
+        assert_eq!(stack.layout_floor(target_rsp), 0x50_0000);
+
+        let layout = crate::signal_frame::compute_sigframe_layout_with_redzone(
+            target_rsp,
+            stack.layout_floor(target_rsp),
+            skip_rz,
+        )
+        .expect("MINSIGSTKSZ altstack must fit full sigframe");
+        assert_eq!(layout.frame_base & 0xF, 8);
+        assert!(layout.frame_base >= alt.sp);
+        assert!(layout.frame_base + crate::signal_frame::SIGFRAME_SIZE as u64 <= target_rsp);
+
+        // Already running on altstack keeps current RSP and red zone.
+        let nested_rsp = alt.sp + 1600;
+        let (nested_top, nested_rz, _) =
+            choose_altstack_target(nested_rsp, SA_ONSTACK, alt).expect("nested altstack");
+        assert_eq!(nested_top, nested_rsp);
+        assert!(nested_rz);
+
+        // Full sigframe assembly writes siginfo + uc_stack + uc_sigmask accurately.
+        let mut ctx = crate::signal_frame::SavedUserContext::default();
+        ctx.rip = 0x40_1000;
+        ctx.rsp = main_rsp;
+        ctx.rflags = 0x202;
+        let fx = [0u8; crate::signal_frame::FXSAVE_SIZE];
+        let info = SigInfo {
+            signo: 35,
+            errno: 0,
+            code: SI_QUEUE,
+            pid: 77,
+            uid: 1000,
+            value: 0x1122_3344_5566_7788,
+        };
+        let mut buf = [0u8; crate::signal_frame::SIGFRAME_SIZE];
+        crate::signal_frame::assemble_sigframe_full(
+            &layout,
+            &ctx,
+            &fx,
+            &info,
+            alt.as_stack_t_fields(main_rsp),
+            0x0000_0000_0000_0200,
+            0x40_2000,
+            0x40_3000,
+            &mut buf,
+        )
+        .expect("assemble full sigframe");
+        // uc_stack at uc+16 (frame+24): ss_sp, ss_flags, ss_size
+        assert_eq!(
+            u64::from_ne_bytes(buf[24..32].try_into().unwrap()),
+            0x50_0000
+        );
+        assert_eq!(u32::from_ne_bytes(buf[32..36].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_ne_bytes(buf[40..48].try_into().unwrap()),
+            MINSIGSTKSZ as u64
+        );
+        // uc_sigmask at frame+304
+        assert_eq!(
+            u64::from_ne_bytes(buf[304..312].try_into().unwrap()),
+            0x0200
+        );
+        // siginfo at frame+312
+        assert_eq!(i32::from_ne_bytes(buf[312..316].try_into().unwrap()), 35);
+        assert_eq!(
+            i32::from_ne_bytes(buf[320..324].try_into().unwrap()),
+            SI_QUEUE
+        );
+        assert_eq!(i32::from_ne_bytes(buf[328..332].try_into().unwrap()), 77);
+        assert_eq!(u32::from_ne_bytes(buf[332..336].try_into().unwrap()), 1000);
+        assert_eq!(
+            u64::from_ne_bytes(buf[336..344].try_into().unwrap()),
+            0x1122_3344_5566_7788
+        );
+    }
+
+    #[test]
+    fn n2_6a_sa_restart_syscall_classification() {
+        use seccomp::syscall_table as st;
+        let z = [0u64; 6];
+        for nr in [
+            st::SYS_READ,
+            st::SYS_WRITE,
+            st::SYS_READV,
+            st::SYS_WRITEV,
+            st::SYS_WAIT4,
+            st::SYS_WAITID,
+            st::SYS_ACCEPT,
+            st::SYS_ACCEPT4,
+            st::SYS_SENDTO,
+            st::SYS_RECVFROM,
+            st::SYS_SENDMSG,
+            st::SYS_RECVMSG,
+        ] {
+            assert!(
+                is_restartable_syscall(nr, &z),
+                "syscall {nr} must be restartable under SA_RESTART"
+            );
+        }
+        // FUTEX_WAIT / FUTEX_WAIT_BITSET with NULL timeout are restartable; with
+        // non-null timeout or FUTEX_WAKE are not.
+        assert!(is_restartable_syscall(st::SYS_FUTEX, &[0, 0, 0, 0, 0, 0]));
+        assert!(is_restartable_syscall(st::SYS_FUTEX, &[0, 128, 0, 0, 0, 0])); // PRIVATE|WAIT
+        assert!(is_restartable_syscall(st::SYS_FUTEX, &[0, 9, 0, 0, 0, 0]));
+        assert!(!is_restartable_syscall(
+            st::SYS_FUTEX,
+            &[0, 0, 0, 0x1000, 0, 0]
+        ));
+        assert!(!is_restartable_syscall(st::SYS_FUTEX, &[0, 1, 0, 0, 0, 0])); // WAKE
+
+        // Never-restartable syscalls per Linux signal(7).
+        for nr in [
+            st::SYS_NANOSLEEP,
+            st::SYS_POLL,
+            st::SYS_PPOLL,
+            st::SYS_SELECT,
+            st::SYS_PSELECT6,
+            st::SYS_RT_SIGSUSPEND,
+            st::SYS_RT_SIGTIMEDWAIT,
+            st::SYS_CONNECT,
+        ] {
+            assert!(
+                !is_restartable_syscall(nr, &z),
+                "syscall {nr} must NEVER restart under SA_RESTART"
+            );
+        }
+    }
+
+    #[test]
+    fn n2_6a_process_group_rt_queue_and_sigwait_fifo() {
+        let proc_arc = Arc::new(crate::owner_lock::OwnerCpuMutex::new(
+            crate::process::Process::new(901, 1, alloc::string::String::from("rt-test"), 10),
+        ));
+        let sig34 = Signal::from_raw(34).unwrap();
+        let sigusr1 = Signal::SIGUSR1;
+
+        {
+            let p = proc_arc.lock();
+            for val in [100u64, 200, 300] {
+                p.thread_group
+                    .queue_shared_info(
+                        sig34,
+                        Some(SigInfo {
+                            signo: 34,
+                            errno: 0,
+                            code: SI_QUEUE,
+                            pid: 11,
+                            uid: 0,
+                            value: val,
+                        }),
+                        true,
+                    )
+                    .expect("queue rt signal");
+            }
+            // Standard signal coalesces to first payload.
+            p.thread_group
+                .queue_shared_info(
+                    sigusr1,
+                    Some(SigInfo::from_sender(sigusr1, SI_USER, 11, 0)),
+                    false,
+                )
+                .unwrap();
+            p.thread_group
+                .queue_shared_info(
+                    sigusr1,
+                    Some(SigInfo::from_sender(sigusr1, SI_USER, 99, 0)),
+                    false,
+                )
+                .unwrap();
+        }
+
+        // Dequeue all 3 RT instances in FIFO order via take_pending_for_sigwait.
+        let mut p = proc_arc.lock();
+        let (s1, i1) = p.take_pending_for_sigwait(sig34.bit()).expect("1st rt");
+        assert_eq!((s1, i1.value), (sig34, 100));
+        assert_ne!(
+            p.pending_bits() & sig34.bit(),
+            0,
+            "2 instances still remain"
+        );
+
+        let (s2, i2) = p.take_pending_for_sigwait(sig34.bit()).expect("2nd rt");
+        assert_eq!((s2, i2.value), (sig34, 200));
+        assert_ne!(
+            p.pending_bits() & sig34.bit(),
+            0,
+            "1 instance still remains"
+        );
+
+        let (s3, i3) = p.take_pending_for_sigwait(sig34.bit()).expect("3rd rt");
+        assert_eq!((s3, i3.value), (sig34, 300));
+        assert_eq!(p.pending_bits() & sig34.bit(), 0, "queue drained");
+        assert!(p.take_pending_for_sigwait(sig34.bit()).is_none());
+
+        // Standard signal delivers once with first sender pid (11).
+        let (su, iu) = p.take_pending_for_sigwait(sigusr1.bit()).expect("usr1");
+        assert_eq!((su, iu.pid), (sigusr1, 11));
+        assert!(p.take_pending_for_sigwait(sigusr1.bit()).is_none());
+    }
 }

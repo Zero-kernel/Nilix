@@ -178,6 +178,26 @@ pub const LINUX_DIRENT64_NAME_OFFSET: usize = core::mem::offset_of!(LinuxDirent6
 const _: [(); 19] = [(); LINUX_DIRENT64_NAME_OFFSET];
 
 // ============================================================================
+// Signal Stack ABI (Linux x86_64 stack_t, N2.6a)
+// ============================================================================
+
+/// Linux x86_64 `stack_t` wire layout for `sigaltstack(2)` (24 bytes, explicit padding).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct StackT {
+    pub(super) ss_sp: u64,
+    pub(super) ss_flags: i32,
+    pub(super) _pad: i32,
+    pub(super) ss_size: usize,
+}
+
+const _: [(); 24] = [(); core::mem::size_of::<StackT>()];
+const _: [(); 8] = [(); core::mem::align_of::<StackT>()];
+const _: [(); 0] = [(); core::mem::offset_of!(StackT, ss_sp)];
+const _: [(); 8] = [(); core::mem::offset_of!(StackT, ss_flags)];
+const _: [(); 16] = [(); core::mem::offset_of!(StackT, ss_size)];
+
+// ============================================================================
 // Socket ABI (Linux x86_64)
 // ============================================================================
 

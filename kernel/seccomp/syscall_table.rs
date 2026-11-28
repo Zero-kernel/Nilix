@@ -333,6 +333,12 @@ define_syscall_table! {
         (107, SYS_GETEUID,            Geteuid,           "geteuid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (108, SYS_GETEGID,            Getegid,           "getegid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
         (110, SYS_GETPPID,            Getppid,           "getppid",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_STDIO),         reason: ""),
+        // Extended RT signals & alternate signal stack (N2.6a)
+        (127, SYS_RT_SIGPENDING,      RtSigpending,      "rt_sigpending",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (128, SYS_RT_SIGTIMEDWAIT,    RtSigtimedwait,    "rt_sigtimedwait",    strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (129, SYS_RT_SIGQUEUEINFO,    RtSigqueueinfo,    "rt_sigqueueinfo",    strict: false, drop_proc: true,  status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (130, SYS_RT_SIGSUSPEND,      RtSigsuspend,      "rt_sigsuspend",      strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (131, SYS_SIGALTSTACK,        Sigaltstack,       "sigaltstack",        strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         // Root/prctl/arch/rlimit/sync
         (155, SYS_PIVOT_ROOT,         PivotRoot,         "pivot_root",         strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (157, SYS_PRCTL,              Prctl,             "prctl",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
@@ -365,6 +371,7 @@ define_syscall_table! {
         (288, SYS_ACCEPT4,            Accept4,           "accept4",            strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (292, SYS_DUP3,               Dup3,              "dup3",               strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (293, SYS_PIPE2,              Pipe2,             "pipe2",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
+        (297, SYS_RT_TGSIGQUEUEINFO,  RtTgsigqueueinfo,  "rt_tgsigqueueinfo",  strict: false, drop_proc: true,  status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (302, SYS_PRLIMIT64,          Prlimit64,         "prlimit64",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Promises(P_RLIMIT),        reason: ""),
         (308, SYS_SETNS,              Setns,             "setns",              strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::Unpledged,                 reason: ""),
         (316, SYS_RENAMEAT2,          Renameat2,         "renameat2",          strict: false, drop_proc: false, status: Dispatched,            pledge: PledgePolicy::PrivateNeverPledged,       reason: ""),

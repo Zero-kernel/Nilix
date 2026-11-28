@@ -45,9 +45,13 @@ pub const SIGFRAME_SIZE: usize = FRAME_SIZE as usize;
 const OFF_PRETCODE: u64 = 0;
 const OFF_UC: u64 = 8;
 const OFF_UC_FLAGS: u64 = OFF_UC; // +0
+const OFF_UC_STACK_SP: u64 = OFF_UC + 16; // ss_sp within uc_stack
 const OFF_UC_STACK_FLAGS: u64 = OFF_UC + 24; // ss_flags within uc_stack (SS_DISABLE)
+const OFF_UC_STACK_SIZE: u64 = OFF_UC + 32; // ss_size within uc_stack
 /// sigcontext (uc_mcontext) starts 40 bytes into the ucontext.
 const OFF_MCONTEXT: u64 = OFF_UC + 40; // 48
+/// uc_sigmask (8-byte kernel sigset_t) sits immediately after the 256-byte sigcontext.
+const OFF_UC_SIGMASK: u64 = OFF_MCONTEXT + 256; // 304 (OFF_UC + 296)
 const OFF_SIGINFO: u64 = OFF_UC + UC_SIZE; // 312
 const OFF_FPSTATE: u64 = OFF_SIGINFO + SIGINFO_SIZE; // 440
 
@@ -78,9 +82,10 @@ const MC_FPSTATE_PTR: u64 = OFF_MCONTEXT + 184;
 const SI_SIGNO: u64 = OFF_SIGINFO; // +0
 const SI_ERRNO: u64 = OFF_SIGINFO + 4;
 const SI_CODE: u64 = OFF_SIGINFO + 8;
-/// SI_USER — a user `kill()`/`raise()` source. The minimal slice-1 siginfo carries
-/// no sender pid/uid/addr (the `PendingSignals` u64 bitmap holds none); a documented
-/// M0 divergence (real `siginfo` is SLICE 4).
+const SI_PID: u64 = OFF_SIGINFO + 16;
+const SI_UID: u64 = OFF_SIGINFO + 20;
+const SI_VALUE: u64 = OFF_SIGINFO + 24;
+/// SI_USER — default `si_code` for user `kill()`/`raise()` signals.
 const SI_USER: u32 = 0;
 
 /// The red zone skipped below the interrupted RSP (SysV AMD64 §3.2.2).
@@ -163,8 +168,19 @@ pub struct SigframeLayout {
 /// VMA and must never mutate main-stack accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigframeStack {
-    Main { floor: u64 },
-    Mmap { floor: u64 },
+    Main {
+        floor: u64,
+    },
+    Mmap {
+        floor: u64,
+    },
+    /// N2.6a: explicit `sigaltstack(2)` range `[floor, top)`. Backed by any
+    /// writable user memory (mmap, brk heap, `.bss`, or main stack); page-table
+    /// writability is enforced by faultable `copy_to_user`.
+    AltStack {
+        floor: u64,
+        on_main_stack: bool,
+    },
     Unlocatable,
 }
 
@@ -175,7 +191,7 @@ impl SigframeStack {
     #[inline]
     pub const fn layout_floor(self, rsp: u64) -> u64 {
         match self {
-            Self::Main { floor } | Self::Mmap { floor } => floor,
+            Self::Main { floor } | Self::Mmap { floor } | Self::AltStack { floor, .. } => floor,
             Self::Unlocatable => rsp,
         }
     }
@@ -185,7 +201,11 @@ impl SigframeStack {
     /// consult or update the main stack's committed-floor watermark.
     #[inline]
     pub const fn needs_main_stack_backing(self, frame_base: u64, eager_floor: u64) -> bool {
-        matches!(self, Self::Main { .. }) && frame_base < eager_floor
+        match self {
+            Self::Main { .. } => frame_base < eager_floor,
+            Self::AltStack { on_main_stack, .. } => on_main_stack && frame_base < eager_floor,
+            Self::Mmap { .. } | Self::Unlocatable => false,
+        }
     }
 }
 
@@ -207,10 +227,26 @@ pub fn compute_sigframe_layout(
     interrupted_rsp: u64,
     stack_floor: u64,
 ) -> Result<SigframeLayout, SyscallError> {
-    // Skip the 128-byte red zone below the interrupted RSP.
-    let top = interrupted_rsp
-        .checked_sub(RED_ZONE)
-        .ok_or(SyscallError::EFAULT)?;
+    compute_sigframe_layout_with_redzone(interrupted_rsp, stack_floor, true)
+}
+
+/// Compute the sigframe layout with optional red-zone skipping.
+///
+/// Switching onto a fresh alternate signal stack (`SA_ONSTACK`) passes
+/// `skip_red_zone = false` so `MINSIGSTKSZ` (2048 B) is not needlessly reduced
+/// by 128 bytes above the top of the alternate stack.
+pub fn compute_sigframe_layout_with_redzone(
+    target_rsp: u64,
+    stack_floor: u64,
+    skip_red_zone: bool,
+) -> Result<SigframeLayout, SyscallError> {
+    let top = if skip_red_zone {
+        target_rsp
+            .checked_sub(RED_ZONE)
+            .ok_or(SyscallError::EFAULT)?
+    } else {
+        target_rsp
+    };
     // Place the frame so frame_base ≡ 8 (mod 16): align the candidate down to 16
     // then drop 8. fpstate (frame_base + 440) is then 16-aligned for fxrstor64.
     let candidate = top.checked_sub(FRAME_SIZE).ok_or(SyscallError::E2BIG)?;
@@ -272,6 +308,34 @@ pub fn assemble_sigframe(
     restorer: u64,
     out: &mut [u8; SIGFRAME_SIZE],
 ) -> Result<(), SyscallError> {
+    let info = crate::signal::SigInfo::default_for_raw(signum);
+    assemble_sigframe_full(
+        layout,
+        ctx,
+        fpstate,
+        &info,
+        (0, crate::signal::SS_DISABLE, 0),
+        0,
+        handler,
+        restorer,
+        out,
+    )
+}
+
+/// Full N2.6a `rt_sigframe` builder carrying queued `siginfo_t` metadata,
+/// `uc_stack` (`sigaltstack`), and `uc_sigmask`.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_sigframe_full(
+    layout: &SigframeLayout,
+    ctx: &SavedUserContext,
+    fpstate: &[u8; FXSAVE_SIZE],
+    siginfo: &crate::signal::SigInfo,
+    uc_stack: (u64, u32, u64),
+    uc_sigmask: u64,
+    handler: u64,
+    restorer: u64,
+    out: &mut [u8; SIGFRAME_SIZE],
+) -> Result<(), SyscallError> {
     // Overflow gate BEFORE any write: a corrupt layout can never diverge the
     // initialized region from the caller's fixed-size usercopy. Unreachable in
     // practice (compute_sigframe_layout always sets len == FRAME_SIZE).
@@ -284,9 +348,11 @@ pub fn assemble_sigframe(
     // pretcode = SA_RESTORER (the handler `ret`s here, which issues rt_sigreturn).
     put_u64(&mut buf, OFF_PRETCODE, restorer);
 
-    // ucontext: uc_flags = 0, uc_link = 0, uc_stack = {0, SS_DISABLE(2), 0}.
+    // ucontext: uc_flags = 0, uc_link = 0, uc_stack = {ss_sp, ss_flags, ss_size}.
     put_u64(&mut buf, OFF_UC_FLAGS, 0);
-    put_u32(&mut buf, OFF_UC_STACK_FLAGS, 2 /* SS_DISABLE */);
+    put_u64(&mut buf, OFF_UC_STACK_SP, uc_stack.0);
+    put_u32(&mut buf, OFF_UC_STACK_FLAGS, uc_stack.1);
+    put_u64(&mut buf, OFF_UC_STACK_SIZE, uc_stack.2);
 
     // sigcontext (uc_mcontext): the interrupted user register state.
     put_u64(&mut buf, MC_R8, ctx.r8);
@@ -302,18 +368,23 @@ pub fn assemble_sigframe(
     put_u64(&mut buf, MC_RBP, ctx.rbp);
     put_u64(&mut buf, MC_RBX, ctx.rbx);
     put_u64(&mut buf, MC_RDX, ctx.rdx);
-    put_u64(&mut buf, MC_RAX, ctx.rax); // the FINAL syscall result — restored on return.
+    put_u64(&mut buf, MC_RAX, ctx.rax); // the FINAL syscall result (or restarted syscall nr).
     put_u64(&mut buf, MC_RCX, ctx.rcx);
     put_u64(&mut buf, MC_RSP, ctx.rsp);
     put_u64(&mut buf, MC_RIP, ctx.rip);
     put_u64(&mut buf, MC_EFLAGS, ctx.rflags);
     // uc_mcontext.fpstate pointer is ABI shape only; rt_sigreturn re-derives the VA.
     put_u64(&mut buf, MC_FPSTATE_PTR, layout.fpstate_va);
+    // uc_sigmask (informative for handler; rt_sigreturn restores PCB saved_blocked).
+    put_u64(&mut buf, OFF_UC_SIGMASK, uc_sigmask);
 
-    // siginfo: minimal (si_signo, si_errno=0, si_code=SI_USER); rest zero.
-    put_u32(&mut buf, SI_SIGNO, signum);
-    put_u32(&mut buf, SI_ERRNO, 0);
-    put_u32(&mut buf, SI_CODE, SI_USER as u32);
+    // siginfo (128-byte Linux x86_64 siginfo_t layout).
+    put_u32(&mut buf, SI_SIGNO, siginfo.signo as u32);
+    put_u32(&mut buf, SI_ERRNO, siginfo.errno as u32);
+    put_u32(&mut buf, SI_CODE, siginfo.code as u32);
+    put_u32(&mut buf, SI_PID, siginfo.pid as u32);
+    put_u32(&mut buf, SI_UID, siginfo.uid);
+    put_u64(&mut buf, SI_VALUE, siginfo.value);
 
     // fpstate: the 512-byte FXSAVE image.
     let o = OFF_FPSTATE as usize;
